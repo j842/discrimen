@@ -465,10 +465,11 @@ where the answer was wrong and some endpoint had it. Grading uses the production
 
 The compose file is the supported path and it is enough for most people.
 
-Upgrading an existing `llm-router` deployment: read
-[docs/upgrading.md](docs/upgrading.md) first. It upgrades in place on the same
-database, but 29 environment variables stop being read, seven endpoints move to
-admin scope, and the whole fleet re-benchmarks once.
+Upgrading an existing `llm-router` deployment: the commands are in
+[docs/upgrading.md](docs/upgrading.md) under "Do this", and the rest of that page
+is why. It upgrades in place on the same database, but 29 environment variables
+stop being read, seven endpoints move to admin scope, and the whole fleet
+re-benchmarks once.
 
 If you use [dropshell](https://github.com/j842/dropshell), there is a template
 at [`deploy/dropshell/discrimen`](deploy/dropshell/discrimen) that pulls the

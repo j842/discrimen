@@ -1,12 +1,65 @@
 # Upgrading from llm-router
 
+## Do this
+
+Replace `SERVICE` and `SERVER` with your own. The service name must not change:
+the Docker volume is derived from it, and a new name means a cold re-profile of
+the whole fleet.
+
+```bash
+# 1. Back up. Everything below is recoverable from this.
+ds backupdata SERVICE SERVER
+ds list-backups SERVICE
+
+# 2. Register the template source.
+ds add-template /home/j/code/github/discrimen
+ds list-templates | grep discrimen        # must print
+
+# 3. Set the admin password. Do this BEFORE the first start.
+ds edit SERVICE SERVER
+#      add:     ROUTER_ADMIN_PASSWORD="<pick one>"
+#      change:  TEMPLATE="llm-router"  ->  TEMPLATE="discrimen"
+#      leave alone: CONTAINER_NAME, DATA_VOLUME, LOG_DB_PATH
+
+# 4. First install FAILS BY DESIGN. Dropshell rewrites service.env and stops.
+ds install SERVICE SERVER
+
+# 5. Check the rewrite kept your password, then install for real.
+ds edit SERVICE SERVER                    # confirm ROUTER_ADMIN_PASSWORD is still set
+ds install SERVICE SERVER
+
+# 6. Verify.
+ds run SERVICE SERVER status.sh           # Running
+curl -sf http://SERVER:8585/health
+
+# 7. Issue one admin key. /backends, /logs and /debug/* need it now.
+curl -sS -c /tmp/cj -X POST http://SERVER:8585/admin/login \
+  -H 'Content-Type: application/json' -d '{"password":"<the one from step 3>"}'
+curl -sS -b /tmp/cj -X POST http://SERVER:8585/admin/keys \
+  -H 'Content-Type: application/json' -d '{"name":"ops","role":"admin"}'
+# copy "secret" from the response — it is shown once
+
+# 8. Put that key where your tooling reads its token.
+#    An admin key also passes client scope, so one key covers chat and /backends.
+```
+
+Then expect every worker to re-benchmark once, in the background, over the
+following hours. The fleet keeps serving throughout at a provisional quality.
+
+To roll back: set `TEMPLATE` back to `llm-router` and run `ds install` twice
+again, for the same reason as step 4.
+
+---
+
+The rest of this page is why, and what breaks if you skip a step.
+
 discrimen is llm-router extracted and renamed. An existing deployment upgrades in
 place: same SQLite file, same `/data/llm-router/logs.sqlite` path, same
 `/backends/register` interface, same worker beacons. Nothing needs re-registering
 and no schema migration has to be run by hand.
 
-Six things change underneath, and every one of them is silent. This page is the
-list.
+Six things change underneath, and every one of them is silent. The sections below
+are the list.
 
 ## Configuration that is gone
 

@@ -496,6 +496,9 @@ func (r *Router) groupShadows(name string) string {
 	if autoModelNames[key] {
 		return "the automatic route"
 	}
+	if shadowed := expertShadow(key); shadowed != "" {
+		return shadowed
+	}
 	for _, b := range r.registry.snapshot() {
 		if isExpired(b) {
 			continue

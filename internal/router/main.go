@@ -1117,9 +1117,11 @@ func (r *Router) handleModelByID(w http.ResponseWriter, req *http.Request) {
 	}
 	// A group answers to its name however it is capitalised, because that is how
 	// routing resolves it — the menu must not 404 a spelling chat/completions
-	// would accept.
+	// would accept. The ensemble is the same case for the same reason.
 	if g, ok := r.groups.lookup(name); ok {
 		name = g.Name
+	} else if isExpertModel(name) {
+		name = expertModel
 	}
 	for _, m := range r.modelCatalogue() {
 		if m["id"] == name || m["root"] == name {
@@ -1198,8 +1200,15 @@ func (r *Router) modelCatalogue() []map[string]any {
 		"object":   "model",
 		"owned_by": routerOwner,
 		"features": fleet,
-	}}
+	}, expertEntry(fleet)}
 	for _, name := range order {
+		// A worker that registered a model called "expert" does not get the name:
+		// the ensemble resolves ahead of it, so the menu has to say where the name
+		// actually goes rather than advertising a row nothing routes to. Same rule
+		// as a shadowed group, and the worker stays reachable by its own id.
+		if id, _ := byModel[name]["id"].(string); isExpertModel(id) {
+			continue
+		}
 		models = append(models, byModel[name])
 	}
 	// Groups last, and they REPLACE a row of the same id rather than sitting
@@ -1391,6 +1400,14 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request)
 		plan.candidates = kept
 	}
 
+	// The ensemble dispatches to every model at once and synthesises the replies,
+	// so it cannot go through proxyToBackend, which is built around one worker
+	// serving one request. It applies the allow-list to its own panel (see
+	// expert.go) — restrictToAllowList above only narrows a "route"-prefixed plan.
+	if plan.expert.active() {
+		r.serveExpert(w, req, ident, plan, body, chatReq)
+		return
+	}
 	r.proxyToBackend(w, req, ident, plan, body, chatReq)
 }
 
@@ -2284,6 +2301,13 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 	if g := plan.group.header(); g != "" {
 		w.Header().Set("X-LLM-Group", g)
 	}
+	// A request that asked for the ensemble and is being served here instead asked
+	// for something this router will not fake (see expert.go). Saying so is the
+	// difference between a client learning that tools and panels don't mix and a
+	// client believing it got a panel.
+	if x := plan.expert.header(); x != "" {
+		w.Header().Set("X-LLM-Expert", x)
+	}
 
 	// Streaming requests can't be retried — once headers are committed we
 	// can't rewind. Fall through to the single-shot path. ttftBase (slot
@@ -2465,6 +2489,9 @@ type routePlan struct {
 	// group is what group resolution decided, and is the zero value when the
 	// client named no group (see groups.go).
 	group groupRoute
+	// expert is what ensemble resolution decided, and is the zero value when the
+	// client named no ensemble (see expert.go).
+	expert expertRoute
 	// rejected records why each eligible worker was hard-filtered out. Only
 	// populated when explain is set — the proxy path allocates nothing for it.
 	rejected []rejection
@@ -2537,6 +2564,16 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 	// model that three workers serve still load-balances across those three.
 	// "default" — what every clabtree guest sends — and an absent model mean auto.
 	wantModel := requestedModel(req)
+	// The `expert` ensemble resolves ahead of everything, groups included: it is
+	// a route rather than a model, so no worker can capture the name and no group
+	// may be created with it (see expert.go). The filter below is cleared for the
+	// same reason the group fallback clears it — the panel is drawn from the whole
+	// fleet, not from a worker answering to "expert".
+	expert := expertRoute{}
+	if isExpertModel(wantModel) {
+		expert.asked = true
+		wantModel = ""
+	}
 	// A GROUP name resolves ahead of a model id, an alias and a worker id, which
 	// is what fixes the precedence between the four spellings the model field
 	// accepts (see groups.go). It is never an unknown model: a group always
@@ -2624,6 +2661,11 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 		return nil, errors.New("no backend satisfies hard context/feature requirements")
 	}
 
+	// The ensemble asks every MODEL, so its panel is the hard-filtered set as it
+	// stands here — before the soft thinking preference narrows it below. A panel
+	// missing every non-thinking model is not the fleet's opinion (see expert.go).
+	panel := filtered
+
 	// Auto-derived "think": prefer thinking-capable workers, but only if at least
 	// one survives the other hard filters — otherwise fall back to the full set.
 	// Auto-thinking must NEVER 503 a request on its own; it's best-effort steering,
@@ -2638,6 +2680,30 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 	// thinking decision resolved above — drives both the deadline filter and the
 	// completion-time ranking.
 	job := costForRequest(req, tr.hardThink || tr.softThink)
+
+	// The ensemble is settled before anything below, because none of it applies:
+	// it picks no single worker, so there is no tier to rank for, no incumbent to
+	// stay with and no deadline filter that could mean anything across N workers.
+	// A request it declines (tools, an open tool loop) carries on down the normal
+	// path with the reason attached, which is what X-LLM-Expert then reports.
+	if expert.asked {
+		if expert.fallback = expertFallback(req); expert.fallback == "" {
+			return &routePlan{
+				candidates: panel,
+				route:      routeExpert,
+				cl:         cl,
+				job:        job,
+				tr:         tr,
+				expert:     expert,
+				rejected:   rejected,
+			}, nil
+		}
+		if !explain {
+			// Logged where it is ACTED on, not where it is previewed — an inspection
+			// must not be indistinguishable from traffic (see the group fallback).
+			log.Printf("expert: %s — this request cannot be answered by a panel, routing it automatically instead", expert.fallback)
+		}
+	}
 
 	// Session affinity. Resolved AFTER the hard filter so an incumbent that no
 	// longer qualifies for this turn (died, too little context, wrong model) is
@@ -2681,6 +2747,7 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 			tr:         tr,
 			session:    sess,
 			group:      gr,
+			expert:     expert,
 			rejected:   rejected,
 		}, nil
 	}
@@ -2697,6 +2764,7 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 		tr:         tr,
 		session:    sess,
 		group:      gr,
+		expert:     expert,
 		rejected:   rejected,
 	}, nil
 }

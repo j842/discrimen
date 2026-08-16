@@ -57,6 +57,7 @@ type previewResponse struct {
 	Job           previewJob      `json:"job"`
 	Session       previewSession  `json:"session"`
 	Group         *previewGroup   `json:"group,omitempty"`
+	Expert        *previewExpert  `json:"expert,omitempty"`
 	// Candidates and Rejected are the ADMIN half — the fleet, worker by worker.
 	// Omitted entirely for a client rather than sent empty, because an empty list
 	// would read as "nothing qualified", which is a different answer. See
@@ -75,6 +76,16 @@ type previewGroup struct {
 	Member   string   `json:"member,omitempty"`
 	Fallback bool     `json:"fallback"`
 	Members  []string `json:"members,omitempty"`
+}
+
+// previewExpert is how the ensemble route resolved: whether this request gets a
+// panel, and how many models would be in it. The COUNT is client-visible and the
+// membership is not, which is the same line the candidate list draws — a caller
+// is entitled to know that its expensive route is about to cost N generations,
+// and not to a list of the operator's workers.
+type previewExpert struct {
+	Members  int    `json:"members"`
+	Fallback string `json:"fallback,omitempty"`
 }
 
 type previewThinking struct {
@@ -164,6 +175,12 @@ func (r *Router) handleRoutePreview(w http.ResponseWriter, req *http.Request) {
 		writeUnavailable(w, r.retryAfterUnavailable(), err.Error())
 		return
 	}
+	// The ensemble's panel is narrowed by the key's allow-list on the proxy path
+	// (see serveExpert), so it has to be narrowed here too, or a restricted key
+	// previews a panel it would never get.
+	if plan.expert.active() && ident != nil && len(ident.Models) > 0 {
+		plan.candidates = filterCandidates(plan.candidates, ident.allowsBackend)
+	}
 	writeJSON(w, http.StatusOK, r.renderPreview(chatReq, plan, budget, full))
 }
 
@@ -218,6 +235,18 @@ func (r *Router) renderPreview(chatReq *ChatRequest, plan *routePlan, budget tim
 				plan.group.name))
 		}
 	}
+	// The ensemble, where one was asked for. A panel of N is N generations plus a
+	// synthesis, which is the one thing a caller previewing this route needs to
+	// know before it sends it; a fallback is the other, because the request would
+	// otherwise be answered normally with nothing looking wrong.
+	if plan.expert.asked {
+		resp.Expert = &previewExpert{Fallback: plan.expert.fallback}
+		if plan.expert.fallback != "" {
+			resp.Notes = append(resp.Notes, fmt.Sprintf(
+				"expert: %s — a panel cannot answer this, because N models produce N incompatible tool calls and no merge of them "+
+					"is honest, so it routes automatically instead", plan.expert.fallback))
+		}
+	}
 	if plan.session.active() {
 		resp.Session = previewSession{
 			Key:       strconv.FormatUint(plan.session.key, 16),
@@ -229,11 +258,22 @@ func (r *Router) renderPreview(chatReq *ChatRequest, plan *routePlan, budget tim
 
 	// The decision itself, which every caller gets: the worker their request
 	// would land on is the one X-LLM-Backend-ID would name if they sent it.
-	if len(plan.candidates) > 0 {
+	//
+	// An ensemble has no such worker — it lands on every model at once — so it
+	// names none and reports the panel size instead. The workers it shows are the
+	// panel rather than the whole eligible set, which is what would actually run.
+	shown := plan.candidates
+	if plan.expert.active() {
+		shown = expertMembers(plan.candidates, plan.job)
+		resp.Expert.Members = len(shown)
+		resp.Notes = append(resp.Notes, fmt.Sprintf(
+			"expert ensemble: this request would be put to %d model(s) and their answers synthesised by the highest-quality "+
+				"worker that can fit them — %d generations plus one synthesis, all charged to this request", len(shown), len(shown)))
+	} else if len(plan.candidates) > 0 {
 		resp.WouldServe = plan.candidates[0].ID
 	}
 	if full {
-		for _, b := range plan.candidates {
+		for _, b := range shown {
 			prefill := prefillSeconds(b, plan.job.promptTokens)
 			incumbent := sessionIncumbent(b, plan.job)
 			if incumbent {
@@ -263,6 +303,15 @@ func (r *Router) renderPreview(chatReq *ChatRequest, plan *routePlan, budget tim
 	} else {
 		resp.Notes = append(resp.Notes,
 			"per-worker candidate and rejection detail is admin-only; this is the decision for this request")
+	}
+	// Everything below is about acquiring ONE worker's slot, which an ensemble
+	// does not do: it takes a slot per member, waits expertSlotWait for each, and
+	// leaves behind whichever is still busy rather than spilling or queueing.
+	if plan.expert.active() {
+		resp.Notes = append(resp.Notes, fmt.Sprintf(
+			"each member waits up to %s for its own worker's slot and is dropped from the panel if none frees — a busy worker "+
+				"costs its model's answer, never the whole request", expertSlotWait))
+		return resp
 	}
 	// The ranked head is only the FIRST choice: acquisition spills past a
 	// saturated front-runner, and a bounded preference may hold the request

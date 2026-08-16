@@ -64,8 +64,8 @@ var (
 // llama.cpp worker still aliases from its real weights path.
 func backendAlias(b *Backend) string {
 	a := modelAlias(niceModelName(b))
-	if autoModelNames[a] {
-		return "" // an alias must never shadow the auto-route sentinels
+	if autoModelNames[a] || isExpertModel(a) {
+		return "" // an alias must never shadow a name the router owns
 	}
 	return a
 }

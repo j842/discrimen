@@ -107,9 +107,14 @@ func TestArenaEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// /backends moved to admin scope in P3, and the arena run lists the fleet
+	// through it, so the run now needs an admin credential rather than the client
+	// token it used to take.
+	issueKey(t, router, adminSecret, apiKey{Role: roleAdmin, Name: "arena"})
+
 	out := filepath.Join(dir, "results.json")
 	err = arenaRun(arenaConfig{
-		router: srv.URL, dataset: dataset, out: out,
+		router: srv.URL, dataset: dataset, out: out, token: adminSecret,
 		concurrency: 2, maxTokens: 512, deadline: 10 * time.Second,
 		oracle: true, robustness: true,
 	})

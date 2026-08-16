@@ -2,6 +2,8 @@ package router
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -665,5 +667,349 @@ func TestObserveWeightsDecodeByLength(t *testing.T) {
 	}
 	if movedLong <= movedShort*3 {
 		t.Fatalf("a long sample must dominate a short one: moved %v vs %v", movedLong, movedShort)
+	}
+}
+
+// ── Northbound API surface ──────────────────────────────────────────────────
+
+// errorEnvelopeOf reads the OpenAI error envelope a northbound error must carry
+// and fails the test if it is not there. The old shape was a bare
+// {"message":"…"}, which every client written against the standard reads as an
+// empty error, so this checks the wrapper as well as the content type.
+func errorEnvelopeOf(t *testing.T, rec *httptest.ResponseRecorder) errorBody {
+	t.Helper()
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Errorf("error content type = %q, want application/json", ct)
+	}
+	var got struct {
+		Error *errorBody `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("error body is not JSON (%v): %s", err, rec.Body.String())
+	}
+	if got.Error == nil {
+		t.Fatalf("error body has no \"error\" object: %s", rec.Body.String())
+	}
+	if got.Error.Message == "" {
+		t.Errorf("error carries no message: %s", rec.Body.String())
+	}
+	return *got.Error
+}
+
+// envelopeRouter is a router with one ready worker and client auth switched on,
+// enough to drive every northbound error path.
+func envelopeRouter(t *testing.T) *Router {
+	t.Helper()
+	reg := newTestRegistry()
+	registerQ(t, reg, "w", 50, 1)
+	return &Router{
+		cfg:      &Config{ClientTokens: []string{"good"}, DefaultMaxTokens: 4096, HealthInterval: 15 * time.Second},
+		registry: reg,
+	}
+}
+
+func post(path, body string, token string) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	return req
+}
+
+// TestNorthboundErrorEnvelope: every error the router returns is the OpenAI
+// envelope with a JSON content type and a type matching its status. This is the
+// contract clients are written against, and it used to hold on none of these
+// paths — validationError marshalled to {"message":…} and the http.Error sites
+// sent a JSON body labelled text/plain.
+func TestNorthboundErrorEnvelope(t *testing.T) {
+	r := envelopeRouter(t)
+	chat := `{"model":"default","messages":[{"role":"user","content":"hi"}]}`
+
+	cases := []struct {
+		name   string
+		serve  func(rec *httptest.ResponseRecorder)
+		status int
+		typ    string
+	}{
+		{"no client token", func(rec *httptest.ResponseRecorder) {
+			r.handleChatCompletions(rec, post("/v1/chat/completions", chat, ""))
+		}, http.StatusUnauthorized, "authentication_error"},
+		{"wrong client token", func(rec *httptest.ResponseRecorder) {
+			r.handleModels(rec, authReq("Bearer nope"))
+		}, http.StatusUnauthorized, "authentication_error"},
+		{"malformed body", func(rec *httptest.ResponseRecorder) {
+			r.handleChatCompletions(rec, post("/v1/chat/completions", `{not json`, "good"))
+		}, http.StatusBadRequest, "invalid_request_error"},
+		{"unsupported role", func(rec *httptest.ResponseRecorder) {
+			r.handleChatCompletions(rec, post("/v1/chat/completions",
+				`{"messages":[{"role":"wizard","content":"hi"}]}`, "good"))
+		}, http.StatusBadRequest, "invalid_request_error"},
+		{"unknown model", func(rec *httptest.ResponseRecorder) {
+			r.handleChatCompletions(rec, post("/v1/chat/completions",
+				`{"model":"gpt-whatever","messages":[{"role":"user","content":"hi"}]}`, "good"))
+		}, http.StatusNotFound, "not_found_error"},
+		{"unknown model object", func(rec *httptest.ResponseRecorder) {
+			req := httptest.NewRequest(http.MethodGet, "/v1/models/gpt-whatever", nil)
+			req.Header.Set("Authorization", "Bearer good")
+			r.handleModelByID(rec, req)
+		}, http.StatusNotFound, "not_found_error"},
+		{"unrouted path", func(rec *httptest.ResponseRecorder) {
+			r.handleDashboard(rec, httptest.NewRequest(http.MethodGet, "/nope", nil))
+		}, http.StatusNotFound, "not_found_error"},
+		{"wrong method", func(rec *httptest.ResponseRecorder) {
+			r.handleChatCompletions(rec, httptest.NewRequest(http.MethodGet, "/v1/chat/completions", nil))
+		}, http.StatusMethodNotAllowed, "invalid_request_error"},
+		{"nothing to serve", func(rec *httptest.ResponseRecorder) {
+			bare := &Router{cfg: r.cfg, registry: newTestRegistry()}
+			bare.handleChatCompletions(rec, post("/v1/chat/completions", chat, "good"))
+		}, http.StatusServiceUnavailable, "service_unavailable"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			tc.serve(rec)
+			if rec.Code != tc.status {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, tc.status, rec.Body.String())
+			}
+			body := errorEnvelopeOf(t, rec)
+			if body.Type != tc.typ {
+				t.Errorf("error type = %q, want %q", body.Type, tc.typ)
+			}
+		})
+	}
+}
+
+// TestRetryAfterOn503: a 503 with no Retry-After tells a client nothing about
+// whether to back off for a second or a minute, so both 503 causes carry one —
+// derived from the health interval (when the router's view of the fleet can
+// change) and the slot queue (how long the caller just spent waiting).
+func TestRetryAfterOn503(t *testing.T) {
+	r := &Router{
+		cfg:      &Config{DefaultMaxTokens: 4096, HealthInterval: 15 * time.Second},
+		registry: newTestRegistry(),
+	}
+	rec := httptest.NewRecorder()
+	r.handleChatCompletions(rec, post("/v1/chat/completions",
+		`{"messages":[{"role":"user","content":"hi"}]}`, ""))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "15" {
+		t.Errorf("Retry-After = %q, want the health interval (15)", got)
+	}
+
+	// Saturation is bounded by the queue the caller just spent, capped so a
+	// ten-minute slot wait is not turned into a ten-minute back-off.
+	if got := r.retryAfterSaturated(); got != retryAfterCeiling {
+		t.Errorf("saturated hint = %s, want the ceiling %s (slotMaxWait is %s)", got, retryAfterCeiling, slotMaxWait)
+	}
+	// Never below one health interval: a retry sooner than that cannot see a
+	// changed fleet.
+	slow := &Router{cfg: &Config{HealthInterval: 2 * time.Minute}}
+	if got := slow.retryAfterSaturated(); got != 2*time.Minute {
+		t.Errorf("saturated hint = %s, want the health interval floor 2m", got)
+	}
+	// And never zero, whatever it is derived from — "0" reads as retry now.
+	rec = httptest.NewRecorder()
+	writeUnavailable(rec, 0, "nothing")
+	if got := rec.Header().Get("Retry-After"); got != "1" {
+		t.Errorf("Retry-After = %q, want 1", got)
+	}
+}
+
+// TestModelByID covers GET /v1/models/{id}, which used to fall through to the
+// dashboard handler and 404 in HTML. The object must be the same one the list
+// publishes, and both published spellings must resolve to it.
+func TestModelByID(t *testing.T) {
+	reg := newTestRegistry()
+	reg.upsert(BackendRegistration{
+		ID: "w1", URL: "http://w1", Model: "/models/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf",
+		TTLSeconds: 3600, Features: []string{"chat"},
+	})
+	reg.finishCertification("w1", true, map[string]Check{}, 50, 10, "")
+	r := &Router{cfg: &Config{}, registry: reg}
+
+	get := func(path string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		r.handleModelByID(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		return rec
+	}
+	// The menu id is the alias; the raw model id is published as "root". Both
+	// have to resolve, and to the same object the list carries.
+	for _, name := range []string{"gemma4", "/models/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf", "default"} {
+		rec := get("/v1/models/" + name)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /v1/models/%s = %d: %s", name, rec.Code, rec.Body.String())
+		}
+		var got map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("model object is not JSON: %v", err)
+		}
+		if got["object"] != "model" {
+			t.Errorf("GET /v1/models/%s returned object=%v, want \"model\"", name, got["object"])
+		}
+		want := "gemma4"
+		if name == "default" {
+			want = "default"
+		}
+		if got["id"] != want {
+			t.Errorf("GET /v1/models/%s returned id=%v, want %q", name, got["id"], want)
+		}
+	}
+	if rec := get("/v1/models/nope"); rec.Code != http.StatusNotFound {
+		t.Errorf("unknown model = %d, want 404", rec.Code)
+	}
+	// The original defect was routing, not handling: /v1/models was an exact
+	// match, so /v1/models/{id} fell through to the dashboard handler and 404'd
+	// in HTML. Dispatch through the real mux, or that can silently come back.
+	rec := httptest.NewRecorder()
+	r.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models/gemma4", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"object":"model"`) {
+		t.Errorf("mux did not route the single-model path: %d %s", rec.Code, rec.Body.String())
+	}
+	// And the list itself is still reachable at the exact pattern.
+	rec = httptest.NewRecorder()
+	r.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"object":"list"`) {
+		t.Errorf("adding the subtree pattern broke the list: %d %s", rec.Code, rec.Body.String())
+	}
+	// A bare trailing slash is still the list, not a model named "".
+	if rec := get("/v1/models/"); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"object":"list"`) {
+		t.Errorf("GET /v1/models/ = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Same client-auth scope as /v1/models.
+	locked := &Router{cfg: &Config{ClientTokens: []string{"good"}}, registry: reg}
+	rec = httptest.NewRecorder()
+	locked.handleModelByID(rec, httptest.NewRequest(http.MethodGet, "/v1/models/gemma4", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("unauthenticated single-model fetch = %d, want 401", rec.Code)
+	}
+}
+
+// TestLegacyFunctionRoleAccepted: "function" is OpenAI's deprecated spelling of
+// a tool result and it still accepts it. The validator rejecting it was stricter
+// than the standard, and inconsistent with the session tracker, which has always
+// treated that role as continuing a tool loop.
+func TestLegacyFunctionRoleAccepted(t *testing.T) {
+	body := []byte(`{"messages":[
+		{"role":"user","content":"weather?"},
+		{"role":"assistant","content":"","function_call":{"name":"weather"}},
+		{"role":"function","name":"weather","content":"17C"}]}`)
+	req, err := parseAndValidateChatRequest(body, 4096)
+	if err != nil {
+		t.Fatalf("legacy function role rejected: %v", err)
+	}
+	if len(req.Messages) != 3 {
+		t.Fatalf("parsed %d messages, want 3", len(req.Messages))
+	}
+	// It carries `name`, not `tool_call_id`, so the tool_call_id requirement must
+	// not be applied to it.
+	if req.Messages[2].ToolCallID != "" {
+		t.Error("a function message should not need a tool_call_id")
+	}
+	// The tracker already agreed it continues a tool loop; the validator now does.
+	if !inToolLoop(req.Messages) {
+		t.Error("a trailing function result should read as an open tool loop")
+	}
+	// Genuinely unknown roles are still refused.
+	if _, err := parseAndValidateChatRequest([]byte(`{"messages":[{"role":"wizard","content":"x"}]}`), 4096); err == nil {
+		t.Error("an unknown role must still be rejected")
+	}
+}
+
+// streamThen serves an SSE response of n content deltas and then either
+// terminates it properly or drops the connection mid-body, which is what a
+// worker dying mid-generation looks like from the router's side.
+func streamThen(t *testing.T, deltas int, clean bool) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fl, _ := w.(http.Flusher)
+		for i := 0; i < deltas; i++ {
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"tokens tokens \"}}]}\n\n")
+			if fl != nil {
+				fl.Flush()
+			}
+		}
+		if clean {
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+			return
+		}
+		panic(http.ErrAbortHandler) // close without the terminating chunk
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func runStream(t *testing.T, srv *httptest.Server) (*httptest.ResponseRecorder, *RequestLog) {
+	t.Helper()
+	reg := newTestRegistry()
+	reg.upsert(BackendRegistration{ID: "w", URL: srv.URL, Model: "m", TTLSeconds: 3600})
+	r := &Router{
+		cfg: &Config{BackendIdleTimeout: 5 * time.Second}, registry: reg,
+		client: &http.Client{}, streamClient: &http.Client{},
+	}
+	logEntry := &RequestLog{}
+	rec := httptest.NewRecorder()
+	req := post("/v1/chat/completions", `{"messages":[{"role":"user","content":"hi"}],"stream":true}`, "")
+	r.dispatchStreaming(rec, req, reg.get("w"), []byte(`{"stream":true}`), "route",
+		logEntry, io.Discard, &sseStats{}, time.Now(), nominalJob(), false)
+	return rec, logEntry
+}
+
+// TestStreamingFailureBecomesAnSSEErrorEvent: once the preamble is out the
+// status code is spent, so a mid-stream failure used to reach the client as
+// nothing but a short answer — indistinguishable from the model stopping early.
+// It has to be reported inside the stream instead.
+func TestStreamingFailureBecomesAnSSEErrorEvent(t *testing.T) {
+	rec, logEntry := runStream(t, streamThen(t, 3, false))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; the preamble was already committed", rec.Code)
+	}
+	if logEntry.Error == "" {
+		t.Error("a truncated stream must still be recorded as an error in the log")
+	}
+	body := rec.Body.String()
+	if !strings.HasSuffix(body, "data: [DONE]\n\n") {
+		t.Errorf("stream was not terminated: %q", body)
+	}
+	// The error frame has to be the OpenAI envelope, or a client reads it as
+	// content.
+	var found bool
+	for _, line := range strings.Split(body, "\n") {
+		payload, ok := strings.CutPrefix(line, "data: ")
+		if !ok || payload == "[DONE]" {
+			continue
+		}
+		var chunk struct {
+			Error *errorBody `json:"error"`
+		}
+		if json.Unmarshal([]byte(payload), &chunk) == nil && chunk.Error != nil {
+			found = true
+			if chunk.Error.Message == "" || chunk.Error.Type != "server_error" {
+				t.Errorf("error event = %+v, want a server_error with a message", *chunk.Error)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("no error event in the stream: %q", body)
+	}
+}
+
+// A clean stream must reach the client byte for byte — the guarantee the
+// tool-call guard tests assert on the same path. Nothing is appended to a
+// stream that ended properly.
+func TestCleanStreamIsUnchanged(t *testing.T) {
+	rec, logEntry := runStream(t, streamThen(t, 3, true))
+	if logEntry.Error != "" {
+		t.Errorf("clean stream recorded an error: %s", logEntry.Error)
+	}
+	want := strings.Repeat("data: {\"choices\":[{\"delta\":{\"content\":\"tokens tokens \"}}]}\n\n", 3) + "data: [DONE]\n\n"
+	if got := rec.Body.String(); got != want {
+		t.Errorf("clean stream was rewritten:\n got %q\nwant %q", got, want)
 	}
 }

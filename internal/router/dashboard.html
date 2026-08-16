@@ -96,10 +96,15 @@
     const LOG_LIMIT = 50;
     let lastLogData = [];
 
+    // Everything this page reads — /backends, /logs, /debug/* — is admin scope,
+    // so the credential has to be an ADMIN key. A client token used to work here
+    // and no longer does: it would have read every stored prompt and response.
+    // An admin session cookie works too, and same-origin fetch sends it without
+    // any help from this function.
     function token() {
       let t = sessionStorage.getItem('routerToken') || '';
       if (!t) {
-        t = prompt('Router token (blank if not configured):') || '';
+        t = prompt('Router admin key (sk-…), or blank if you are signed in:') || '';
         sessionStorage.setItem('routerToken', t);
       }
       return t;

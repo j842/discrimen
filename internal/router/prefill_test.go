@@ -397,3 +397,51 @@ func TestBackfillCachedProfileRereadsContext(t *testing.T) {
 		t.Fatalf("failed probe clobbered a cached context: got %dk, want 512k", stale.ContextK)
 	}
 }
+
+// A cached profile predates the thinking dialect, so without a backfill clause
+// every already-profiled worker would carry the zero value forever — the failure
+// backfillCachedProfile exists to prevent, and the one its doc comment warns any
+// new WorkerProfile field will inherit.
+func TestBackfillCachedProfileThinkingDialect(t *testing.T) {
+	var probes int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		body, _ := io.ReadAll(req.Body)
+		w.Header().Set("Content-Type", "application/json")
+		if bytes.Contains(body, []byte(`"reasoning_effort"`)) {
+			probes++
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"75","reasoning_content":"worked it out"}}]}`)
+			return
+		}
+		if bytes.Contains(body, []byte(`"chat_template_kwargs"`)) {
+			probes++
+		}
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"75"}}]}`)
+	}))
+	defer srv.Close()
+
+	r := &Router{client: &http.Client{}}
+	b := &Backend{BackendRegistration: BackendRegistration{ID: "w", URL: srv.URL}}
+
+	// Missing dialect: probe, record it, and surface a check so /backends shows
+	// which spelling this endpoint answers to.
+	prof := &WorkerProfile{Model: "m", BenchVersion: benchmarkVersion,
+		SpeedVersion: speedProbeVersion, PrefillTPS: 77}
+	r.backfillCachedProfile("w", b, prof)
+	if prof.ThinkingDialect != thinkingDialectEffort {
+		t.Fatalf("dialect = %q, want %q", prof.ThinkingDialect, thinkingDialectEffort)
+	}
+	if !prof.Thinking {
+		t.Error("the re-probe found a reasoning block but the profile still says it cannot think")
+	}
+	if _, ok := prof.Checks["thinking"]; !ok {
+		t.Error("dialect was measured but no check surfaced it in /backends")
+	}
+	before := probes
+
+	// Already measured: silent. This runs on every registration keepalive, so a
+	// probe here is a 1024-token generation on the whole fleet every ~60s.
+	r.backfillCachedProfile("w", b, prof)
+	if probes != before {
+		t.Errorf("re-probed a profile that already carried a dialect: %d extra requests", probes-before)
+	}
+}

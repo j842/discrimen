@@ -94,18 +94,34 @@ type Config struct {
 }
 
 type BackendRegistration struct {
-	ID             string   `json:"id"`
-	URL            string   `json:"url"`
-	Model          string   `json:"model"`
-	Quality        int      `json:"quality"`
-	Thinking       bool     `json:"thinking"`
-	ContextK       int      `json:"context_k"`
-	BaselineTPS    float64  `json:"baseline_tps"`
-	Features       []string `json:"features"`
-	HealthPath     string   `json:"health_path"`
-	TTLSeconds     int      `json:"ttl_seconds"`
-	MaxConcurrency int      `json:"max_concurrency"`
-	APIKey         string   `json:"api_key,omitempty"`
+	ID          string   `json:"id"`
+	URL         string   `json:"url"`
+	Model       string   `json:"model"`
+	Quality     int      `json:"quality"`
+	Thinking    bool     `json:"thinking"`
+	ContextK    int      `json:"context_k"`
+	BaselineTPS float64  `json:"baseline_tps"`
+	Features    []string `json:"features"`
+	HealthPath  string   `json:"health_path"`
+	TTLSeconds  int      `json:"ttl_seconds"`
+	// MaxConcurrency is a declared concurrency ceiling. On a MANUAL row it
+	// outranks the capacity ramp outright; on a beacon row it is the seed it has
+	// always been, replaced by the measurement. See providers.go.
+	MaxConcurrency int    `json:"max_concurrency"`
+	APIKey         string `json:"api_key,omitempty"`
+
+	// Provider names where this row runs ("local", "openai", "anthropic", …) and
+	// Source records how it got here — "beacon" for a worker that registered
+	// itself, "manual" for a row an operator entered. Both default on the way in
+	// (see normalizeProviderFields): a registration that arrives without them is
+	// a local beacon at zero cost, which is what every deployed worker sends.
+	Provider string `json:"provider,omitempty"`
+	Source   string `json:"source,omitempty"`
+	// Price per MILLION tokens, in whatever currency the operator is billed in.
+	// Zero means free, which is the truth for every local worker and therefore
+	// the right default (see PLAN.md, P4).
+	InputPricePerMtok  float64 `json:"input_price_per_mtok,omitempty"`
+	OutputPricePerMtok float64 `json:"output_price_per_mtok,omitempty"`
 }
 
 type Backend struct {
@@ -375,10 +391,11 @@ func writeError(w http.ResponseWriter, status int, format string, args ...any) {
 	writeJSON(w, status, validationError{Message: fmt.Sprintf(format, args...)})
 }
 
-// unauthorized is the single 401 answer. Every scope check uses it, so the
-// wording and the shape can't drift apart across twenty handlers.
+// unauthorized is the single 401 answer, for both the client and worker scopes.
+// Every scope check uses it, so the wording and the shape cannot drift apart
+// across twenty handlers.
 func unauthorized(w http.ResponseWriter) {
-	writeError(w, http.StatusUnauthorized, "unauthorized: supply a client token as `Authorization: Bearer <token>`")
+	writeError(w, http.StatusUnauthorized, "unauthorized: send a bearer token in the Authorization header")
 }
 
 // notFound is the 404 for a path this router does not serve.
@@ -402,6 +419,11 @@ type RequestLog struct {
 	Input          string    `json:"input"`
 	Output         string    `json:"output"`
 	Error          string    `json:"error,omitempty"`
+	// KeyID identifies the caller: the api_keys row id as a decimal string, "env"
+	// for one of the bootstrap environment tokens, empty when the router required
+	// no credential (every row written before P3, and a trusted-LAN deployment
+	// with no tokens configured). See identity.logKeyID.
+	KeyID string `json:"key_id,omitempty"`
 }
 
 type LogStore struct {
@@ -424,6 +446,11 @@ func Main() {
 	if runArenaCommand(os.Args) {
 		return
 	}
+	// `discrimen prices fetch` refreshes the embedded LiteLLM price snapshot (see
+	// pricing.go). Developer command, run from a checkout, never in the container.
+	if runPricesCommand(os.Args) {
+		return
+	}
 
 	cfg := loadConfig()
 	registry := &Registry{
@@ -438,6 +465,13 @@ func Main() {
 	defer logs.Close()
 
 	router := &Router{cfg: cfg, registry: registry, client: &http.Client{Timeout: cfg.BackendHTTPTimeout}, streamClient: &http.Client{}, benchClient: &http.Client{}, logs: logs}
+	// Before anything is served: generate the credentials the operator did not
+	// supply and print them once. An empty ROUTER_CLIENT_TOKENS used to mean no
+	// client authentication at all, which is right on a trusted LAN and wrong for
+	// a public image — .env.example already promises operators this behaviour.
+	if err := router.bootstrapCredentials(context.Background()); err != nil {
+		log.Fatalf("bootstrap credentials: %v", err)
+	}
 	if cfg.AutoDifficulty || cfg.AutoThinking {
 		router.classifier = newDifficultyClassifier(cfg, router.embedTexts)
 		log.Printf("prompt auto-routing enabled (difficulty=%v bands=%q, thinking=%v threshold=%.2f)",
@@ -480,34 +514,9 @@ func Main() {
 	go router.healthLoop()
 	go router.logRetentionLoop()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", router.handleDashboard)
-	mux.HandleFunc("/health", router.handleHealth)
-	mux.HandleFunc("/v1/health", router.handleHealth)
-	mux.HandleFunc("/backends", router.handleBackends)
-	mux.HandleFunc("/backends/register", router.handleRegisterBackend)
-	mux.HandleFunc("/backends/", router.handleBackendByID)
-	mux.HandleFunc("/workers", router.handleBackends)
-	mux.HandleFunc("/workers/register", router.handleRegisterBackend)
-	mux.HandleFunc("/workers/", router.handleBackendByID)
-	mux.HandleFunc("/v1/models", router.handleModels)
-	mux.HandleFunc("/v1/models/", router.handleModelByID)
-	mux.HandleFunc("/v1/chat/completions", router.handleChatCompletions)
-	mux.HandleFunc("/chat/completions", router.handleChatCompletions)
-	mux.HandleFunc("/v1/completions", router.handleCompletions)
-	mux.HandleFunc("/completions", router.handleCompletions)
-	mux.HandleFunc("/v1/embeddings", router.handleEmbeddings)
-	mux.HandleFunc("/embeddings", router.handleEmbeddings)
-	mux.HandleFunc("/logs", router.handleLogs)
-	mux.HandleFunc("/v1/route-feedback", router.handleRouteFeedback)
-	mux.HandleFunc("/route-feedback", router.handleRouteFeedback)
-	mux.HandleFunc("/v1/route-preview", router.handleRoutePreview)
-	mux.HandleFunc("/route-preview", router.handleRoutePreview)
-	mux.HandleFunc("/debug/backends/", router.handleDebugBackends)
-
 	server := &http.Server{
 		Addr:              ":" + cfg.Port,
-		Handler:           logRequests(mux),
+		Handler:           logRequests(router.routes()),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -529,6 +538,20 @@ type Router struct {
 	profiling    sync.Map              // worker ids with a cold-start profile in flight (de-dups overlapping profiles)
 	gateAudited  atomic.Bool           // set once the thinking-gate-vs-tier audit has logged (model-independent)
 	sessions     *sessionTracker       // conversation → worker affinity; nil disables stickiness (see session.go)
+
+	// adminAuth holds live admin password sessions. A value, not a pointer, so
+	// the zero Router is usable — every test that builds one by hand would
+	// otherwise have to remember to construct it, and forgetting would be a nil
+	// dereference on the login path rather than a compile error.
+	adminAuth adminSessions
+	// Whether a client / worker credential is REQUIRED, cached from the keys
+	// table so the check is not a database read per request. Refreshed at startup
+	// and after every write to that table (see refreshAuthRequired).
+	clientKeysExist atomic.Bool
+	workerKeysExist atomic.Bool
+	// keyStamped throttles the last_used_at write for calls that spend no tokens
+	// (see keyUseDue). key id → time.Time.
+	keyStamped sync.Map
 }
 
 // Routing constants. These were environment variables. They are not any more.
@@ -666,6 +689,54 @@ func parseTokenList(raw string) []string {
 	return out
 }
 
+// routes wires the northbound and registry surfaces onto a mux. Separate from
+// Main so the pattern set itself is testable: "/v1/models" is an exact match and
+// "/v1/models/" a subtree, and getting that pair wrong is not a compile error —
+// it is a single-model fetch quietly falling through to the dashboard handler
+// and 404ing in HTML, which is exactly what it did.
+func (r *Router) routes() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", r.handleDashboard)
+	mux.HandleFunc("/health", r.handleHealth)
+	mux.HandleFunc("/v1/health", r.handleHealth)
+	mux.HandleFunc("/backends", r.handleBackends)
+	mux.HandleFunc("/backends/register", r.handleRegisterBackend)
+	mux.HandleFunc("/backends/", r.handleBackendByID)
+	mux.HandleFunc("/workers", r.handleBackends)
+	mux.HandleFunc("/workers/register", r.handleRegisterBackend)
+	mux.HandleFunc("/workers/", r.handleBackendByID)
+	mux.HandleFunc("/v1/models", r.handleModels)
+	mux.HandleFunc("/v1/models/", r.handleModelByID)
+	mux.HandleFunc("/v1/chat/completions", r.handleChatCompletions)
+	mux.HandleFunc("/chat/completions", r.handleChatCompletions)
+	mux.HandleFunc("/v1/completions", r.handleCompletions)
+	mux.HandleFunc("/completions", r.handleCompletions)
+	mux.HandleFunc("/v1/embeddings", r.handleEmbeddings)
+	mux.HandleFunc("/embeddings", r.handleEmbeddings)
+	mux.HandleFunc("/logs", r.handleLogs)
+	mux.HandleFunc("/v1/route-feedback", r.handleRouteFeedback)
+	mux.HandleFunc("/route-feedback", r.handleRouteFeedback)
+	mux.HandleFunc("/v1/route-preview", r.handleRoutePreview)
+	mux.HandleFunc("/route-preview", r.handleRoutePreview)
+	mux.HandleFunc("/debug/backends/", r.handleDebugBackends)
+	// The admin write surface. Separate from /backends on purpose: that path is
+	// frozen by the compatibility contract, and a row created here is
+	// operator-owned in a way a pushed registration never is.
+	mux.HandleFunc("/admin/providers", r.handleAdminProviders)
+	mux.HandleFunc("/admin/providers/", r.handleAdminProviderByID)
+	mux.HandleFunc("/admin/keys", r.handleAdminKeys)
+	mux.HandleFunc("/admin/keys/", r.handleAdminKeyByID)
+	// The password session. /admin/login and /admin/session are the only two
+	// unauthenticated routes under /admin, and neither discloses anything: login
+	// answers the same 401 for "wrong password" and "no password is set", and
+	// session reports one boolean about the caller's own cookie.
+	mux.HandleFunc("/admin/login", r.handleAdminLogin)
+	mux.HandleFunc("/admin/logout", r.handleAdminLogout)
+	mux.HandleFunc("/admin/session", r.handleAdminSession)
+	mux.HandleFunc("/admin/password", r.handleAdminPassword)
+	return mux
+}
+
 func (r *Router) handleHealth(w http.ResponseWriter, req *http.Request) {
 	if req.Method != http.MethodGet {
 		methodNotAllowed(w)
@@ -716,13 +787,16 @@ func (r *Router) warnIfNoEmbeddings() {
 	}
 }
 
+// handleBackends lists the fleet. ADMIN scope since P3: the payload is every
+// worker's id, URL, model, measured quality, load and last error, which is a map
+// of the operator's infrastructure. A client that needs to know what it can ask
+// for reads /v1/models, which publishes the menu and not the estate.
 func (r *Router) handleBackends(w http.ResponseWriter, req *http.Request) {
 	if req.Method != http.MethodGet {
 		methodNotAllowed(w)
 		return
 	}
-	if !authorizedAsClient(req, r.cfg.ClientTokens) {
-		unauthorized(w)
+	if !r.requireAdmin(w, req) {
 		return
 	}
 	pub := publicBackends(r.registry.snapshot())
@@ -736,14 +810,15 @@ func (r *Router) handleBackends(w http.ResponseWriter, req *http.Request) {
 
 // serveBenchmark returns the stored per-question results (questions, expected
 // answers, and the model's actual answers) from a worker's most recent profiling
-// run: GET /backends/{id}/benchmark. Read-only, client-token auth.
+// run: GET /backends/{id}/benchmark. Read-only, ADMIN scope since P3 — it is the
+// grading set and one worker's answers to it, which is both fleet detail and the
+// benchmark's own answer key.
 func (r *Router) serveBenchmark(w http.ResponseWriter, req *http.Request, id string) {
 	if req.Method != http.MethodGet {
 		methodNotAllowed(w)
 		return
 	}
-	if !authorizedAsClient(req, r.cfg.ClientTokens) {
-		unauthorized(w)
+	if !r.requireAdmin(w, req) {
 		return
 	}
 	prof, ok := r.logs.LoadWorkerProfileByID(req.Context(), id)
@@ -784,10 +859,12 @@ func (r *Router) handleBackendByID(w http.ResponseWriter, req *http.Request) {
 	}
 	switch req.Method {
 	case http.MethodDelete:
-		// DELETE accepts either a worker token (a worker de-registering itself
-		// on shutdown) or any client token (operator clearing a stale entry).
-		// Live ready+healthy backends are still refused below.
-		if !authorizedAsWorker(req, r.cfg.WorkerToken) && !authorizedAsClient(req, r.cfg.ClientTokens) {
+		// DELETE accepts a worker credential (a worker de-registering itself on
+		// shutdown) or admin (an operator clearing a stale entry). It used to
+		// accept any CLIENT token, which since P3 is a stranger's credential and
+		// has no business evicting workers. Live ready+healthy backends are still
+		// refused below.
+		if !r.workerAuthorized(req) && !r.adminAuthenticated(req) {
 			unauthorized(w)
 			return
 		}
@@ -820,8 +897,8 @@ func (r *Router) handleBackendByID(w http.ResponseWriter, req *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"status": "removed", "id": id})
 	case http.MethodGet:
-		if !authorizedAsClient(req, r.cfg.ClientTokens) {
-			unauthorized(w)
+		// Admin scope, same reasoning as the /backends list it is a row of.
+		if !r.requireAdmin(w, req) {
 			return
 		}
 		b := r.registry.get(id)
@@ -838,13 +915,16 @@ func (r *Router) handleBackendByID(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+// handleLogs serves the request log. ADMIN scope since P3, and the single most
+// important of the moves: the rows carry every stored prompt and response, so a
+// client token here reads every other client's traffic. That was acceptable for
+// a private fleet and stops being so the moment a token goes to someone else.
 func (r *Router) handleLogs(w http.ResponseWriter, req *http.Request) {
 	if req.Method != http.MethodGet {
 		methodNotAllowed(w)
 		return
 	}
-	if !authorizedAsClient(req, r.cfg.ClientTokens) {
-		unauthorized(w)
+	if !r.requireAdmin(w, req) {
 		return
 	}
 	limit := envBoundedInt(req.URL.Query().Get("limit"), 100, 1, 500)
@@ -863,8 +943,7 @@ func (r *Router) handleRegisterBackend(w http.ResponseWriter, req *http.Request)
 		methodNotAllowed(w)
 		return
 	}
-	if !authorizedAsWorker(req, r.cfg.WorkerToken) {
-		unauthorized(w)
+	if !r.requireWorker(w, req) {
 		return
 	}
 
@@ -873,8 +952,24 @@ func (r *Router) handleRegisterBackend(w http.ResponseWriter, req *http.Request)
 		writeError(w, http.StatusBadRequest, "invalid json: %s", err)
 		return
 	}
+	// A push registration is a beacon by construction, whatever the payload says.
+	// Manual is the flag that makes a row operator-owned — probes stop overwriting
+	// its declared values (see providers.go) — and it is not something a worker
+	// holding the worker token gets to grant itself.
+	reg.Source = sourceBeacon
 	if err := normalizeRegistration(&reg); err != nil {
 		writeError(w, http.StatusBadRequest, "%s", err)
+		return
+	}
+	// Nor may it take over a row an operator entered by hand. The id collision is
+	// almost certainly a mistake, and silently converting the operator's row into
+	// a beacon would discard exactly the declared values manual rows exist to
+	// protect.
+	if existing := r.registry.get(reg.ID); isManualRow(existing) {
+		writeJSON(w, http.StatusConflict, validationError{
+			Message: fmt.Sprintf("backend %q is an operator-managed provider row; register under a different id", reg.ID),
+			Param:   "id",
+		})
 		return
 	}
 
@@ -898,13 +993,15 @@ func (r *Router) handleRegisterBackend(w http.ResponseWriter, req *http.Request)
 // empty/truncated detection. A client (e.g. the agent on escalation) POSTs the
 // X-LLM-Route of the response it's grading plus a verdict. No-op when online
 // adaptation is disabled.
+// handleRouteFeedback stays CLIENT scope: a caller grading its own answer feeds
+// the adapter a signal only that caller has, and the payload names no worker,
+// no other client and nothing about the fleet.
 func (r *Router) handleRouteFeedback(w http.ResponseWriter, req *http.Request) {
 	if req.Method != http.MethodPost {
 		methodNotAllowed(w)
 		return
 	}
-	if !authorizedAsClient(req, r.cfg.ClientTokens) {
-		unauthorized(w)
+	if _, ok := r.requireClient(w, req); !ok {
 		return
 	}
 	var fb struct {
@@ -938,13 +1035,15 @@ func (r *Router) handleRouteFeedback(w http.ResponseWriter, req *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "recorded"})
 }
 
+// handleModels stays CLIENT scope, and has to: a client cannot use an OpenAI
+// API without being able to read the model list, and every SDK fetches it. It
+// publishes the MENU — ids, aliases, features — and not the estate behind it.
 func (r *Router) handleModels(w http.ResponseWriter, req *http.Request) {
 	if req.Method != http.MethodGet {
 		methodNotAllowed(w)
 		return
 	}
-	if !authorizedAsClient(req, r.cfg.ClientTokens) {
-		unauthorized(w)
+	if _, ok := r.requireClient(w, req); !ok {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": r.modelCatalogue()})
@@ -965,8 +1064,7 @@ func (r *Router) handleModelByID(w http.ResponseWriter, req *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	if !authorizedAsClient(req, r.cfg.ClientTokens) {
-		unauthorized(w)
+	if _, ok := r.requireClient(w, req); !ok {
 		return
 	}
 	name := strings.TrimPrefix(req.URL.Path, "/v1/models/")
@@ -1099,8 +1197,10 @@ func (r *Router) handleDebugBackendCertify(w http.ResponseWriter, req *http.Requ
 		methodNotAllowed(w)
 		return
 	}
-	if !authorizedAsClient(req, r.cfg.ClientTokens) {
-		unauthorized(w)
+	// Admin scope since P3. It re-runs a cold-start profile, which on a metered
+	// endpoint spends the operator's money and on a local one takes the worker
+	// out of rotation for minutes.
+	if !r.requireAdmin(w, req) {
 		return
 	}
 	if r.registry.get(id) == nil {
@@ -1116,8 +1216,10 @@ func (r *Router) handleDebugBackendChat(w http.ResponseWriter, req *http.Request
 		methodNotAllowed(w)
 		return
 	}
-	if !authorizedAsClient(req, r.cfg.ClientTokens) {
-		unauthorized(w)
+	// Admin scope since P3. It pins a worker by id, so it bypasses routing, the
+	// per-key allow-list and every hard filter — a client-scoped escape hatch
+	// around the controls this phase adds would make them decorative.
+	if !r.requireAdmin(w, req) {
 		return
 	}
 	body, err := readRequestBody(w, req)
@@ -1137,8 +1239,9 @@ func (r *Router) handleDebugBackendChat(w http.ResponseWriter, req *http.Request
 	}
 	// No classification on the debug path (nil) — auto-thinking is skipped, as on
 	// the pinned path; only explicit thinking signals apply. target=0 ⇒ no quality
-	// floor (the debug path pins one backend anyway).
-	r.proxyToBackend(w, req, &routePlan{candidates: []*Backend{backend}, route: "debug"}, body, chatReq)
+	// floor (the debug path pins one backend anyway). The caller is an admin, so
+	// there is no per-key budget to charge and the log row records who they were.
+	r.proxyToBackend(w, req, r.identify(req), &routePlan{candidates: []*Backend{backend}, route: "debug"}, body, chatReq)
 }
 
 func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request) {
@@ -1146,8 +1249,8 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request)
 		methodNotAllowed(w)
 		return
 	}
-	if !authorizedAsClient(req, r.cfg.ClientTokens) {
-		unauthorized(w)
+	ident, ok := r.requireClient(w, req)
+	if !ok {
 		return
 	}
 
@@ -1160,6 +1263,11 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request)
 	chatReq, err := parseAndValidateChatRequest(body, r.cfg.DefaultMaxTokens)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, validationError{Message: err.Error()})
+		return
+	}
+	// Per-key limits before anything is dispatched: a request that is going to be
+	// refused should not first take a worker slot.
+	if !r.enforceKeyLimits(w, ident, requestedModel(chatReq)) {
 		return
 	}
 
@@ -1193,7 +1301,7 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request)
 		}
 	}
 
-	r.proxyToBackend(w, req, plan, body, chatReq)
+	r.proxyToBackend(w, req, ident, plan, body, chatReq)
 }
 
 // completionRequest is the legacy /v1/completions shape. We don't rewrite
@@ -1213,8 +1321,8 @@ func (r *Router) handleCompletions(w http.ResponseWriter, req *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	if !authorizedAsClient(req, r.cfg.ClientTokens) {
-		unauthorized(w)
+	ident, ok := r.requireClient(w, req)
+	if !ok {
 		return
 	}
 	body, err := readRequestBody(w, req)
@@ -1238,12 +1346,15 @@ func (r *Router) handleCompletions(w http.ResponseWriter, req *http.Request) {
 		Stream:       compReq.Stream,
 		Requirements: compReq.Requirements,
 	}
+	if !r.enforceKeyLimits(w, ident, requestedModel(chatReq)) {
+		return
+	}
 	candidates, _, _, _, err := r.selectBackends(chatReq, callerBudget(req, chatReq))
 	if err != nil {
 		writeUnavailable(w, r.retryAfterUnavailable(), err.Error())
 		return
 	}
-	r.proxyPassthrough(w, req, candidates, body, "/v1/completions", "completions")
+	r.proxyPassthrough(w, req, ident, candidates, body, "/v1/completions", "completions")
 }
 
 func (r *Router) handleEmbeddings(w http.ResponseWriter, req *http.Request) {
@@ -1251,8 +1362,8 @@ func (r *Router) handleEmbeddings(w http.ResponseWriter, req *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	if !authorizedAsClient(req, r.cfg.ClientTokens) {
-		unauthorized(w)
+	ident, ok := r.requireClient(w, req)
+	if !ok {
 		return
 	}
 	body, err := readRequestBody(w, req)
@@ -1260,12 +1371,17 @@ func (r *Router) handleEmbeddings(w http.ResponseWriter, req *http.Request) {
 		writeError(w, http.StatusBadRequest, "read request: %s", err)
 		return
 	}
+	// No model name to check against the allow-list here — /v1/embeddings routes
+	// by feature — but a budget still applies.
+	if !r.enforceKeyLimits(w, ident, "") {
+		return
+	}
 	candidates, err := r.selectBackendsByFeature("embeddings")
 	if err != nil {
 		writeUnavailable(w, r.retryAfterUnavailable(), err.Error())
 		return
 	}
-	r.proxyPassthrough(w, req, candidates, body, "/v1/embeddings", "embeddings")
+	r.proxyPassthrough(w, req, ident, candidates, body, "/v1/embeddings", "embeddings")
 }
 
 // callerBudget reports how long the caller will still wait for a response, from
@@ -1321,7 +1437,7 @@ func (r *Router) selectBackendsByFeature(feature string) ([]*Backend, error) {
 // body (in contrast to /v1/chat/completions, which uses proxyToBackend for
 // retry + max_tokens patching). Honours backend slot accounting (spilling
 // across candidates), circuit-breaker feedback, and request logging.
-func (r *Router) proxyPassthrough(w http.ResponseWriter, req *http.Request, candidates []*Backend, body []byte, openAIPath, route string) {
+func (r *Router) proxyPassthrough(w http.ResponseWriter, req *http.Request, ident *identity, candidates []*Backend, body []byte, openAIPath, route string) {
 	if len(candidates) == 0 {
 		writeUnavailable(w, r.retryAfterUnavailable(), "no backend available")
 		return
@@ -1345,9 +1461,15 @@ func (r *Router) proxyPassthrough(w http.ResponseWriter, req *http.Request, cand
 		CertifiedTPS: backend.Certification.TokensPerSec,
 		BaselineTPS:  backend.BaselineTPS,
 		SpeedScore:   speedScore(backend),
+		KeyID:        ident.logKeyID(),
 	}
+	// Small capture, kept only to read the endpoint's usage block for per-key
+	// budgeting. Head-and-tail bounded, and usage sits at the tail in both the
+	// buffered and the SSE shape.
+	usage := newBoundedCapture(usageCaptureBytes)
 	defer func() {
 		logEntry.DurationMillis = time.Since(start).Milliseconds()
+		r.recordKeyUse(ident, usageTotalTokens(usage.Bytes()))
 		// Async: this defer runs before releaseSlot (LIFO) and a synchronous
 		// SQLite write here would extend the worker's busy window.
 		entry := logEntry
@@ -1407,6 +1529,7 @@ func (r *Router) proxyPassthrough(w http.ResponseWriter, req *http.Request, cand
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
+			_, _ = usage.Write(buf[:n])
 			if _, werr := w.Write(buf[:n]); werr != nil {
 				logEntry.Error = werr.Error()
 				return
@@ -1646,7 +1769,7 @@ func (r *Router) pickAndAcquirePreferred(ctx context.Context, candidates []*Back
 // when non-zero, acquisition prefers to wait BRIEFLY (qualityFloorWait) for an
 // above-target worker before spilling below it (fix #2). The pinned/debug callers
 // pass a bare plan, so their behaviour is unchanged.
-func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, plan *routePlan, body []byte, chatReq *ChatRequest) {
+func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident *identity, plan *routePlan, body []byte, chatReq *ChatRequest) {
 	candidates, route, target := plan.candidates, plan.route, plan.target
 	if len(candidates) == 0 {
 		writeUnavailable(w, r.retryAfterUnavailable(), "no backend available")
@@ -1751,6 +1874,7 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, plan *
 		SpeedScore:   speedScore(backend),
 		Stream:       chatReq.Stream,
 		Input:        string(body),
+		KeyID:        ident.logKeyID(),
 	}
 	capture := newBoundedCapture(r.cfg.LogMaxBodyBytes)
 	var stats *sseStats
@@ -1775,10 +1899,23 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, plan *
 		// executes BEFORE releaseSlot (defer LIFO), and a synchronous SQLite insert
 		// here would extend the busy window of a max_concurrency=1 worker after
 		// every request.
+		// Charge the key's budget from what the endpoint reported it used, falling
+		// back to what routing estimated when it reported nothing (or when the
+		// capture dropped the usage block). A budget is a spending bound, not an
+		// invoice, so an approximation in the fallback is the right trade.
+		charged := usageTotalTokens(capture.Bytes())
+		if charged == 0 {
+			charged = job.promptTokens
+			if stats != nil {
+				charged += stats.genTokens()
+			}
+		}
 		entry := logEntry
 		served := backend
 		didEscalate := escalated
+		caller := ident
 		go func() {
+			r.recordKeyUse(caller, charged)
 			// Self-improvement: feed this auto-routed request's outcome back to the
 			// online tier adapter (no-op unless enabled and this was a "route:d=" pick).
 			// A failed/aborted transfer (client hung up mid-stream, worker died) says
@@ -3206,6 +3343,8 @@ func normalizeRegistration(reg *BackendRegistration) error {
 		reg.MaxConcurrency = 0
 	}
 	reg.Features = normalizeFeatures(reg.Features)
+	// Defaults a registration that predates P2 must land on: local, beacon, free.
+	normalizeProviderFields(reg)
 	return nil
 }
 
@@ -4140,11 +4279,45 @@ func (s *LogStore) init(ctx context.Context) error {
 			updated_at TEXT NOT NULL,
 			registration_json TEXT NOT NULL
 		)`,
+		// worker_profiles is the cached cold-start profile for the whole fleet, and
+		// re-measuring it costs hours of GPU time and, since P2, real money. Note
+		// the key here is `id` alone while LoadWorkerProfile selects on
+		// (id, model): the effect is that one id holds one profile, and a worker
+		// that changes model re-profiles and replaces the row. That is correct
+		// under P2's "one row per (endpoint, model)" rule — every servable thing
+		// has its own id — so the mismatch is left alone rather than rebuilt,
+		// because rebuilding a table is exactly how this data gets lost.
 		`CREATE TABLE IF NOT EXISTS worker_profiles (
 			id TEXT PRIMARY KEY,
 			model TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
 			profile_json TEXT NOT NULL
+		)`,
+		// Virtual keys (P3). key_hash is a SHA-256 of the plaintext; the plaintext
+		// exists once, in the response to the call that created it.
+		`CREATE TABLE IF NOT EXISTS api_keys (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			key_hash TEXT NOT NULL UNIQUE,
+			prefix TEXT NOT NULL,
+			name TEXT NOT NULL DEFAULT '',
+			role TEXT NOT NULL,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			created_at TEXT NOT NULL,
+			last_used_at TEXT NOT NULL DEFAULT '',
+			models TEXT NOT NULL DEFAULT '',
+			token_budget INTEGER NOT NULL DEFAULT 0,
+			tokens_used INTEGER NOT NULL DEFAULT 0
+		)`,
+		// Authentication reads this on every request that presents a bearer token,
+		// so it is an index rather than a scan.
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys (key_hash)`,
+		// Key/value rather than a one-row table with a column per setting, which
+		// would need a migration for every setting ever added. Holds the admin
+		// password hash; the database is canonical for it.
+		`CREATE TABLE IF NOT EXISTS router_settings (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL,
+			updated_at TEXT NOT NULL
 		)`,
 	}
 	for _, stmt := range stmts {
@@ -4152,11 +4325,18 @@ func (s *LogStore) init(ctx context.Context) error {
 			return err
 		}
 	}
+	// Columns added to a table that already exists in the field. SQLite has no
+	// ADD COLUMN IF NOT EXISTS, so the duplicate is swallowed and everything else
+	// is still an error — a typo must not pass as "already applied".
 	for _, stmt := range []string{
 		`ALTER TABLE request_logs ADD COLUMN observed_tps REAL NOT NULL DEFAULT 0`,
 		`ALTER TABLE request_logs ADD COLUMN certified_tps REAL NOT NULL DEFAULT 0`,
 		`ALTER TABLE request_logs ADD COLUMN baseline_tps REAL NOT NULL DEFAULT 0`,
 		`ALTER TABLE request_logs ADD COLUMN speed_score INTEGER NOT NULL DEFAULT 0`,
+		// Which key made the request. Rows written before P3 keep the empty
+		// default, which reads as "the router required no credential" — true of
+		// every request made under the old client-token-or-nothing scheme.
+		`ALTER TABLE request_logs ADD COLUMN key_id TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return err
@@ -4171,8 +4351,8 @@ func (s *LogStore) Close() error {
 
 func (s *LogStore) Insert(ctx context.Context, entry RequestLog) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO request_logs
-		(created_at, backend_id, backend_model, route, observed_tps, certified_tps, baseline_tps, speed_score, stream, status_code, duration_ms, input, output, error)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		(created_at, backend_id, backend_model, route, observed_tps, certified_tps, baseline_tps, speed_score, stream, status_code, duration_ms, input, output, error, key_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		entry.CreatedAt.Format(time.RFC3339Nano),
 		entry.BackendID,
 		entry.BackendModel,
@@ -4187,6 +4367,7 @@ func (s *LogStore) Insert(ctx context.Context, entry RequestLog) error {
 		clipLog(entry.Input, s.maxBody),
 		clipLog(entry.Output, s.maxBody),
 		clipLog(entry.Error, s.maxBody),
+		entry.KeyID,
 	)
 	return err
 }
@@ -4211,10 +4392,10 @@ func (s *LogStore) List(ctx context.Context, backendID string, limit int, offset
 		err  error
 	)
 	if backendID == "" {
-		rows, err = s.db.QueryContext(ctx, `SELECT id, created_at, backend_id, backend_model, route, observed_tps, certified_tps, baseline_tps, speed_score, stream, status_code, duration_ms, input, output, error
+		rows, err = s.db.QueryContext(ctx, `SELECT id, created_at, backend_id, backend_model, route, observed_tps, certified_tps, baseline_tps, speed_score, stream, status_code, duration_ms, input, output, error, key_id
 			FROM request_logs ORDER BY created_at DESC LIMIT ? OFFSET ?`, limit, offset)
 	} else {
-		rows, err = s.db.QueryContext(ctx, `SELECT id, created_at, backend_id, backend_model, route, observed_tps, certified_tps, baseline_tps, speed_score, stream, status_code, duration_ms, input, output, error
+		rows, err = s.db.QueryContext(ctx, `SELECT id, created_at, backend_id, backend_model, route, observed_tps, certified_tps, baseline_tps, speed_score, stream, status_code, duration_ms, input, output, error, key_id
 			FROM request_logs WHERE backend_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`, backendID, limit, offset)
 	}
 	if err != nil {
@@ -4227,7 +4408,7 @@ func (s *LogStore) List(ctx context.Context, backendID string, limit int, offset
 		var entry RequestLog
 		var created string
 		var stream int
-		if err := rows.Scan(&entry.ID, &created, &entry.BackendID, &entry.BackendModel, &entry.Route, &entry.ObservedTPS, &entry.CertifiedTPS, &entry.BaselineTPS, &entry.SpeedScore, &stream, &entry.StatusCode, &entry.DurationMillis, &entry.Input, &entry.Output, &entry.Error); err != nil {
+		if err := rows.Scan(&entry.ID, &created, &entry.BackendID, &entry.BackendModel, &entry.Route, &entry.ObservedTPS, &entry.CertifiedTPS, &entry.BaselineTPS, &entry.SpeedScore, &stream, &entry.StatusCode, &entry.DurationMillis, &entry.Input, &entry.Output, &entry.Error, &entry.KeyID); err != nil {
 			return nil, err
 		}
 		entry.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)

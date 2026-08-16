@@ -268,6 +268,8 @@ type benchBackend struct {
 }
 
 // benchFetchBackends lists the ready chat backends worth calibrating against.
+// /backends is ADMIN scope since P3, so the token here has to be an admin key
+// rather than the client token these developer commands used to take.
 // Embeddings-only workers and anything not ready are skipped — a backend still
 // profiling would contribute noise, not difficulty signal.
 func benchFetchBackends(routerURL, token string) ([]benchBackend, error) {

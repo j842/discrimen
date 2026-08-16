@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -490,5 +493,46 @@ func TestWorkerProfileRoundTrip(t *testing.T) {
 	}
 	if !hasFeature(b, "tools") {
 		t.Fatalf("features not applied: %v", b.Features)
+	}
+}
+
+// The version history above benchmarkVersion is written as "vNN:" comment
+// blocks, and benchmarkVersion is what invalidates every cached profile in
+// worker_profiles. v33 and v34 both landed without the constant moving, so
+// workers scored under the old flat-percentage rules stayed in the table marked
+// current while autoTargetQuality read every score as one absolute 0-100 scale.
+// Nothing caught it, because nothing was looking.
+//
+// This test looks: the constant must be at least as high as the highest version
+// the file claims to have implemented. It reads the source rather than any
+// in-memory value, because the failure mode is precisely that the comment and
+// the constant disagree.
+func TestBenchmarkVersionCoversScoringChanges(t *testing.T) {
+	marker := regexp.MustCompile(`//\s*v(\d+):`)
+	highest, where := 0, ""
+	for _, name := range []string{"benchmark.go", "benchmark_data.go"} {
+		src, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		for _, m := range marker.FindAllStringSubmatch(string(src), -1) {
+			n, err := strconv.Atoi(m[1])
+			if err != nil {
+				continue
+			}
+			if n > highest {
+				highest, where = n, name
+			}
+		}
+	}
+	if highest == 0 {
+		t.Fatal("found no vNN: version-history markers — has the comment style changed?")
+	}
+	if benchmarkVersion < highest {
+		t.Errorf("benchmarkVersion is %d but %s documents changes up to v%d.\n"+
+			"A scoring or question-set change that does not bump the constant leaves "+
+			"profiles measured under the old rules in worker_profiles marked current, "+
+			"on a quality scale that no longer means the same thing.",
+			benchmarkVersion, where, highest)
 	}
 }

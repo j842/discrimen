@@ -63,7 +63,18 @@ import (
 // now sits beside Johnny's mother, the identical trap, which has always been tier 3.
 // benchHardTier stays 3 and the audit stays an INDEPENDENT cross-check: the fix here is the
 // labels, not the gate.
-const benchmarkVersion = 32
+// v33: the frontier tiers (>= benchFrontierTier) got a longer answer deadline, and tier 11
+// was added. See benchAnswerDeadlineFrontier below.
+// v34: quality became a WEIGHTED two-bucket score instead of a flat percentage. See
+// runQualityBenchmark.
+//
+// v33 and v34 both landed WITHOUT bumping this constant, which is the failure this constant
+// exists to prevent: a profile measured under the flat-percentage rules stayed in
+// worker_profiles marked current, and autoTargetQuality reads every cached score as one
+// absolute 0-100 scale, so pre-v33 and post-v34 workers were being compared on scales that
+// no longer meant the same thing. Bumped here to 34 to invalidate them and re-measure.
+// TestBenchmarkVersionCoversScoringChanges now fails CI if this happens again.
+const benchmarkVersion = 34
 
 // benchmarkQ is one graded question in the cold-start quality benchmark. The
 // question set lives in benchmark_data.go.

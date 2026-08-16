@@ -1352,3 +1352,210 @@ func TestReadSSEStreamPrefersUsage(t *testing.T) {
 		t.Fatalf("want usage's 52 tokens, got %d", tokens)
 	}
 }
+
+// ── Measured thinking dialect ───────────────────────────────────────────────
+
+// dialectWorker is an endpoint that reasons only when asked in `honours`, and
+// refuses the other gate outright when `strict` — which is what a provider that
+// validates its input does with chat_template_kwargs.
+func dialectWorker(t *testing.T, honours string, strict bool) *Backend {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(req.Body).Decode(&body)
+		_, hasKwargs := body["chat_template_kwargs"]
+		_, hasEffort := body["reasoning_effort"]
+		asked := map[string]bool{thinkingDialectKwargs: hasKwargs, thinkingDialectEffort: hasEffort}
+		if strict && asked[thinkingDialectKwargs] && honours != thinkingDialectKwargs {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"message":"Unrecognized request argument supplied: chat_template_kwargs","type":"invalid_request_error"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if asked[honours] {
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"75 km/h","reasoning_content":"60+90 over 2.5h"}}]}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"75 km/h"}}]}`)
+	}))
+	t.Cleanup(srv.Close)
+	return &Backend{BackendRegistration: BackendRegistration{ID: "w", URL: srv.URL, Model: "m"}}
+}
+
+// The router used to declare the dialect: it always wrote
+// chat_template_kwargs.enable_thinking, which is a vLLM and llama.cpp extension.
+// A provider that speaks reasoning_effort ignores it, and a strict one rejects
+// the unknown field — either way the router believes it asked for thinking and
+// never got it.
+func TestThinkingProbeMeasuresTheDialect(t *testing.T) {
+	cases := []struct {
+		name         string
+		honours      string
+		strict       bool
+		wantThinking bool
+		wantDialect  string
+	}{
+		{"local worker: the kwargs gate, tried first and settled on the spot",
+			thinkingDialectKwargs, false, true, thinkingDialectKwargs},
+		{"provider that quietly ignores the kwargs object still gets its own field tried",
+			thinkingDialectEffort, false, true, thinkingDialectEffort},
+		{"strict provider that refuses the kwargs object outright",
+			thinkingDialectEffort, true, true, thinkingDialectEffort},
+		{"a model that reasons for neither gate",
+			"nothing", false, false, thinkingDialectNone},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &Router{client: &http.Client{Timeout: 5 * time.Second}}
+			thinking, dialect, inconclusive := r.thinkingProbe(dialectWorker(t, tc.honours, tc.strict))
+			if inconclusive {
+				t.Fatal("probe was inconclusive against a responsive worker")
+			}
+			if thinking != tc.wantThinking || dialect != tc.wantDialect {
+				t.Errorf("probe = (thinking %v, dialect %q), want (%v, %q)",
+					thinking, dialect, tc.wantThinking, tc.wantDialect)
+			}
+		})
+	}
+}
+
+// TestPatchForwardedBodyHonoursThinkingDialect: the gate goes out in the
+// spelling the CHOSEN endpoint was measured to honour, and in no other.
+func TestPatchForwardedBodyHonoursThinkingDialect(t *testing.T) {
+	bare := []byte(`{"messages":[]}`)
+	cases := []struct {
+		name    string
+		body    string
+		tr      thinkingResolution
+		want    []string
+		wantNot []string
+	}{
+		{"unmeasured falls back to the dialect the fleet has always spoken",
+			`{"messages":[]}`, thinkingResolution{patch: true, enable: true},
+			[]string{`"enable_thinking":true`}, []string{`"reasoning_effort"`}},
+		{"measured kwargs is the same thing, said explicitly",
+			`{"messages":[]}`, thinkingResolution{patch: true, enable: true, dialect: thinkingDialectKwargs},
+			[]string{`"enable_thinking":true`}, []string{`"reasoning_effort"`}},
+		{"measured reasoning_effort: on with no level asked for is the neutral level",
+			`{"messages":[]}`, thinkingResolution{patch: true, enable: true, dialect: thinkingDialectEffort},
+			[]string{`"reasoning_effort":"medium"`}, []string{`chat_template_kwargs`}},
+		{"measured reasoning_effort: a resolved level travels verbatim",
+			`{"messages":[]}`, thinkingResolution{patch: true, enable: true, effort: "high", dialect: thinkingDialectEffort},
+			[]string{`"reasoning_effort":"high"`}, []string{`chat_template_kwargs`}},
+		{"measured reasoning_effort: off is the standard's own spelling for off",
+			`{"messages":[]}`, thinkingResolution{patch: true, enable: false, dialect: thinkingDialectEffort},
+			[]string{`"reasoning_effort":"none"`}, []string{`chat_template_kwargs`}},
+		{"the escape hatch holds in the new dialect too",
+			`{"reasoning_effort":"LOW"}`, thinkingResolution{patch: true, enable: true, effort: "high", dialect: thinkingDialectEffort},
+			[]string{`"reasoning_effort":"LOW"`}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := string(patchForwardedBody([]byte(tc.body), 0, 0, tc.tr, ""))
+			for _, want := range tc.want {
+				if !strings.Contains(got, want) {
+					t.Errorf("missing %s: %s", want, got)
+				}
+			}
+			for _, unwanted := range tc.wantNot {
+				if strings.Contains(got, unwanted) {
+					t.Errorf("wrote %s to an endpoint that does not read it: %s", unwanted, got)
+				}
+			}
+		})
+	}
+
+	// Measured as honouring neither gate: send neither. A field a strict endpoint
+	// can reject, bought for nothing, is exactly what this is here to stop.
+	tr := thinkingResolution{patch: true, enable: false, dialect: thinkingDialectNone}
+	if got := patchForwardedBody(bare, 0, 0, tr, ""); string(got) != string(bare) {
+		t.Errorf("wrote a gate to an endpoint that honours none: %s", got)
+	}
+
+	// The dialect is stamped from the worker that will actually serve the
+	// request, after selection.
+	if got := tr.forBackend(&Backend{ThinkingDialect: thinkingDialectEffort}).dialect; got != thinkingDialectEffort {
+		t.Errorf("forBackend = %q, want the worker's measured dialect", got)
+	}
+	if got := tr.forBackend(nil).dialect; got != thinkingDialectNone {
+		t.Errorf("forBackend(nil) changed the resolution: %q", got)
+	}
+}
+
+// ── Derived classifier deadline ─────────────────────────────────────────────
+
+// A fixed two-second classification deadline silently disabled auto-routing on a
+// slow box: every classify() timed out, routing fell back to plain quality and
+// speed, and /health still reported the embeddings worker present — so nothing
+// said so. The deadline is derived from that worker's measured latency instead.
+func TestClassifierDeadlineFromMeasuredLatency(t *testing.T) {
+	c := newDifficultyClassifier(&Config{DifficultyTimeout: difficultyTimeoutFallback}, fakeEmbed)
+	if got := c.deadline(); got != difficultyTimeoutFallback {
+		t.Fatalf("deadline before any measurement = %s, want the %s fallback", got, difficultyTimeoutFallback)
+	}
+	cases := []struct {
+		name     string
+		measured time.Duration
+		want     time.Duration
+	}{
+		{"a quick worker cannot make the deadline tighter than what the router shipped with",
+			10 * time.Millisecond, difficultyTimeoutFallback},
+		{"a slow worker raises it by the probe-to-classification factor",
+			500 * time.Millisecond, 500 * time.Millisecond * classifierDeadlineFactor},
+		{"a pathological worker is capped at the window the router already accepts being wrong for",
+			30 * time.Second, embedFailCooldown},
+	}
+	for _, tc := range cases {
+		if got := c.observeEmbedLatency(tc.measured); got != tc.want {
+			t.Errorf("%s: %s measured → %s, want %s", tc.name, tc.measured, got, tc.want)
+		}
+	}
+}
+
+// End to end: certifying the embeddings worker measures it, and what the
+// deadline settled on is readable rather than folklore.
+func TestEmbeddingsCertificationPublishesTheDeadline(t *testing.T) {
+	const latency = 400 * time.Millisecond
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		time.Sleep(latency)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"data":[{"index":0,"embedding":[0.1,0.2,0.3]}]}`)
+	}))
+	defer srv.Close()
+
+	reg := newTestRegistry()
+	reg.upsert(BackendRegistration{
+		ID: "emb", URL: srv.URL, Model: "default",
+		Features: []string{"embeddings"}, TTLSeconds: 3600, HealthPath: "/health",
+	})
+	cfg := &Config{DifficultyTimeout: difficultyTimeoutFallback}
+	r := &Router{cfg: cfg, registry: reg, client: &http.Client{Timeout: 5 * time.Second},
+		classifier: newDifficultyClassifier(cfg, fakeEmbed)}
+	r.certifyBackend("emb")
+
+	got := r.classifier.deadline()
+	if got <= difficultyTimeoutFallback {
+		t.Fatalf("deadline = %s; a %s round trip must have raised it above the %s fallback",
+			got, latency, difficultyTimeoutFallback)
+	}
+	// The certification check records the measurement an operator would otherwise
+	// have to infer.
+	if msg := reg.get("emb").Certification.Checks["embeddings"].Message; !strings.Contains(msg, "classifier deadline") {
+		t.Errorf("embeddings check does not report what the deadline settled on: %q", msg)
+	}
+	// And /health publishes it, because it is a number nobody can predict.
+	rec := httptest.NewRecorder()
+	r.handleHealth(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	var health map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &health); err != nil {
+		t.Fatalf("health is not JSON: %v", err)
+	}
+	if health["classifier_deadline"] != got.String() {
+		t.Errorf("/health reports classifier_deadline=%v, want %s", health["classifier_deadline"], got)
+	}
+}

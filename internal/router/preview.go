@@ -88,8 +88,12 @@ func (r *Router) handleRoutePreview(w http.ResponseWriter, req *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	if !authorizedAsClient(req, r.cfg.ClientTokens) {
-		unauthorized(w)
+	// CLIENT scope, deliberately. The preview explains one caller's own routing
+	// decision and discloses a superset of /v1/models (worker ids, quality, load)
+	// but no URLs, no credentials and nobody else's traffic — and /v1/models has
+	// to stay client-scoped anyway, so moving this would buy very little.
+	ident, ok := r.requireClient(w, req)
+	if !ok {
 		return
 	}
 	body, err := readRequestBody(w, req)
@@ -100,6 +104,15 @@ func (r *Router) handleRoutePreview(w http.ResponseWriter, req *http.Request) {
 	chatReq, err := parseAndValidateChatRequest(body, r.cfg.DefaultMaxTokens)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, validationError{Message: err.Error()})
+		return
+	}
+	// The allow-list applies here too — previewing a model a key may not call
+	// would answer a question about a worker the caller cannot reach. The budget
+	// does not: a preview contacts nothing and generates nothing.
+	if !ident.allowsModel(requestedModel(chatReq)) {
+		writeJSON(w, http.StatusForbidden, validationError{
+			Message: fmt.Sprintf("this key may not use model %q", requestedModel(chatReq)), Param: "model",
+		})
 		return
 	}
 

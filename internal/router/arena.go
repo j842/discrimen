@@ -284,7 +284,8 @@ func arenaUsage() {
 
 Flags for run:
   -out FILE          where to write results json (default arena-results.json)
-  -token TOKEN       router client token (default $ROUTER_CLIENT_TOKEN)
+  -token TOKEN       router admin key (default $ROUTER_ADMIN_KEY) — the run
+                     lists the fleet via /backends, which is admin scope
   -limit N           only the first N questions (0 = all)
   -concurrency N     questions in flight (default 4)
   -max-tokens N      completion budget per answer (default 8192)
@@ -323,7 +324,7 @@ func runArenaCommand(argv []string) bool {
 		router := fs.String("router", "", "router base URL (required)")
 		dataset := fs.String("dataset", "", "graded dataset, JSONL or JSON array (required)")
 		out := fs.String("out", "arena-results.json", "where to write results")
-		token := fs.String("token", os.Getenv("ROUTER_CLIENT_TOKEN"), "router client token")
+		token := fs.String("token", os.Getenv("ROUTER_ADMIN_KEY"), "router admin key — the run lists the fleet via /backends, which is admin scope")
 		limit := fs.Int("limit", 0, "only the first N questions (0 = all)")
 		conc := fs.Int("concurrency", 4, "questions in flight")
 		maxTokens := fs.Int("max-tokens", 8192, "completion budget per answer")

@@ -71,10 +71,13 @@ const provisionalQuality = 30
 // consecutive failures, spaced by the delay below. Cheap insurance: the measured
 // value is cached per (id, model) and never re-measured on its own, so a single
 // false negative here permanently under-rates a worker.
-const (
-	capacityProbeAttempts   = 3
-	capacityProbeRetryDelay = 3 * time.Second
-)
+//
+// The delay is a package var for the same reason slotMaxWait and qualityFloorWait
+// are — a test that has to spend nine real seconds proving a retry ladder works
+// is a test nobody runs.
+const capacityProbeAttempts = 3
+
+var capacityProbeRetryDelay = 3 * time.Second
 
 // fmtProfileDuration renders a profile's wall time as "6m 48s" (minutes + seconds).
 func fmtProfileDuration(ms int64) string {
@@ -187,16 +190,7 @@ func (r *Router) profileBackend(b *Backend, model string) (*WorkerProfile, error
 	if !capOK {
 		return nil, errors.New("worker unreachable during capacity probe; discarding partial measurements")
 	}
-	// The ramp infers capacity from aggregate throughput, which can over-report on a
-	// worker that serialises: at n=2 a single-slot worker runs the two requests
-	// back-to-back, and if the samples are noisy the second level still clears the
-	// 1.15x knee test. Where the worker publishes its own slot count, that is ground
-	// truth and outranks the inference.
-	if slots := r.querySlots(b); slots > 0 && capN > slots {
-		log.Printf("capacity probe: %s ramp suggested %d but the worker reports %d slot(s) — using %d",
-			b.ID, capN, slots, slots)
-		capN = slots
-	}
+	capN = r.resolveCapacity(b, capN)
 	// Prefill rate is measured here rather than left to the live EWMA, which only
 	// samples non-thinking requests and so never fills in for a thinking-heavy worker.
 	// A failure is not fatal: routing falls back to the flat TTFT average as before.
@@ -374,6 +368,14 @@ func (r *Router) capacityProbe(b *Backend) (capacity int, ok bool) {
 	if maxN < 1 {
 		maxN = 16
 	}
+	// A declared ceiling on a manual row bounds the ramp as well as settling it.
+	// capacityProbeMax is one global number for a whole fleet; this is the
+	// operator saying what THIS endpoint will take, and firing 32 concurrent
+	// probes at a provider they have told us tops out at 4 buys nothing but rate
+	// limiting — on a metered endpoint, paid for.
+	if declared := r.registry.operatorMaxConcurrency(b.ID); declared > 0 && declared < maxN {
+		maxN = declared
+	}
 	best, prev := 1, 0.0
 	for _, n := range []int{1, 2, 4, 8, 16, 32, 64} {
 		if n > maxN {
@@ -412,6 +414,38 @@ func (r *Router) capacityProbe(b *Backend) (capacity int, ok bool) {
 		best, prev = n, agg
 	}
 	return best, true
+}
+
+// resolveCapacity settles a worker's concurrency from the ramp's inference and
+// the two PUBLICATIONS that outrank it. Both say the same thing — where a real
+// number exists, an inference from aggregate throughput does not get to
+// contradict it — but they guard opposite failures, so they move the answer in
+// opposite directions.
+//
+// llama.cpp's total_slots can only ever LOWER it. The ramp over-reports on a
+// worker that serialises: at n=2 a single-slot worker runs the two requests
+// back-to-back, and if the samples are noisy the second level still clears the
+// 1.15x knee test. --parallel is a hard limit regardless of what throughput
+// appeared to show, but the ramp may still find a lower PRACTICAL knee than the
+// configured slot count, so it caps rather than replaces.
+//
+// An operator's declared ceiling on a manual row replaces it outright, and can
+// raise it. The failure there is the mirror image: a rate-limited endpoint
+// answers a burst with 429s, measureConcurrent fails the whole level, and the
+// verdict is cached per (id, model) and never re-measured on its own — so one
+// throttled minute would cost that endpoint its capacity permanently.
+func (r *Router) resolveCapacity(b *Backend, ramp int) int {
+	if slots := r.querySlots(b); slots > 0 && ramp > slots {
+		log.Printf("capacity probe: %s ramp suggested %d but the worker reports %d slot(s) — using %d",
+			b.ID, ramp, slots, slots)
+		ramp = slots
+	}
+	if declared := r.registry.operatorMaxConcurrency(b.ID); declared > 0 && declared != ramp {
+		log.Printf("capacity probe: %s ramp measured %d but the operator declared %d — using the declared value",
+			b.ID, ramp, declared)
+		ramp = declared
+	}
+	return ramp
 }
 
 // measureConcurrent fires n identical short completions at once and returns the
@@ -704,13 +738,18 @@ func (r *Router) backendGET(b *Backend, path string) (map[string]any, error) {
 	return out, nil
 }
 
-// applyProfileIfGen copies measured values onto the live backend — declared
-// values are only ever a seed; the measured profile wins. It applies only when
-// the backend still exists at the registration generation the profile was
-// measured against: results from a stale generation (the worker re-registered
+// applyProfileIfGen copies measured values onto the live backend — a beacon's
+// declared values are only ever a seed; the measured profile wins. It applies
+// only when the backend still exists at the registration generation the profile
+// was measured against: results from a stale generation (the worker re-registered
 // with new content, or was deleted, mid-measurement) are dropped, and the
 // caller must not persist them either. gen 0 skips the check (tests, callers
 // that hold no generation).
+//
+// A MANUAL row is the exception, and the central invariant of P2: it is
+// operator-owned, so a probe fills in what the operator left blank and never
+// overwrites what they entered. See providers.go for why the two are not the
+// same kind of claim.
 func (r *Registry) applyProfileIfGen(id string, gen int64, p *WorkerProfile) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -718,19 +757,22 @@ func (r *Registry) applyProfileIfGen(id string, gen int64, p *WorkerProfile) boo
 	if b == nil || (gen != 0 && b.profileGen != gen) {
 		return false
 	}
-	if p.Model != "" {
+	// Zero for every field on a beacon row, so the guards below collapse to the
+	// behaviour the whole deployed fleet already has.
+	declared := operatorDeclared(b)
+	if p.Model != "" && declared.Model == "" {
 		b.Model = p.Model
 	}
-	if p.Quality > 0 {
+	if p.Quality > 0 && declared.Quality == 0 {
 		b.Quality = p.Quality
 	}
-	if p.ContextK > 0 {
+	if p.ContextK > 0 && declared.ContextK == 0 {
 		b.ContextK = p.ContextK
 	}
-	if p.MaxConcurrency > 0 {
+	if p.MaxConcurrency > 0 && declared.MaxConcurrency == 0 {
 		b.MaxConcurrency = p.MaxConcurrency
 	}
-	if p.BaselineTPS > 0 {
+	if p.BaselineTPS > 0 && declared.BaselineTPS == 0 {
 		b.BaselineTPS = p.BaselineTPS
 	}
 	// Seed the prefill EWMA from the probe, but never overwrite a live one — same rule
@@ -740,6 +782,11 @@ func (r *Registry) applyProfileIfGen(id string, gen int64, p *WorkerProfile) boo
 	if p.PrefillTPS > 0 && b.ObservedPrefillTPS == 0 {
 		b.ObservedPrefillTPS = p.PrefillTPS
 	}
+	// Features are exempt from the operator-owned rule, and deliberately so:
+	// capabilities are the one thing the router settles by sending a request and
+	// reading the answer, and profileQuick already carries the declared semantic
+	// tags it cannot probe (uncensored, vision) across into the measured set. So
+	// nothing an operator declares is lost here — it is merged, not overwritten.
 	if len(p.Features) > 0 {
 		b.Features = append([]string(nil), p.Features...)
 	}
@@ -752,8 +799,12 @@ func (r *Registry) applyProfileIfGen(id string, gen int64, p *WorkerProfile) boo
 	// saturated worker. Only a FULL profile carries a measured value
 	// (BenchVersion is set); profileQuick's MaxConcurrency=1 is a provisional
 	// placeholder that must not throttle a fresh worker to serial dispatch.
+	//
+	// Sync the EFFECTIVE cap rather than the profile's own: on a manual row the
+	// guard above kept the operator's number, and the slot channel has to hold
+	// that one or the declared ceiling would be advisory only.
 	if p.BenchVersion > 0 {
-		r.syncSlotsLocked(id, p.MaxConcurrency)
+		r.syncSlotsLocked(id, b.MaxConcurrency)
 	}
 	return true
 }

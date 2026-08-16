@@ -177,3 +177,97 @@ func TestNiceModelName(t *testing.T) {
 		}
 	}
 }
+
+// probeModel decides what every capability probe puts in its "model" field.
+// Sending the literal "default" was fine against a single-model local worker and
+// fatal against an endpoint that validates model names — a strict provider
+// failed certification over the model field, never reaching its capabilities.
+func TestProbeModel(t *testing.T) {
+	cases := []struct {
+		name string
+		b    *Backend
+		want string
+	}{
+		{"served id wins: it is the one spelling the endpoint's validator accepts",
+			&Backend{BackendRegistration: BackendRegistration{Model: "declared"},
+				ModelMeta: ModelMeta{ServedID: "gpt-5.2"}}, "gpt-5.2"},
+		{"before the first fingerprint, the declared model is all there is",
+			&Backend{BackendRegistration: BackendRegistration{Model: "declared"}}, "declared"},
+		{"nothing declared either falls back to the historical literal",
+			&Backend{}, "default"},
+		{"no backend at all", nil, "default"},
+	}
+	for _, tc := range cases {
+		if got := probeModel(tc.b); got != tc.want {
+			t.Errorf("%s: probeModel = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestServedIDPinsTheDeclaredModel: ServedID used to be data[0].id
+// unconditionally. On a catalogue endpoint serving hundreds of models that is an
+// arbitrary one — and patchForwardedBody stamps ServedID onto every client
+// request routed to that endpoint, so an arbitrary pick rewrites every request
+// to a model nobody asked for.
+func TestServedIDPinsTheDeclaredModel(t *testing.T) {
+	const catalogue = `{"data":[{"id":"gpt-4o-mini","max_model_len":128000},
+		{"id":"gpt-5.2","max_model_len":400000},{"id":"o5"}]}`
+	cases := []struct {
+		name       string
+		models     string
+		declared   string
+		wantServed string
+		wantID     string
+		wantCtxK   int
+	}{
+		{"declared model present in the catalogue is pinned",
+			catalogue, "gpt-5.2", "gpt-5.2", "gpt-5.2", 400000 / 1024},
+		{"declared model absent from the catalogue pins nothing, so the client's own model travels through",
+			catalogue, "llm-local", "", "llm-local", 0},
+		{"a placeholder declaration against a catalogue is still not data[0]",
+			catalogue, "default", "", "w", 0},
+		{"the single-model worker case the old code was written for is unchanged",
+			`{"data":[{"id":"Qwen/Qwen3-32B-AWQ","max_model_len":32768}]}`, "default",
+			"Qwen/Qwen3-32B-AWQ", "Qwen/Qwen3-32B-AWQ", 32},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b, done := fakeWorker(t, tc.models, "")
+			defer done()
+			b.Model = tc.declared
+			r := &Router{client: &http.Client{}}
+
+			id, meta := r.queryModelInfo(b)
+			if meta.ServedID != tc.wantServed {
+				t.Errorf("ServedID = %q, want %q", meta.ServedID, tc.wantServed)
+			}
+			if id != tc.wantID {
+				t.Errorf("model fingerprint = %q, want %q", id, tc.wantID)
+			}
+			// Context comes off the same entry, or a catalogue would report some
+			// other model's window as this row's.
+			ctxK, ok := r.queryContextMeasured(b)
+			if tc.wantCtxK == 0 {
+				if ok {
+					t.Errorf("context measured as %dk from an entry that is not ours", ctxK)
+				}
+			} else if !ok || ctxK != tc.wantCtxK {
+				t.Errorf("context = %dk (measured=%v), want %dk", ctxK, ok, tc.wantCtxK)
+			}
+		})
+	}
+}
+
+// The weights metadata must come off the entry that was selected, not data[0].
+func TestModelMetaComesFromTheSelectedEntry(t *testing.T) {
+	b, done := fakeWorker(t, `{"data":[
+		{"id":"other","meta":{"n_params":1,"ftype":"wrong"}},
+		{"id":"ours","meta":{"n_params":284334567511,"ftype":"MXFP4 MoE"}}]}`, "")
+	defer done()
+	b.Model = "ours"
+
+	r := &Router{client: &http.Client{}}
+	if _, meta := r.queryModelInfo(b); meta.ModelParams != 284334567511 || meta.ModelQuant != "MXFP4 MoE" {
+		t.Errorf("metadata came from the wrong entry: %+v", meta)
+	}
+}

@@ -1,6 +1,9 @@
 package router
 
 import (
+	"bytes"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -279,5 +282,198 @@ func TestEscalationRespectsADeclaredDeadline(t *testing.T) {
 	r.handleChatCompletions(rec2, req2)
 	if goodHits.Load() != 1 {
 		t.Fatalf("a generous deadline should still allow the repair, better worker called %d times", goodHits.Load())
+	}
+}
+
+// ── Unknown-parameter backstop ──────────────────────────────────────────────
+
+// rejectedField is what decides whether a 400 is safe to retry around, so it is
+// graded directly against the shapes servers actually emit.
+func TestRejectedField(t *testing.T) {
+	const request = `{"model":"m","messages":[],"chat_template_kwargs":{"enable_thinking":true},"temperature":0.7}`
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		want   string
+	}{
+		{"OpenAI prose", http.StatusBadRequest,
+			`{"error":{"message":"Unrecognized request argument supplied: chat_template_kwargs","type":"invalid_request_error","param":null,"code":null}}`,
+			"chat_template_kwargs"},
+		{"OpenAI param, when the endpoint fills it in", http.StatusBadRequest,
+			`{"error":{"message":"Unknown parameter.","param":"chat_template_kwargs","type":"invalid_request_error"}}`,
+			"chat_template_kwargs"},
+		{"pydantic detail[].loc, which is what vLLM validation looks like", http.StatusUnprocessableEntity,
+			`{"detail":[{"type":"extra_forbidden","loc":["body","chat_template_kwargs"],"msg":"Extra inputs are not permitted"}]}`,
+			"chat_template_kwargs"},
+		{"gateway phrasing", http.StatusBadRequest,
+			`{"error":{"message":"Unknown field: chat_template_kwargs"}}`, "chat_template_kwargs"},
+
+		// Everything below must NOT be retried.
+		{"an invalid VALUE is not an unknown field — stripping it silently changes the request", http.StatusBadRequest,
+			`{"error":{"message":"temperature must be <= 2","param":"temperature"}}`, ""},
+		{"a field the request does not carry identifies nothing", http.StatusBadRequest,
+			`{"error":{"message":"Unrecognized request argument supplied: logit_bias"}}`, ""},
+		{"a field that carries the caller's meaning is never dropped", http.StatusBadRequest,
+			`{"error":{"message":"Unknown model: m","param":"model"}}`, ""},
+		{"two candidates is ambiguous, and picking one would be a guess", http.StatusBadRequest,
+			`{"error":{"message":"unknown fields: chat_template_kwargs, temperature"}}`, ""},
+		{"a 500 is the endpoint's problem, not the request's", http.StatusInternalServerError,
+			`{"error":{"message":"Unrecognized request argument supplied: chat_template_kwargs"}}`, ""},
+		{"an unparseable error body", http.StatusBadRequest, `<html>unknown chat_template_kwargs</html>`, "chat_template_kwargs"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := rejectedField(tc.status, []byte(tc.body), []byte(request))
+			if tc.want == "" {
+				if ok {
+					t.Fatalf("retried on %q", got)
+				}
+				return
+			}
+			if !ok || got != tc.want {
+				t.Fatalf("field = %q (ok=%v), want %q", got, ok, tc.want)
+			}
+		})
+	}
+}
+
+// strictWorker is an endpoint that refuses any request carrying `field` — what a
+// provider validating its input does — recording each body it saw.
+func strictWorker(t *testing.T, field string, seen *[]string) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		body, _ := io.ReadAll(req.Body)
+		*seen = append(*seen, string(body))
+		w.Header().Set("Content-Type", "application/json")
+		if bytes.Contains(body, []byte(`"`+field+`"`)) {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = fmt.Fprintf(w, `{"error":{"message":"Unrecognized request argument supplied: %s","type":"invalid_request_error"}}`, field)
+			return
+		}
+		_, _ = io.WriteString(w, realAnswer)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// routerFor is a router with one ready worker at url and a real log store.
+func routerFor(t *testing.T, url string) *Router {
+	t.Helper()
+	reg := newTestRegistry()
+	reg.upsert(BackendRegistration{
+		ID: "strict", URL: url, Model: "m", Quality: 50,
+		BaselineTPS: 100, MaxConcurrency: 2, TTLSeconds: 3600, Features: []string{"chat"},
+	})
+	reg.finishCertification("strict", true, map[string]Check{}, 100, 10, "")
+
+	dir := t.TempDir()
+	logs, err := openLogStore(dir+"/logs.sqlite", 16384, "")
+	if err != nil {
+		t.Fatalf("open log store: %v", err)
+	}
+	t.Cleanup(func() { logs.Close() })
+	return &Router{
+		cfg:      &Config{DefaultMaxTokens: 4096, HealthInterval: 15 * time.Second},
+		registry: reg, client: &http.Client{Timeout: 5 * time.Second},
+		streamClient: &http.Client{}, logs: logs,
+	}
+}
+
+// TestStripAndRetry: an endpoint that refuses a field the router sent gets the
+// request again without it, once, and the verdict sticks so later requests never
+// pay for it again.
+func TestStripAndRetry(t *testing.T) {
+	var seen []string
+	r := routerFor(t, strictWorker(t, "chat_template_kwargs", &seen))
+	// The client pins the kwargs gate itself (the escape hatch), so the router
+	// forwards it verbatim and the strict endpoint refuses the request.
+	body := `{"model":"m","messages":[{"role":"user","content":"say hello"}],` +
+		`"chat_template_kwargs":{"enable_thinking":false}}`
+
+	rec := runChat(t, r, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the retry to have succeeded: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Paris") {
+		t.Fatalf("client did not get the retried answer: %s", rec.Body.String())
+	}
+	if len(seen) != 2 {
+		t.Fatalf("want one rejection and one retry, got %d requests", len(seen))
+	}
+	if !strings.Contains(seen[0], "chat_template_kwargs") {
+		t.Errorf("first attempt should have carried the field: %s", seen[0])
+	}
+	if strings.Contains(seen[1], "chat_template_kwargs") {
+		t.Errorf("retry still carried the refused field: %s", seen[1])
+	}
+	// Remembered against the backend, and visible in /backends.
+	if got := r.registry.get("strict").RejectedFields; len(got) != 1 || got[0] != "chat_template_kwargs" {
+		t.Fatalf("rejected field not remembered: %v", got)
+	}
+
+	// The next request omits it up front — one worker hit, no rejection.
+	seen = nil
+	if rec := runChat(t, r, body); rec.Code != http.StatusOK {
+		t.Fatalf("second request = %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(seen) != 1 {
+		t.Fatalf("want a single clean request, got %d", len(seen))
+	}
+	if strings.Contains(seen[0], "chat_template_kwargs") {
+		t.Errorf("a learned field was sent again: %s", seen[0])
+	}
+
+	// A re-registration is a different deployment, so what the old one refused
+	// says nothing about it.
+	r.registry.upsert(BackendRegistration{
+		ID: "strict", URL: "http://elsewhere", Model: "m", TTLSeconds: 3600, Features: []string{"chat"},
+	})
+	if got := r.registry.get("strict").RejectedFields; len(got) != 0 {
+		t.Errorf("re-registration kept the old deployment's verdicts: %v", got)
+	}
+}
+
+// One retry, never a loop: an endpoint that refuses every request gets exactly
+// two, and the caller gets the rejection rather than an unbounded hunt for a
+// body it will accept.
+func TestStripAndRetryIsBounded(t *testing.T) {
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		body, _ := io.ReadAll(req.Body)
+		seen = append(seen, string(body))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		// Names whichever field the body still carries, so a looping
+		// implementation would keep going until nothing was left.
+		field := "chat_template_kwargs"
+		if !bytes.Contains(body, []byte(field)) {
+			field = "top_k"
+		}
+		_, _ = fmt.Fprintf(w, `{"error":{"message":"Unrecognized request argument supplied: %s"}}`, field)
+	}))
+	defer srv.Close()
+
+	r := routerFor(t, srv.URL)
+
+	rec := runChat(t, r, `{"model":"m","messages":[{"role":"user","content":"hi"}],`+
+		`"chat_template_kwargs":{"enable_thinking":false},"top_k":40}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want the endpoint's own 400 passed through", rec.Code)
+	}
+	if len(seen) != 2 {
+		t.Fatalf("want exactly one retry, got %d requests", len(seen))
+	}
+}
+
+// A streaming request is never retried: bytes are already on the wire and there
+// is no rewinding them (the same rule proxyRetryDelays records).
+func TestStripAndRetrySkipsStreaming(t *testing.T) {
+	var seen []string
+	r := routerFor(t, strictWorker(t, "chat_template_kwargs", &seen))
+	runChat(t, r, `{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}],`+
+		`"chat_template_kwargs":{"enable_thinking":false}}`)
+	if len(seen) != 1 {
+		t.Fatalf("a streamed request must be forwarded once, got %d", len(seen))
 	}
 }

@@ -169,7 +169,7 @@ fleet re-benchmark, so monthly is not worth it for a set that only turns over
 every six months:
 
   go run . bench fetch
-  go run . bench calibrate -router http://epyc.home:8585 -token "$ROUTER_CLIENT_TOKEN"
+  go run . bench calibrate -router http://epyc.home:8585 -token "$ROUTER_ADMIN_KEY"
   go run . bench emit
   # then bump benchmarkVersion, drop the replaced tiers from benchmark_data.go,
   # and commit the generated file in the SAME commit as the version bump.
@@ -198,7 +198,7 @@ func runBenchCommand(argv []string) bool {
 	case "calibrate":
 		fs := flag.NewFlagSet("calibrate", flag.ExitOnError)
 		router := fs.String("router", "", "router base URL (required)")
-		token := fs.String("token", os.Getenv("ROUTER_CLIENT_TOKEN"), "router client token")
+		token := fs.String("token", os.Getenv("ROUTER_ADMIN_KEY"), "router admin key — calibration lists the fleet via /backends, which is admin scope")
 		conc := fs.Int("concurrency", 2, "concurrent questions per backend")
 		limit := fs.Int("limit", 0, "max questions per task (0 = all) — for a smoke test before the full run")
 		_ = fs.Parse(args)

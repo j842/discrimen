@@ -109,6 +109,14 @@ func TestMigrationsApplyToAnOldDatabase(t *testing.T) {
 	if prof.Quality != 71 || prof.ContextK != 128 || prof.MaxConcurrency != 4 {
 		t.Errorf("cached profile altered by the migration: %+v", prof)
 	}
+	// P4 added cost accounting to the profile JSON. A profile measured before it
+	// existed has to come back with zeroes — "not measured", which is why the
+	// token counts and not the cost are what say whether the run was ever priced
+	// (see WorkerProfile.ProfilePromptTokens).
+	if prof.ProfilePromptTokens != 0 || prof.ProfileOutputTokens != 0 || prof.ProfileCost != 0 {
+		t.Errorf("pre-P4 profile invented a cost: %d/%d tokens, cost %g",
+			prof.ProfilePromptTokens, prof.ProfileOutputTokens, prof.ProfileCost)
+	}
 
 	// Rows written before key_id existed still read, with the empty default.
 	rows, err := logs.List(ctx, "", 10, 0)

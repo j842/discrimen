@@ -500,6 +500,7 @@ func Main() {
 	if cfg.EscalateInline {
 		log.Printf("inline escalation enabled (empty non-streamed answers are re-dispatched to a better worker)")
 	}
+	router.loadGroups(context.Background())
 	if saved, err := logs.LoadBackendRegistrations(context.Background()); err != nil {
 		log.Printf("load persisted backend registrations failed: %v", err)
 	} else {
@@ -542,18 +543,22 @@ type Router struct {
 	judgeCount   atomic.Uint64         // sample counter for background answer judging
 	judgePaid    judgeBudget           // rolling token allowance for grading with a PAID model (see judge.go)
 	profiling    sync.Map              // worker ids with a cold-start profile in flight (de-dups overlapping profiles)
+	gateAudited  atomic.Bool           // set once the thinking-gate-vs-tier audit has logged (model-independent)
+	sessions     *sessionTracker       // conversation → worker affinity; nil disables stickiness (see session.go)
+
 	// profileMeters holds a *profileMeter per worker id for the span of that
 	// worker's profiling run, so what the run consumed can be totalled onto the
 	// profile it produces. Empty at every other moment (see profile.go).
 	profileMeters sync.Map
-	gateAudited  atomic.Bool           // set once the thinking-gate-vs-tier audit has logged (model-independent)
-	sessions     *sessionTracker       // conversation → worker affinity; nil disables stickiness (see session.go)
 
 	// adminAuth holds live admin password sessions. A value, not a pointer, so
 	// the zero Router is usable — every test that builds one by hand would
 	// otherwise have to remember to construct it, and forgetting would be a nil
 	// dereference on the login path rather than a compile error.
 	adminAuth adminSessions
+	// groups holds the named preference lists a client can select through the
+	// model field (see groups.go). A value for the same reason as adminAuth.
+	groups groupStore
 	// Whether a client / worker credential is REQUIRED, cached from the keys
 	// table so the check is not a database read per request. Refreshed at startup
 	// and after every write to that table (see refreshAuthRequired).
@@ -736,6 +741,8 @@ func (r *Router) routes() *http.ServeMux {
 	mux.HandleFunc("/admin/providers/", r.handleAdminProviderByID)
 	mux.HandleFunc("/admin/keys", r.handleAdminKeys)
 	mux.HandleFunc("/admin/keys/", r.handleAdminKeyByID)
+	mux.HandleFunc("/admin/groups", r.handleAdminGroups)
+	mux.HandleFunc("/admin/groups/", r.handleAdminGroupByName)
 	// The password session. /admin/login and /admin/session are the only two
 	// unauthenticated routes under /admin, and neither discloses anything: login
 	// answers the same 401 for "wrong password" and "no password is set", and
@@ -1089,6 +1096,12 @@ func (r *Router) handleModelByID(w http.ResponseWriter, req *http.Request) {
 		r.handleModels(w, req) // a bare trailing slash is still the list
 		return
 	}
+	// A group answers to its name however it is capitalised, because that is how
+	// routing resolves it — the menu must not 404 a spelling chat/completions
+	// would accept.
+	if g, ok := r.groups.lookup(name); ok {
+		name = g.Name
+	}
 	for _, m := range r.modelCatalogue() {
 		if m["id"] == name || m["root"] == name {
 			writeJSON(w, http.StatusOK, m)
@@ -1113,10 +1126,12 @@ func (r *Router) modelCatalogue() []map[string]any {
 	order := []string{}
 	fleetFeatures := []string{"chat"}
 	aliasModels := map[string][]string{} // alias → distinct models claiming it
+	servable := []*Backend{}             // what a group's members can resolve to
 	for _, b := range r.registry.snapshot() {
 		if isExpired(b) || isEmbeddingsOnly(b) {
 			continue
 		}
+		servable = append(servable, b)
 		fleetFeatures = append(fleetFeatures, b.Features...)
 		entry, seen := byModel[b.Model]
 		if !seen {
@@ -1161,11 +1176,28 @@ func (r *Router) modelCatalogue() []map[string]any {
 	models := []map[string]any{{
 		"id":       "default",
 		"object":   "model",
-		"owned_by": "llm-router",
+		"owned_by": routerOwner,
 		"features": normalizeFeatures(fleetFeatures),
 	}}
 	for _, name := range order {
 		models = append(models, byModel[name])
+	}
+	// Groups last, and they REPLACE a row of the same id rather than sitting
+	// beside it. A group resolves ahead of model ids and aliases (see planRoute),
+	// so where a worker has since registered under a group's name the menu has to
+	// say where that name actually goes. The admin API refuses to create such a
+	// group, so this only fires when the worker arrived second.
+	for _, entry := range groupEntries(r.groups.list(), servable, normalizeFeatures(fleetFeatures)) {
+		replaced := false
+		for i, m := range models {
+			if m["id"] == entry["id"] {
+				models[i], replaced = entry, true
+				break
+			}
+		}
+		if !replaced {
+			models = append(models, entry)
+		}
 	}
 	return models
 }
@@ -2007,6 +2039,14 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 	if s := plan.session.outcome(backend.ID); s != "" {
 		w.Header().Set("X-LLM-Session", s)
 	}
+	// Which member of the named group served, or "fallback" when none qualified
+	// and the request routed automatically. Observable the same way X-LLM-Route
+	// and X-LLM-Session are, and set here so streaming and buffered dispatch both
+	// carry it. Deliberately NOT folded into X-LLM-Route, whose "route:d=" form
+	// the tier adapter parses.
+	if g := plan.group.header(); g != "" {
+		w.Header().Set("X-LLM-Group", g)
+	}
 
 	// Streaming requests can't be retried — once headers are committed we
 	// can't rewind. Fall through to the single-shot path. ttftBase (slot
@@ -2189,6 +2229,9 @@ type routePlan struct {
 	job        jobCost
 	tr         thinkingResolution
 	session    sessionRoute
+	// group is what group resolution decided, and is the zero value when the
+	// client named no group (see groups.go).
+	group groupRoute
 	// rejected records why each eligible worker was hard-filtered out. Only
 	// populated when explain is set — the proxy path allocates nothing for it.
 	rejected []rejection
@@ -2261,7 +2304,12 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 	// model that three workers serve still load-balances across those three.
 	// "default" — what every clabtree guest sends — and an absent model mean auto.
 	wantModel := requestedModel(req)
-	if wantModel != "" && len(filterCandidates(candidates, func(b *Backend) bool { return backendServesModel(b, wantModel) })) == 0 {
+	// A GROUP name resolves ahead of a model id, an alias and a worker id, which
+	// is what fixes the precedence between the four spellings the model field
+	// accepts (see groups.go). It is never an unknown model: a group always
+	// routes, falling back to automatic selection when no member qualifies.
+	group, isGroup := r.groups.lookup(wantModel)
+	if !isGroup && wantModel != "" && len(filterCandidates(candidates, func(b *Backend) bool { return backendServesModel(b, wantModel) })) == 0 {
 		return nil, unknownModelError{name: wantModel}
 	}
 
@@ -2304,6 +2352,29 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 		needTools:        needTools,
 		requiredFeatures: requiredFeatures,
 		hardThink:        tr.hardThink,
+	}
+	// Resolve the group now the hard filter exists — "qualifies" means "past the
+	// hard filters", so the two cannot be settled in either order. A resolved
+	// member replaces the group name in the filter; a fallback removes it
+	// entirely, because a group is a preference and must never be a refusal.
+	gr := groupRoute{}
+	if isGroup {
+		hf.wantModel = ""
+		gr.name = group.Name
+		if member, ok := group.resolve(candidates, hf); ok {
+			gr.member, hf.wantModel = member, member
+		} else {
+			gr.fallback = true
+			// The ROUTER is choosing now, so the route reads "route:" and the tier
+			// adapter and judge learn from it — see routeKind.
+			wantModel = ""
+			if !explain {
+				// The preview renders the fallback instead of logging it; logging on
+				// a preview would make an inspection indistinguishable from traffic.
+				log.Printf("group %q: no member is registered, healthy and past the hard filters (members=%v) — falling back to automatic routing",
+					group.Name, group.Members)
+			}
+		}
 	}
 	var rejected []rejection
 	filtered := filterCandidates(candidates, func(b *Backend) bool {
@@ -2376,6 +2447,7 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 			job:        job,
 			tr:         tr,
 			session:    sess,
+			group:      gr,
 			rejected:   rejected,
 		}, nil
 	}
@@ -2391,6 +2463,7 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 		job:        job,
 		tr:         tr,
 		session:    sess,
+		group:      gr,
 		rejected:   rejected,
 	}, nil
 }
@@ -4388,6 +4461,14 @@ func (s *LogStore) init(ctx context.Context) error {
 		// Authentication reads this on every request that presents a bearer token,
 		// so it is an index rather than a scan.
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys (key_hash)`,
+		// Named groups (P5). The name is stored already lowercased (see groupKey),
+		// so the primary key is the lookup key; members are a JSON array because a
+		// member is a model id and model ids are not a comma-free alphabet.
+		`CREATE TABLE IF NOT EXISTS router_groups (
+			name TEXT PRIMARY KEY,
+			members TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
 		// Key/value rather than a one-row table with a column per setting, which
 		// would need a migration for every setting ever added. Holds the admin
 		// password hash; the database is canonical for it.

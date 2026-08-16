@@ -3,7 +3,87 @@ package router
 import (
 	"strings"
 	"testing"
+	"time"
 )
+
+// TestJudgeGraderPrefersFree: the judge grades a sampled fraction of ordinary
+// traffic forever, so the moment the best model in the fleet is a metered one
+// that becomes a standing spend. It must reach for the best FREE model first
+// and only fall through when none of them outranks the worker being graded.
+func TestJudgeGraderPrefersFree(t *testing.T) {
+	reg := newTestRegistry()
+	registerPriced(t, reg, "cheapie", 3, 4, 0, 0)
+	registerPriced(t, reg, "free-mid", 7, 4, 0, 0)
+	registerPriced(t, reg, "paid-top", 9, 4, 3, 15)
+	r := &Router{registry: reg}
+
+	// A free model outranks the worker that served → grade for nothing.
+	if got, paid := r.judgeGrader(reg.get("cheapie")); got == nil || got.ID != "free-mid" || paid {
+		t.Errorf("grading a cheap answer: got %v (paid=%v), want free-mid for free", got, paid)
+	}
+	// Nothing free outranks it → the paid model, flagged so the caller charges.
+	if got, paid := r.judgeGrader(reg.get("free-mid")); got == nil || got.ID != "paid-top" || !paid {
+		t.Errorf("no free model is better: got %v (paid=%v), want paid-top flagged paid", got, paid)
+	}
+	// With the paid model gone there is simply nothing better to grade with; the
+	// best free model comes back and maybeJudge's own guard drops the sample.
+	reg.remove("paid-top")
+	if got, paid := r.judgeGrader(reg.get("free-mid")); got == nil || got.ID != "free-mid" || paid {
+		t.Errorf("free-only fleet: got %v (paid=%v), want free-mid for free", got, paid)
+	}
+	// An embeddings-only worker is never a grader, whatever its quality.
+	reg.upsert(BackendRegistration{ID: "emb", URL: "http://emb", Model: "e", Quality: 100,
+		TTLSeconds: 3600, Features: []string{"embeddings"}})
+	reg.finishCertification("emb", true, map[string]Check{}, 0, 0, "")
+	if got, _ := r.judgeGrader(reg.get("cheapie")); got == nil || got.ID != "free-mid" {
+		t.Errorf("embeddings worker used as a grader: %v", got)
+	}
+}
+
+// TestJudgePaidBudget: the cap is a rolling token allowance, so an exhausted
+// window pauses paid grading and a rolled-over one resumes it.
+func TestJudgePaidBudget(t *testing.T) {
+	var b judgeBudget
+	if !b.allow() {
+		t.Fatal("a fresh window must allow the first call")
+	}
+	b.charge(judgePaidTokenBudget - 1)
+	if !b.allow() {
+		t.Fatal("one token short of the cap is still inside it")
+	}
+	b.charge(1)
+	if b.allow() {
+		t.Fatal("a spent allowance must refuse")
+	}
+	// Roll the window over by hand; the allowance comes back and the spend resets.
+	b.resetAt = time.Now().Add(-time.Second)
+	if !b.allow() {
+		t.Fatal("a rolled-over window must allow again")
+	}
+	if b.spent != 0 {
+		t.Errorf("spend carried across the window boundary: %d", b.spent)
+	}
+}
+
+func TestJudgeCallTokens(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  map[string]any
+		want int
+	}{
+		{"the endpoint's own total wins", map[string]any{"usage": map[string]any{
+			"total_tokens": 321.0, "prompt_tokens": 300.0, "completion_tokens": 21.0}}, 321},
+		{"summed when no total is published", map[string]any{"usage": map[string]any{
+			"prompt_tokens": 300.0, "completion_tokens": 21.0}}, 321},
+		{"silence is charged the ceiling", map[string]any{}, judgeMaxCallTokens},
+		{"an empty usage block is silence too", map[string]any{"usage": map[string]any{}}, judgeMaxCallTokens},
+	}
+	for _, c := range cases {
+		if got := judgeCallTokens(c.raw); got != c.want {
+			t.Errorf("%s: judgeCallTokens = %d, want %d", c.name, got, c.want)
+		}
+	}
+}
 
 func TestParseJudgeVerdict(t *testing.T) {
 	cases := []struct {

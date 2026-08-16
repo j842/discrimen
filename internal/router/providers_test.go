@@ -1,7 +1,12 @@
 package router
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
+	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -470,6 +475,362 @@ func TestSameEndpointModel(t *testing.T) {
 			t.Errorf("sameEndpointModel(%s/%s, %s/%s) = %v, want %v",
 				c.a.URL, c.a.Model, c.b.URL, c.b.Model, got, c.want)
 		}
+	}
+}
+
+// ── P4: cost in the ranker ──────────────────────────────────────────────────
+
+// pricedBackend is mkBackend with declared prices — the same worker, metered.
+func pricedBackend(id string, quality, tps, maxConc, active int, in, out float64) *Backend {
+	b := mkBackend(id, quality, tps, maxConc, active)
+	b.InputPricePerMtok, b.OutputPricePerMtok = in, out
+	return b
+}
+
+// registerPriced registers a ready worker carrying declared prices.
+func registerPriced(t *testing.T, reg *Registry, id string, quality, maxConcurrency int, in, out float64) *Backend {
+	t.Helper()
+	reg.upsert(BackendRegistration{
+		ID: id, URL: "http://" + id, Model: "default", Quality: quality,
+		MaxConcurrency: maxConcurrency, TTLSeconds: 3600, Features: []string{"chat"},
+		InputPricePerMtok: in, OutputPricePerMtok: out,
+	})
+	reg.finishCertification(id, true, map[string]Check{}, 50, 10, "")
+	return reg.get(id)
+}
+
+func TestIsFreeBackendAndTokenCost(t *testing.T) {
+	cases := []struct {
+		name     string
+		in, out  float64
+		free     bool
+		perMtoks float64 // cost of one million prompt + one million completion tokens
+	}{
+		{"a local worker declares nothing", 0, 0, true, 0},
+		{"input priced only", 3, 0, false, 3},
+		{"output priced only", 0, 15, false, 15},
+		{"both priced", 3, 15, false, 18},
+	}
+	for _, c := range cases {
+		b := &Backend{BackendRegistration: BackendRegistration{InputPricePerMtok: c.in, OutputPricePerMtok: c.out}}
+		if got := isFreeBackend(b); got != c.free {
+			t.Errorf("%s: isFreeBackend = %v, want %v", c.name, got, c.free)
+		}
+		if got := tokenCost(b, 1_000_000, 1_000_000); math.Abs(got-c.perMtoks) > 1e-9 {
+			t.Errorf("%s: tokenCost = %g, want %g", c.name, got, c.perMtoks)
+		}
+	}
+	if !isFreeBackend(nil) {
+		t.Error("a nil backend must not read as paid")
+	}
+	if got := tokenCost(nil, 1000, 1000); got != 0 {
+		t.Errorf("tokenCost(nil) = %g", got)
+	}
+}
+
+// TestRankByDifficultyPrefersFreeAboveTheBar is PLAN.md's P4 rule as a ranking:
+// among the workers that clear the quality bar the free one leads, even when a
+// paid one would finish sooner. Below the bar cost says nothing — the router has
+// already missed the quality it wanted, and buying a worse answer to save money
+// is not a trade anyone asked for.
+func TestRankByDifficultyPrefersFreeAboveTheBar(t *testing.T) {
+	free := mkBackend("free", 8, 30, 4, 0)
+	paidFast := pricedBackend("paid-fast", 9, 200, 4, 0, 3, 15)
+	if got := rankByDifficulty([]*Backend{paidFast, free}, 7, nominalJob()); got[0].ID != "free" {
+		t.Errorf("both clear q>=7: want the free worker first, got %s", got[0].ID)
+	}
+	// Only the paid worker clears the bar → it leads. Cost never buys worse.
+	if got := rankByDifficulty([]*Backend{free, paidFast}, 9, nominalJob()); got[0].ID != "paid-fast" {
+		t.Errorf("only paid clears q>=9: want paid-fast, got %s", got[0].ID)
+	}
+	// Below the bar, closest quality still wins.
+	freeWeak := mkBackend("free-weak", 3, 200, 4, 0)
+	paidMid := pricedBackend("paid-mid", 6, 30, 4, 0, 3, 15)
+	if got := rankByDifficulty([]*Backend{freeWeak, paidMid}, 9, nominalJob()); got[0].ID != "paid-mid" {
+		t.Errorf("both below q>=9: want the closest (paid-mid), got %s", got[0].ID)
+	}
+	// A saturated free worker still loses the head of the list: holding the
+	// request for it is the acquire step's job, not the ranker's.
+	fullFree := mkBackend("free", 8, 30, 1, 1)
+	if got := rankByDifficulty([]*Backend{fullFree, paidFast}, 7, nominalJob()); got[0].ID != "paid-fast" {
+		t.Errorf("free worker full: want paid-fast at the head, got %s", got[0].ID)
+	}
+}
+
+// TestRankBackendsCostIsOnlyATieBreak covers the FALLBACK ranker (no classifier,
+// so no quality bar): cost separates workers this ranker already considers
+// interchangeable, and nothing more.
+func TestRankBackendsCostIsOnlyATieBreak(t *testing.T) {
+	// Identical quality and speed. The ids are chosen so that WITHOUT the cost
+	// rule the final a.ID < b.ID tiebreak would put the paid one first.
+	free := mkBackend("zzz-free", 7, 50, 4, 0)
+	paid := pricedBackend("aaa-paid", 7, 50, 4, 0, 3, 15)
+	if got := rankBackends([]*Backend{paid, free}, nominalJob()); got[0].ID != "zzz-free" {
+		t.Errorf("equal score: want the free worker first, got %s", got[0].ID)
+	}
+	better := pricedBackend("aaa-paid-better", 10, 50, 4, 0, 3, 15)
+	if got := rankBackends([]*Backend{free, better}, nominalJob()); got[0].ID != "aaa-paid-better" {
+		t.Errorf("a clearly better paid worker must still lead, got %s", got[0].ID)
+	}
+}
+
+// TestQualityFloorPreferenceTiers pins which bounded preference applies, since
+// that single choice is where free-first and the quality floor are reconciled.
+func TestQualityFloorPreferenceTiers(t *testing.T) {
+	free8 := mkBackend("free8", 8, 50, 2, 0)
+	free3 := mkBackend("free3", 3, 50, 2, 0)
+	paid9 := pricedBackend("paid9", 9, 50, 2, 0, 3, 15)
+	paid2 := pricedBackend("paid2", 2, 50, 2, 0, 3, 15)
+	cases := []struct {
+		name       string
+		candidates []*Backend
+		target     int
+		why        string
+	}{
+		{"free and paid both clear the bar", []*Backend{free8, paid9}, 7, "free-first"},
+		{"no classification, so no bar to clear", []*Backend{free8, paid9}, 0, "free-first"},
+		{"every above-bar worker is paid", []*Backend{free3, paid9}, 7, "quality-floor"},
+		{"no free worker at all", []*Backend{paid2, paid9}, 7, "quality-floor"},
+		{"everything is free and above the bar", []*Backend{free8, free3}, 3, ""},
+		{"everything is free, no bar", []*Backend{free8, free3}, 0, ""},
+		{"nothing clears the bar", []*Backend{free3}, 9, ""},
+	}
+	for _, c := range cases {
+		pref := qualityFloorPreference(c.candidates, c.target)
+		if pref.why != c.why {
+			t.Errorf("%s: preference = %q, want %q", c.name, pref.why, c.why)
+		}
+		if c.why == "" && pref.keep != nil {
+			t.Errorf("%s: a no-op preference must be the zero value", c.name)
+		}
+	}
+}
+
+// TestFreeFirstServesFreeWhileItHasASlot: the ranked head is a paid endpoint
+// (the free worker is slower), and acquisition still lands on the free one.
+func TestFreeFirstServesFreeWhileItHasASlot(t *testing.T) {
+	withQualityFloorWait(t, 5*time.Second) // large; must NOT be consumed
+	reg := newTestRegistry()
+	paid := registerPriced(t, reg, "paid", 9, 1, 3, 15)
+	free := registerPriced(t, reg, "free", 8, 1, 0, 0)
+	r := &Router{registry: reg}
+
+	start := time.Now()
+	got, slot, missed, err := r.pickAndAcquireWithFloor(context.Background(), []*Backend{paid, free}, 7)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.ID != "free" {
+		t.Fatalf("a free worker had a slot: want free, got %s", got.ID)
+	}
+	if missed {
+		t.Error("serving the preferred free worker must not report a miss")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("took %s — the free worker was idle, there was nothing to wait for", elapsed)
+	}
+	reg.releaseSlot(slot)
+}
+
+// TestFreeFirstSpillsToPaidOnlyPastTheGrace: money is spent only after every
+// free candidate has been saturated for the whole existing grace.
+func TestFreeFirstSpillsToPaidOnlyPastTheGrace(t *testing.T) {
+	withQualityFloorWait(t, 80*time.Millisecond)
+	reg := newTestRegistry()
+	paid := registerPriced(t, reg, "paid", 9, 1, 3, 15)
+	free := registerPriced(t, reg, "free", 8, 1, 0, 0)
+	r := &Router{registry: reg}
+
+	if _, ok := reg.tryAcquireSlot("free"); !ok {
+		t.Fatal("could not saturate the free worker")
+	}
+	start := time.Now()
+	got, slot, missed, err := r.pickAndAcquireWithFloor(context.Background(), []*Backend{paid, free}, 7)
+	if err != nil {
+		t.Fatalf("the spill must still serve, got err=%v", err)
+	}
+	if got.ID != "paid" {
+		t.Fatalf("free stayed full past the grace: want the paid spill, got %s", got.ID)
+	}
+	if !missed {
+		t.Error("spending money after the grace must report a missed preference")
+	}
+	if elapsed := time.Since(start); elapsed < qualityFloorWait {
+		t.Errorf("spent money after %s, before the %s grace elapsed", elapsed, qualityFloorWait)
+	}
+	reg.releaseSlot(slot)
+}
+
+// TestFreeFirstTakesTheFreeSlotThatFreesWithinTheGrace: the mirror case — the
+// free worker frees up in time, so nothing is spent.
+func TestFreeFirstTakesTheFreeSlotThatFreesWithinTheGrace(t *testing.T) {
+	withQualityFloorWait(t, 2*time.Second)
+	reg := newTestRegistry()
+	paid := registerPriced(t, reg, "paid", 9, 1, 3, 15)
+	free := registerPriced(t, reg, "free", 8, 1, 0, 0)
+	r := &Router{registry: reg}
+
+	held, ok := reg.tryAcquireSlot("free")
+	if !ok {
+		t.Fatal("could not saturate the free worker")
+	}
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		reg.releaseSlot(held)
+	}()
+	got, slot, missed, err := r.pickAndAcquireWithFloor(context.Background(), []*Backend{paid, free}, 7)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.ID != "free" || missed {
+		t.Fatalf("a free slot freed within the grace: got %s (missed=%v), want free", got.ID, missed)
+	}
+	reg.releaseSlot(slot)
+}
+
+// ── P4: what a profiling run cost ───────────────────────────────────────────
+
+// profilingWorker is a fake endpoint that answers everything a cold profile
+// asks it, reporting a FIXED usage block per completion so the accounting can
+// be checked against a known total.
+//
+// Tools and JSON mode are refused with a 400 — a definitive reject, which is
+// what a text-only endpoint does, and which keeps the capability probes from
+// spending their transient-retry ladders (and this test's wall clock) on them.
+func profilingWorker(t *testing.T, promptTokens, completionTokens int) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == http.MethodGet {
+			http.NotFound(w, req) // no catalogue, no /props: context and slots stay unmeasured
+			return
+		}
+		body, _ := io.ReadAll(req.Body)
+		if bytes.Contains(body, []byte(`"tools"`)) || bytes.Contains(body, []byte(`"response_format"`)) {
+			http.Error(w, `{"error":{"message":"unsupported"}}`, http.StatusBadRequest)
+			return
+		}
+		usage := fmt.Sprintf(`"usage":{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d}`,
+			promptTokens, completionTokens, promptTokens+completionTokens)
+		if bytes.Contains(body, []byte(`"stream":true`)) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok ok ok ok\"}}]}\n\n")
+			fmt.Fprintf(w, "data: {\"choices\":[],%s}\n\n", usage)
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			return
+		}
+		fmt.Fprintf(w, `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],%s}`, usage)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// profileCostRouter is a router wired for a real cold profile against srv, with
+// the capacity ramp capped so the test doesn't measure a fake worker's ceiling.
+func profileCostRouter(t *testing.T, srv *httptest.Server, in, out float64) (*Router, *Backend) {
+	t.Helper()
+	reg := newTestRegistry()
+	r := &Router{
+		cfg:         &Config{CapacityProbeMax: 2},
+		registry:    reg,
+		client:      &http.Client{Timeout: 10 * time.Second},
+		benchClient: &http.Client{},
+	}
+	reg.upsert(manualReg(t, BackendRegistration{
+		ID: "metered", URL: srv.URL, Model: "m", TTLSeconds: 3600,
+		InputPricePerMtok: in, OutputPricePerMtok: out,
+	}))
+	return r, reg.get("metered")
+}
+
+// TestProfileRecordsWhatItSpent: a cold profile of a metered endpoint has to
+// leave behind what it consumed and what that cost, or the operator finds out
+// from their invoice (PLAN.md, "Known costs").
+func TestProfileRecordsWhatItSpent(t *testing.T) {
+	srv := profilingWorker(t, 1000, 40)
+	r, b := profileCostRouter(t, srv, 3, 15)
+
+	prof, err := r.profileBackend(b, "m")
+	if err != nil {
+		t.Fatalf("profileBackend: %v", err)
+	}
+	if prof.ProfilePromptTokens <= 0 || prof.ProfileOutputTokens <= 0 {
+		t.Fatalf("nothing was metered: %d prompt / %d completion",
+			prof.ProfilePromptTokens, prof.ProfileOutputTokens)
+	}
+	// The benchmark is the bulk of a run, so the totals have to be at least the
+	// question count — anything less means whole probes went unmetered.
+	if prof.ProfileOutputTokens < 40*len(benchmarkQuestions) {
+		t.Errorf("completion tokens %d are below the %d questions' worth alone",
+			prof.ProfileOutputTokens, len(benchmarkQuestions))
+	}
+	want := float64(prof.ProfilePromptTokens)/1e6*3 + float64(prof.ProfileOutputTokens)/1e6*15
+	if math.Abs(prof.ProfileCost-want) > 1e-9 {
+		t.Errorf("ProfileCost = %g, want %g at the row's declared prices", prof.ProfileCost, want)
+	}
+	if msg := prof.Checks["cost"].Message; !strings.Contains(msg, "at declared prices") {
+		t.Errorf("the run's cost is not in the check list: %q", msg)
+	}
+	// The metering span closes with the run: nothing may keep counting afterwards.
+	if _, still := r.profileMeters.Load("metered"); still {
+		t.Error("the profile meter outlived the profiling run")
+	}
+}
+
+// TestProfileOfAFreeWorkerCostsNothingButIsStillMeasured is the other half of
+// "zero means not measured": a local worker consumes tokens and costs nothing,
+// which must not read the same as a profile taken before the accounting existed.
+func TestProfileOfAFreeWorkerCostsNothingButIsStillMeasured(t *testing.T) {
+	srv := profilingWorker(t, 1000, 40)
+	r, b := profileCostRouter(t, srv, 0, 0)
+
+	prof, err := r.profileBackend(b, "m")
+	if err != nil {
+		t.Fatalf("profileBackend: %v", err)
+	}
+	if prof.ProfilePromptTokens <= 0 || prof.ProfileOutputTokens <= 0 {
+		t.Fatal("a free worker's profile still has to record what it consumed")
+	}
+	if prof.ProfileCost != 0 {
+		t.Errorf("a free worker's run cost %g", prof.ProfileCost)
+	}
+	if msg := prof.Checks["cost"].Message; !strings.Contains(msg, "free at declared prices") {
+		t.Errorf("cost check = %q, want it to say the run was free", msg)
+	}
+
+	// A profile cached before P4 carries neither, and that reads as "not
+	// measured" rather than "free" — the pair is what carries the distinction.
+	old := &WorkerProfile{Model: "m", Quality: 71}
+	if old.ProfilePromptTokens != 0 || old.ProfileOutputTokens != 0 || old.ProfileCost != 0 {
+		t.Fatal("an old profile must decode to zeroes")
+	}
+}
+
+// TestProfileMeterIgnoresTrafficOutsideARun: the meter is scoped to one run
+// against one endpoint, so ordinary traffic can never inflate a stored cost.
+func TestProfileMeterIgnoresTrafficOutsideARun(t *testing.T) {
+	srv := profilingWorker(t, 100, 50)
+	r, b := profileCostRouter(t, srv, 3, 15)
+	payload := map[string]any{"model": "m", "messages": []map[string]string{{"role": "user", "content": "hi"}}}
+
+	if _, err := r.rawCompletion(b, payload); err != nil {
+		t.Fatalf("completion before the span: %v", err)
+	}
+	meter, done := r.meterProfile(b.ID)
+	if _, err := r.rawCompletion(b, payload); err != nil {
+		t.Fatalf("completion inside the span: %v", err)
+	}
+	done()
+	if _, err := r.rawCompletion(b, payload); err != nil {
+		t.Fatalf("completion after the span: %v", err)
+	}
+	prompt, output := meter.totals()
+	if prompt != 100 || output != 50 {
+		t.Errorf("metered %d/%d tokens, want exactly the one call inside the span (100/50)", prompt, output)
+	}
+	// A run against a DIFFERENT endpoint is a different meter.
+	r.meterProfileTokens("someone-else", 999, 999)
+	if prompt, output = meter.totals(); prompt != 100 || output != 50 {
+		t.Errorf("another endpoint's tokens landed on this meter: %d/%d", prompt, output)
 	}
 }
 

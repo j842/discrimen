@@ -56,9 +56,21 @@ type previewResponse struct {
 	Thinking      previewThinking    `json:"thinking"`
 	Job           previewJob         `json:"job"`
 	Session       previewSession     `json:"session"`
+	Group         *previewGroup      `json:"group,omitempty"`
 	Candidates    []previewCandidate `json:"candidates"`
 	Rejected      []rejection        `json:"rejected"`
 	Notes         []string           `json:"notes,omitempty"`
+}
+
+// previewGroup is how a named group resolved. A group that silently fell back
+// to automatic routing is exactly the thing this endpoint exists to make
+// visible — the request still gets an answer, so nothing else about it looks
+// wrong.
+type previewGroup struct {
+	Name     string   `json:"name"`
+	Member   string   `json:"member,omitempty"`
+	Fallback bool     `json:"fallback"`
+	Members  []string `json:"members,omitempty"`
 }
 
 type previewThinking struct {
@@ -168,6 +180,18 @@ func (r *Router) renderPreview(chatReq *ChatRequest, plan *routePlan, budget tim
 		resp.Notes = append(resp.Notes,
 			"prompt not classified — auto-tiering and auto-thinking are OFF for this request "+
 				"(no embeddings worker, classifier not ready, or no user turn to classify)")
+	}
+	if plan.group.name != "" {
+		g := previewGroup{Name: plan.group.name, Member: plan.group.member, Fallback: plan.group.fallback}
+		if stored, ok := r.groups.lookup(plan.group.name); ok {
+			g.Members = stored.Members
+		}
+		resp.Group = &g
+		if plan.group.fallback {
+			resp.Notes = append(resp.Notes, fmt.Sprintf(
+				"group %q fell back: no member is registered, healthy and past the hard filters, so the group filter was dropped and this request routes automatically",
+				plan.group.name))
+		}
 	}
 	if plan.session.active() {
 		resp.Session = previewSession{

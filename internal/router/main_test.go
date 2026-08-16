@@ -717,6 +717,15 @@ func post(path, body string, token string) *http.Request {
 	return req
 }
 
+// authGet is post's read-side twin, for the endpoints a client GETs.
+func authGet(path string, token string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	return req
+}
+
 // TestNorthboundErrorEnvelope: every error the router returns is the OpenAI
 // envelope with a JSON content type and a type matching its status. This is the
 // contract clients are written against, and it used to hold on none of these

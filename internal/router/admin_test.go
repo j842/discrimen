@@ -320,6 +320,59 @@ func TestAdminProviderSeedsFromPriceData(t *testing.T) {
 	}
 }
 
+// TestAdminProviderListCarriesPriceReference: seeding leaves no trace on the
+// row it seeds, so the listing has to carry the table's own answer alongside it
+// or the admin page cannot attribute a single number it is showing.
+func TestAdminProviderListCarriesPriceReference(t *testing.T) {
+	if len(prices().exact) == 0 {
+		t.Skip("prices.json is the empty snapshot")
+	}
+	r := adminRouter(t)
+	serveAdmin(r, adminReq(http.MethodPost, "/admin/providers",
+		`{"url":"https://api.openai.com/v1","model":"gpt-4o","provider":"openai"}`))
+	// Nothing publishes a price for a local llama.cpp build, which is the normal
+	// case and must simply be absent rather than zero.
+	serveAdmin(r, adminReq(http.MethodPost, "/admin/providers",
+		`{"id":"homelab","url":"http://192.0.2.9:8080","model":"some-local-build-Q4_K_M"}`))
+
+	rec := serveAdmin(r, adminReq(http.MethodGet, "/admin/providers", ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list = %d: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Providers []map[string]any          `json:"providers"`
+		Reference map[string]publishedPrice `json:"price_reference"`
+		Source    map[string]string         `json:"price_source"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("list is not JSON: %v", err)
+	}
+	ref, ok := body.Reference["openai-gpt-4o"]
+	if !ok {
+		t.Fatalf("no published price reported for a priced row: %s", rec.Body.String())
+	}
+	if ref.InputPricePerMtok <= 0 || ref.OutputPricePerMtok <= 0 || ref.ContextK <= 0 {
+		t.Errorf("published reference looks wrong: %+v", ref)
+	}
+	// The stored row and the reference have to AGREE, or the page's "this is
+	// what LiteLLM publishes" marker would never appear on a row that was seeded
+	// from exactly that entry.
+	for _, row := range body.Providers {
+		if row["id"] != "openai-gpt-4o" {
+			continue
+		}
+		if in, _ := row["input_price_per_mtok"].(float64); in != ref.InputPricePerMtok {
+			t.Errorf("seeded row price %v != published %v", in, ref.InputPricePerMtok)
+		}
+	}
+	if _, published := body.Reference["homelab"]; published {
+		t.Errorf("a local build was given a published price: %+v", body.Reference["homelab"])
+	}
+	if body.Source["source"] != priceSourceURL || body.Source["fetched_at"] == "" {
+		t.Errorf("price source not attributed: %+v", body.Source)
+	}
+}
+
 // ── Admin session ───────────────────────────────────────────────────────────
 
 // passwordRouter is a router whose admin password is set, without an admin key,

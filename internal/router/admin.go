@@ -104,7 +104,16 @@ func (r *Router) handleAdminProviders(w http.ResponseWriter, req *http.Request) 
 	}
 	switch req.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, map[string]any{"providers": r.registry.manualRows()})
+		rows := r.registry.manualRows()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"providers": rows,
+			// What the embedded LiteLLM table publishes for these models, so the
+			// admin page can attribute a price or a context window it is showing
+			// instead of presenting an invented number as an operator's own. See
+			// priceReference: seeding leaves no trace on the row itself.
+			"price_reference": priceReference(rows),
+			"price_source":    priceSourceInfo(),
+		})
 	case http.MethodPost:
 		r.createProvider(w, req)
 	default:

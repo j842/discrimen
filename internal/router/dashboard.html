@@ -22,6 +22,7 @@
     .pill { border: 1px solid #334155; border-radius: 999px; padding: 2px 7px; color: #cbd5e1; font-size: 12px; }
     button { background: #2563eb; color: white; border: 0; border-radius: 6px; padding: 7px 10px; cursor: pointer; }
     button.secondary { background: #334155; }
+    button.danger { background: #7f1d1d; }
     button:disabled { opacity: .55; cursor: not-allowed; }
     .try { display: none; padding: 14px; background: #0f141d; border-top: 1px solid #2a2f3a; }
     .try.open { display: block; }
@@ -31,8 +32,14 @@
     .output { white-space: pre-wrap; min-height: 72px; background: #080b10; border: 1px solid #303847; padding: 10px; border-radius: 6px; margin-top: 10px; }
     .panel { margin-top: 18px; background: #151923; border: 1px solid #2a2f3a; }
     .panel h2 { font-size: 16px; margin: 0; padding: 14px 16px; border-bottom: 1px solid #252b36; }
+    .panel-body { padding: 14px 16px; }
     .tabs { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 16px; border-bottom: 1px solid #252b36; }
     .tabs button.active { background: #1d4ed8; }
+    .tabbar { display: flex; flex-wrap: wrap; gap: 8px; padding-bottom: 12px; margin-bottom: 4px; border-bottom: 1px solid #2a2f3a; }
+    .tabbar button.active { background: #1d4ed8; }
+    .view { display: none; }
+    .view.active { display: block; }
+    [hidden] { display: none !important; }
     .logs { padding: 12px 16px 18px; display: grid; gap: 10px; }
     .logitem { border: 1px solid #303847; border-radius: 6px; background: #0f141d; padding: 10px; }
     .loghead { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
@@ -44,7 +51,29 @@
     .modal-backdrop { position: fixed; inset: 0; z-index: 1000; display: none; align-items: center; justify-content: center; padding: 20px; background: rgba(0,0,0,.64); }
     .modal-backdrop.open { display: flex; }
     .modal-card { width: min(960px, 100%); max-height: min(86vh, 900px); overflow: auto; background: #111827; border: 1px solid #303847; border-radius: 10px; box-shadow: 0 24px 80px rgba(0,0,0,.48); }
+    .modal-card.narrow { width: min(520px, 100%); }
     .modal-card .logitem { border: 0; border-radius: 0; }
+    .formgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px 12px; }
+    label { display: block; font-size: 12px; color: #aeb8c6; margin-bottom: 4px; }
+    .field { min-width: 0; }
+    .stack { display: grid; gap: 10px; }
+    .rowline { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .hint { color: #9aa4b2; font-size: 12px; }
+    .ok { color: #62d26f; }
+    .warn { color: #f7c948; }
+    .bad { color: #ff6b6b; }
+    .pill.src { border-color: #3f4a5f; }
+    .pill.seeded { border-color: #4c5a2f; color: #b7d17a; }
+    .banner { border: 1px solid #303847; border-radius: 6px; padding: 10px 12px; background: #0f141d; font-size: 13px; }
+    .banner.bad { border-color: #5c2626; color: #ffb4b4; }
+    .banner.ok { border-color: #255c2e; color: #a9e8b0; }
+    .banner.warn { border-color: #6b5b12; color: #f7c948; }
+    .banner:empty { display: none; }
+    .login { max-width: 440px; margin: 48px auto 0; }
+    .secret { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+    .members { display: grid; gap: 6px; }
+    .member { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .member .idx { color: #9aa4b2; font-size: 12px; min-width: 18px; }
     @media (max-width: 900px) { .wide { display: none; } .grid { grid-template-columns: 1fr; } table { font-size: 12px; } }
   </style>
 </head>
@@ -54,74 +83,569 @@
       <h1>LLM Router</h1>
       <div class="muted">Generated {{.GeneratedAt}}</div>
     </div>
-    <div><button class="secondary" onclick="location.reload()">Refresh</button></div>
+    <div class="rowline" id="session-actions" hidden>
+      <span class="muted" id="session-state">Signed in as admin</span>
+      <button class="secondary" id="btn-refresh">Refresh</button>
+      <button class="secondary" id="btn-password">Change password</button>
+      <button class="secondary" id="btn-logout">Log out</button>
+    </div>
   </header>
   <main>
-    <table>
-      <thead>
-        <tr>
-          <th>Status</th><th>Backend</th><th>Model</th><th>Quality</th><th>Speed</th><th>Context</th><th>Load</th><th class="wide">Capabilities</th><th>Actions</th>
-        </tr>
-      </thead>
-      <tbody id="backends-body">
-        <tr><td colspan="9" class="muted">Loading backends…</td></tr>
-      </tbody>
-    </table>
-    <section class="panel">
-      <h2>Request Logs</h2>
-      <div class="tabs" id="log-tabs">
-        <button class="secondary active" id="tab-all" onclick="logOffset=0;loadLogs('')">All</button>
-      </div>
-      <div id="logs-table-wrap" style="padding:0 16px 4px; overflow-x:auto;">
-        <table id="logs-table" style="display:none; font-size:13px;">
-          <thead><tr><th>Time</th><th>Backend</th><th>Status</th><th>Duration</th><th>Route</th><th>Preview</th></tr></thead>
-          <tbody id="logs-body"></tbody>
-        </table>
-      </div>
-      <div class="logs" id="logs-empty"><div class="muted">Select a tab to load recent requests.</div></div>
-      <div id="logs-detail" style="display:none; padding:0 16px 18px;"></div>
-      <div style="display:flex; gap:8px; padding:8px 16px 18px; align-items:center;">
-        <button class="secondary" id="logs-prev" onclick="logPrev()" disabled>&larr; Newer</button>
-        <span class="muted" id="logs-page"></span>
-        <button class="secondary" id="logs-next" onclick="logNext()">Older &rarr;</button>
+    <section class="panel login" id="login-view" hidden>
+      <h2>Admin sign-in</h2>
+      <div class="panel-body">
+        <form class="stack" id="login-form">
+          <div class="field">
+            <label for="login-password">Admin password</label>
+            <input type="password" id="login-password" autocomplete="current-password" autofocus>
+          </div>
+          <div class="rowline"><button type="submit">Sign in</button></div>
+          <div class="banner" id="login-note"></div>
+          <div class="hint">
+            Everything on this page — the fleet, the request log, provider rows and keys — is admin scope.
+            The password is set by ROUTER_ADMIN_PASSWORD on a fresh database, or generated and printed
+            once to the router's log on first start.
+          </div>
+        </form>
       </div>
     </section>
-  </main>
-  <div class="modal-backdrop" id="log-modal" onclick="closeLogDetail(event)">
-    <div class="modal-card" id="log-modal-card" onclick="event.stopPropagation()"></div>
-  </div>
-  <script>
-    let activeLogBackend = '';
-    let logOffset = 0;
-    const LOG_LIMIT = 50;
-    let lastLogData = [];
 
-    // Everything this page reads — /backends, /logs, /debug/* — is admin scope,
-    // so the credential has to be an ADMIN key. A client token used to work here
-    // and no longer does: it would have read every stored prompt and response.
-    // An admin session cookie works too, and same-origin fetch sends it without
-    // any help from this function.
-    function token() {
-      let t = sessionStorage.getItem('routerToken') || '';
-      if (!t) {
-        t = prompt('Router admin key (sk-…), or blank if you are signed in:') || '';
-        sessionStorage.setItem('routerToken', t);
+    <div id="admin-view" hidden>
+      <nav class="tabbar" id="main-tabs">
+        <button class="secondary" id="mtab-fleet">Fleet</button>
+        <button class="secondary" id="mtab-providers">Providers</button>
+        <button class="secondary" id="mtab-keys">Keys</button>
+        <button class="secondary" id="mtab-groups">Groups</button>
+        <button class="secondary" id="mtab-logs">Logs</button>
+      </nav>
+
+      <section class="view" id="view-fleet">
+        <table>
+          <thead>
+            <tr>
+              <th>Status</th><th>Backend</th><th>Model</th><th>Quality</th><th>Speed</th><th>Context</th><th>Load</th><th>Profile cost</th><th class="wide">Capabilities</th><th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="backends-body">
+            <tr><td colspan="10" class="muted">Loading backends…</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="view" id="view-providers">
+        <div class="rowline" style="margin-bottom:12px">
+          <button id="btn-new-provider">Add a provider</button>
+          <span class="hint" id="provider-source-note"></span>
+        </div>
+        <div class="banner" id="provider-note"></div>
+        <section class="panel" id="provider-form-panel" hidden>
+          <h2 id="provider-form-title">New provider row</h2>
+          <div class="panel-body stack">
+            <div class="formgrid" id="provider-fields"></div>
+            <div class="rowline">
+              <button id="btn-save-provider">Save</button>
+              <button class="secondary" id="btn-cancel-provider">Cancel</button>
+            </div>
+            <div class="banner" id="provider-form-note"></div>
+            <div class="hint">
+              One row is one (endpoint, model) pair. Leave a price or context window blank and it is seeded
+              from the embedded LiteLLM table where the model id matches; type 0 to declare a model free and
+              it stays free. Quality and speed are not settable here — the router measures them.
+            </div>
+          </div>
+        </section>
+        <table style="margin-top:12px">
+          <thead>
+            <tr>
+              <th>Provider</th><th>Source</th><th>Model</th><th>Price / Mtok</th><th>Context</th><th>Concurrency</th><th>Status</th><th>Profile cost</th><th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="providers-body">
+            <tr><td colspan="9" class="muted">Loading providers…</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="view" id="view-keys">
+        <div class="rowline" style="margin-bottom:12px">
+          <button id="btn-new-key">Issue a key</button>
+        </div>
+        <div class="banner" id="key-note"></div>
+        <section class="panel" id="key-form-panel" hidden>
+          <h2>Issue an API key</h2>
+          <div class="panel-body stack">
+            <div class="formgrid">
+              <div class="field">
+                <label for="k-name">Name</label>
+                <input id="k-name" placeholder="who this is for">
+              </div>
+              <div class="field">
+                <label for="k-role">Role</label>
+                <select id="k-role">
+                  <option value="client">client — calls /v1/*</option>
+                  <option value="admin">admin — this page and /admin/*</option>
+                  <option value="worker">worker — registers backends</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="k-models">Model allow-list</label>
+                <input id="k-models" placeholder="blank ⇒ any model">
+              </div>
+              <div class="field">
+                <label for="k-budget">Token budget</label>
+                <input id="k-budget" type="number" min="0" placeholder="blank ⇒ unlimited">
+              </div>
+            </div>
+            <div class="rowline">
+              <button id="btn-issue-key">Issue</button>
+              <button class="secondary" id="btn-cancel-key">Cancel</button>
+            </div>
+            <div class="banner" id="key-form-note"></div>
+            <div class="hint">
+              The allow-list is matched against whatever the client names — a model id, an alias, a worker id
+              or a group name — so a key restricted to a group needs the group's name, not its members'.
+              The budget is a lifetime ceiling on tokens.
+            </div>
+          </div>
+        </section>
+        <table style="margin-top:12px">
+          <thead>
+            <tr>
+              <th>Key</th><th>Name</th><th>Role</th><th>State</th><th>Created</th><th>Last used</th><th>Models</th><th>Tokens</th><th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="keys-body">
+            <tr><td colspan="9" class="muted">Loading keys…</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="view" id="view-groups">
+        <div class="rowline" style="margin-bottom:12px">
+          <button id="btn-new-group">Create a group</button>
+        </div>
+        <div class="banner" id="group-note"></div>
+        <section class="panel" id="group-form-panel" hidden>
+          <h2>New group</h2>
+          <div class="panel-body stack">
+            <div class="formgrid">
+              <div class="field">
+                <label for="g-name">Name</label>
+                <input id="g-name" placeholder="coding">
+              </div>
+              <div class="field">
+                <label for="g-members">Members, best first</label>
+                <input id="g-members" placeholder="qwen3.8, llm-naples, gpt-4o">
+              </div>
+            </div>
+            <div class="rowline">
+              <button id="btn-create-group">Create</button>
+              <button class="secondary" id="btn-cancel-group">Cancel</button>
+            </div>
+            <div class="banner" id="group-form-note"></div>
+            <div class="hint">
+              A group is a preference, never a constraint: the router walks the members in order and takes the
+              first one it can serve, and falls back to automatic routing when none of them qualify. Members
+              are model ids, aliases or backend ids, resolved per request, so listing something you have not
+              stood up yet is legitimate.
+            </div>
+          </div>
+        </section>
+        <table style="margin-top:12px">
+          <thead>
+            <tr><th>Group</th><th>Members, in preference order</th><th>Actions</th></tr>
+          </thead>
+          <tbody id="groups-body">
+            <tr><td colspan="3" class="muted">Loading groups…</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="view" id="view-logs">
+        <section class="panel">
+          <h2>Request Logs</h2>
+          <div class="tabs" id="log-tabs">
+            <button class="secondary active" id="tab-all">All</button>
+          </div>
+          <div id="logs-table-wrap" style="padding:0 16px 4px; overflow-x:auto;">
+            <table id="logs-table" style="display:none; font-size:13px;">
+              <thead><tr><th>Time</th><th>Backend</th><th>Status</th><th>Duration</th><th>Route</th><th>Preview</th></tr></thead>
+              <tbody id="logs-body"></tbody>
+            </table>
+          </div>
+          <div class="logs" id="logs-empty"><div class="muted">Select a tab to load recent requests.</div></div>
+          <div id="logs-detail" style="display:none; padding:0 16px 18px;"></div>
+          <div style="display:flex; gap:8px; padding:8px 16px 18px; align-items:center;">
+            <button class="secondary" id="logs-prev" disabled>&larr; Newer</button>
+            <span class="muted" id="logs-page"></span>
+            <button class="secondary" id="logs-next">Older &rarr;</button>
+          </div>
+        </section>
+      </section>
+    </div>
+  </main>
+
+  <div class="modal-backdrop" id="log-modal">
+    <div class="modal-card" id="log-modal-card"></div>
+  </div>
+  <div class="modal-backdrop" id="dialog-modal">
+    <div class="modal-card narrow" id="dialog-card"></div>
+  </div>
+
+  <script>
+    // ── Admin session ───────────────────────────────────────────────────────
+    //
+    // Everything this page reads — /backends, /logs, /debug/*, /admin/* — is
+    // admin scope. The credential is the SESSION COOKIE that POST /admin/login
+    // sets; a same-origin fetch sends it without any help from here, so there is
+    // no Authorization header anywhere below.
+    //
+    // The old page prompted for a bearer key and kept it in sessionStorage. That
+    // is gone. A bearer admin key still works against every one of these
+    // endpoints and is the right credential for a script or a terminal, but it
+    // is the wrong one for a browser: prompt() shows a secret in clear text,
+    // sessionStorage hands it to anything that ever manages to run script on
+    // this origin, and holding a stored token alongside a cookie gives the page
+    // two disagreeing answers to "am I signed in". The cookie is HttpOnly, is
+    // revoked server-side by /admin/logout, and expires on its own.
+    let signedIn = false;
+    let activeTab = 'fleet';
+    const TABS = ['fleet', 'providers', 'keys', 'groups', 'logs'];
+
+    // Any key the previous version of this page left behind. Removed rather than
+    // migrated: it is a live admin credential in a store this page no longer has
+    // any use for.
+    try { sessionStorage.removeItem('routerToken'); } catch (_) {}
+
+    // request performs an admin call and flattens it into the three outcomes
+    // every caller here actually distinguishes: ok with a decoded body, 401 (the
+    // session is gone — show the login form, never an empty table), and anything
+    // else with a message worth putting on screen.
+    async function request(path, options) {
+      const opts = options || {};
+      const init = {method: opts.method || 'GET', credentials: 'same-origin', headers: {}};
+      if (opts.body !== undefined) {
+        init.headers['Content-Type'] = 'application/json';
+        init.body = JSON.stringify(opts.body);
       }
-      return t;
+      let res;
+      try {
+        res = await fetch(path, init);
+      } catch (err) {
+        return {ok: false, error: 'could not reach the router: ' + err};
+      }
+      if (res.status === 401) {
+        // allow401 is for the two calls where a 401 is an ANSWER rather than an
+        // expired session: signing in with the wrong password, and signing out.
+        if (!opts.allow401) sessionLost();
+        return {ok: false, status: 401, error: 'Log in to see this.'};
+      }
+      const text = await res.text();
+      let data = null;
+      try { data = text ? JSON.parse(text) : null; } catch (_) {}
+      if (!res.ok) return {ok: false, status: res.status, data: data, error: errorText(data, text, res.status)};
+      return {ok: true, status: res.status, data: data};
     }
-    function headers() {
-      const h = {'Content-Type':'application/json'};
-      const t = token();
-      if (t) h.Authorization = 'Bearer ' + t;
-      return h;
+    // errorText reads the OpenAI error envelope every handler here answers with,
+    // falling back to the raw body for anything that is not one.
+    function errorText(data, text, status) {
+      if (data && data.error && data.error.message) return data.error.message;
+      if (data && data.message) return data.message;
+      const raw = (text || '').trim();
+      return raw || ('HTTP ' + status);
+    }
+    function setBanner(id, message, kind) {
+      const node = document.getElementById(id);
+      node.className = 'banner' + (kind ? ' ' + kind : '');
+      node.textContent = message || '';
+    }
+    async function checkSession() {
+      const res = await request('/admin/session', {allow401: true});
+      setSignedIn(!!(res.ok && res.data && res.data.admin));
+    }
+    function setSignedIn(value, note) {
+      signedIn = value;
+      document.getElementById('login-view').hidden = value;
+      document.getElementById('admin-view').hidden = !value;
+      document.getElementById('session-actions').hidden = !value;
+      if (value) {
+        setBanner('login-note', '');
+        // Anything cached under the previous session belongs to it.
+        profileRuns = {};
+        showTab(activeTab);
+        // The per-backend log tabs are built from the fleet listing, so it is
+        // fetched once on sign-in whichever tab is open.
+        if (activeTab !== 'fleet') refreshBackends();
+      } else {
+        closeDialog(true);
+        setBanner('login-note', note || '', note ? 'warn' : '');
+        const field = document.getElementById('login-password');
+        if (field) field.focus();
+      }
+    }
+    function sessionLost() {
+      if (signedIn) setSignedIn(false, 'Your admin session has ended. Sign in again.');
+    }
+    async function login(event) {
+      event.preventDefault();
+      const field = document.getElementById('login-password');
+      setBanner('login-note', 'Signing in…');
+      const res = await request('/admin/login', {method: 'POST', body: {password: field.value}, allow401: true});
+      if (!res.ok) {
+        setBanner('login-note', res.status === 401 ? 'Invalid admin password.' : res.error, 'bad');
+        return;
+      }
+      field.value = '';
+      setSignedIn(true);
+    }
+    async function logout() {
+      await request('/admin/logout', {method: 'POST', allow401: true});
+      setSignedIn(false, 'Signed out.');
+    }
+
+    // ── Tabs ────────────────────────────────────────────────────────────────
+    function showTab(name) {
+      if (TABS.indexOf(name) === -1) name = 'fleet';
+      activeTab = name;
+      TABS.forEach(t => {
+        document.getElementById('view-' + t).classList.toggle('active', t === name);
+        document.getElementById('mtab-' + t).classList.toggle('active', t === name);
+      });
+      if (location.hash.slice(1) !== name) history.replaceState(null, '', '#' + name);
+      loadTab(name);
+    }
+    function loadTab(name) {
+      if (!signedIn) return;
+      if (name === 'fleet') refreshBackends();
+      else if (name === 'providers') loadProviders();
+      else if (name === 'keys') loadKeys();
+      else if (name === 'groups') loadGroups();
+      else if (name === 'logs') loadLogs(activeLogBackend);
+    }
+
+    // ── DOM helpers ─────────────────────────────────────────────────────────
+    // el builds an element with attributes and children (strings become text
+    // nodes), so interpolated values are set via textContent/dataset — never
+    // spliced into an HTML or attribute string — and can't inject markup.
+    function el(tag, attrs, children) {
+      const node = document.createElement(tag);
+      if (attrs) for (const k in attrs) {
+        if (k === 'class') node.className = attrs[k];
+        else if (k === 'dataset') for (const d in attrs[k]) node.dataset[d] = attrs[k][d];
+        else node.setAttribute(k, attrs[k]);
+      }
+      (children || []).forEach(c => node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c));
+      return node;
+    }
+    function btn(label, onClick, cls) {
+      const node = el('button', {class: cls || 'secondary'}, [label]);
+      node.addEventListener('click', onClick);
+      return node;
+    }
+    function on(id, event, handler) {
+      const node = document.getElementById(id);
+      if (node) node.addEventListener(event, handler);
+    }
+    function td(children, attrs) {
+      return el('td', attrs || {}, children);
+    }
+    function emptyRow(bodyID, columns, message, kind) {
+      const body = document.getElementById(bodyID);
+      body.innerHTML = '';
+      body.appendChild(el('tr', {}, [td([message], {colspan: String(columns), class: kind || 'muted'})]));
+    }
+    function escapeHtml(value) {
+      return String(value || '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    }
+    function pretty(value) {
+      if (!value) return '';
+      try { return JSON.stringify(JSON.parse(value), null, 2); } catch (_) { return value; }
+    }
+    function timeAgo(iso) {
+      const s = (Date.now() - new Date(iso).getTime()) / 1000;
+      if (s < 60) return Math.floor(s) + 's ago';
+      if (s < 3600) return Math.floor(s/60) + 'm ago';
+      if (s < 86400) return Math.floor(s/3600) + 'h ago';
+      return Math.floor(s/86400) + 'd ago';
+    }
+    function stamp(iso) {
+      if (!iso || iso.indexOf('0001-01-01') === 0) return null;
+      const at = new Date(iso);
+      return isNaN(at.getTime()) ? null : at;
+    }
+    function whenCell(iso, never) {
+      const at = stamp(iso);
+      if (!at) return el('span', {class: 'muted'}, [never]);
+      return el('span', {title: at.toLocaleString()}, [timeAgo(iso)]);
+    }
+    function commaList(value) {
+      return String(value || '').split(',').map(s => s.trim()).filter(s => s !== '');
+    }
+    function kTokens(n) {
+      n = Number(n) || 0;
+      return n >= 1000 ? Math.round(n / 1000) + 'k' : String(n);
+    }
+    function numberText(n) {
+      return (Number(n) || 0).toLocaleString();
+    }
+    // sameNumber compares a stored value with a published one. Both sides are
+    // the same float64 when a value was seeded, but a round trip through JSON
+    // and back is not something to bet an exact == on.
+    function sameNumber(a, b) {
+      if (!a || !b) return false;
+      return Math.abs(a - b) <= Math.abs(b) * 1e-9;
+    }
+    function priceText(v) {
+      const n = Number(v) || 0;
+      if (n === 0) return '0';
+      return n >= 1 ? n.toFixed(2) : n.toPrecision(3);
+    }
+
+    // ── Modal dialogs ───────────────────────────────────────────────────────
+    let dialogDismissable = true;
+    function openDialog(node, dismissable) {
+      const card = document.getElementById('dialog-card');
+      card.innerHTML = '';
+      card.appendChild(node);
+      dialogDismissable = dismissable !== false;
+      document.getElementById('dialog-modal').classList.add('open');
+    }
+    function closeDialog(force) {
+      if (!dialogDismissable && force !== true) return;
+      document.getElementById('dialog-modal').classList.remove('open');
+      document.getElementById('dialog-card').innerHTML = '';
+      dialogDismissable = true;
+    }
+    function dialogPanel(title, children) {
+      return el('div', {}, [
+        el('h2', {style: 'font-size:16px;margin:0;padding:14px 16px;border-bottom:1px solid #252b36'}, [title]),
+        el('div', {class: 'panel-body stack'}, children),
+      ]);
+    }
+
+    // ── Change password ─────────────────────────────────────────────────────
+    function openPasswordDialog() {
+      const current = el('input', {type: 'password', id: 'pw-current', autocomplete: 'current-password'});
+      const next = el('input', {type: 'password', id: 'pw-new', autocomplete: 'new-password'});
+      const note = el('div', {class: 'banner', id: 'pw-note'});
+      const save = btn('Change password', async () => {
+        note.className = 'banner';
+        note.textContent = 'Saving…';
+        const res = await request('/admin/password', {
+          method: 'POST',
+          body: {current_password: current.value, new_password: next.value},
+          allow401: true,
+        });
+        if (!res.ok) {
+          note.className = 'banner bad';
+          // allow401 above keeps an expired session from pulling the dialog away
+          // mid-edit, so this one 401 covers both causes and has to say so.
+          note.textContent = res.status === 401
+            ? 'The current password is incorrect, or your session has expired.'
+            : res.error;
+          return;
+        }
+        note.className = 'banner ok';
+        note.textContent = 'Password changed. Existing sessions, including this one, stay signed in.';
+        current.value = '';
+        next.value = '';
+      }, '');
+      openDialog(dialogPanel('Change admin password', [
+        el('div', {class: 'field'}, [el('label', {for: 'pw-current'}, ['Current password']), current]),
+        el('div', {class: 'field'}, [el('label', {for: 'pw-new'}, ['New password']), next]),
+        el('div', {class: 'rowline'}, [save, btn('Close', () => closeDialog())]),
+        note,
+        el('div', {class: 'hint'}, [
+          'At least 10 characters. The current password is required as well as the session, so a browser ' +
+          'left open on a shared machine is not enough to lock you out of your own router.',
+        ]),
+      ]));
+    }
+
+    // ── Profiling cost ──────────────────────────────────────────────────────
+    //
+    // What a cold profile consumed, from GET /backends/{id}/benchmark. Profiling
+    // a paid model spends real money — a cold run lands near 200-300k output
+    // tokens — so the number goes next to the endpoint in both the fleet and the
+    // provider tables.
+    //
+    // ZERO tokens means NOT MEASURED, not free: profiles cached before the
+    // router metered its own runs carry no counts, and what an already-paid run
+    // cost cannot be re-derived. Free is tokens > 0 with a cost of 0, which is
+    // every local worker. The two render differently on purpose — a confident
+    // "0.00" on an unmeasured profile is a lie about money.
+    let profileRuns = {};
+    function profileRun(id) {
+      if (profileRuns[id] === undefined) {
+        profileRuns[id] = {state: 'loading'};
+        request('/backends/' + encodeURIComponent(id) + '/benchmark').then(res => {
+          if (res.ok) profileRuns[id] = {state: 'ready', data: res.data || {}};
+          else if (res.status === 404) profileRuns[id] = {state: 'none'};
+          else profileRuns[id] = {state: 'error', error: res.error};
+          paintProfileCells();
+        });
+      }
+      return profileRuns[id];
+    }
+    function costNodes(id) {
+      const run = profileRun(id);
+      if (run.state === 'loading') return [el('span', {class: 'muted'}, ['…'])];
+      if (run.state === 'none') {
+        return [el('span', {class: 'muted', title: 'No profiling run has been stored for this backend yet.'}, ['no profile yet'])];
+      }
+      if (run.state === 'error') return [el('span', {class: 'muted'}, [run.error])];
+      const d = run.data;
+      if (!d.profile_cost_measured) {
+        return [el('span', {
+          class: 'muted',
+          title: 'This profile was cached before the router metered profiling runs, so what it cost is unknown. Certify again to measure one.',
+        }, ['not measured'])];
+      }
+      const cost = Number(d.profile_cost) || 0;
+      const head = cost > 0
+        ? el('span', {title: "At this row's declared prices, in whatever currency you are billed in."}, [priceText(cost)])
+        : el('span', {class: 'ok', title: 'The run was metered and this endpoint declares no price per token.'}, ['free']);
+      const detail = kTokens(d.profile_prompt_tokens) + ' in + ' + kTokens(d.profile_output_tokens) + ' out' +
+        (d.profiled_in ? ' · ' + d.profiled_in : '');
+      return [head, el('div', {class: 'muted'}, [detail])];
+    }
+    function costCell(id) {
+      return td(costNodes(id), {dataset: {costFor: id}});
+    }
+    function paintProfileCells() {
+      document.querySelectorAll('[data-cost-for]').forEach(cell => {
+        cell.innerHTML = '';
+        costNodes(cell.dataset.costFor).forEach(n => cell.appendChild(n));
+      });
+    }
+
+    // ── Fleet ───────────────────────────────────────────────────────────────
+    // The backend table and the per-backend log tabs are rendered CLIENT-SIDE
+    // from /backends. The unauthenticated server render discloses nothing about
+    // the fleet; everything below is built only after that admin-scoped fetch
+    // succeeds.
+    let knownBackendIDs = [];
+    let fleetCache = [];
+    function speedScoreOf(b) {
+      // Mirror the server-side speedScore: ceil(baseline_tps/10), clamped to [1,10].
+      const s = Math.ceil((b.baseline_tps || 0) / 10);
+      return Math.min(10, Math.max(1, s));
+    }
+    function tokensPerSecOf(b) {
+      return b.observed_tps || (b.certification && b.certification.tokens_per_sec) || 0;
     }
     function toggleTry(id) {
       document.getElementById('try-' + id).classList.toggle('open');
     }
     async function certify(id) {
-      const res = await fetch('/debug/backends/' + encodeURIComponent(id) + '/certify', {method:'POST', headers: headers()});
-      if (!res.ok) alert(await res.text());
-      setTimeout(() => location.reload(), 1200);
+      const res = await request('/debug/backends/' + encodeURIComponent(id) + '/certify', {method: 'POST'});
+      if (!res.ok) {
+        alert(res.error);
+        return;
+      }
+      // A re-certification re-profiles, so whatever it cost is about to change.
+      delete profileRuns[id];
+      setTimeout(refreshBackends, 1200);
     }
     async function sendTest(id) {
       const out = document.getElementById('out-' + id);
@@ -139,7 +663,18 @@
           {role: 'user', content: document.getElementById('prompt-' + id).value}
         ]
       };
-      const res = await fetch('/debug/backends/' + encodeURIComponent(id) + '/chat', {method:'POST', headers: headers(), body: JSON.stringify(body)});
+      // Raw fetch rather than request(): this one reads the response as a stream.
+      const res = await fetch('/debug/backends/' + encodeURIComponent(id) + '/chat', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body),
+      });
+      if (res.status === 401) {
+        meta.textContent = 'signed out';
+        sessionLost();
+        return;
+      }
       if (!res.ok || !res.body) {
         out.textContent = await res.text();
         meta.textContent = 'failed';
@@ -170,20 +705,565 @@
       const elapsed = (performance.now() - started) / 1000;
       meta.textContent = elapsed.toFixed(2) + 's, approx ' + (chars/4/elapsed).toFixed(1) + ' tok/s';
     }
-    function escapeHtml(value) {
-      return String(value || '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    function buildTryPanel(id) {
+      const prompt = el('textarea', {id: 'prompt-' + id, placeholder: 'Send a test message to ' + id}, ['Say hello in one short sentence.']);
+      const system = el('input', {id: 'system-' + id, value: 'You are a concise assistant.', placeholder: 'System prompt'});
+      const thinking = el('select', {id: 'thinking-' + id});
+      [['off','thinking off'],['auto','thinking auto'],['on','thinking on']].forEach(o => thinking.appendChild(el('option', {value: o[0]}, [o[1]])));
+      const tokens = el('input', {id: 'tokens-' + id, type: 'number', value: '256', min: '1', max: '4096'});
+      const sendBtn = el('button', {}, ['Send']);
+      sendBtn.addEventListener('click', () => sendTest(id));
+      const grid = el('div', {class: 'grid'}, [system, thinking, tokens, sendBtn]);
+      const panel = el('div', {class: 'try', id: 'try-' + id}, [
+        prompt, grid,
+        el('div', {class: 'muted', id: 'meta-' + id}),
+        el('div', {class: 'output', id: 'out-' + id}),
+      ]);
+      const cell = td([panel], {colspan: '10', style: 'padding:0;border-bottom:1px solid #252b36'});
+      return el('tr', {}, [cell]);
     }
-    function pretty(value) {
-      if (!value) return '';
-      try { return JSON.stringify(JSON.parse(value), null, 2); } catch (_) { return value; }
+    function renderBackends(list) {
+      const body = document.getElementById('backends-body');
+      // Preserve any existing Try panel rows across the 10s re-render so an open
+      // panel (and its in-flight streamed output) survives a refresh; the row
+      // CELLS are rebuilt with fresh status/load, but the panel DOM is reused.
+      const keptPanels = {};
+      body.querySelectorAll('.try').forEach(p => {
+        const row = p.closest('tr');
+        if (row && p.id.startsWith('try-')) keptPanels[p.id.slice(4)] = row;
+      });
+      body.innerHTML = '';
+      if (!list.length) {
+        body.appendChild(el('tr', {}, [td(['No backends registered.'], {colspan: '10', class: 'muted'})]));
+      }
+      list.forEach(b => {
+        const tr = el('tr', {class: b.status || ''});
+        const statusTd = td([String(b.status || '')], {class: 'status'});
+        if (b.certification && b.certification.last_error) statusTd.appendChild(el('div', {class: 'muted'}, [b.certification.last_error]));
+        tr.appendChild(statusTd);
+        const idTd = td([el('code', {}, [String(b.id || '')])]);
+        idTd.appendChild(el('div', {class: 'muted'}, [String(b.url || '')]));
+        tr.appendChild(idTd);
+        tr.appendChild(td([String(b.model || '')]));
+        tr.appendChild(td([(b.quality != null ? b.quality : 0) + '%']));
+        const speedTd = td([tokensPerSecOf(b).toFixed(1) + ' tok/s']);
+        speedTd.appendChild(el('div', {class: 'muted'}, ['score ' + speedScoreOf(b)]));
+        tr.appendChild(speedTd);
+        tr.appendChild(td([(b.context_k || 0) + 'k']));
+        tr.appendChild(td([(b.active_requests || 0) + ' / ' + (b.max_concurrency || 0)]));
+        tr.appendChild(costCell(b.id));
+        const feats = el('div', {class: 'features'});
+        (b.features || []).forEach(f => feats.appendChild(el('span', {class: 'pill'}, [String(f)])));
+        if (b.thinking) feats.appendChild(el('span', {class: 'pill'}, ['thinking']));
+        tr.appendChild(td([feats], {class: 'wide'}));
+        const tryBtn = el('button', {}, ['Try']);
+        tryBtn.addEventListener('click', () => toggleTry(b.id));
+        tr.appendChild(td([tryBtn, btn('Certify', () => certify(b.id))]));
+        body.appendChild(tr);
+        body.appendChild(keptPanels[b.id] || buildTryPanel(b.id));
+      });
     }
-    function timeAgo(iso) {
-      const s = (Date.now() - new Date(iso).getTime()) / 1000;
-      if (s < 60) return Math.floor(s) + 's ago';
-      if (s < 3600) return Math.floor(s/60) + 'm ago';
-      if (s < 86400) return Math.floor(s/3600) + 'h ago';
-      return Math.floor(s/86400) + 'd ago';
+    // syncLogTabs adds a tab button per backend (the "All" tab is static); it only
+    // appends newly-seen IDs so an in-progress log view isn't disrupted on refresh.
+    function syncLogTabs(list) {
+      const tabs = document.getElementById('log-tabs');
+      list.forEach(b => {
+        if (knownBackendIDs.indexOf(b.id) !== -1) return;
+        knownBackendIDs.push(b.id);
+        const node = el('button', {class: 'secondary', id: 'tab-' + b.id}, [String(b.id)]);
+        node.addEventListener('click', () => { logOffset = 0; loadLogs(b.id); });
+        tabs.appendChild(node);
+      });
     }
+    async function refreshBackends() {
+      const res = await request('/backends');
+      if (!res.ok) {
+        emptyRow('backends-body', 10, res.error);
+        return;
+      }
+      fleetCache = (res.data && res.data.backends) || [];
+      renderBackends(fleetCache);
+      syncLogTabs(fleetCache);
+    }
+    function backendByID(id) {
+      for (const b of fleetCache) {
+        if (b.id === id) return b;
+      }
+      return null;
+    }
+
+    // ── Providers ───────────────────────────────────────────────────────────
+    //
+    // The table lists EVERY row, beacon and manual, because "what does this
+    // router talk to and what does it cost" is one question. Only manual rows
+    // get an edit control: a beacon row's values belong to the worker that
+    // posts them, the admin API answers 409 for an edit, and the next keepalive
+    // would overwrite whatever was typed anyway.
+    const PROVIDER_FIELDS = [
+      {id: 'p-id', key: 'id', label: 'Row id', kind: 'text', placeholder: 'blank ⇒ provider-model'},
+      {id: 'p-provider', key: 'provider', label: 'Provider', kind: 'text', placeholder: 'openai'},
+      {id: 'p-model', key: 'model', label: 'Model', kind: 'text', placeholder: 'gpt-4o'},
+      {id: 'p-url', key: 'url', label: 'Base URL', kind: 'text', placeholder: 'https://api.openai.com/v1'},
+      {id: 'p-apikey', key: 'api_key', label: 'API key', kind: 'password', placeholder: 'sent to the endpoint'},
+      {id: 'p-health', key: 'health_path', label: 'Health path', kind: 'text', placeholder: '/v1/models'},
+      {id: 'p-conc', key: 'max_concurrency', label: 'Max concurrency', kind: 'int', placeholder: 'declared ceiling'},
+      {id: 'p-context', key: 'context_k', label: 'Context (k)', kind: 'int', placeholder: 'blank ⇒ measured'},
+      {id: 'p-in', key: 'input_price_per_mtok', label: 'Input / Mtok', kind: 'float', placeholder: 'blank ⇒ seeded'},
+      {id: 'p-out', key: 'output_price_per_mtok', label: 'Output / Mtok', kind: 'float', placeholder: 'blank ⇒ seeded'},
+      {id: 'p-features', key: 'features', label: 'Features', kind: 'list', placeholder: 'vision, tools'},
+    ];
+    let providerForm = {mode: 'create', id: '', initial: {}};
+    let priceReference = {};
+
+    function buildProviderFields() {
+      const wrap = document.getElementById('provider-fields');
+      if (wrap.childElementCount) return;
+      PROVIDER_FIELDS.forEach(f => {
+        const input = el('input', {
+          id: f.id,
+          placeholder: f.placeholder || '',
+          type: f.kind === 'password' ? 'password' : (f.kind === 'int' || f.kind === 'float' ? 'number' : 'text'),
+        });
+        if (f.kind === 'float') input.setAttribute('step', 'any');
+        if (f.kind === 'int' || f.kind === 'float') input.setAttribute('min', '0');
+        wrap.appendChild(el('div', {class: 'field'}, [el('label', {for: f.id}, [f.label]), input]));
+      });
+    }
+    function openProviderForm(row) {
+      buildProviderFields();
+      const values = {};
+      PROVIDER_FIELDS.forEach(f => {
+        let v = '';
+        if (row) {
+          if (f.kind === 'password') v = ''; // never rendered back; the API scrubs it
+          else if (f.kind === 'list') v = (row[f.key] || []).join(', ');
+          else if (row[f.key] !== undefined && row[f.key] !== null) v = String(row[f.key]);
+        }
+        values[f.id] = v;
+        const input = document.getElementById(f.id);
+        input.value = v;
+        input.disabled = !!(row && f.key === 'id');
+      });
+      providerForm = {mode: row ? 'edit' : 'create', id: row ? row.id : '', initial: values};
+      document.getElementById('provider-form-title').textContent = row ? 'Edit ' + row.id : 'New provider row';
+      document.getElementById('provider-form-panel').hidden = false;
+      setBanner('provider-form-note', row
+        ? 'These are the LIVE values, which include what profiling measured. Only the fields you change are sent, so a measured value you leave alone stays measured and keeps being refined.'
+        : '');
+    }
+    function closeProviderForm() {
+      document.getElementById('provider-form-panel').hidden = true;
+      setBanner('provider-form-note', '');
+    }
+    // providerPayload collects the fields worth sending. On an edit that is only
+    // what CHANGED, which is what makes the form safe against the one trap in
+    // this API: the row it was filled from carries measurements as well as
+    // declarations, and sending a measurement back would promote it to a
+    // declaration the profiler may never refine again.
+    function providerPayload() {
+      const body = {};
+      for (const f of PROVIDER_FIELDS) {
+        const raw = document.getElementById(f.id).value.trim();
+        if (providerForm.mode === 'edit' && raw === providerForm.initial[f.id]) continue;
+        if (raw === '') continue;
+        if (f.kind === 'int') {
+          const n = parseInt(raw, 10);
+          if (isNaN(n)) return {error: f.label + ' must be a whole number'};
+          body[f.key] = n;
+        } else if (f.kind === 'float') {
+          const n = parseFloat(raw);
+          if (isNaN(n)) return {error: f.label + ' must be a number'};
+          body[f.key] = n;
+        } else if (f.kind === 'list') {
+          body[f.key] = commaList(raw);
+        } else {
+          body[f.key] = raw;
+        }
+      }
+      return {body: body};
+    }
+    async function saveProvider() {
+      const payload = providerPayload();
+      if (payload.error) {
+        setBanner('provider-form-note', payload.error, 'bad');
+        return;
+      }
+      const editing = providerForm.mode === 'edit';
+      if (editing && Object.keys(payload.body).length === 0) {
+        setBanner('provider-form-note', 'Nothing changed.', 'warn');
+        return;
+      }
+      setBanner('provider-form-note', 'Saving…');
+      const res = editing
+        ? await request('/admin/providers/' + encodeURIComponent(providerForm.id), {method: 'PATCH', body: payload.body})
+        : await request('/admin/providers', {method: 'POST', body: payload.body});
+      if (!res.ok) {
+        setBanner('provider-form-note', res.error, 'bad');
+        return;
+      }
+      // seeded_from_price_data is the API saying which numbers it invented. It
+      // is the one moment provenance is certain, so it is quoted verbatim.
+      const seeded = (res.data && res.data.seeded_from_price_data) || [];
+      closeProviderForm();
+      loadProviders(seeded.length
+        ? 'Saved. Seeded from the embedded LiteLLM price table: ' + seeded.join(', ') + '.'
+        : 'Saved.');
+    }
+    async function deleteProvider(id) {
+      if (!confirm('Delete provider row ' + id + '? Nothing re-creates a manual row.')) return;
+      const res = await request('/admin/providers/' + encodeURIComponent(id), {method: 'DELETE'});
+      loadProviders(res.ok ? 'Removed ' + id + '.' : res.error, res.ok ? 'ok' : 'bad');
+    }
+    // seededPill marks a value that is exactly what the embedded LiteLLM table
+    // publishes for this model — which is the value seeding would have filled in.
+    // It says "matches", not "was seeded": once stored, a seeded number and a
+    // typed one are the same bytes, and claiming to know which is which would be
+    // inventing a fact.
+    function seededPill(rowValue, published) {
+      if (!sameNumber(rowValue, published)) return null;
+      return el('span', {
+        class: 'pill seeded',
+        title: 'Matches the embedded LiteLLM price table, which is what blank prices and context windows are seeded from on save.',
+      }, ['LiteLLM']);
+    }
+    function priceLine(label, value, published) {
+      const line = el('div', {class: 'rowline'}, [el('span', {}, [label + ' ' + priceText(value)])]);
+      const pill = seededPill(value, published);
+      if (pill) line.appendChild(pill);
+      return line;
+    }
+    async function loadProviders(note, kind) {
+      if (note !== undefined) setBanner('provider-note', note, kind || 'ok');
+      const [fleet, manual] = await Promise.all([request('/backends'), request('/admin/providers')]);
+      if (!fleet.ok) {
+        emptyRow('providers-body', 9, fleet.error);
+        return;
+      }
+      priceReference = (manual.ok && manual.data && manual.data.price_reference) || {};
+      const source = manual.ok && manual.data && manual.data.price_source;
+      // Only claim something about the price table when the call that carries it
+      // actually answered. "No table is embedded" and "that request failed" are
+      // different facts, and guessing between them is how a UI starts lying.
+      document.getElementById('provider-source-note').textContent = !manual.ok ? ''
+        : source ? 'Prices seeded from the LiteLLM table embedded at build time (fetched ' + source.fetched_at + ').'
+        : 'No price table is embedded in this build; prices are whatever you enter.';
+      if (!manual.ok) setBanner('provider-note', manual.error, 'bad');
+      const rows = (fleet.data && fleet.data.backends) || [];
+      if (!rows.length) {
+        emptyRow('providers-body', 9, 'No endpoints. Add one here, or point a worker at /backends/register.');
+        return;
+      }
+      const body = document.getElementById('providers-body');
+      body.innerHTML = '';
+      rows.forEach(b => {
+        const manualRow = b.source === 'manual';
+        const ref = priceReference[b.id] || {};
+        const tr = el('tr', {class: b.status || ''});
+        const providerTd = td([String(b.provider || 'local')]);
+        providerTd.appendChild(el('div', {class: 'muted'}, [el('code', {}, [String(b.id || '')])]));
+        tr.appendChild(providerTd);
+        tr.appendChild(td([el('span', {
+          class: 'pill src',
+          title: manualRow
+            ? 'Entered here. The operator owns its values: a probe refines what you left blank and never overwrites what you filled in.'
+            : 'This backend registered itself and re-posts a keepalive. Its values belong to the worker.',
+        }, [String(b.source || 'beacon')])]));
+        const modelTd = td([String(b.model || '')]);
+        modelTd.appendChild(el('div', {class: 'muted'}, [String(b.url || '')]));
+        tr.appendChild(modelTd);
+        const priceTd = td([
+          priceLine('in', b.input_price_per_mtok, ref.input_price_per_mtok),
+          priceLine('out', b.output_price_per_mtok, ref.output_price_per_mtok),
+        ]);
+        if (!b.input_price_per_mtok && !b.output_price_per_mtok) {
+          priceTd.appendChild(el('div', {class: 'muted'}, ['free']));
+        }
+        tr.appendChild(priceTd);
+        const contextTd = td([(b.context_k || 0) + 'k']);
+        const contextPill = seededPill(b.context_k, ref.context_k);
+        if (contextPill) contextTd.appendChild(contextPill);
+        tr.appendChild(contextTd);
+        tr.appendChild(td([String(b.max_concurrency || 0)], {
+          title: 'A ceiling you declared outranks the capacity ramp on a manual row; otherwise this is what the ramp measured.',
+        }));
+        tr.appendChild(td([String(b.status || '')], {class: 'status'}));
+        tr.appendChild(costCell(b.id));
+        const actions = el('div', {class: 'actions'});
+        if (manualRow) {
+          actions.appendChild(btn('Edit', () => openProviderForm(b)));
+          actions.appendChild(btn('Delete', () => deleteProvider(b.id), 'danger'));
+        } else {
+          actions.appendChild(el('span', {class: 'muted'}, ['managed by its beacon']));
+        }
+        tr.appendChild(td([actions]));
+        body.appendChild(tr);
+      });
+    }
+
+    // ── Keys ────────────────────────────────────────────────────────────────
+    async function loadKeys(note, kind) {
+      if (note !== undefined) setBanner('key-note', note, kind || 'ok');
+      const res = await request('/admin/keys');
+      if (!res.ok) {
+        emptyRow('keys-body', 9, res.error);
+        return;
+      }
+      const keys = (res.data && res.data.keys) || [];
+      if (!keys.length) {
+        emptyRow('keys-body', 9, 'No keys issued. Bootstrap credentials from the environment have no row here.');
+        return;
+      }
+      const body = document.getElementById('keys-body');
+      body.innerHTML = '';
+      keys.forEach(k => {
+        const tr = el('tr', {});
+        tr.appendChild(td([el('code', {}, [String(k.prefix || '')]), el('span', {class: 'muted'}, ['…'])]));
+        tr.appendChild(td([String(k.name || '')]));
+        tr.appendChild(td([el('span', {class: 'pill'}, [String(k.role || '')])]));
+        tr.appendChild(td([k.enabled
+          ? el('span', {class: 'ok'}, ['enabled'])
+          : el('span', {class: 'muted', title: 'Disabled keys are refused, but stay here so the key id on old log rows still resolves.'}, ['disabled'])]));
+        tr.appendChild(td([whenCell(k.created_at, 'unknown')]));
+        tr.appendChild(td([whenCell(k.last_used_at, 'never')]));
+        const models = el('div', {class: 'features'});
+        if ((k.models || []).length) k.models.forEach(m => models.appendChild(el('span', {class: 'pill'}, [String(m)])));
+        else models.appendChild(el('span', {class: 'muted'}, ['any model']));
+        tr.appendChild(td([models]));
+        tr.appendChild(td([k.token_budget
+          ? el('span', {class: k.tokens_used >= k.token_budget ? 'bad' : ''}, [numberText(k.tokens_used) + ' / ' + numberText(k.token_budget)])
+          : el('span', {}, [numberText(k.tokens_used)]),
+          el('div', {class: 'muted'}, [k.token_budget ? 'budget' : 'no budget'])]));
+        const actions = el('div', {class: 'actions'});
+        actions.appendChild(btn(k.enabled ? 'Disable' : 'Enable', () => setKeyEnabled(k, !k.enabled)));
+        actions.appendChild(btn('Delete', () => deleteKey(k), 'danger'));
+        tr.appendChild(td([actions]));
+        body.appendChild(tr);
+      });
+    }
+    async function setKeyEnabled(key, enabled) {
+      const res = await request('/admin/keys/' + key.id, {method: 'PATCH', body: {enabled: enabled}});
+      loadKeys(res.ok ? (enabled ? 'Enabled ' : 'Disabled ') + key.prefix + '…' : res.error, res.ok ? 'ok' : 'bad');
+    }
+    async function deleteKey(key) {
+      if (!confirm('Delete key ' + key.prefix + '…? Disabling it instead keeps the key id on old log rows resolvable.')) return;
+      const res = await request('/admin/keys/' + key.id, {method: 'DELETE'});
+      loadKeys(res.ok ? 'Deleted ' + key.prefix + '…' : res.error, res.ok ? 'ok' : 'bad');
+    }
+    async function issueKey() {
+      const body = {role: document.getElementById('k-role').value};
+      const name = document.getElementById('k-name').value.trim();
+      const models = commaList(document.getElementById('k-models').value);
+      const budget = document.getElementById('k-budget').value.trim();
+      if (name) body.name = name;
+      if (models.length) body.models = models;
+      if (budget !== '') {
+        const n = parseInt(budget, 10);
+        if (isNaN(n) || n < 0) {
+          setBanner('key-form-note', 'The token budget must be a whole number of tokens, or blank.', 'bad');
+          return;
+        }
+        body.token_budget = n;
+      }
+      setBanner('key-form-note', 'Issuing…');
+      const res = await request('/admin/keys', {method: 'POST', body: body});
+      if (!res.ok) {
+        setBanner('key-form-note', res.error, 'bad');
+        return;
+      }
+      document.getElementById('k-name').value = '';
+      document.getElementById('k-models').value = '';
+      document.getElementById('k-budget').value = '';
+      document.getElementById('key-form-panel').hidden = true;
+      showSecret(res.data);
+      loadKeys();
+    }
+    // showSecret is the one moment the plaintext key exists anywhere. The table
+    // holds a SHA-256 and the displayed prefix, so nothing can show it again and
+    // no endpoint could. Hence a dialog that cannot be dismissed by clicking
+    // past it or pressing Escape: the only way out is the button that says the
+    // operator has copied it.
+    function showSecret(data) {
+      const secret = (data && data.secret) || '';
+      const key = (data && data.key) || {};
+      const field = el('input', {class: 'secret', readonly: 'readonly', value: secret});
+      field.addEventListener('focus', () => field.select());
+      const note = el('div', {class: 'hint'}, ['']);
+      const copy = btn('Copy', async () => {
+        note.textContent = await copyText(field, secret);
+      }, '');
+      openDialog(dialogPanel('Copy this key now', [
+        el('div', {class: 'banner warn'}, [
+          'This is the only time the secret is shown. The router stores a SHA-256 hash and the prefix, ' +
+          'so nothing here or anywhere else can show it again — if you lose it, issue another key.',
+        ]),
+        field,
+        el('div', {class: 'rowline'}, [copy, btn('I have copied it', () => closeDialog(true), 'secondary')]),
+        note,
+        el('div', {class: 'muted'}, [
+          'Role ' + (key.role || '') + (key.name ? ', named ' + key.name : '') + '. Send it as a bearer token.',
+        ]),
+      ]), false);
+      field.focus();
+    }
+    // copyText copies through the clipboard API where there is one. There often
+    // is not: it needs a secure context, and this router is routinely deployed on
+    // plain HTTP on a LAN. The fallbacks are execCommand and, in the end, telling
+    // the operator to copy the selected text themselves.
+    async function copyText(field, text) {
+      field.focus();
+      field.select();
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        try {
+          await navigator.clipboard.writeText(text);
+          return 'Copied to the clipboard.';
+        } catch (_) {}
+      }
+      try {
+        if (document.execCommand('copy')) return 'Copied to the clipboard.';
+      } catch (_) {}
+      return 'This browser will not copy for a page served over plain HTTP. The key is selected — copy it by hand.';
+    }
+
+    // ── Groups ──────────────────────────────────────────────────────────────
+    let groupResolution = {};
+    let editingGroup = null;
+    let groupDraft = [];
+    async function loadGroups(note, kind) {
+      if (note !== undefined) setBanner('group-note', note, kind || 'ok');
+      // The fleet is fetched alongside so a resolved member can be shown with
+      // the live status of whatever is serving it.
+      const [res, fleet] = await Promise.all([request('/admin/groups'), request('/backends')]);
+      if (fleet.ok) fleetCache = (fleet.data && fleet.data.backends) || [];
+      if (!res.ok) {
+        emptyRow('groups-body', 3, res.error);
+        return;
+      }
+      const groups = (res.data && res.data.groups) || [];
+      groupResolution = (res.data && res.data.resolves) || {};
+      if (!groups.length) {
+        emptyRow('groups-body', 3, 'No groups. A group gives an ordered preference list a name that clients can ask for.');
+        return;
+      }
+      const body = document.getElementById('groups-body');
+      body.innerHTML = '';
+      groups.forEach(g => {
+        const editing = editingGroup === g.name;
+        const tr = el('tr', {});
+        const nameTd = td([el('code', {}, [g.name])]);
+        const updated = stamp(g.updated_at);
+        if (updated) nameTd.appendChild(el('div', {class: 'muted'}, ['changed ' + timeAgo(g.updated_at)]));
+        tr.appendChild(nameTd);
+        tr.appendChild(td([editing ? groupEditor(g) : memberList(g)]));
+        const actions = el('div', {class: 'actions'});
+        if (editing) {
+          actions.appendChild(btn('Save', () => saveGroup(g), ''));
+          actions.appendChild(btn('Cancel', () => { editingGroup = null; loadGroups(); }));
+        } else {
+          actions.appendChild(btn('Edit', () => { editingGroup = g.name; groupDraft = (g.members || []).slice(); loadGroups(); }));
+          actions.appendChild(btn('Delete', () => deleteGroup(g), 'danger'));
+        }
+        tr.appendChild(td([actions]));
+        body.appendChild(tr);
+      });
+    }
+    // memberStatus says whether a member currently resolves. An unresolved one
+    // is legitimate, not an error: membership is by name and resolved per
+    // request, so a model you have not stood up yet is a preference over time.
+    function memberStatus(group, member) {
+      const serving = (groupResolution[group] || {})[member] || '';
+      if (!serving) {
+        return el('span', {
+          class: 'muted',
+          title: 'Nothing registered serves this name right now. The router simply skips it and tries the next member.',
+        }, ['not currently served']);
+      }
+      const backend = backendByID(serving);
+      const state = backend ? String(backend.status || '') : '';
+      const healthy = backend ? backend.healthy && state === 'ready' : true;
+      return el('span', {class: healthy ? 'ok' : 'warn'}, ['→ ' + serving + (state ? ' · ' + state : '')]);
+    }
+    function memberList(g) {
+      const wrap = el('div', {class: 'members'});
+      (g.members || []).forEach((m, i) => {
+        wrap.appendChild(el('div', {class: 'member'}, [
+          el('span', {class: 'idx'}, [String(i + 1) + '.']),
+          el('code', {}, [m]),
+          memberStatus(g.name, m),
+        ]));
+      });
+      return wrap;
+    }
+    function groupEditor(g) {
+      const wrap = el('div', {class: 'members'});
+      groupDraft.forEach((m, i) => {
+        const move = (delta) => {
+          const to = i + delta;
+          if (to < 0 || to >= groupDraft.length) return;
+          const tmp = groupDraft[i];
+          groupDraft[i] = groupDraft[to];
+          groupDraft[to] = tmp;
+          loadGroups();
+        };
+        const up = btn('↑', () => move(-1));
+        const down = btn('↓', () => move(1));
+        up.disabled = i === 0;
+        down.disabled = i === groupDraft.length - 1;
+        wrap.appendChild(el('div', {class: 'member'}, [
+          el('span', {class: 'idx'}, [String(i + 1) + '.']),
+          el('code', {}, [m]),
+          memberStatus(g.name, m),
+          up, down,
+          btn('Remove', () => { groupDraft.splice(i, 1); loadGroups(); }, 'danger'),
+        ]));
+      });
+      const field = el('input', {placeholder: 'add a model id, alias or backend id'});
+      const add = btn('Add', () => {
+        const v = field.value.trim();
+        if (!v) return;
+        groupDraft.push(v);
+        loadGroups();
+      });
+      wrap.appendChild(el('div', {class: 'member'}, [field, add]));
+      return wrap;
+    }
+    async function saveGroup(g) {
+      if (!groupDraft.length) {
+        setBanner('group-note', 'A group needs at least one member.', 'bad');
+        return;
+      }
+      const res = await request('/admin/groups/' + encodeURIComponent(g.name), {method: 'PATCH', body: {members: groupDraft}});
+      editingGroup = res.ok ? null : editingGroup;
+      loadGroups(res.ok ? 'Saved ' + g.name + '.' : res.error, res.ok ? 'ok' : 'bad');
+    }
+    async function deleteGroup(g) {
+      if (!confirm('Delete group ' + g.name + '? Clients naming it fall back to automatic routing.')) return;
+      const res = await request('/admin/groups/' + encodeURIComponent(g.name), {method: 'DELETE'});
+      loadGroups(res.ok ? 'Removed ' + g.name + '.' : res.error, res.ok ? 'ok' : 'bad');
+    }
+    async function createGroup() {
+      const name = document.getElementById('g-name').value.trim();
+      const members = commaList(document.getElementById('g-members').value);
+      if (!name || !members.length) {
+        setBanner('group-form-note', 'A group needs a name and at least one member.', 'bad');
+        return;
+      }
+      setBanner('group-form-note', 'Creating…');
+      const res = await request('/admin/groups', {method: 'POST', body: {name: name, members: members}});
+      if (!res.ok) {
+        setBanner('group-form-note', res.error, 'bad');
+        return;
+      }
+      document.getElementById('g-name').value = '';
+      document.getElementById('g-members').value = '';
+      document.getElementById('group-form-panel').hidden = true;
+      loadGroups('Created ' + name + '.');
+    }
+
+    // ── Logs ────────────────────────────────────────────────────────────────
+    let activeLogBackend = '';
+    let logOffset = 0;
+    const LOG_LIMIT = 50;
+    let lastLogData = [];
     function inputPreview(raw) {
       if (!raw) return '';
       try {
@@ -211,6 +1291,11 @@
     }
     function logPrev() { if (logOffset >= LOG_LIMIT) { logOffset -= LOG_LIMIT; loadLogs(activeLogBackend); } }
     function logNext() { if (lastLogData.length === LOG_LIMIT) { logOffset += LOG_LIMIT; loadLogs(activeLogBackend); } }
+    function callerLabel(row) {
+      if (!row.key_id) return 'no credential required';
+      if (row.key_id === 'env') return 'environment token';
+      return 'key ' + row.key_id;
+    }
     function showLogDetail(idx) {
       const row = lastLogData[idx];
       if (!row) return;
@@ -220,7 +1305,7 @@
       card.innerHTML = '<article class="logitem">' +
         '<div class="loghead"><div><code>' + escapeHtml(row.backend_id) + '</code> <span class="muted">' + escapeHtml(row.backend_model) + '</span></div>' +
         '<div><button class="secondary" onclick="closeLogDetail()">&times; Close</button></div></div>' +
-        '<div class="muted" style="margin-bottom:8px">' + new Date(row.created_at).toLocaleString() + ' · ' + escapeHtml(row.route) + ' · HTTP ' + row.status_code + ' · ' + row.duration_ms + 'ms</div>' +
+        '<div class="muted" style="margin-bottom:8px">' + new Date(row.created_at).toLocaleString() + ' · ' + escapeHtml(row.route) + ' · HTTP ' + row.status_code + ' · ' + row.duration_ms + 'ms · ' + escapeHtml(callerLabel(row)) + '</div>' +
         (speed ? '<div class="route-speed" style="margin-bottom:8px">' + escapeHtml(speed) + '</div>' : '') +
         (row.error ? '<div style="color:#ff6b6b;margin-bottom:8px">' + escapeHtml(row.error) + '</div>' : '') +
         '<details open><summary>Input</summary><pre>' + escapeHtml(pretty(row.input)) + '</pre></details>' +
@@ -232,12 +1317,11 @@
       if (event && event.target && event.target.id !== 'log-modal') return;
       document.getElementById('log-modal').classList.remove('open');
     }
-    document.addEventListener('keydown', event => {
-      if (event.key === 'Escape') closeLogDetail();
-    });
     async function loadLogs(backendID) {
       activeLogBackend = backendID || '';
-      document.querySelectorAll('.tabs button').forEach(b => b.classList.remove('active'));
+      // Scoped to #log-tabs: the page's own tab bar is a .tabs too, and clearing
+      // its active class here would leave the top of the page unlabelled.
+      document.querySelectorAll('#log-tabs button').forEach(b => b.classList.remove('active'));
       const tab = document.getElementById('tab-' + (activeLogBackend || 'all'));
       if (tab) tab.classList.add('active');
       const tbody = document.getElementById('logs-body');
@@ -251,13 +1335,12 @@
       empty.style.display = 'none';
       const qs = new URLSearchParams({limit: String(LOG_LIMIT), offset: String(logOffset)});
       if (activeLogBackend) qs.set('backend_id', activeLogBackend);
-      const res = await fetch('/logs?' + qs.toString(), {headers: headers()});
+      const res = await request('/logs?' + qs.toString());
       if (!res.ok) {
-        tbody.innerHTML = '<tr><td colspan="6" class="muted">' + escapeHtml(await res.text()) + '</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="6" class="muted">' + escapeHtml(res.error) + '</td></tr>';
         return;
       }
-      const data = await res.json();
-      lastLogData = data.logs || [];
+      lastLogData = (res.data && res.data.logs) || [];
       document.getElementById('logs-prev').disabled = logOffset === 0;
       document.getElementById('logs-next').disabled = lastLogData.length < LOG_LIMIT;
       const page = Math.floor(logOffset / LOG_LIMIT) + 1;
@@ -280,121 +1363,49 @@
           '</tr>';
       }).join('');
     }
-    // ── Backend table + log tabs are rendered CLIENT-SIDE from /backends ──
-    // The unauthenticated server render discloses nothing about the fleet; the
-    // table and per-backend log tabs below are built only after a token-gated
-    // /backends fetch succeeds.
-    let knownBackendIDs = [];
-    function speedScoreOf(b) {
-      // Mirror the server-side speedScore: ceil(baseline_tps/10), clamped to [1,10].
-      const s = Math.ceil((b.baseline_tps || 0) / 10);
-      return Math.min(10, Math.max(1, s));
-    }
-    function tokensPerSecOf(b) {
-      return b.observed_tps || (b.certification && b.certification.tokens_per_sec) || 0;
-    }
-    // el builds an element with attributes and children (strings become text nodes),
-    // so interpolated fleet values are set via textContent/dataset — never spliced
-    // into an HTML/attribute string — and can't inject markup.
-    function el(tag, attrs, children) {
-      const node = document.createElement(tag);
-      if (attrs) for (const k in attrs) {
-        if (k === 'class') node.className = attrs[k];
-        else if (k === 'dataset') for (const d in attrs[k]) node.dataset[d] = attrs[k][d];
-        else node.setAttribute(k, attrs[k]);
-      }
-      (children || []).forEach(c => node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c));
-      return node;
-    }
-    function buildTryPanel(id) {
-      const prompt = el('textarea', {id: 'prompt-' + id, placeholder: 'Send a test message to ' + id}, ['Say hello in one short sentence.']);
-      const system = el('input', {id: 'system-' + id, value: 'You are a concise assistant.', placeholder: 'System prompt'});
-      const thinking = el('select', {id: 'thinking-' + id});
-      [['off','thinking off'],['auto','thinking auto'],['on','thinking on']].forEach(o => thinking.appendChild(el('option', {value: o[0]}, [o[1]])));
-      const tokens = el('input', {id: 'tokens-' + id, type: 'number', value: '256', min: '1', max: '4096'});
-      const sendBtn = el('button', {}, ['Send']);
-      sendBtn.addEventListener('click', () => sendTest(id));
-      const grid = el('div', {class: 'grid'}, [system, thinking, tokens, sendBtn]);
-      const panel = el('div', {class: 'try', id: 'try-' + id}, [
-        prompt, grid,
-        el('div', {class: 'muted', id: 'meta-' + id}),
-        el('div', {class: 'output', id: 'out-' + id}),
-      ]);
-      const td = el('td', {colspan: '9', style: 'padding:0;border-bottom:1px solid #252b36'}, [panel]);
-      return el('tr', {}, [td]);
-    }
-    function renderBackends(list) {
-      const body = document.getElementById('backends-body');
-      // Preserve any existing Try panel rows across the 10s re-render so an open
-      // panel (and its in-flight streamed output) survives a refresh; the row
-      // CELLS are rebuilt with fresh status/load, but the panel DOM is reused.
-      const keptPanels = {};
-      body.querySelectorAll('.try').forEach(p => {
-        const row = p.closest('tr');
-        if (row && p.id.startsWith('try-')) keptPanels[p.id.slice(4)] = row;
-      });
-      body.innerHTML = '';
-      if (!list.length) {
-        body.appendChild(el('tr', {}, [el('td', {colspan: '9', class: 'muted'}, ['No backends registered.'])]));
-      }
-      list.forEach(b => {
-        const tr = el('tr', {class: b.status || ''});
-        const statusTd = el('td', {class: 'status'}, [String(b.status || '')]);
-        if (b.certification && b.certification.last_error) statusTd.appendChild(el('div', {class: 'muted'}, [b.certification.last_error]));
-        tr.appendChild(statusTd);
-        const idTd = el('td', {}, [el('code', {}, [String(b.id || '')])]);
-        idTd.appendChild(el('div', {class: 'muted'}, [String(b.url || '')]));
-        tr.appendChild(idTd);
-        tr.appendChild(el('td', {}, [String(b.model || '')]));
-        tr.appendChild(el('td', {}, [(b.quality != null ? b.quality : 0) + '%']));
-        const speedTd = el('td', {}, [tokensPerSecOf(b).toFixed(1) + ' tok/s']);
-        speedTd.appendChild(el('div', {class: 'muted'}, ['score ' + speedScoreOf(b)]));
-        tr.appendChild(speedTd);
-        tr.appendChild(el('td', {}, [(b.context_k || 0) + 'k']));
-        tr.appendChild(el('td', {}, [(b.active_requests || 0) + ' / ' + (b.max_concurrency || 0)]));
-        const feats = el('div', {class: 'features'});
-        (b.features || []).forEach(f => feats.appendChild(el('span', {class: 'pill'}, [String(f)])));
-        if (b.thinking) feats.appendChild(el('span', {class: 'pill'}, ['thinking']));
-        tr.appendChild(el('td', {class: 'wide'}, [feats]));
-        const tryBtn = el('button', {}, ['Try']);
-        tryBtn.addEventListener('click', () => toggleTry(b.id));
-        const certBtn = el('button', {class: 'secondary'}, ['Certify']);
-        certBtn.addEventListener('click', () => certify(b.id));
-        tr.appendChild(el('td', {}, [tryBtn, certBtn]));
-        body.appendChild(tr);
-        body.appendChild(keptPanels[b.id] || buildTryPanel(b.id));
-      });
-    }
-    // syncLogTabs adds a tab button per backend (the "All" tab is static); it only
-    // appends newly-seen IDs so an in-progress log view isn't disrupted on refresh.
-    function syncLogTabs(list) {
-      const tabs = document.getElementById('log-tabs');
-      list.forEach(b => {
-        if (knownBackendIDs.indexOf(b.id) !== -1) return;
-        knownBackendIDs.push(b.id);
-        const btn = el('button', {class: 'secondary', id: 'tab-' + b.id}, [String(b.id)]);
-        btn.addEventListener('click', () => { logOffset = 0; loadLogs(b.id); });
-        tabs.appendChild(btn);
-      });
-    }
-    async function refreshBackends() {
-      let res;
-      try { res = await fetch('/backends', {headers: headers()}); } catch (_) { return; }
-      if (!res.ok) {
-        const body = document.getElementById('backends-body');
-        body.innerHTML = '';
-        body.appendChild(el('tr', {}, [el('td', {colspan: '9', class: 'muted'}, [await res.text()])]));
-        return;
-      }
-      const data = await res.json();
-      const list = data.backends || [];
-      renderBackends(list);
-      syncLogTabs(list);
-    }
-    // Initial load + auto-refresh every 10s.
-    refreshBackends();
-    setInterval(refreshBackends, 10000);
-    loadLogs('');
+
+    // ── Wiring ──────────────────────────────────────────────────────────────
+    document.getElementById('login-form').addEventListener('submit', login);
+    on('btn-logout', 'click', logout);
+    on('btn-password', 'click', openPasswordDialog);
+    on('btn-refresh', 'click', () => loadTab(activeTab));
+    TABS.forEach(t => on('mtab-' + t, 'click', () => showTab(t)));
+    on('tab-all', 'click', () => { logOffset = 0; loadLogs(''); });
+    on('logs-prev', 'click', logPrev);
+    on('logs-next', 'click', logNext);
+    on('log-modal', 'click', closeLogDetail);
+    on('log-modal-card', 'click', event => event.stopPropagation());
+    on('dialog-modal', 'click', event => { if (event.target.id === 'dialog-modal') closeDialog(); });
+    on('btn-new-provider', 'click', () => openProviderForm(null));
+    on('btn-save-provider', 'click', saveProvider);
+    on('btn-cancel-provider', 'click', closeProviderForm);
+    on('btn-new-key', 'click', () => {
+      document.getElementById('key-form-panel').hidden = false;
+      setBanner('key-form-note', '');
+    });
+    on('btn-issue-key', 'click', issueKey);
+    on('btn-cancel-key', 'click', () => { document.getElementById('key-form-panel').hidden = true; });
+    on('btn-new-group', 'click', () => {
+      document.getElementById('group-form-panel').hidden = false;
+      setBanner('group-form-note', '');
+    });
+    on('btn-create-group', 'click', createGroup);
+    on('btn-cancel-group', 'click', () => { document.getElementById('group-form-panel').hidden = true; });
+    document.addEventListener('keydown', event => {
+      if (event.key !== 'Escape') return;
+      closeLogDetail();
+      closeDialog();
+    });
+    window.addEventListener('hashchange', () => showTab(location.hash.slice(1)));
+
+    // Auto-refresh the fleet, but only while it is on screen and the session is
+    // live: polling an admin endpoint from a signed-out page just answers 401.
+    setInterval(() => {
+      if (signedIn && activeTab === 'fleet') refreshBackends();
+    }, 10000);
+
+    activeTab = TABS.indexOf(location.hash.slice(1)) === -1 ? 'fleet' : location.hash.slice(1);
+    checkSession();
   </script>
 </body>
 </html>

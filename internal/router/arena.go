@@ -1,6 +1,6 @@
 package router
 
-// `llm-router arena …` — a router-level regression gate.
+// `discrimen arena …` — a router-level regression gate.
 //
 // The cold-start benchmark (benchmark.go) measures WORKERS. Nothing measured the
 // ROUTER: whether the difficulty classifier actually sends each prompt to the
@@ -30,8 +30,8 @@ package router
 // second copy of the grader would diverge silently and score a routing policy
 // that never existed.
 //
-//	llm-router arena run -router URL -dataset FILE [-oracle] [-out FILE]
-//	llm-router arena report -in FILE
+//	discrimen arena run -router URL -dataset FILE [-oracle] [-out FILE]
+//	discrimen arena report -in FILE
 
 import (
 	"bytes"
@@ -277,7 +277,7 @@ type arenaWorkerInfo struct {
 // ── Command wiring ──────────────────────────────────────────────────────────
 
 func arenaUsage() {
-	fmt.Fprint(os.Stderr, `llm-router arena — measure the ROUTER (not the workers) against a graded dataset
+	fmt.Fprint(os.Stderr, `discrimen arena — measure the ROUTER (not the workers) against a graded dataset
 
   arena run -router URL -dataset FILE [flags]   Route + grade every question
   arena report -in FILE                         Print the metrics table
@@ -302,11 +302,11 @@ subject, difficulty|level, plus optional choices|options and an explicit match
 
 To run RouterArena's own split (github.com/RouteWorks/RouterArena):
   uv run python ./scripts/process_datasets/prep_datasets.py   # writes their splits
-  llm-router arena run -router http://epyc.home:8585 -dataset sub_10.jsonl -oracle
+  discrimen arena run -router http://localhost:8585 -dataset sub_10.jsonl -oracle
 `)
 }
 
-// runArenaCommand dispatches `llm-router arena …`. Returns false if argv isn't an
+// runArenaCommand dispatches `discrimen arena …`. Returns false if argv isn't an
 // arena invocation, so main() can carry on and start the server.
 func runArenaCommand(argv []string) bool {
 	if len(argv) < 2 || argv[1] != "arena" {

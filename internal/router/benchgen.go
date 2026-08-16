@@ -1,7 +1,7 @@
 package router
 
 // benchgen builds the GENERATED half of the quality benchmark from LiveBench.
-// It runs as a subcommand of the router binary — `llm-router bench …` — rather
+// It runs as a subcommand of the router binary — `discrimen bench …` — rather
 // than as a separate tool, for one reason that outranks the tidiness of a
 // tools/ directory: calibration must grade with the EXACT production grader.
 // A second copy of checkAnswer would silently diverge, and the tier assignments
@@ -27,9 +27,9 @@ package router
 //
 // THREE PHASES, separate because their costs differ by orders of magnitude:
 //
-//	llm-router bench fetch      network, seconds.  HF        -> benchdata/pool.json
-//	llm-router bench calibrate  fleet, HOURS.      pool.json -> benchdata/calibration.json
-//	llm-router bench emit       hermetic, instant. calib     -> benchmark_data_live.go
+//	discrimen bench fetch      network, seconds.  HF        -> benchdata/pool.json
+//	discrimen bench calibrate  fleet, HOURS.      pool.json -> benchdata/calibration.json
+//	discrimen bench emit       hermetic, instant. calib     -> benchmark_data_live.go
 //
 // Only fetch touches the network, only calibrate touches the fleet, so emit can
 // be re-run freely while tuning the tier shape.
@@ -158,7 +158,7 @@ func benchDataDir() string {
 func benchAppDir() string { return filepath.Dir(benchDataDir()) }
 
 func benchUsage() {
-	fmt.Fprint(os.Stderr, `llm-router bench — build the generated half of the quality benchmark
+	fmt.Fprint(os.Stderr, `discrimen bench — build the generated half of the quality benchmark
 
   bench fetch                     Pull candidate questions from HuggingFace
   bench calibrate -router URL     Grade the pool against every ready backend
@@ -169,14 +169,14 @@ fleet re-benchmark, so monthly is not worth it for a set that only turns over
 every six months:
 
   go run . bench fetch
-  go run . bench calibrate -router http://epyc.home:8585 -token "$ROUTER_ADMIN_KEY"
+  go run . bench calibrate -router http://localhost:8585 -token "$ROUTER_ADMIN_KEY"
   go run . bench emit
   # then bump benchmarkVersion, drop the replaced tiers from benchmark_data.go,
   # and commit the generated file in the SAME commit as the version bump.
 `)
 }
 
-// runBenchCommand dispatches `llm-router bench …`. Returns false if argv isn't a
+// runBenchCommand dispatches `discrimen bench …`. Returns false if argv isn't a
 // bench invocation, so main() can carry on and start the server.
 func runBenchCommand(argv []string) bool {
 	if len(argv) < 2 || argv[1] != "bench" {

@@ -17,7 +17,7 @@ import (
 // WorkerProfile is everything the router measures about a worker at cold start,
 // so the worker itself declares almost nothing (just id/url/api_key). It's
 // persisted per (id, model) and reused on warm restarts — see the /llm skill and
-// llm-router/README.md.
+// the README.
 type WorkerProfile struct {
 	Model          string  `json:"model"`
 	Quality        int     `json:"quality"`

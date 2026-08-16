@@ -270,6 +270,60 @@ func seedPricesWith(t *priceTable, reg *BackendRegistration, stated priceStated)
 	return filled
 }
 
+// ── Provenance ──────────────────────────────────────────────────────────────
+
+// publishedPrice is what the snapshot says about one model, in the units the
+// registry stores rather than LiteLLM's: price per MILLION tokens, and a context
+// window in the same k the rest of the router speaks.
+type publishedPrice struct {
+	InputPricePerMtok  float64 `json:"input_price_per_mtok,omitempty"`
+	OutputPricePerMtok float64 `json:"output_price_per_mtok,omitempty"`
+	ContextK           int     `json:"context_k,omitempty"`
+}
+
+// priceReference reports what the embedded table publishes for each of these
+// rows, keyed by row id, omitting the rows nothing is published for.
+//
+// It exists because seeding leaves NO TRACE on the row it seeds. seedPrices
+// writes the published number into the registration before it is stored, so a
+// price the router invented and one an operator typed are the same bytes
+// afterwards — and the admin page, which is the only place either of them is
+// ever read back, has no way to attribute the numbers it is showing. Publishing
+// the table's own answer alongside the row lets the page say where a value could
+// have come from without claiming to know which keystroke produced it.
+func priceReference(rows []*Backend) map[string]publishedPrice {
+	out := map[string]publishedPrice{}
+	for _, b := range rows {
+		entry, ok := lookupPrice(b.Model, b.Provider)
+		if !ok {
+			continue
+		}
+		ref := publishedPrice{
+			InputPricePerMtok:  entry.InputCostPerToken * 1e6,
+			OutputPricePerMtok: entry.OutputCostPerToken * 1e6,
+		}
+		// The same floor seedPrices applies, so this reports what seeding WOULD
+		// have filled in rather than a number seeding would have skipped.
+		if entry.MaxInputTokens >= 1024 {
+			ref.ContextK = entry.MaxInputTokens / 1024
+		}
+		out[b.ID] = ref
+	}
+	return out
+}
+
+// priceSourceInfo names where the snapshot came from and when it was taken, so a
+// seeded number can be attributed to LiteLLM rather than presented as the
+// router's own opinion. Nil for an empty snapshot, which is a supported state —
+// see the note on priceData.
+func priceSourceInfo() map[string]string {
+	t := prices()
+	if len(t.exact) == 0 {
+		return nil
+	}
+	return map[string]string{"source": t.snapshot.Source, "fetched_at": t.snapshot.FetchedAt}
+}
+
 func isAllDigits(s string) bool {
 	if s == "" {
 		return false

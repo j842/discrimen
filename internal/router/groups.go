@@ -54,6 +54,10 @@ import (
 
 // routerOwner is the `owned_by` a /v1/models entry carries when the router owns
 // it rather than a worker: the automatic "default" route, and every group.
+//
+// Still the old name after the rename, deliberately. This is a wire value that
+// deployed clients already filter on to tell a router-owned menu entry from a
+// worker's, and nothing is gained by breaking them to match the box.
 const routerOwner = "llm-router"
 
 // Group is a named, ordered preference list. Members are model ids, aliases or
@@ -291,7 +295,11 @@ func (r *Router) handleAdminGroups(w http.ResponseWriter, req *http.Request) {
 	}
 	switch req.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, map[string]any{"groups": r.groups.list()})
+		groups := r.groups.list()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"groups":   groups,
+			"resolves": r.memberResolution(groups),
+		})
 	case http.MethodPost:
 		r.createGroup(w, req)
 	default:
@@ -323,6 +331,48 @@ func (r *Router) handleAdminGroupByName(w http.ResponseWriter, req *http.Request
 	default:
 		methodNotAllowed(w)
 	}
+}
+
+// memberResolution reports which members of each group the fleet can currently
+// serve: group name → member → the id of a backend serving that name, or "" for
+// none.
+//
+// An unresolved member is LEGITIMATE, and that is the whole reason this is
+// reported rather than validated. Membership is by name and resolved per
+// request, so a model an operator has not stood up yet, or one whose only worker
+// is mid-restart, is a statement of preference over time and not a broken
+// reference — createGroup deliberately does not reject it. The admin page has to
+// be able to show the difference, and it cannot work it out for itself: an alias
+// is a server-side reduction of a raw model id (see backendAlias), so a page
+// comparing strings would report every aliased member as missing.
+//
+// It answers about REGISTRATION only. Group.resolve additionally applies the
+// request's hard filters, which depend on a request that has not arrived yet; a
+// resolved member here is one the fleet serves, not a promise about the next
+// call. The backend id is returned rather than a boolean so the caller can pair
+// it with that backend's live status.
+func (r *Router) memberResolution(groups []Group) map[string]map[string]string {
+	live := []*Backend{}
+	for _, b := range r.registry.snapshot() {
+		if !isExpired(b) {
+			live = append(live, b)
+		}
+	}
+	out := map[string]map[string]string{}
+	for _, g := range groups {
+		members := map[string]string{}
+		for _, m := range g.Members {
+			members[m] = ""
+			for _, b := range live {
+				if backendServesModel(b, m) {
+					members[m] = b.ID
+					break
+				}
+			}
+		}
+		out[g.Name] = members
+	}
+	return out
 }
 
 func (r *Router) createGroup(w http.ResponseWriter, req *http.Request) {

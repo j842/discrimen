@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -63,6 +64,11 @@ func TestUnauthenticatedDashboardDisclosesNoFleetDetail(t *testing.T) {
 		Status: "ready",
 	}
 	router := &Router{cfg: &Config{}, registry: registry}
+	// The same rule holds for everything P6 added a tab for. A group name, a
+	// provider row and a key prefix are all configuration an unauthenticated
+	// caller has no business reading, and all three are one convenient template
+	// field away from being published here.
+	router.groups.put(Group{Name: "secret-group", Members: []string{"secret-member"}})
 
 	rec := httptest.NewRecorder()
 	router.handleDashboard(rec, httptest.NewRequest(http.MethodGet, "/", nil))
@@ -73,10 +79,112 @@ func TestUnauthenticatedDashboardDisclosesNoFleetDetail(t *testing.T) {
 	body := rec.Body.String()
 	for _, secret := range []string{
 		"secret-worker", "192.0.2.77", "internal-model-name",
+		"secret-group", "secret-member",
 	} {
 		if strings.Contains(body, secret) {
-			t.Errorf("unauthenticated dashboard leaked %q — the fleet table must "+
-				"be fetched client-side with a token, not server-rendered", secret)
+			t.Errorf("unauthenticated dashboard leaked %q — every table on this page must "+
+				"be fetched client-side behind the admin gate, not server-rendered", secret)
 		}
 	}
+}
+
+// The page is five tabs over the admin API, and each one is a table nobody sees
+// fail: a renamed element id breaks a view silently, at runtime, in a file no
+// compiler reads. These are the anchors every view is wired to.
+func TestDashboardShellCarriesEveryAdminView(t *testing.T) {
+	body := renderDashboard(t)
+	for _, anchor := range []string{
+		// The tab bar and its five panels.
+		`id="mtab-fleet"`, `id="view-fleet"`,
+		`id="mtab-providers"`, `id="view-providers"`,
+		`id="mtab-keys"`, `id="view-keys"`,
+		`id="mtab-groups"`, `id="view-groups"`,
+		`id="mtab-logs"`, `id="view-logs"`,
+		// The tables each view fills client-side.
+		`id="backends-body"`, `id="providers-body"`, `id="keys-body"`,
+		`id="groups-body"`, `id="logs-body"`,
+		// The password session: a login form, a visible way out, and a way to
+		// change the password without a redeploy.
+		`id="login-form"`, `id="login-password"`, `id="btn-logout"`, `id="btn-password"`,
+	} {
+		if !strings.Contains(body, anchor) {
+			t.Errorf("the dashboard shell has no %s — a view is wired to an element that does not exist", anchor)
+		}
+	}
+}
+
+// Every endpoint the page calls has to be a route this mux actually serves.
+// Getting it wrong is not a compile error; it is a tab that answers 404 in HTML
+// through the catch-all dashboard handler, which is the exact failure the
+// /v1/models pattern bug produced.
+func TestDashboardCallsOnlyRoutesTheMuxServes(t *testing.T) {
+	body := renderDashboard(t)
+	calls := regexp.MustCompile(`(?:request|fetch)\('(/[^']*)'`).FindAllStringSubmatch(body, -1)
+	if len(calls) < 10 {
+		t.Fatalf("found %d endpoint calls in the dashboard — the extraction has stopped matching", len(calls))
+	}
+	mux := (&Router{cfg: &Config{}, registry: newTestRegistry()}).routes()
+	seen := map[string]bool{}
+	for _, call := range calls {
+		path, _, _ := strings.Cut(call[1], "?")
+		if seen[path] {
+			continue
+		}
+		seen[path] = true
+		_, pattern := mux.Handler(httptest.NewRequest(http.MethodGet, path, nil))
+		// "/" is the dashboard's own catch-all: matching only that means nothing
+		// more specific is registered, so the call falls through to this page.
+		if pattern == "" || pattern == "/" {
+			t.Errorf("the dashboard calls %q, which no route serves (matched pattern %q)", path, pattern)
+		}
+	}
+	// And the reverse direction: a tab whose endpoint was dropped from the page.
+	for _, want := range []string{
+		"/admin/session", "/admin/login", "/admin/logout", "/admin/password",
+		"/admin/providers", "/admin/keys", "/admin/groups",
+		"/backends", "/logs",
+	} {
+		if !seen[want] && !seen[want+"/"] {
+			t.Errorf("nothing on the dashboard calls %s", want)
+		}
+	}
+}
+
+// The page reads what a cold profile cost from the benchmark endpoint, and has
+// to render "not measured" and "free" differently: zero tokens means the run was
+// never metered, and a confident zero on it would be a lie about money.
+func TestDashboardDistinguishesUnmeasuredProfileCostFromFree(t *testing.T) {
+	body := renderDashboard(t)
+	for _, needle := range []string{"profile_cost_measured", "not measured", "'free'"} {
+		if !strings.Contains(body, needle) {
+			t.Errorf("the profile cost cell does not mention %q", needle)
+		}
+	}
+}
+
+// The bearer-token prompt is gone: admin is a password session, the cookie is
+// HttpOnly, and a page that also kept a copy of an admin key in sessionStorage
+// would be handing a live credential to anything that ever ran script on this
+// origin. removeItem stays — it clears what the previous version stored.
+func TestDashboardHoldsNoBearerCredential(t *testing.T) {
+	body := renderDashboard(t)
+	for _, banned := range []string{"sessionStorage.getItem", "sessionStorage.setItem", "Bearer '"} {
+		if strings.Contains(body, banned) {
+			t.Errorf("the dashboard still handles a bearer credential (%q); admin is a session cookie", banned)
+		}
+	}
+	if !strings.Contains(body, "credentials: 'same-origin'") {
+		t.Error("the dashboard does not send the session cookie with its admin calls")
+	}
+}
+
+func renderDashboard(t *testing.T) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	router := &Router{cfg: &Config{}, registry: newTestRegistry()}
+	router.handleDashboard(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dashboard returned %d", rec.Code)
+	}
+	return rec.Body.String()
 }

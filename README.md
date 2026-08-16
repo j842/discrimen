@@ -2,8 +2,8 @@
 
 A self-measuring, OpenAI-compatible LLM router.
 
-Point it at some endpoints — local vLLM and llama.cpp workers, metered internet
-providers, anything that speaks an OpenAI base URL — and it publishes one
+Point it at some endpoints (local vLLM and llama.cpp workers, metered internet
+providers, anything that speaks an OpenAI base URL) and it publishes one
 `/v1/chat/completions` over all of them. Clients send a plain OpenAI request
 with no routing fields, and discrimen decides which endpoint answers it.
 
@@ -21,8 +21,8 @@ capacity, context and capabilities are all measured, by running an objective
 benchmark and a set of probes against it. Internet providers are profiled on
 exactly the same terms as local ones.
 
-A client that *does* want to choose says so in plain OpenAI — `model`,
-`reasoning_effort` — and gets what it asked for. Both live on the one port:
+A client that *does* want to choose says so in plain OpenAI, with `model` and
+`reasoning_effort`, and gets what it asked for. Both live on the one port:
 automatic is what you get by saying nothing, not a mode you switch into.
 
 ---
@@ -38,7 +38,7 @@ docker compose up -d
 
 That brings up two containers, and you want both. Auto-routing works by
 embedding the prompt, and the only thing that can embed it is the embeddings
-worker. Without one, discrimen does not fail — it falls back to plain
+worker. Without one, discrimen does not fail. It falls back to plain
 quality-and-speed ranking and says so on `/health` as
 `"auto_routing": "degraded"`. Running the router alone is a legitimate
 configuration; set `ROUTER_AUTO_ROUTING=false` and mean it. Running it alone by
@@ -57,7 +57,7 @@ and prints them to its log. Grab them before you do anything else:
 docker compose logs discrimen | grep -i bootstrap
 ```
 
-Leaving them empty and ignoring the log means no authentication at all — fine
+Leaving them empty and ignoring the log means no authentication at all: fine
 on a trusted LAN, wrong anywhere else.
 
 ## Adding a model
@@ -80,11 +80,11 @@ curl -X POST localhost:8585/backends/register \
 ```
 
 That is the whole payload. No quality, no speed, no context window, no
-concurrency — the router measures all of it.
+concurrency. The router measures all of it.
 
 **You enter it on the web page.** For an endpoint that will never call you: an
 OpenAI-compatible provider, a box you do not control, anything without a beacon.
-Same registry row, marked `manual` instead of `beacon`, and owned by you — probes
+Same registry row, marked `manual` instead of `beacon`, and owned by you: probes
 refine a manual row but never overwrite a value you declared.
 
 ### The reachability footgun
@@ -95,7 +95,7 @@ endpoint's view of itself, and not yours.
 `localhost` from inside a container is that container. A worker on the same host
 as the router in a bridge network that registers `http://localhost:8000` has
 just pointed the router at its own port. Registration succeeds, health checks
-fail or — worse — succeed against the wrong thing, and every request to that
+fail or, worse, succeed against the wrong thing, and every request to that
 worker breaks. It is the most common way a first deployment goes wrong, and it
 breaks quietly.
 
@@ -109,9 +109,9 @@ The first time discrimen sees an endpoint it has no profile for, it measures it
 properly, and that takes a while.
 
 Profiling splits in two so a fresh deployment does not black out the fleet. The
-quick half — capabilities, speed, context — makes the endpoint routable in
-**seconds**. The slow half — a concurrency ramp and a 102-question graded
-benchmark — runs in the background and then refines the live values. Until the
+quick half (capabilities, speed, context) makes the endpoint routable in
+**seconds**. The slow half, a concurrency ramp and a 102-question graded
+benchmark, runs in the background and then refines the live values. Until the
 benchmark finishes, an unproven endpoint holds a conservative provisional
 quality of 30, so it only draws easy traffic.
 
@@ -131,7 +131,7 @@ For each `POST /v1/chat/completions`:
 
 1. **Hard filters.** Drop endpoints that cannot serve it: not the model the
    client named, insufficient context (estimated from messages plus tools plus a
-   nominal answer reserve — *not* the client's `max_tokens` ceiling), missing
+   nominal answer reserve, *not* the client's `max_tokens` ceiling), missing
    required features (`tools` detected from the request's `tools` field,
    `vision` from image content), or thinking required and unsupported.
 
@@ -144,7 +144,7 @@ For each `POST /v1/chat/completions`:
    region.
 
 3. **Reasoning to thinking mode.** A second centroid pair scores whether the
-   prompt needs reasoning, and if so the router turns thinking on — in whichever
+   prompt needs reasoning, and if so the router turns thinking on, in whichever
    dialect it measured the chosen endpoint to speak. Simple prompts run with
    thinking off.
 
@@ -156,8 +156,8 @@ For each `POST /v1/chat/completions`:
    automatically.
 
    The estimate is per *request*, not per endpoint. Prefill scales with the
-   prompt — an agent turn's system prompt and tool schemas run to thousands of
-   tokens — and decode scales with the expected output, which is roughly six
+   prompt (an agent turn's system prompt and tool schemas run to thousands of
+   tokens) and decode scales with the expected output, which is roughly six
    times longer once thinking is on. That matters because the two phases have
    very different cross-endpoint spreads: on the fleet this was built against, a
    4k-token prompt prefills in 0.67s on a GPU worker and 37.2s on a CPU one, a
@@ -168,8 +168,8 @@ For each `POST /v1/chat/completions`:
 
    Two measurement rules keep the inputs comparable. **TTFT and prefill are
    sampled only from non-thinking turns**, because vLLM buffers reasoning so a
-   thinking turn's whole think phase lands inside TTFT — 12.45s of a 13.15s turn
-   — while llama.cpp streams it, 0.7s on the same job. Mixing them made the
+   thinking turn's whole think phase lands inside TTFT, 12.45s of a 13.15s turn,
+   while llama.cpp streams it, 0.7s on the same job. Mixing them made the
    faster prefill engine look 30x slower. And **decode samples are weighted by
    generation length**, because llama.cpp CPU decode degrades as the KV cache
    grows: unweighted short replies had one CPU worker reporting 51 tok/s when it
@@ -178,7 +178,7 @@ For each `POST /v1/chat/completions`:
 5. **Cost.** Among endpoints that clear the quality bar, prefer the free ones.
    Spill to a paid endpoint only when nothing free clears the bar, or every free
    candidate is saturated past the grace period below. Price is a declared fact
-   about an endpoint, in the same category as an `uncensored` tag — not a
+   about an endpoint, in the same category as an `uncensored` tag, not a
    routing knob.
 
 6. **Spill.** Walk the ranked list and take the first endpoint with a free
@@ -203,8 +203,8 @@ contacts no endpoint and changes no state.
 
 Routing every turn from scratch is right for a one-shot prompt and wrong for a
 tool loop. Moving turn N+1 elsewhere throws away the KV cache and re-prefills
-the whole system prompt and tool schemas — exactly the prompt shape where
-prefill dominates — and switching mid-loop hands a tool result to a model that
+the whole system prompt and tool schemas, which is exactly the prompt shape
+where prefill dominates, and switching mid-loop hands a tool result to a model that
 never emitted the matching tool call.
 
 A conversation is identified by hashing the **head** of the message list, the
@@ -272,7 +272,7 @@ endpoint safe rather than merely contained: a complete-but-wrong answer looks
 like success to the inadequacy check, but the judge catches it. Judging is
 dormant until you run something below the top tier, since the best model has
 nothing better to grade it. It prefers the best *free* model, and falls back to
-a paid one only under a budget cap — otherwise the arrival of a paid frontier
+a paid one only under a budget cap. Otherwise the arrival of a paid frontier
 model would turn background grading into continuous spend on ordinary traffic.
 
 **Throughput accounting** counts both content and reasoning tokens, so a
@@ -313,7 +313,7 @@ chose.
 
 `max_tokens` is a ceiling, not a reservation. The context filter charges a
 nominal answer rather than the client's declared cap, and the cap is trimmed to
-fit the chosen endpoint on the way out — so a harness declaring a huge budget no
+fit the chosen endpoint on the way out, so a harness declaring a huge budget no
 longer excludes the cheap fleet from its own one-word prompts.
 
 Clients must **not** append `/no_think` to prompts or set `chat_template_kwargs`
@@ -338,9 +338,9 @@ automatic decision off.
 | DELETE | `/backends/{id}` | worker or admin | Remove an entry, its persisted row and its cached profile |
 | GET | `/backends` | admin | The fleet: quality, throughput, features, status |
 | GET | `/logs` | admin | Stored request logs |
-| — | `/admin/providers[/{id}]` | admin | CRUD over manually-entered endpoints |
-| — | `/admin/keys[/{id}]` | admin | Issue, list, disable and delete API keys |
-| — | `/admin/groups[/{id}]` | admin | CRUD over named groups |
+| any | `/admin/providers[/{id}]` | admin | CRUD over manually-entered endpoints |
+| any | `/admin/keys[/{id}]` | admin | Issue, list, disable and delete API keys |
+| any | `/admin/groups[/{id}]` | admin | CRUD over named groups |
 | POST | `/admin/login`, `/admin/logout` | password | Session cookie |
 | GET | `/` | none | Dashboard shell. Discloses nothing; the fleet table is fetched client-side with a token |
 
@@ -356,7 +356,7 @@ working with no edits.
 ## Configuration
 
 Fourteen environment variables. The test for whether a setting belongs here is
-whether it describes something only the operator can know — hardware, network,
+whether it describes something only the operator can know: hardware, network,
 ports, credentials, retention, how long a caller is willing to queue. Learning
 rates, classifier thresholds, latency estimates and tier bands are not: they are
 the router's own decisions, and a site that has to set them has been handed the
@@ -398,7 +398,7 @@ an alias or an endpoint id. Call it as a model:
 The resolver walks the list in order and takes the first member that is
 registered, healthy and past the hard filters. If none qualify it drops the
 group filter entirely, routes automatically, and says so with
-`X-LLM-Group: fallback` and a log line — a group is a preference, not a
+`X-LLM-Group: fallback` and a log line. A group is a preference, not a
 constraint that can fail a request.
 
 Groups also fix a display wrinkle. Two endpoints running different builds of the
@@ -409,7 +409,7 @@ correctly. A group over both restores the readable name.
 ## Measuring the router
 
 The cold-start benchmark measures **endpoints**. `discrimen arena` measures the
-**router** — whether the classifier actually sends each prompt to the cheapest
+**router**: whether the classifier actually sends each prompt to the cheapest
 endpoint that can answer it, which is the one claim the whole design rests on.
 
 ```bash
@@ -417,16 +417,16 @@ discrimen arena run -router http://localhost:8585 -dataset sub_10.jsonl -oracle 
 discrimen arena report -in arena-results.json
 ```
 
-It follows [RouterArena](https://github.com/RouteWorks/RouterArena)'s shape —
-accuracy, cost, routing optimality, robustness, routing latency — with two
-departures. **Cost is worker-seconds, not dollars**, because there is no
+It follows [RouterArena](https://github.com/RouteWorks/RouterArena)'s shape,
+measuring accuracy, cost, routing optimality, robustness and routing latency,
+with two departures. **Cost is worker-seconds, not dollars**, because there is no
 per-token price on a self-hosted fleet and what a request costs is the time it
 occupies. And **robustness measures the decision, not the answer**: perturbing a
 prompt and re-asking costs another full pass, while asking `/v1/route-preview`
 whether it still routes the same way costs milliseconds and tests the classifier
 directly.
 
-`-oracle` runs every question on every endpoint — questions × endpoints
+`-oracle` runs every question on every endpoint: questions × endpoints
 generations, expensive, and the only way optimality can be computed at all. The
 report splits the two failure directions that matter: **overspend**, where the
 answer was right but a cheaper endpoint was also right, and **undershoot**,
@@ -454,9 +454,9 @@ go build ./...
 go test ./... -count=1
 ```
 
-One direct dependency, `modernc.org/sqlite`, which is pure Go — hence
-`CGO_ENABLED=0` and an alpine runtime image. Everything else is the standard
-library.
+One direct dependency, `modernc.org/sqlite`, which is pure Go. That is why the
+build is `CGO_ENABLED=0` and the runtime image is alpine. Everything else is the
+standard library.
 
 ## Source map
 
@@ -464,7 +464,7 @@ library.
 |---|---|
 | `main.go` | server, registry, proxy, selection, persistence, health and certification loops |
 | `difficulty.go` | embedding-centroid classifier, target quality, ranking, latency estimates |
-| `profile.go` | cold-start profiling — capability, speed, context and capacity probes, and their persistence |
+| `profile.go` | cold-start profiling: capability, speed, context and capacity probes, and their persistence |
 | `benchmark.go`, `benchmark_data.go` | the tiered quality benchmark |
 | `session.go` | conversation identity, tool-loop detection, affinity tracker |
 | `escalate.go` | buffered dispatch, inline escalation, strip-and-retry |
@@ -478,12 +478,12 @@ Everything lives in `internal/router/`.
 
 ## Licence
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
 
 Two third-party snapshots ride along, both recorded in [NOTICE](NOTICE):
 
 - **LiveBench** questions and ground-truth answers, under the Apache License
-  2.0. Parts of that snapshot derive from material LiveBench does not own —
+  2.0. Parts of that snapshot derive from material LiveBench does not own:
   competition problems copyright the Mathematical Association of America and
   the United Kingdom Mathematics Trust, both non-commercial-use-only. NOTICE
   carries those terms forward and says which subsets are affected. **Read it

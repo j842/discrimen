@@ -153,6 +153,15 @@ func TestMigrationsApplyToAnOldDatabase(t *testing.T) {
 	if err := logs.SaveSetting(ctx, settingAdminPasswordHash, "x"); err != nil {
 		t.Fatalf("router_settings unusable after migration: %v", err)
 	}
+	// P5's groups table is created by the same migration and has to round-trip on
+	// a database that predates it.
+	if err := logs.SaveGroup(ctx, Group{Name: "coding", Members: []string{"gemma4", "qwen3"}, UpdatedAt: time.Now().UTC()}); err != nil {
+		t.Fatalf("router_groups unusable after migration: %v", err)
+	}
+	groups, err := logs.LoadGroups(ctx)
+	if err != nil || len(groups) != 1 || groups[0].Name != "coding" || len(groups[0].Members) != 2 {
+		t.Fatalf("group did not round-trip: %+v, err=%v", groups, err)
+	}
 	if err := logs.Insert(ctx, RequestLog{
 		CreatedAt: time.Now().UTC(), BackendID: "b", BackendModel: "m", Route: "route",
 		StatusCode: 200, Input: "i", Output: "o", KeyID: "7",

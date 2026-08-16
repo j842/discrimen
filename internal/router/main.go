@@ -438,14 +438,14 @@ type LogStore struct {
 }
 
 func Main() {
-	// `llm-router bench …` builds the generated half of the quality benchmark
+	// `discrimen bench …` builds the generated half of the quality benchmark
 	// (see benchgen.go). It lives in this binary rather than a tools/ directory
 	// so calibration grades with the production checkAnswer — a second copy of
 	// the grader would diverge silently and mis-tier every question it touched.
 	if runBenchCommand(os.Args) {
 		return
 	}
-	// `llm-router arena …` measures the ROUTER against a graded dataset (see
+	// `discrimen arena …` measures the ROUTER against a graded dataset (see
 	// arena.go). Same reasoning as bench: it grades with the production
 	// checkAnswer, so it lives in this binary rather than beside it.
 	if runArenaCommand(os.Args) {
@@ -526,7 +526,7 @@ func Main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	log.Printf("llm-router listening on :%s", cfg.Port)
+	log.Printf("discrimen listening on :%s", cfg.Port)
 	log.Fatal(server.ListenAndServe())
 }
 
@@ -1173,11 +1173,12 @@ func (r *Router) modelCatalogue() []map[string]any {
 	// of the fleet's features — a tools request to default hard-filters to
 	// tools-capable workers, so default really does serve whatever any worker
 	// can — where a pooled concrete id advertises the intersection.
+	fleet := normalizeFeatures(fleetFeatures)
 	models := []map[string]any{{
 		"id":       "default",
 		"object":   "model",
 		"owned_by": routerOwner,
-		"features": normalizeFeatures(fleetFeatures),
+		"features": fleet,
 	}}
 	for _, name := range order {
 		models = append(models, byModel[name])
@@ -1187,7 +1188,7 @@ func (r *Router) modelCatalogue() []map[string]any {
 	// so where a worker has since registered under a group's name the menu has to
 	// say where that name actually goes. The admin API refuses to create such a
 	// group, so this only fires when the worker arrived second.
-	for _, entry := range groupEntries(r.groups.list(), servable, normalizeFeatures(fleetFeatures)) {
+	for _, entry := range groupEntries(r.groups.list(), servable, fleet) {
 		replaced := false
 		for i, m := range models {
 			if m["id"] == entry["id"] {

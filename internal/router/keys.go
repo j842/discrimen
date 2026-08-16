@@ -117,9 +117,11 @@ func (id *identity) logKeyID() string {
 // and an empty allow-list means every model.
 //
 // The list is matched against whatever spelling the client sent, which is the
-// same string backendServesModel resolves: the model id, the worker id, or the
+// same string selection resolves: a group name, a model id, a worker id, or the
 // published alias. An allow-list entry therefore means what an operator reading
-// /v1/models would expect it to mean.
+// /v1/models would expect it to mean — and a key restricted to a group needs
+// the GROUP's name on the list, not its members', because the group is what the
+// client named.
 func (id *identity) allowsModel(name string) bool {
 	if id == nil || len(id.Models) == 0 || name == "" {
 		return true

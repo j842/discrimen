@@ -15,7 +15,7 @@ package router
 // had. The adapter still learns — an escalation is fed to it as "this bin needed
 // a better model", precisely so the repair doesn't teach it the opposite.
 //
-// Four deliberate boundaries:
+// Five deliberate boundaries:
 //
 //   - NON-STREAMED ONLY. Once SSE bytes are on the wire they cannot be recalled,
 //     and buffering a stream to inspect it would destroy the streaming latency
@@ -26,6 +26,8 @@ package router
 //   - ROUTER-CHOSEN ROUTES ONLY. A client that named a model, pinned a worker or
 //     hit /debug asked for that worker specifically. Silently answering from a
 //     different model would be a worse failure than the empty reply.
+//   - NEVER MID-TOOL-LOOP. See the guard in escalate: an open loop is the one
+//     place where a second opinion cannot be asked for at all.
 //   - ONE HOP. If the better worker is also empty, the original response is
 //     returned. Escalation may cost one extra generation; it may never loop.
 
@@ -131,6 +133,15 @@ func (r *Router) escalate(req *http.Request, d *dispatch, orig bufferedResult) (
 	if _, auto := parseRouteScore(d.plan.route); !auto {
 		return nil, orig, false
 	}
+	// Never inside an open tool loop. Moving a mid-loop turn to another model hands
+	// it a tool result whose matching tool call it never emitted (session.go), which
+	// the receiving model usually refuses outright on the orphan tool_call_id — so
+	// the caller is billed for a second generation, on a paid endpoint, and still
+	// gets the empty answer back. Acquisition already spends sessionLockWait
+	// defending this; escalating past it here would undo that in one hop.
+	if d.plan.session.locked() {
+		return nil, orig, false
+	}
 	from := *d.backend
 	better := betterCandidates(d.plan.candidates, from, d.job)
 	if len(better) == 0 {
@@ -169,7 +180,7 @@ func (r *Router) escalate(req *http.Request, d *dispatch, orig bufferedResult) (
 	// clamp would hand the better worker a budget shaped by a worker it is
 	// replacing. The served-model rewrite differs per worker too.
 	body := patchForwardedBody(d.raw, d.inject, budgetCeiling(target, d.job), d.tr.forBackend(target), target.ServedID)
-	body = stripBodyFields(body, target.RejectedFields)
+	body = r.stripLearned(body, d.raw, target.ID)
 
 	r.registry.incActive(target.ID, 1)
 	res := r.requestBuffered(req, target, body)
@@ -232,11 +243,12 @@ func (r *Router) requestBuffered(req *http.Request, backend *Backend, body []byt
 			return bufferedResult{netErr: err}
 		}
 		proxyReq.Header.Set("Content-Type", "application/json")
-		if backend.APIKey != "" {
-			proxyReq.Header.Set("Authorization", "Bearer "+backend.APIKey)
-		} else if auth := req.Header.Get("Authorization"); auth != "" {
-			proxyReq.Header.Set("Authorization", auth)
-		}
+		// The backend's own credential and nothing else. proxyToBackend drops the
+		// caller's header before it gets here, so the old "else relay the client's
+		// Authorization" fallback was already dead — expressing the rule in one place
+		// (setBackendCredential) rather than relying on that Del to neutralise a
+		// second copy of it is the point.
+		setBackendCredential(proxyReq, backend)
 
 		resp, err := r.client.Do(proxyReq)
 		if err != nil {
@@ -306,24 +318,32 @@ func (r *Router) writeBuffered(w http.ResponseWriter, req *http.Request, backend
 // The router works out what an endpoint speaks — the served model id, the
 // thinking dialect — and strips the fields that are only ever ours, so a strict
 // provider should not normally see something it cannot parse. This catches the
-// ones it does. Rather than hand a client a 400 it can do nothing about, the
-// field named in the rejection is removed, the request goes again, and the
-// verdict is remembered against that backend so every later request omits the
-// field up front and pays nothing for it.
+// ones it does. Rather than hand a client a 400 caused by an addition of OURS,
+// the injected field named in the rejection is removed, the request goes again,
+// and — once that has been shown to work — the verdict is remembered against
+// that backend so later requests omit the field up front and pay nothing for it.
 //
 // Bounded, deliberately:
 //
+//   - ONLY THE ROUTER'S OWN ADDITIONS (routerInjectedFields). This is the whole
+//     design intent: a backstop for an endpoint refusing something the ROUTER
+//     put in the body. It was never a negotiation over the caller's request.
 //   - ONE retry. A second rejection is the endpoint's answer, not a puzzle to
 //     keep solving at the caller's expense.
 //   - NON-STREAMING only, for the reason recorded on proxyRetryDelays: bytes are
-//     already on the wire and there is no rewinding them.
-//   - Only a field the request actually carries, only when the error says
-//     "unrecognised" in one of the spellings servers use, and never a field that
-//     carries what the caller asked for (stripUnsafeFields). Where the field
-//     cannot be identified, nothing is retried.
-//   - In memory. A restart re-learns each field for the price of one rejected
-//     request, which is cheaper than persisting a verdict the provider's next
-//     deploy could invalidate.
+//     already on the wire and there is no rewinding them. Which is also why a
+//     verdict learned here must be one that cannot change what an answer MEANS:
+//     it is applied up front to every later request, streamed ones included,
+//     where none of this logic runs and nothing can notice it went wrong.
+//   - Only a field the request actually carries, and only when the error says
+//     "unrecognised" in one of the spellings servers use. Where the field cannot
+//     be identified, nothing is retried.
+//   - LEARNED ONLY FROM A RETRY THAT WORKED. Recording the verdict before the
+//     retry is validated blacklists a field on the strength of a guess, and the
+//     blacklist outlives the request that made it.
+//   - EXPIRING (rejectedFieldTTL) and in memory. A provider's next deploy can
+//     start accepting a field it used to refuse, and nothing tells us; the cost
+//     of finding out is one rejected-and-retried request per field per TTL.
 
 // unknownFieldMarkers are the ways an OpenAI-compatible server says "I do not
 // know this field": OpenAI's own wording, FastAPI/pydantic's (what a vLLM
@@ -337,24 +357,46 @@ var unknownFieldMarkers = []string{
 	"not permitted", "not allowed", "additionalproperties", "no longer supported",
 }
 
-// stripUnsafeFields are never removed, whatever an endpoint says about them:
-// without any one of them the request stops meaning what the caller asked for.
-// The budget fields are the sharp ones — silently dropping max_tokens on a
-// metered endpoint turns a 400 the client can see into a bill it cannot.
-var stripUnsafeFields = map[string]bool{
-	"messages": true, "model": true, "stream": true,
-	"tools": true, "tool_choice": true,
-	"max_tokens": true, "max_completion_tokens": true,
+// routerInjectedFields are the ONLY fields this backstop may drop: the ones
+// patchForwardedBody adds on the router's own initiative. Everything else in the
+// body came from the caller, and dropping any of it turns a 400 they can see
+// into a silent change of meaning they cannot — a json_schema response_format
+// removed on the way to a model that only does json_object gets the caller
+// free-form prose with a 200, and every later request to that backend, streamed
+// ones included, is quietly answered the same way.
+//
+// The list is short because the router adds little: the thinking gate, in
+// whichever of the two spellings the endpoint was measured to honour. Its
+// absence is a difference of degree — the model reasons or it doesn't — not a
+// difference in what was asked for.
+//
+// max_tokens is injectable and deliberately NOT here. It is the sharp one:
+// silently dropping a budget on a metered endpoint turns a 400 the client can
+// see into a bill it cannot. A model, messages or tools field is not here
+// either, and could not be — none of them is ever ours.
+var routerInjectedFields = map[string]bool{
+	"chat_template_kwargs": true,
+	"reasoning_effort":     true,
 }
 
+// rejectedFieldTTL is how long a learned verdict stands before the field is sent
+// again to see whether it is still refused. Not forever: providers redeploy, and
+// nothing announces it, so a verdict learned once would otherwise strip a field
+// from every request for the rest of the process's life — including, for a row
+// an operator added by hand, across every keepalive, since only changed
+// registration content clears the set. Re-testing costs one rejected-and-retried
+// request per field per TTL, which is the same price a restart already pays.
+var rejectedFieldTTL = 30 * time.Minute
+
 // stripAndRetry re-runs, once and without the offending field, a request the
-// endpoint rejected for naming a field it does not recognise. It returns the
-// original result untouched whenever there is nothing safe to do.
+// endpoint rejected for naming a field the ROUTER injected and it does not
+// recognise. It returns the original result untouched whenever there is nothing
+// safe to do.
 func (r *Router) stripAndRetry(req *http.Request, backend *Backend, d *dispatch, res bufferedResult) bufferedResult {
 	if res.netErr != nil {
 		return res
 	}
-	field, ok := rejectedField(res.statusCode, res.body, d.body)
+	field, ok := rejectedField(res.statusCode, res.body, d.body, d.raw)
 	if !ok {
 		return res
 	}
@@ -362,11 +404,6 @@ func (r *Router) stripAndRetry(req *http.Request, backend *Backend, d *dispatch,
 	if bytes.Equal(stripped, d.body) {
 		return res
 	}
-	if r.registry.noteRejectedField(backend.ID, field) {
-		log.Printf("backend=%s refused %q as an unrecognised request field — retrying without it, and omitting it from later requests (%s)",
-			backend.ID, field, truncate(string(res.body), 160))
-	}
-	d.body = stripped
 	retried := r.requestBuffered(req, backend, stripped)
 	if retried.netErr != nil {
 		// The retry failed to reach the worker at all. The original rejection at
@@ -374,20 +411,62 @@ func (r *Router) stripAndRetry(req *http.Request, backend *Backend, d *dispatch,
 		// error tells them nothing.
 		return res
 	}
+	if !retried.ok() {
+		// Still refused. The field was not the problem, or not the only one — so
+		// there is nothing here worth remembering, and the caller gets the
+		// endpoint's own answer rather than a blacklist built on a wrong guess.
+		return retried
+	}
+	// Only now is the verdict evidence rather than a hypothesis.
+	d.body = stripped
+	if r.registry.noteRejectedField(backend.ID, field) {
+		log.Printf("backend=%s refused %q as an unrecognised request field and accepted the request without it — omitting it from later requests for %s (%s)",
+			backend.ID, field, rejectedFieldTTL, truncate(string(res.body), 160))
+	}
 	return retried
 }
 
-// rejectedField reports which request field an endpoint refused as
-// unrecognised, or ok=false when the router cannot tell — in which case nothing
-// is retried.
+// stripLearned removes the fields this endpoint has already been shown to refuse
+// (rejectedField/stripAndRetry) from a body about to be forwarded to it.
 //
-// Conservative in three independent ways: the status has to be a validation
+// A field the CLIENT sent is never dropped, whatever was learned: the verdict
+// was learned from a request where the router had injected that field, and the
+// same name arriving from the caller is a different fact about a different
+// request. Sending it and getting a 400 is a failure the caller can see and act
+// on; dropping it is one they cannot.
+//
+// Free when nothing has been learned, which is every backend almost all of the
+// time: one map read, no parse of what may be a multi-MB vision body.
+func (r *Router) stripLearned(body, clientBody []byte, backendID string) []byte {
+	learned := r.registry.rejectedFields(backendID)
+	if len(learned) == 0 {
+		return body
+	}
+	var client map[string]json.RawMessage
+	if err := json.Unmarshal(clientBody, &client); err != nil {
+		return body // can't tell what the caller sent, so drop nothing
+	}
+	drop := learned[:0] // learned is our own copy
+	for _, field := range learned {
+		if _, fromClient := client[field]; !fromClient {
+			drop = append(drop, field)
+		}
+	}
+	return stripBodyFields(body, drop)
+}
+
+// rejectedField reports which INJECTED request field an endpoint refused as
+// unrecognised, or ok=false when the router cannot tell — in which case nothing
+// is retried. reqBody is what was sent; clientBody is what the caller sent, and
+// the difference between them is exactly the set this may name.
+//
+// Conservative in four independent ways: the status has to be a validation
 // reject, the message has to actually say "unrecognised" in one of its
-// spellings, and the name has to match a top-level key the request really
-// carries. That last test is what makes scanning free text safe — a message
-// naming no field of ours identifies nothing, and one naming several is
-// ambiguous rather than actionable.
-func rejectedField(status int, errBody, reqBody []byte) (string, bool) {
+// spellings, the name has to match a top-level key the request really carries,
+// and that key must be one the router put there. The last two are what make
+// scanning free text safe — a message naming no field of ours identifies
+// nothing, and one naming several is ambiguous rather than actionable.
+func rejectedField(status int, errBody, reqBody, clientBody []byte) (string, bool) {
 	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity {
 		return "", false
 	}
@@ -402,19 +481,26 @@ func rejectedField(status int, errBody, reqBody []byte) (string, bool) {
 	if !marked {
 		return "", false
 	}
-	var request map[string]json.RawMessage
+	var request, client map[string]json.RawMessage
 	if err := json.Unmarshal(reqBody, &request); err != nil {
 		return "", false
 	}
+	// A client body that won't parse means the router cannot tell its own
+	// additions from the caller's fields, and the safe answer to that is to strip
+	// nothing. (It parsed once already — parseAndValidateChatRequest — so this is
+	// belt and braces.)
+	if err := json.Unmarshal(clientBody, &client); err != nil {
+		return "", false
+	}
 	// The machine-readable answer first, where the endpoint bothered to give one.
-	if p := rejectParam(errBody); strippableField(request, p) {
+	if p := rejectParam(errBody); strippableField(request, client, p) {
 		return p, true
 	}
 	// Otherwise read the name out of the prose, believing only a name the request
 	// actually carries.
 	found := ""
 	for field := range request {
-		if !strippableField(request, field) || !strings.Contains(text, strings.ToLower(field)) {
+		if !strippableField(request, client, field) || !strings.Contains(text, strings.ToLower(field)) {
 			continue
 		}
 		if found != "" {
@@ -455,12 +541,21 @@ func rejectParam(errBody []byte) string {
 	return ""
 }
 
-// strippableField reports whether field is one the request carries and the
-// router is willing to drop.
-func strippableField(request map[string]json.RawMessage, field string) bool {
-	if field == "" || stripUnsafeFields[field] {
+// strippableField reports whether field is one the ROUTER put in this request
+// and is therefore willing to drop: an injectable field, carried by the body
+// that was sent, and absent from the body the caller sent.
+//
+// The last test is what makes the first safe. chat_template_kwargs is the
+// router's gate when the router wrote it and the client's escape hatch when the
+// client did (see mergeThinkingKwargs), and the two are indistinguishable by the
+// time the endpoint complains about one.
+func strippableField(request, client map[string]json.RawMessage, field string) bool {
+	if field == "" || !routerInjectedFields[field] {
 		return false
 	}
-	_, present := request[field]
-	return present
+	if _, present := request[field]; !present {
+		return false
+	}
+	_, fromClient := client[field]
+	return !fromClient
 }

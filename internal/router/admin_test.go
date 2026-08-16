@@ -373,6 +373,169 @@ func TestAdminProviderListCarriesPriceReference(t *testing.T) {
 	}
 }
 
+// TestAdminProviderLocalRowIsNeverPriced: a hand-entered local row is a GPU in
+// the next room, and nobody bills for it. The embedded table is keyed by model
+// NAME, so its basename index resolves a worker serving gpt-oss-120b to
+// azure_ai's listing of the same open weights — and a price seeded from there is
+// money nobody owes, a worker dropped out of the free-first band, and a changed
+// free/paid split for the judge. It contradicts the flat statement in
+// providers.go that a local worker costs nothing per token.
+func TestAdminProviderLocalRowIsNeverPriced(t *testing.T) {
+	if len(prices().exact) == 0 {
+		t.Skip("prices.json is the empty snapshot")
+	}
+	// A model id the shipped table publishes only under resellers' prefixes, which
+	// is the shape every open-weights model has: azure_ai/gpt-oss-120b,
+	// deepinfra/Qwen/Qwen3-30B-A3B, deepinfra/google/gemma-3-27b-it.
+	const model = "gpt-oss-120b"
+	if _, ok := lookupPrice(model, "azure_ai"); !ok {
+		t.Skipf("the embedded snapshot no longer publishes %s at all", model)
+	}
+	r := adminRouter(t)
+	rec := serveAdmin(r, adminReq(http.MethodPost, "/admin/providers",
+		`{"id":"homelab","url":"http://192.0.2.9:8080","model":"`+model+`"}`))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create = %d: %s", rec.Code, rec.Body.String())
+	}
+	row := decodeProvider(t, rec)
+	if row["provider"] != providerLocal {
+		t.Fatalf("a row that names no provider must settle to %q, got %v", providerLocal, row["provider"])
+	}
+	// omitempty: a free row carries no price field at all.
+	for _, field := range []string{"input_price_per_mtok", "output_price_per_mtok", "context_k"} {
+		if v, present := row[field]; present {
+			t.Errorf("a local worker was seeded a %s of %v from a reseller's listing", field, v)
+		}
+	}
+	if strings.Contains(rec.Body.String(), "seeded_from_price_data") {
+		t.Errorf("seeding ran on a local row: %s", rec.Body.String())
+	}
+	if b := r.registry.get("homelab"); !isFreeBackend(b) {
+		t.Errorf("a local worker must be free, got in=%v out=%v", b.InputPricePerMtok, b.OutputPricePerMtok)
+	}
+}
+
+// TestAdminProviderDeclaredZeroSurvivesAnUnrelatedEdit: an explicit 0 declares a
+// model free — a real thing on an otherwise metered endpoint, and the whole
+// reason the write shape uses pointers. Statedness is read off the pointers on
+// the CURRENT request, so the next edit, which has no reason to mention a price,
+// must not hand the field back to the seeder.
+//
+// This is the ordinary dashboard path, not a corner: a zero price is absent from
+// the JSON, renders blank in the edit form, and the payload builder drops blank
+// fields.
+func TestAdminProviderDeclaredZeroSurvivesAnUnrelatedEdit(t *testing.T) {
+	if len(prices().exact) == 0 {
+		t.Skip("prices.json is the empty snapshot")
+	}
+	r := adminRouter(t)
+	rec := serveAdmin(r, adminReq(http.MethodPost, "/admin/providers",
+		`{"id":"free-tier","url":"https://api.example.com/v1","model":"gpt-4o","provider":"openai",`+
+			`"input_price_per_mtok":0,"output_price_per_mtok":0}`))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create = %d: %s", rec.Code, rec.Body.String())
+	}
+	if row := decodeProvider(t, rec); row["input_price_per_mtok"] != nil || row["output_price_per_mtok"] != nil {
+		t.Fatalf("create seeded over an explicit 0: %v", row)
+	}
+
+	rec = serveAdmin(r, adminReq(http.MethodPatch, "/admin/providers/free-tier", `{"max_concurrency":4}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("update = %d: %s", rec.Code, rec.Body.String())
+	}
+	row := decodeProvider(t, rec)
+	for _, field := range []string{"input_price_per_mtok", "output_price_per_mtok"} {
+		if v, present := row[field]; present {
+			t.Errorf("an edit that never mentioned price re-seeded %s to %v", field, v)
+		}
+	}
+	if b := r.registry.get("free-tier"); !isFreeBackend(b) {
+		t.Errorf("a declared-free row became paid: in=%v out=%v", b.InputPricePerMtok, b.OutputPricePerMtok)
+	}
+	// And it has to be free after a restart too, since that is what the row on
+	// disk decides.
+	saved, err := r.logs.LoadBackendRegistrations(t.Context())
+	if err != nil || len(saved) != 1 {
+		t.Fatalf("persisted registrations = %d, err=%v", len(saved), err)
+	}
+	if saved[0].InputPricePerMtok != 0 || saved[0].OutputPricePerMtok != 0 {
+		t.Errorf("the persisted row carries a price nobody typed: %+v", saved[0])
+	}
+
+	// Renaming the model is a different claim: the row now describes something
+	// else, so seeding is free to fill the blanks again.
+	rec = serveAdmin(r, adminReq(http.MethodPatch, "/admin/providers/free-tier",
+		`{"model":"claude-sonnet-4-5","provider":"anthropic"}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("model change = %d: %s", rec.Code, rec.Body.String())
+	}
+	if in, _ := decodeProvider(t, rec)["input_price_per_mtok"].(float64); in <= 0 {
+		t.Errorf("a row pointed at a new model was not re-seeded: %v", in)
+	}
+}
+
+// TestAdminProviderFailedPersistOnEditKeepsTheLiveRow: saveProvider is shared by
+// create and update, and rolling back with remove() is only right for a create.
+// On an edit it deletes a row that is still on disk — so a transient write
+// failure takes the provider out of routing and /v1/models while the pre-edit row
+// sits in SQLite waiting to reappear at the next restart. groups.go gets this
+// right by putting the previous value back.
+func TestAdminProviderFailedPersistOnEditKeepsTheLiveRow(t *testing.T) {
+	r := adminRouter(t)
+	rec := serveAdmin(r, adminReq(http.MethodPost, "/admin/providers",
+		`{"id":"p","url":"https://api.example.com/v1","model":"some-unpriced-model","provider":"whoever",`+
+			`"max_concurrency":8,"input_price_per_mtok":3,"output_price_per_mtok":15}`))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create = %d: %s", rec.Code, rec.Body.String())
+	}
+	before := r.registry.get("p")
+	if before == nil {
+		t.Fatal("the row was not registered")
+	}
+
+	// A write that fails, from the only place a SQLite write can fail without a
+	// disk to break: the store is gone.
+	if err := r.logs.Close(); err != nil {
+		t.Fatalf("close log store: %v", err)
+	}
+	rec = serveAdmin(r, adminReq(http.MethodPatch, "/admin/providers/p", `{"max_concurrency":2}`))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("failed persist = %d, want 500: %s", rec.Code, rec.Body.String())
+	}
+	after := r.registry.get("p")
+	if after == nil {
+		t.Fatal("a failed edit deleted the live row; the pre-edit one is still on disk and would come back at the next restart")
+	}
+	if after.MaxConcurrency != before.MaxConcurrency {
+		t.Errorf("the failed edit was left half-applied: max_concurrency = %d, want %d", after.MaxConcurrency, before.MaxConcurrency)
+	}
+	if after.InputPricePerMtok != 3 || after.OutputPricePerMtok != 15 {
+		t.Errorf("the failed edit changed the row's prices: %+v", after.BackendRegistration)
+	}
+	declared, ok := r.registry.declaredRegistration("p")
+	if !ok || declared.MaxConcurrency != before.MaxConcurrency {
+		t.Errorf("the declared registration was left edited: %+v", declared)
+	}
+}
+
+// TestAdminProviderFailedPersistOnCreateRemovesTheRow is the other half: nothing
+// re-posts a manual row, so a create whose write failed must not leave a row in
+// memory that no restart will bring back.
+func TestAdminProviderFailedPersistOnCreateRemovesTheRow(t *testing.T) {
+	r := adminRouter(t)
+	if err := r.logs.Close(); err != nil {
+		t.Fatalf("close log store: %v", err)
+	}
+	rec := serveAdmin(r, adminReq(http.MethodPost, "/admin/providers",
+		`{"id":"p","url":"https://api.example.com/v1","model":"m","provider":"whoever","input_price_per_mtok":1}`))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("failed persist = %d, want 500: %s", rec.Code, rec.Body.String())
+	}
+	if r.registry.get("p") != nil {
+		t.Error("a create that could not be persisted left the row in the registry")
+	}
+}
+
 // ── Admin session ───────────────────────────────────────────────────────────
 
 // passwordRouter is a router whose admin password is set, without an admin key,

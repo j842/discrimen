@@ -146,9 +146,10 @@ type Backend struct {
 	ObservedPrefillTPS float64   `json:"observed_prefill_tps,omitempty"` // live EWMA of PREFILL throughput (prompt tokens / TTFT), tok/s
 	ThinkingDialect    string    `json:"thinking_dialect,omitempty"`     // measured spelling of the thinking gate (see WorkerProfile.ThinkingDialect)
 	// RejectedFields are request fields this endpoint has refused as
-	// unrecognised; they are omitted from everything sent to it from then on (see
-	// stripAndRetry). Learned at runtime and deliberately not persisted, so a
-	// provider that starts accepting a field is forgiven on the next restart.
+	// unrecognised; they are omitted from everything sent to it until the verdict
+	// ages out (see stripAndRetry and rejectedFieldTTL). Learned at runtime and
+	// deliberately not persisted, so a provider that starts accepting a field is
+	// forgiven on the next restart as well.
 	RejectedFields []string  `json:"rejected_fields,omitempty"`
 	QualityDetail  string    `json:"quality_detail,omitempty"`    // benchmark per-tier + truncation breakdown
 	Failed         []string  `json:"failed_benchmarks,omitempty"` // benchmark questions the worker missed
@@ -171,6 +172,14 @@ type Backend struct {
 	lastReg        *BackendRegistration
 	profileGen     int64
 	lastModelCheck time.Time
+	// rejectedAt is when each RejectedFields entry was learned, so a verdict can
+	// age out and be re-tested instead of standing for the life of the process
+	// (see rejectedFieldTTL).
+	rejectedAt map[string]time.Time
+	// profileAborts counts consecutive background profiles discarded for this
+	// registration; it drives the retry backoff and the point at which the router
+	// stops paying for another attempt (see scheduleProfileRetry).
+	profileAborts int
 }
 
 // nextProfileGen issues registration generations. Globally unique (not per
@@ -2124,8 +2133,10 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 	rawBody := body
 	body = patchForwardedBody(body, injectMaxTokens, budgetCeiling(backend, job), tr.forBackend(backend), backend.ServedID)
 	// Fields this endpoint has already refused as unrecognised never go out
-	// again — see stripAndRetry. Usually empty, and then free.
-	body = stripBodyFields(body, backend.RejectedFields)
+	// again — see stripAndRetry. Read through the registry rather than off the
+	// clone, so an aged-out verdict is re-tested rather than believed for ever.
+	// Usually empty, and then free.
+	body = r.stripLearned(body, rawBody, backend.ID)
 	// Make a missed preference observable WITHOUT touching X-LLM-Route (its
 	// route:d=…,q>=… form is parsed by parseRouteScore): a dedicated response
 	// header plus a log line. The route header still records the target the prompt
@@ -2771,12 +2782,65 @@ func (e unknownModelError) Error() string {
 	return fmt.Sprintf("model %q not found — GET /v1/models lists what this router serves", e.name)
 }
 
-// profileRetryDelay is how long after an aborted background profile (worker
-// blipped mid-benchmark) the router retries it. Short, because until the
+// profileRetryDelay is how long after the FIRST aborted background profile
+// (worker blipped mid-benchmark) the router retries it. Short, because until the
 // retry succeeds the worker runs on a provisional quality that distorts the
 // fleet's tier range. A worker that's actually down fails the health check in
 // the retry and falls into the normal recert backoff instead.
 const profileRetryDelay = 2 * time.Minute
+
+// profileRetryMaxAttempts is how many aborted profiles in a row the router pays
+// for before it stops trying.
+//
+// There has to be a limit, and it has to be small. An abort is not free: the
+// benchmark set is 130 questions, runQualityBenchmark only gives up after
+// wg.Wait(), and a metered endpoint that sustains 429s under the benchmark's
+// concurrency fails the same way every time — so an unbounded retry is an
+// unbounded bill, spent on measurements that are discarded the moment they
+// arrive. Past this the worker keeps its provisional profile and stays routable;
+// re-registering it, or POST /debug/backends/{id}/certify, starts the count
+// again, which is the operator saying they have fixed something.
+const profileRetryMaxAttempts = 4
+
+// profileRetryBackoff grows the gap between aborted background profiles: 2m, 4m,
+// 8m, … capped at an hour. Same shape as recertBackoff, and for the same reason
+// — a failure that repeats should cost less each time, not the same.
+func profileRetryBackoff(aborts int) time.Duration {
+	const ceiling = time.Hour
+	if aborts < 1 {
+		aborts = 1
+	}
+	d := profileRetryDelay
+	for i := 1; i < aborts && d < ceiling; i++ {
+		d *= 2
+	}
+	if d > ceiling {
+		d = ceiling
+	}
+	return d
+}
+
+// scheduleProfileRetry reacts to a background profile that was discarded:
+// records the attempt and what it spent where an operator will see it, and
+// schedules the next attempt on a growing backoff. Returns the delay it
+// scheduled, or 0 when it has given up on this registration.
+func (r *Router) scheduleProfileRetry(id string, cause error) time.Duration {
+	aborts := r.registry.noteProfileAbort(id)
+	if aborts >= profileRetryMaxAttempts {
+		log.Printf("background profile %s aborted %d times in a row: %v — GIVING UP. The worker keeps its provisional quality; re-register it or POST /debug/backends/%s/certify once the endpoint is healthy",
+			id, aborts, cause, id)
+		r.registry.setCheck(id, "profile", Check{Message: fmt.Sprintf(
+			"abandoned after %d aborted attempts: %v — serving on a provisional quality until re-certified", aborts, cause)})
+		return 0
+	}
+	delay := profileRetryBackoff(aborts)
+	log.Printf("background profile %s aborted (attempt %d/%d): %v (keeping provisional; retrying in %s)",
+		id, aborts, profileRetryMaxAttempts, cause, delay)
+	r.registry.setCheck(id, "profile", Check{Message: fmt.Sprintf(
+		"provisional — attempt %d/%d aborted: %v; retrying in %s", aborts, profileRetryMaxAttempts, cause, delay)})
+	time.AfterFunc(delay, func() { r.certifyBackend(id) })
+	return delay
+}
 
 // recertifyIfRegenerated re-certifies when a different registration generation
 // landed while a certification/profile held the guard: that registration's own
@@ -4041,7 +4105,9 @@ func (r *Registry) upsert(reg BackendRegistration) (*Backend, bool) {
 	existing.certFailures = 0
 	existing.nextCertifyAt = time.Time{}
 	existing.proxyFailures = 0
+	existing.profileAborts = 0
 	existing.RejectedFields = nil
+	existing.rejectedAt = nil
 	// Sync the per-backend slot channel with the registered max_concurrency.
 	// On first registration we lazily create the channel; on re-registration
 	// with a different cap we replace it. Any in-flight requests still hold
@@ -4288,8 +4354,12 @@ func (r *Registry) finishCertification(id string, ready bool, checks map[string]
 }
 
 // noteRejectedField records that an endpoint refused a request field it did not
-// recognise, so everything sent to it from now on omits that field. Reports
-// whether this is the first time, which is what gates the log line.
+// recognise AND then accepted the same request without it, so everything sent to
+// it from now on omits that field. Reports whether this is the first time, which
+// is what gates the log line.
+//
+// A re-learn restarts the clock: the field was just re-tested and refused again,
+// so the next re-test belongs a full TTL away, not immediately.
 func (r *Registry) noteRejectedField(id, field string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -4297,6 +4367,10 @@ func (r *Registry) noteRejectedField(id, field string) bool {
 	if b == nil {
 		return false
 	}
+	if b.rejectedAt == nil {
+		b.rejectedAt = map[string]time.Time{}
+	}
+	b.rejectedAt[field] = time.Now()
 	for _, f := range b.RejectedFields {
 		if f == field {
 			return false
@@ -4305,6 +4379,46 @@ func (r *Registry) noteRejectedField(id, field string) bool {
 	b.RejectedFields = append(b.RejectedFields, field)
 	sort.Strings(b.RejectedFields)
 	return true
+}
+
+// rejectedFields returns the fields this endpoint is still believed to refuse,
+// dropping any whose verdict has aged out so the next request re-tests it.
+//
+// The empty case — every backend, nearly always — costs one read lock and no
+// allocation. The returned slice is a copy: the caller filters it, and the
+// registry's own may be re-sorted by a concurrent noteRejectedField.
+func (r *Registry) rejectedFields(id string) []string {
+	r.mu.RLock()
+	b := r.backends[id]
+	empty := b == nil || len(b.RejectedFields) == 0
+	r.mu.RUnlock()
+	if empty {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	b = r.backends[id]
+	if b == nil {
+		return nil
+	}
+	live := make([]string, 0, len(b.RejectedFields))
+	for _, f := range b.RejectedFields {
+		// A missing timestamp is treated as expired: it can only come from a row
+		// that was written before the clock was, and re-testing is the safe way to
+		// resolve a verdict of unknown age.
+		if at, ok := b.rejectedAt[f]; !ok || time.Since(at) > rejectedFieldTTL {
+			delete(b.rejectedAt, f)
+			log.Printf("backend=%s: re-testing %q — the endpoint may have started accepting it since it was learned", id, f)
+			continue
+		}
+		live = append(live, f)
+	}
+	if len(live) == 0 {
+		b.RejectedFields = nil
+		return nil
+	}
+	b.RejectedFields = live
+	return append([]string(nil), live...)
 }
 
 func (r *Registry) setError(id string, lastError string) {
@@ -4479,6 +4593,10 @@ func cloneBackend(b *Backend) *Backend {
 	cp := *b
 	cp.Features = append([]string(nil), b.Features...)
 	cp.RejectedFields = append([]string(nil), b.RejectedFields...)
+	// The verdict CLOCK stays behind the registry lock. A clone that shared the
+	// map would hand a reader something the next noteRejectedField writes to;
+	// everything that needs the timestamps asks the registry (rejectedFields).
+	cp.rejectedAt = nil
 	if b.Certification.Checks != nil {
 		cp.Certification.Checks = make(map[string]Check, len(b.Certification.Checks))
 		for k, v := range b.Certification.Checks {

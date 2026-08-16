@@ -145,6 +145,50 @@ func (r *Router) meterProfile(id string) (*profileMeter, func()) {
 	return m, func() { r.profileMeters.Delete(id) }
 }
 
+// profileSpend reads what a run has consumed so far and prices it. Prices come
+// from the LIVE row rather than the clone the profile was started with: an
+// operator may have corrected them while the benchmark ran, and the later number
+// is the one they will be billed at.
+func (r *Router) profileSpend(b *Backend, meter *profileMeter) (prompt, output int, cost float64) {
+	prompt, output = meter.totals()
+	priced := b
+	if live := r.registry.get(b.ID); live != nil {
+		priced = live
+	}
+	return prompt, output, tokenCost(priced, prompt, output)
+}
+
+// abortedProfile is a profiling run discarded before it produced anything —
+// carrying what it spent on the way.
+//
+// The tokens are gone either way; the point of carrying them is that a discarded
+// run must not look free. Only the SUCCESS path writes ProfilePromptTokens and
+// friends onto a profile, so an abort used to lose the number entirely: a
+// metered endpoint that fails the benchmark under its own rate limiting can run
+// the full 130-question set, bill for it, be discarded, and repeat — with
+// ProfileCost recorded as zero and nothing at all in front of the operator.
+type abortedProfile struct {
+	reason string
+	prompt int
+	output int
+	cost   float64
+}
+
+func (e *abortedProfile) Error() string {
+	spend := fmt.Sprintf("%.0fk prompt + %.0fk completion tokens",
+		float64(e.prompt)/1000, float64(e.output)/1000)
+	if e.cost > 0 {
+		spend += fmt.Sprintf(", %.4g at declared prices", e.cost)
+	}
+	return fmt.Sprintf("%s; discarding partial measurements (spent %s)", e.reason, spend)
+}
+
+// abort discards a profiling run, recording what it consumed before it was.
+func (r *Router) abort(b *Backend, meter *profileMeter, reason string) error {
+	prompt, output, cost := r.profileSpend(b, meter)
+	return &abortedProfile{reason: reason, prompt: prompt, output: output, cost: cost}
+}
+
 // meterProfileTokens folds a measured token count into the profiling run in
 // flight against this endpoint. A no-op — one failed map load — when the
 // endpoint is not being profiled, which is every live request.
@@ -278,7 +322,7 @@ func (r *Router) profileBackend(b *Backend, model string) (*WorkerProfile, error
 	// discarded here anyway. The worker keeps its provisional profile and the
 	// caller schedules a retry.
 	if !capOK {
-		return nil, errors.New("worker unreachable during capacity probe; discarding partial measurements")
+		return nil, r.abort(b, meter, "worker unreachable during capacity probe")
 	}
 	capN = r.resolveCapacity(b, capN)
 	// Prefill rate is measured here rather than left to the live EWMA, which only
@@ -302,9 +346,11 @@ func (r *Router) profileBackend(b *Backend, model string) (*WorkerProfile, error
 	quality, qOK, qBreakdown, qFailed, qResults := r.runQualityBenchmark(b, benchConc)
 	r.auditThinkingGate() // log where the reasoning gate disagrees with tier (model-independent, once)
 	// If the worker went unreachable mid-benchmark, the quality number is
-	// garbage — abort rather than persist an under-rating.
+	// garbage — abort rather than persist an under-rating. Note what it cost on
+	// the way out: runQualityBenchmark only gives up AFTER wg.Wait(), so up to
+	// half the 130 questions were generated and billed before we got here.
 	if !qOK {
-		return nil, errors.New("worker unreachable during quality benchmark; discarding partial measurements")
+		return nil, r.abort(b, meter, "worker unreachable during quality benchmark")
 	}
 	p.MaxConcurrency = capN
 	p.Checks["capacity"] = Check{OK: true, Message: fmt.Sprintf("%d concurrent", capN)}
@@ -321,15 +367,8 @@ func (r *Router) profileBackend(b *Backend, model string) (*WorkerProfile, error
 	p.MeasuredAt = time.Now()
 	p.ProfileMillis = time.Since(start).Milliseconds()
 	// What the run cost, recorded on the profile it produced so it survives the
-	// restart and reaches the API. Prices come from the LIVE row rather than the
-	// clone this function was handed: an operator may have corrected them while
-	// the benchmark ran, and the later number is the one they will be billed at.
-	p.ProfilePromptTokens, p.ProfileOutputTokens = meter.totals()
-	priced := b
-	if live := r.registry.get(b.ID); live != nil {
-		priced = live
-	}
-	p.ProfileCost = tokenCost(priced, p.ProfilePromptTokens, p.ProfileOutputTokens)
+	// restart and reaches the API.
+	p.ProfilePromptTokens, p.ProfileOutputTokens, p.ProfileCost = r.profileSpend(b, meter)
 	p.Checks["cost"] = Check{OK: true, Message: profileCostMessage(p)}
 	return p, nil
 }

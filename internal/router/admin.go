@@ -623,7 +623,10 @@ func (r *Router) handleAdminKeys(w http.ResponseWriter, req *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, validationError{Message: err.Error()})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"keys": keys})
+		// Environment tokens ride along as read-only rows so this page answers
+		// "who can call this router" completely — see envCredential.
+		writeJSON(w, http.StatusOK, map[string]any{
+			"keys": keys, "env_tokens": envCredentials(r.cfg)})
 	case http.MethodPost:
 		r.createKey(w, req)
 	default:

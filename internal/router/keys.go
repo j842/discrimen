@@ -671,6 +671,55 @@ func (r *Router) reopenedGates(keys []apiKey, id int64) []authGate {
 	return out
 }
 
+// ── Environment credentials, made visible ───────────────────────────────────
+
+// envCredential is a read-only row describing a bearer token configured through
+// the environment (ROUTER_CLIENT_TOKENS / ROUTER_WORKER_TOKEN) rather than
+// issued from the admin page. Env tokens authorise requests exactly like table
+// keys of the same role, but they have no row in the keys table — and an
+// operator reading that page to answer "who can call this router" must not be
+// shown half the truth. Only existence, a short identifying prefix and the
+// variable they came from are exposed: the tokens are edited in service.env,
+// revoked by removing them there and restarting, and never leave the process
+// whole.
+type envCredential struct {
+	Prefix string `json:"prefix"`
+	Role   string `json:"role"`
+	Source string `json:"source"` // the environment variable it came from
+}
+
+// envCredentialPrefix shows enough of a token to tell rows apart without giving
+// away material entropy: at most 6 characters, and never more than a quarter of
+// the token, so a short token is not mostly disclosed by its own visibility row.
+func envCredentialPrefix(token string) string {
+	n := len(token) / 4
+	if n > 6 {
+		n = 6
+	}
+	if n < 1 {
+		n = 1
+	}
+	return token[:n]
+}
+
+// envCredentials lists the environment-configured tokens as displayable rows,
+// client tokens first in their configured order, then the worker token.
+func envCredentials(cfg *Config) []envCredential {
+	if cfg == nil {
+		return nil
+	}
+	var out []envCredential
+	for _, tok := range cfg.ClientTokens {
+		out = append(out, envCredential{
+			Prefix: envCredentialPrefix(tok), Role: roleClient, Source: "ROUTER_CLIENT_TOKENS"})
+	}
+	if cfg.WorkerToken != "" {
+		out = append(out, envCredential{
+			Prefix: envCredentialPrefix(cfg.WorkerToken), Role: roleWorker, Source: "ROUTER_WORKER_TOKEN"})
+	}
+	return out
+}
+
 // ── Per-key limits on the request path ──────────────────────────────────────
 
 // enforceKeyLimits applies a key's allow-list and budget. It writes the refusal

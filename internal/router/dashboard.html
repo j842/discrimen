@@ -1009,12 +1009,30 @@
         return;
       }
       const keys = (res.data && res.data.keys) || [];
-      if (!keys.length) {
-        emptyRow('keys-body', 9, 'No keys issued. Bootstrap credentials from the environment have no row here.');
+      const envTokens = (res.data && res.data.env_tokens) || [];
+      if (!keys.length && !envTokens.length) {
+        emptyRow('keys-body', 9, 'No keys issued and no tokens configured in the environment.');
         return;
       }
       const body = document.getElementById('keys-body');
       body.innerHTML = '';
+      // Environment tokens first: they exist before any key is issued, and this
+      // page must answer "who can call this router" completely. They are shown,
+      // never edited — service.env owns them, so change or revoke them there
+      // and restart.
+      envTokens.forEach(k => {
+        const tr = el('tr', {});
+        tr.appendChild(td([el('code', {}, [String(k.prefix || '')]), el('span', {class: 'muted'}, ['…'])]));
+        tr.appendChild(td([el('span', {class: 'muted'}, [String(k.source || '')])]));
+        tr.appendChild(td([el('span', {class: 'pill'}, [String(k.role || '')])]));
+        tr.appendChild(td([el('span', {class: 'ok', title: 'Configured in service.env. To change or revoke it, edit it there and restart the router — it cannot be edited here.'}, ['from environment'])]));
+        tr.appendChild(td([el('span', {class: 'muted'}, ['—'])]));
+        tr.appendChild(td([el('span', {class: 'muted'}, ['—'])]));
+        tr.appendChild(td([el('span', {class: 'muted'}, ['any model'])]));
+        tr.appendChild(td([el('span', {class: 'muted', title: 'Usage is only metered for issued keys; environment tokens have no key row to meter against.'}, ['—'])]));
+        tr.appendChild(td([el('span', {class: 'muted'}, ['service.env'])]));
+        body.appendChild(tr);
+      });
       keys.forEach(k => {
         const tr = el('tr', {});
         tr.appendChild(td([el('code', {}, [String(k.prefix || '')]), el('span', {class: 'muted'}, ['…'])]));

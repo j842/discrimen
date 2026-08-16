@@ -930,3 +930,78 @@ func TestAdminKeyValidation(t *testing.T) {
 		t.Errorf("non-numeric key id = %d, want 404", rec.Code)
 	}
 }
+
+// ── Environment tokens are visible, and only barely ─────────────────────────
+
+// The keys page answers "who can call this router". Tokens configured through
+// ROUTER_CLIENT_TOKENS / ROUTER_WORKER_TOKEN authorise requests exactly like
+// issued keys, so hiding them made that answer wrong — but showing them must
+// not become a disclosure: a row proves a token exists and identifies it, never
+// more than a quarter of it.
+func TestAdminKeysListShowsEnvTokens(t *testing.T) {
+	r := adminRouter(t)
+	longClient := "atlas-e083f43f7babea0ab0fb617cd6d6204eaefb3930e7eb04f9"
+	worker := "woeirhoiwerhjoerwhowrehowruehoweruhwer"
+	r.cfg = &Config{ClientTokens: []string{longClient, "shorty"}, WorkerToken: worker}
+
+	rec := serveAdmin(r, adminReq(http.MethodGet, "/admin/keys", ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list = %d: %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		EnvTokens []envCredential `json:"env_tokens"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("list response is not JSON: %v", err)
+	}
+	want := []envCredential{
+		{Prefix: "atlas-", Role: roleClient, Source: "ROUTER_CLIENT_TOKENS"},
+		{Prefix: "s", Role: roleClient, Source: "ROUTER_CLIENT_TOKENS"},
+		{Prefix: "woeirh", Role: roleWorker, Source: "ROUTER_WORKER_TOKEN"},
+	}
+	if len(out.EnvTokens) != len(want) {
+		t.Fatalf("env_tokens = %+v, want %d rows", out.EnvTokens, len(want))
+	}
+	for i, w := range want {
+		if out.EnvTokens[i] != w {
+			t.Errorf("env_tokens[%d] = %+v, want %+v", i, out.EnvTokens[i], w)
+		}
+	}
+	// Existence, not disclosure: no full token in the body.
+	for _, tok := range []string{longClient, worker} {
+		if strings.Contains(rec.Body.String(), tok) {
+			t.Errorf("the key list carries a whole environment token (prefix %q)", tok[:6])
+		}
+	}
+}
+
+// The prefix rule: at most 6 characters and never more than a quarter, so a
+// short token is not mostly disclosed by its own visibility row.
+func TestEnvCredentialPrefixNeverLeaksShortTokens(t *testing.T) {
+	for _, tc := range []struct{ token, want string }{
+		{"ab", "a"},                  // floor of one character
+		{"12345678", "12"},           // a quarter of a short token
+		{"1234567890123456", "1234"}, // still a quarter
+		{"atlas-e083f43f7babea0ab0fb617cd6d6204eaefb3930e7eb04f9", "atlas-"}, // capped at 6
+	} {
+		if got := envCredentialPrefix(tc.token); got != tc.want {
+			t.Errorf("prefix(%q) = %q, want %q", tc.token, got, tc.want)
+		}
+	}
+}
+
+// No environment tokens configured: the field is empty and the page keeps its
+// pre-existing shape.
+func TestAdminKeysListWithoutEnvTokens(t *testing.T) {
+	r := adminRouter(t)
+	rec := serveAdmin(r, adminReq(http.MethodGet, "/admin/keys", ""))
+	var out struct {
+		EnvTokens []envCredential `json:"env_tokens"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("list response is not JSON: %v", err)
+	}
+	if len(out.EnvTokens) != 0 {
+		t.Errorf("env_tokens = %+v, want none", out.EnvTokens)
+	}
+}

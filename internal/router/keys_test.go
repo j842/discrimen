@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -293,7 +294,7 @@ func TestPasswordHashing(t *testing.T) {
 		t.Fatal("a wrong password verified")
 	}
 	// Salted: the same password twice must not produce the same hash.
-	again, _ := hashPassword(pw)
+	again, _ := hashPasswordIter(pw, 1000)
 	if again == hash {
 		t.Fatal("hashing is not salted")
 	}
@@ -597,4 +598,217 @@ func jsonOf(t *testing.T, v any) string {
 		t.Fatalf("marshal: %v", err)
 	}
 	return string(b)
+}
+
+// ── Per-key limits on a real request ────────────────────────────────────────
+
+// keyLimitRouter is a fleet with one fake worker that answers a completion with
+// a usage block, plus a client key carrying the given allow-list and budget.
+func keyLimitRouter(t *testing.T, models []string, budget int64) (*Router, *Router) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"hello"},"finish_reason":"stop"}],` +
+			`"usage":{"prompt_tokens":30,"completion_tokens":70,"total_tokens":100}}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	reg := newTestRegistry()
+	reg.upsert(BackendRegistration{
+		ID: "w", URL: srv.URL, Model: "gemma4", Quality: 50,
+		TTLSeconds: 3600, Features: []string{"chat"},
+	})
+	reg.finishCertification("w", true, map[string]Check{}, 50, 10, "")
+
+	r := &Router{
+		cfg:      &Config{DefaultMaxTokens: 4096, HealthInterval: 15 * time.Second},
+		registry: reg, logs: newTestLogStore(t),
+		client: &http.Client{Timeout: 5 * time.Second}, streamClient: &http.Client{},
+	}
+	issueKey(t, r, clientSecret, apiKey{Role: roleClient, Name: "limited", Models: models, TokenBudget: budget})
+	return r, r
+}
+
+// TestModelAllowListEnforced: a key with an allow-list may only name models on
+// it. Naming nothing is the auto route and stays allowed — the router still only
+// picks from its own fleet.
+func TestModelAllowListEnforced(t *testing.T) {
+	r, _ := keyLimitRouter(t, []string{"gemma4"}, 0)
+	cases := []struct {
+		name, model string
+		status      int
+	}{
+		{"allowed model", `"gemma4"`, http.StatusOK},
+		// Off the list, whether or not the fleet serves it. The check runs BEFORE
+		// model resolution on purpose: a 403 for one name and a 404 for another
+		// would let a restricted key enumerate the fleet a model at a time.
+		{"denied model the fleet does not serve", `"qwen3"`, http.StatusForbidden},
+		{"auto route", `"default"`, http.StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			r.routes().ServeHTTP(rec, post("/v1/chat/completions",
+				`{"model":`+tc.model+`,"messages":[{"role":"user","content":"hi"}]}`, clientSecret))
+			if rec.Code != tc.status {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, tc.status, rec.Body.String())
+			}
+		})
+	}
+	// A model the FLEET serves but the key may not is a permission error, which
+	// tells a client to ask for access rather than to change model.
+	r2, _ := keyLimitRouter(t, []string{"qwen3"}, 0)
+	rec := httptest.NewRecorder()
+	r2.routes().ServeHTTP(rec, post("/v1/chat/completions",
+		`{"model":"gemma4","messages":[{"role":"user","content":"hi"}]}`, clientSecret))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("a fleet model the key may not use = %d, want 403: %s", rec.Code, rec.Body.String())
+	}
+	if body := errorEnvelopeOf(t, rec); body.Type != "permission_error" {
+		t.Errorf("error type = %q, want permission_error", body.Type)
+	}
+	// And no worker was contacted for a refused request: the check runs before a
+	// slot is taken.
+	if rows, _ := r2.logs.List(t.Context(), "", 10, 0); len(rows) != 0 {
+		t.Errorf("a refused request reached a worker: %+v", rows)
+	}
+}
+
+// TestTokenBudgetEnforced: a request is charged what the endpoint reported, and
+// a key past its budget gets a 429 in the OpenAI envelope.
+func TestTokenBudgetEnforced(t *testing.T) {
+	r, _ := keyLimitRouter(t, nil, 150)
+	chat := func() *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		r.routes().ServeHTTP(rec, post("/v1/chat/completions",
+			`{"messages":[{"role":"user","content":"hi"}]}`, clientSecret))
+		return rec
+	}
+	if rec := chat(); rec.Code != http.StatusOK {
+		t.Fatalf("first request = %d: %s", rec.Code, rec.Body.String())
+	}
+	// The charge lands in a goroutine after the response is committed, so wait
+	// for it rather than racing it.
+	used := waitForTokens(t, r, clientSecret, 100)
+	if used != 100 {
+		t.Fatalf("charged %d tokens, want the 100 the endpoint reported", used)
+	}
+
+	// Still under 150: the second request is served and takes it over.
+	if rec := chat(); rec.Code != http.StatusOK {
+		t.Fatalf("second request = %d: %s", rec.Code, rec.Body.String())
+	}
+	waitForTokens(t, r, clientSecret, 200)
+
+	rec := chat()
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("over budget = %d, want 429: %s", rec.Code, rec.Body.String())
+	}
+	body := errorEnvelopeOf(t, rec)
+	if body.Type != "rate_limit_error" {
+		t.Errorf("error type = %q, want rate_limit_error", body.Type)
+	}
+	if !strings.Contains(body.Message, "budget") {
+		t.Errorf("the refusal does not say why: %q", body.Message)
+	}
+}
+
+// waitForTokens polls until a key's charged total reaches want, or the test
+// times out. The charge is deliberately asynchronous (see recordKeyUse).
+func waitForTokens(t *testing.T, r *Router, secret string, want int64) int64 {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		key, ok := r.logs.LookupAPIKey(context.Background(), secret)
+		if ok && key.TokensUsed >= want {
+			return key.TokensUsed
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("tokens_used did not reach %d (got %d)", want, key.TokensUsed)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestRequestLogStampsKeyID: every log row records who made the request, so a
+// stored prompt can be attributed to a caller after the fact.
+func TestRequestLogStampsKeyID(t *testing.T) {
+	r, _ := keyLimitRouter(t, nil, 0)
+	key, _ := r.logs.LookupAPIKey(t.Context(), clientSecret)
+
+	rec := httptest.NewRecorder()
+	r.routes().ServeHTTP(rec, post("/v1/chat/completions",
+		`{"messages":[{"role":"user","content":"hi"}]}`, clientSecret))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("chat = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	want := strconv.FormatInt(key.ID, 10)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		rows, err := r.logs.List(context.Background(), "", 10, 0)
+		if err != nil {
+			t.Fatalf("list logs: %v", err)
+		}
+		if len(rows) > 0 {
+			if rows[0].KeyID != want {
+				t.Fatalf("log row key_id = %q, want %q", rows[0].KeyID, want)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no log row was written")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestEnvTokenStampsEnv: a bootstrap environment token has no row, so it stamps
+// the one label that is true of it rather than a made-up id.
+func TestEnvTokenStampsEnv(t *testing.T) {
+	cases := []struct {
+		name string
+		id   *identity
+		want string
+	}{
+		{"api key", &identity{KeyID: 42}, "42"},
+		{"environment token", &identity{Role: roleClient}, "env"},
+		{"no credential required", &identity{Role: roleClient, Anonymous: true}, ""},
+		{"nobody", nil, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.id.logKeyID(); got != tc.want {
+				t.Errorf("logKeyID = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSharedEnvTokenStillRegisters: nothing ever forbade setting the same string
+// as both ROUTER_WORKER_TOKEN and ROUTER_CLIENT_TOKENS, and a deployment that
+// did must keep registering. identify resolves the client list first, so the
+// worker check has to run ahead of it.
+func TestSharedEnvTokenStillRegisters(t *testing.T) {
+	const shared = "one-token-for-everything"
+	r := &Router{
+		cfg:      &Config{WorkerToken: shared, ClientTokens: []string{shared}},
+		registry: newTestRegistry(),
+		logs:     newTestLogStore(t),
+		client:   &http.Client{Timeout: time.Second},
+	}
+	rec := httptest.NewRecorder()
+	r.routes().ServeHTTP(rec, post("/backends/register",
+		`{"id":"llm-a750","url":"http://a750:8080","model":"gemma4"}`, shared))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("register with a shared token = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	// And the same token still works on the client surface.
+	rec = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+shared)
+	r.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/v1/models with a shared token = %d, want 200", rec.Code)
+	}
 }

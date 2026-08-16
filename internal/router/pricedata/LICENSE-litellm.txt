@@ -8,7 +8,7 @@ four fields per model are kept (input and output cost per token, context window,
 provider) and only rows publishing a per-token price at all; nothing else is
 altered. Refresh it with `go run . prices fetch`.
 
-The repository root NOTICE file should carry this attribution too.
+The repository root NOTICE file carries this attribution too, in section 2.
 
 ---
 MIT License

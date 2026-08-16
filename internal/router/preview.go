@@ -211,13 +211,23 @@ func (r *Router) renderPreview(chatReq *ChatRequest, plan *routePlan, budget tim
 	// The ranked head is only the FIRST choice: acquisition spills past a
 	// saturated front-runner, and a bounded preference may hold the request
 	// briefly for a preferred worker first. Say which preference is in play so the
-	// preview isn't read as a promise.
+	// preview isn't read as a promise. Read from qualityFloorPreference rather
+	// than re-derived, for the same reason the whole preview shares planRoute.
+	pref := qualityFloorPreference(plan.candidates, plan.target)
 	switch {
 	case plan.session.locked():
 		resp.Notes = append(resp.Notes, fmt.Sprintf(
 			"tool loop open — acquisition waits up to %s for incumbent %q before spilling (the session lock outranks the quality floor)",
 			sessionLockWait, plan.session.incumbent))
-	case plan.target > 0:
+	case pref.why == "free-first":
+		bar := ""
+		if plan.target > 0 {
+			bar = fmt.Sprintf(" at q>=%d", plan.target)
+		}
+		resp.Notes = append(resp.Notes, fmt.Sprintf(
+			"acquisition waits up to %s for a free worker%s before spilling to a paid endpoint",
+			qualityFloorWait, bar))
+	case pref.why == "quality-floor":
 		resp.Notes = append(resp.Notes, fmt.Sprintf(
 			"acquisition waits up to %s for a worker at q>=%d before serving below the floor",
 			qualityFloorWait, plan.target))

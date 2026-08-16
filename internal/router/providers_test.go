@@ -47,6 +47,9 @@ func TestRegistrationDefaultsAreLocalBeaconFree(t *testing.T) {
 	if reg.Source != sourceBeacon {
 		t.Errorf("source = %q, want %q", reg.Source, sourceBeacon)
 	}
+	// Zero cost is not cosmetic: it is what P4's "prefer the free ones" rule
+	// reads, so a default that drifted would start spending money on local
+	// traffic.
 	if reg.InputPricePerMtok != 0 || reg.OutputPricePerMtok != 0 {
 		t.Errorf("a worker that declared no price must cost nothing, got %v/%v",
 			reg.InputPricePerMtok, reg.OutputPricePerMtok)
@@ -57,9 +60,6 @@ func TestRegistrationDefaultsAreLocalBeaconFree(t *testing.T) {
 	}
 	if reg.HealthPath != "/health" {
 		t.Errorf("health path = %q, want the frozen default /health", reg.HealthPath)
-	}
-	if isMetered(&Backend{BackendRegistration: reg}) {
-		t.Error("a local worker must not read as metered")
 	}
 }
 

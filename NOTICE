@@ -175,3 +175,48 @@ CITATION
     booktitle={The Thirteenth International Conference on Learning Representations},
     year={2025},
   }
+
+================================================================================
+2. LiteLLM model price table — internal/router/pricedata/prices.json
+================================================================================
+
+WHAT IT IS
+
+  internal/router/pricedata/prices.json is a trimmed 387,380-byte snapshot of
+  LiteLLM's public model price and context-window table:
+
+      https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
+      https://github.com/BerriAI/litellm
+
+  It is embedded in the binary and used to seed prices and context windows on a
+  manually-entered provider row where the model id matches. Seeding is
+  best-effort and never load-bearing: the router measures context itself, and a
+  price it cannot find stays zero.
+
+  The file records its own provenance in two top-level fields, `source` and
+  `fetched_at`. It covers 2,435 models across 81 providers.
+
+LICENCE
+
+  MIT, which is LiteLLM's own. The full text is at
+  internal/router/pricedata/LICENSE-litellm.txt, alongside the snapshot.
+
+  Unlike the LiveBench pool in section 1, there is nothing here that LiteLLM
+  does not own. A table of published list prices carries no third-party rights
+  to carry forward.
+
+MODIFICATIONS
+
+  Made by this project:
+
+    - Trimmed to five fields per model: the model key, input_cost_per_token,
+      output_cost_per_token, max_input_tokens (or max_tokens), and
+      litellm_provider. Everything else upstream publishes is dropped.
+    - Restricted to rows publishing a per-token price at all, which drops the
+      image, audio and embedding rows. Together these take the file from about
+      1.75 MB to 378 KB.
+    - Re-emitted one model per line with sorted keys, so a refresh produces a
+      readable diff rather than a single reflowed blob.
+
+  No price, context window or provider value is altered. Refresh the snapshot
+  with `go run . prices fetch`.

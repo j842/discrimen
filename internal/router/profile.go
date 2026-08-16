@@ -10,6 +10,7 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -54,6 +55,22 @@ type WorkerProfile struct {
 	Checks          map[string]Check `json:"checks,omitempty"`
 	MeasuredAt      time.Time        `json:"measured_at"`
 	ProfileMillis   int64            `json:"profile_ms,omitempty"` // wall time of the full cold-start profile (capacity ramp + quality benchmark)
+	// What the run that produced this profile consumed, and what that cost at the
+	// endpoint's declared prices. Profiling a paid model spends real money — the
+	// set is 102 questions, 94 of them graded thinking-on with a 16k ceiling, so a
+	// cold profile lands near 200-300k output tokens — and a number nobody can see
+	// is a number nobody can budget for (PLAN.md, "Known costs").
+	//
+	// A ZERO token count means NOT MEASURED, not free: every profile cached before
+	// these fields existed has one, and there is no way to re-derive what a run
+	// that already happened cost short of paying for another. Free is tokens > 0
+	// with ProfileCost == 0, which is every local worker. Read them as a pair.
+	//
+	// Scoped exactly like ProfileMillis, to profileBackend — which re-runs the
+	// quick probes itself, so the two describe the same span.
+	ProfilePromptTokens int     `json:"profile_prompt_tokens,omitempty"`
+	ProfileOutputTokens int     `json:"profile_output_tokens,omitempty"`
+	ProfileCost         float64 `json:"profile_cost,omitempty"` // in whatever currency the operator is billed in
 	// Incomplete marks a profile where one or more capability probes never got a
 	// verdict (transient errors exhausted their retries). The worker stays
 	// routable on these values, but the profile must NOT be persisted — a cached
@@ -78,6 +95,77 @@ const provisionalQuality = 30
 const capacityProbeAttempts = 3
 
 var capacityProbeRetryDelay = 3 * time.Second
+
+// profileMeter accumulates the tokens one profiling run consumes at one
+// endpoint, so the money it spent can be recorded on the profile it produced.
+//
+// It is registered per backend id for the span of profileBackend rather than
+// threaded through the dozen probe functions under it. doCompletion is the
+// single funnel every non-streamed probe and every benchmark question already
+// goes through, so metering there picks up the probes that exist today and the
+// ones added later, with no signature to keep in sync — and the benchmark is
+// ~99% of the bill.
+//
+// The cost of that choice is attribution: anything else the router sends to
+// this endpoint during the run — a background judge call, say — lands here too.
+// That is a fraction of a percent of a 200-300k token profile, and it errs
+// HIGH, which is the safe direction for a number an operator will reconcile
+// against an invoice.
+type profileMeter struct {
+	mu     sync.Mutex
+	prompt int
+	output int
+}
+
+func (m *profileMeter) add(prompt, output int) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.prompt += prompt
+	m.output += output
+}
+
+func (m *profileMeter) totals() (prompt, output int) {
+	if m == nil {
+		return 0, 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.prompt, m.output
+}
+
+// meterProfile opens a metering span for one endpoint and returns the meter and
+// its closer. Overlapping profiles of the same id cannot happen — certifyBackend
+// holds a single atomic guard for the whole span — so one meter per id is enough.
+func (r *Router) meterProfile(id string) (*profileMeter, func()) {
+	m := &profileMeter{}
+	r.profileMeters.Store(id, m)
+	return m, func() { r.profileMeters.Delete(id) }
+}
+
+// meterProfileTokens folds a measured token count into the profiling run in
+// flight against this endpoint. A no-op — one failed map load — when the
+// endpoint is not being profiled, which is every live request.
+func (r *Router) meterProfileTokens(id string, prompt, output int) {
+	if m, ok := r.profileMeters.Load(id); ok {
+		m.(*profileMeter).add(prompt, output)
+	}
+}
+
+// meterProfileUsage is meterProfileTokens reading an OpenAI usage block. The
+// endpoint's OWN count, not an estimate: it is the number the invoice is
+// computed from, and measure-don't-trust cuts this way too.
+func (r *Router) meterProfileUsage(id string, raw map[string]any) {
+	u, ok := raw["usage"].(map[string]any)
+	if !ok {
+		return
+	}
+	in, _ := u["prompt_tokens"].(float64)
+	out, _ := u["completion_tokens"].(float64)
+	r.meterProfileTokens(id, int(in), int(out))
+}
 
 // fmtProfileDuration renders a profile's wall time as "6m 48s" (minutes + seconds).
 func fmtProfileDuration(ms int64) string {
@@ -177,6 +265,8 @@ func (r *Router) profileQuick(b *Backend, model string) (*WorkerProfile, error) 
 // restarts. Returns an error only if the worker can't serve chat at all.
 func (r *Router) profileBackend(b *Backend, model string) (*WorkerProfile, error) {
 	start := time.Now()
+	meter, done := r.meterProfile(b.ID)
+	defer done()
 	p, err := r.profileQuick(b, model)
 	if err != nil {
 		return nil, err
@@ -230,7 +320,30 @@ func (r *Router) profileBackend(b *Backend, model string) (*WorkerProfile, error
 	p.Checks["quality"] = Check{OK: true, Message: qMsg}
 	p.MeasuredAt = time.Now()
 	p.ProfileMillis = time.Since(start).Milliseconds()
+	// What the run cost, recorded on the profile it produced so it survives the
+	// restart and reaches the API. Prices come from the LIVE row rather than the
+	// clone this function was handed: an operator may have corrected them while
+	// the benchmark ran, and the later number is the one they will be billed at.
+	p.ProfilePromptTokens, p.ProfileOutputTokens = meter.totals()
+	priced := b
+	if live := r.registry.get(b.ID); live != nil {
+		priced = live
+	}
+	p.ProfileCost = tokenCost(priced, p.ProfilePromptTokens, p.ProfileOutputTokens)
+	p.Checks["cost"] = Check{OK: true, Message: profileCostMessage(p)}
 	return p, nil
+}
+
+// profileCostMessage renders a run's spend for the per-probe check list, which
+// is what puts the number in front of an operator on /backends — cached
+// profiles included, since the checks are persisted with them.
+func profileCostMessage(p *WorkerProfile) string {
+	tokens := fmt.Sprintf("%.0fk prompt + %.0fk completion tokens",
+		float64(p.ProfilePromptTokens)/1000, float64(p.ProfileOutputTokens)/1000)
+	if p.ProfileCost <= 0 {
+		return tokens + "; free at declared prices"
+	}
+	return fmt.Sprintf("%s; %.4g at declared prices", tokens, p.ProfileCost)
 }
 
 func appendUnique(s []string, v string) []string {

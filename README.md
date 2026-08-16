@@ -338,6 +338,10 @@ automatic decision off.
 | DELETE | `/backends/{id}` | worker or admin | Remove an entry, its persisted row and its cached profile |
 | GET | `/backends` | admin | The fleet: quality, throughput, features, status |
 | GET | `/logs` | admin | Stored request logs |
+| — | `/admin/providers[/{id}]` | admin | CRUD over manually-entered endpoints |
+| — | `/admin/keys[/{id}]` | admin | Issue, list, disable and delete API keys |
+| — | `/admin/groups[/{id}]` | admin | CRUD over named groups |
+| POST | `/admin/login`, `/admin/logout` | password | Session cookie |
 | GET | `/` | none | Dashboard shell. Discloses nothing; the fleet table is fetched client-side with a token |
 
 `/logs` and `/backends` are admin-scoped, not client-scoped. Any client token
@@ -476,10 +480,13 @@ Everything lives in `internal/router/`.
 
 MIT — see [LICENSE](LICENSE).
 
-The repository redistributes a snapshot of questions and ground-truth answers
-from [LiveBench](https://livebench.ai) under the Apache License 2.0. Parts of
-that snapshot derive from material LiveBench does not own — competition problems
-copyright the Mathematical Association of America and the United Kingdom
-Mathematics Trust, both non-commercial-use-only. [NOTICE](NOTICE) carries those
-terms forward and says which subsets are affected. Read it before putting the
-benchmark data to commercial use.
+Two third-party snapshots ride along, both recorded in [NOTICE](NOTICE):
+
+- **LiveBench** questions and ground-truth answers, under the Apache License
+  2.0. Parts of that snapshot derive from material LiveBench does not own —
+  competition problems copyright the Mathematical Association of America and
+  the United Kingdom Mathematics Trust, both non-commercial-use-only. NOTICE
+  carries those terms forward and says which subsets are affected. **Read it
+  before putting the benchmark data to commercial use.**
+- **LiteLLM**'s model price and context-window table, under MIT, used to seed
+  prices on a manually-entered provider. Nothing to watch out for there.

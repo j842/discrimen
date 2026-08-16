@@ -84,10 +84,15 @@ type apiKey struct {
 // presented, which is not the same as "not allowed" — see requireClient.
 type identity struct {
 	Role string
-	// KeyID is the api_keys row, or 0 for a bootstrap environment token, which
-	// has no row and no per-key limits.
-	KeyID       int64
-	Name        string
+	// KeyID is the api_keys row, or 0 for an environment token, which has no row
+	// and no per-key limits.
+	KeyID int64
+	Name  string
+	// Anonymous marks a caller the router let through because it required no
+	// credential at all — the trusted-LAN case. Distinct from an environment
+	// token in the request log, where "nothing was asked for" and "one of the
+	// two shared secrets" are different facts about who was there.
+	Anonymous   bool
 	Models      []string
 	TokenBudget int64
 	TokensUsed  int64
@@ -98,7 +103,7 @@ type identity struct {
 // cannot be told apart), empty when the router required no credential at all.
 func (id *identity) logKeyID() string {
 	switch {
-	case id == nil:
+	case id == nil, id.Anonymous:
 		return ""
 	case id.KeyID > 0:
 		return strconv.FormatInt(id.KeyID, 10)
@@ -488,7 +493,7 @@ func (r *Router) requireClient(w http.ResponseWriter, req *http.Request) (*ident
 		// No client credential is configured at all: the historical open-fleet
 		// behaviour, kept for the trusted-LAN deployment. Bootstrap generates one
 		// on first run precisely so a public image never lands here.
-		return &identity{Role: roleClient, Name: "unauthenticated"}, true
+		return &identity{Role: roleClient, Anonymous: true, Name: "unauthenticated"}, true
 	}
 	unauthorized(w)
 	return nil, false
@@ -508,6 +513,14 @@ func (r *Router) requireWorker(w http.ResponseWriter, req *http.Request) bool {
 // workerAuthorized is requireWorker without the 401, for the one caller that
 // accepts either a worker or an admin and has to try both.
 func (r *Router) workerAuthorized(req *http.Request) bool {
+	// ROUTER_WORKER_TOKEN is checked here directly, ahead of identify, because
+	// identify resolves the client list first. Nothing ever forbade setting the
+	// same string as both ROUTER_WORKER_TOKEN and ROUTER_CLIENT_TOKENS, and a
+	// deployment that did would otherwise have its beacons identified as clients
+	// and refused at the registration endpoint they have always used.
+	if r.cfg != nil && r.cfg.WorkerToken != "" && authorizedAsWorker(req, r.cfg.WorkerToken) {
+		return true
+	}
 	if id := r.identify(req); id != nil {
 		switch id.Role {
 		case roleWorker, roleAdmin:

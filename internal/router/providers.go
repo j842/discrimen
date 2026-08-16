@@ -81,13 +81,6 @@ func normalizeProviderFields(reg *BackendRegistration) {
 // isManualRow reports whether a row is operator-owned.
 func isManualRow(b *Backend) bool { return b != nil && b.Source == sourceManual }
 
-// isMetered reports whether serving a token on this row costs money. Local
-// workers are free, which is what keeps the P4 cost rule simple enough to need
-// no tuning.
-func isMetered(b *Backend) bool {
-	return b != nil && (b.InputPricePerMtok > 0 || b.OutputPricePerMtok > 0)
-}
-
 // operatorDeclared is the set of values an OPERATOR entered by hand on this row,
 // or the zero registration when the row is a beacon (which owns nothing).
 //
@@ -148,6 +141,32 @@ func (r *Registry) manualRows() []*Backend {
 		}
 	}
 	return out
+}
+
+// ── Price ───────────────────────────────────────────────────────────────────
+//
+// Everything cost does to routing is below, and it is deliberately two
+// functions. Price is a declared fact about an endpoint, in the same category
+// as the `uncensored` tag, and NOT a routing knob: there is no cost weight to
+// tune, no price threshold to set and no budget mode. Free versus paid is a
+// binary derived from a declared price of zero, which is what makes the rule
+// need no tuning — every local worker declares zero, so "prefer the free ones"
+// is already right on the fleet this router grew up on.
+
+// isFreeBackend reports whether an endpoint costs nothing per token.
+func isFreeBackend(b *Backend) bool {
+	return b == nil || (b.InputPricePerMtok <= 0 && b.OutputPricePerMtok <= 0)
+}
+
+// tokenCost is what promptTokens in and outputTokens out cost at this row's
+// DECLARED prices, in whatever currency the operator is billed in. Zero for
+// every local worker, which is the truth and not a placeholder — see
+// isFreeBackend for why a zero here is load-bearing.
+func tokenCost(b *Backend, promptTokens, outputTokens int) float64 {
+	if b == nil {
+		return 0
+	}
+	return float64(promptTokens)/1e6*b.InputPricePerMtok + float64(outputTokens)/1e6*b.OutputPricePerMtok
 }
 
 // sameEndpointModel reports whether two rows describe the same servable thing.

@@ -35,9 +35,14 @@ import (
 )
 
 type Config struct {
-	Port               string
+	Port string
+	// Bootstrap credentials. Both stay because the compatibility contract freezes
+	// their names, and both are now only ONE of the ways in: since P3 the api_keys
+	// table carries per-caller keys with roles, and an empty value here means the
+	// database is canonical rather than that the surface is open (see
+	// bootstrapCredentials).
 	WorkerToken        string   // single token; auths POST /backends/register* + DELETE /backends/{id}
-	ClientTokens       []string // any-of list; auths /v1/*, /backends GET, /logs, /debug/*
+	ClientTokens       []string // any-of list; auths the /v1/* OpenAI surface
 	DefaultMaxTokens   int
 	HealthInterval     time.Duration
 	BackendHTTPTimeout time.Duration // whole-exchange cap for BUFFERED requests + probes (streams use the idle timeout instead)
@@ -535,7 +540,12 @@ type Router struct {
 	adapter      *tierAdapter          // nil unless online tier adaptation is enabled
 	judgeSem     chan struct{}         // bounds concurrent background judge calls; nil unless judging enabled
 	judgeCount   atomic.Uint64         // sample counter for background answer judging
+	judgePaid    judgeBudget           // rolling token allowance for grading with a PAID model (see judge.go)
 	profiling    sync.Map              // worker ids with a cold-start profile in flight (de-dups overlapping profiles)
+	// profileMeters holds a *profileMeter per worker id for the span of that
+	// worker's profiling run, so what the run consumed can be totalled onto the
+	// profile it produces. Empty at every other moment (see profile.go).
+	profileMeters sync.Map
 	gateAudited  atomic.Bool           // set once the thinking-gate-vs-tier audit has logged (model-independent)
 	sessions     *sessionTracker       // conversation → worker affinity; nil disables stickiness (see session.go)
 
@@ -834,7 +844,14 @@ func (r *Router) serveBenchmark(w http.ResponseWriter, req *http.Request, id str
 		"measured_at":   prof.MeasuredAt,
 		"profile_ms":    prof.ProfileMillis,
 		"profiled_in":   fmtProfileDuration(prof.ProfileMillis),
-		"results":       prof.BenchResults,
+		// What the run cost. Omitted entirely for a profile measured before the
+		// accounting existed, so a UI renders nothing rather than a confident zero
+		// (see WorkerProfile.ProfilePromptTokens).
+		"profile_prompt_tokens": prof.ProfilePromptTokens,
+		"profile_output_tokens": prof.ProfileOutputTokens,
+		"profile_cost":          prof.ProfileCost,
+		"profile_cost_measured": prof.ProfilePromptTokens > 0 || prof.ProfileOutputTokens > 0,
+		"results":               prof.BenchResults,
 	})
 }
 
@@ -1675,16 +1692,44 @@ type acquirePreference struct {
 	why string
 }
 
-// qualityFloorPreference prefers workers at or above the classified tier.
-func qualityFloorPreference(target int) acquirePreference {
-	if target <= 0 {
-		return acquirePreference{}
+// qualityFloorPreference is the bounded first choice for an ordinary request:
+// the workers at or above the classified tier and, among those, the FREE ones.
+//
+// Cost rides INSIDE the quality floor rather than beside it. PLAN.md's rule is
+// "among the workers that clear the quality bar, prefer the free ones, and
+// spill to a paid endpoint only when nothing free clears the bar or every free
+// candidate is saturated past the existing grace period" — which is one
+// preference set and the grace that already exists, not a second mechanism. Two
+// independent graces would also compose into a wait nobody budgeted for.
+//
+// The set is the first of these that is a non-empty, STRICT subset of the
+// candidates:
+//
+//  1. free and at/above the tier — the ordinary case, and the one PLAN.md
+//     describes;
+//  2. at/above the tier — every above-bar worker is paid, so there is nothing
+//     free to hold out for and the floor keeps its own grace unchanged.
+//
+// A subset that is the whole list is no preference at all, and returning one
+// would report every slow acquisition as a missed floor. target <= 0 (an
+// unclassified request, or the fallback ranker) makes the tier test vacuous and
+// leaves free-first on its own, which is what "prefer the free ones" means when
+// there is no bar to clear.
+func qualityFloorPreference(candidates []*Backend, target int) acquirePreference {
+	aboveBar := func(b *Backend) bool { return target <= 0 || b.Quality >= target }
+	tiers := []struct {
+		why  string
+		keep func(*Backend) bool
+	}{
+		{"free-first", func(b *Backend) bool { return aboveBar(b) && isFreeBackend(b) }},
+		{"quality-floor", aboveBar},
 	}
-	return acquirePreference{
-		keep: func(b *Backend) bool { return b.Quality >= target },
-		wait: qualityFloorWait,
-		why:  "quality-floor",
+	for _, tier := range tiers {
+		if n := len(filterCandidates(candidates, tier.keep)); n > 0 && n < len(candidates) {
+			return acquirePreference{keep: tier.keep, wait: qualityFloorWait, why: tier.why}
+		}
 	}
+	return acquirePreference{}
 }
 
 // sessionLockPreference prefers the worker that served the previous turn. It
@@ -1705,7 +1750,7 @@ func sessionLockPreference(incumbent string) acquirePreference {
 // pickAndAcquireWithFloor is pickAndAcquire under the quality-floor preference.
 // Retained as the named entry point for the floor policy (and its tests).
 func (r *Router) pickAndAcquireWithFloor(ctx context.Context, candidates []*Backend, target int) (*Backend, chan struct{}, bool, error) {
-	return r.pickAndAcquirePreferred(ctx, candidates, qualityFloorPreference(target))
+	return r.pickAndAcquirePreferred(ctx, candidates, qualityFloorPreference(candidates, target))
 }
 
 // pickAndAcquirePreferred is pickAndAcquire plus a bounded first-choice set.
@@ -1811,7 +1856,7 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 	// is open the session lock wins instead — handing a tool result to a model that
 	// never emitted the matching tool call breaks the loop outright, which is worse
 	// than serving that turn a tier low.
-	pref := qualityFloorPreference(target)
+	pref := qualityFloorPreference(candidates, target)
 	if plan.session.locked() {
 		pref = sessionLockPreference(plan.session.incumbent)
 	}
@@ -1842,14 +1887,23 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 	// was classified to need; this records that we couldn't honour it within the
 	// grace and served elsewhere.
 	if missedPref {
-		switch pref.why {
-		case "session-lock":
+		if pref.why == "session-lock" {
 			log.Printf("session lock: %s tool loop moved off incumbent=%s to backend=%s after %s grace — no incumbent slot freed",
 				route, plan.session.incumbent, backend.ID, sessionLockWait)
-		default:
-			w.Header().Set("X-LLM-Quality-Floor", "downgraded")
-			log.Printf("quality floor: %s served below target q>=%d on backend=%s (q=%d) after %s grace — no above-bar slot freed",
-				route, target, backend.ID, backend.Quality, qualityFloorWait)
+		} else {
+			// Read the two facts off the worker we actually landed on rather than
+			// off the preference: one missed floor can be a tier downgrade, a spill
+			// onto a paid endpoint, or both, and a slot that frees during the
+			// handover can make it neither.
+			if pref.why == "free-first" && !isFreeBackend(backend) {
+				log.Printf("cost: %s served on PAID backend=%s (in %g / out %g per Mtok) after %s grace — no free worker above the bar freed a slot",
+					route, backend.ID, backend.InputPricePerMtok, backend.OutputPricePerMtok, qualityFloorWait)
+			}
+			if target > 0 && backend.Quality < target {
+				w.Header().Set("X-LLM-Quality-Floor", "downgraded")
+				log.Printf("quality floor: %s served below target q>=%d on backend=%s (q=%d) after %s grace — no above-bar slot freed",
+					route, target, backend.ID, backend.Quality, qualityFloorWait)
+			}
 		}
 	}
 	// TTFT base: measure first-token latency from the moment we hold a worker
@@ -2700,6 +2754,10 @@ func (r *Router) speedProbe(backend *Backend) (float64, int64, error) {
 	if tokenCount == 0 {
 		tokens = math.Max(1, float64(len(out))/4.0) // non-delta dialect: fall back
 	}
+	// The one streamed probe, so it meters by hand. Completion tokens only: an SSE
+	// stream carries no prompt count, and the probe's prompt is ~30 tokens against
+	// a profile's several hundred thousand.
+	r.meterProfileTokens(backend.ID, 0, int(tokens))
 	// Decode throughput = tokens / (total − TTFT), so the certified speed reflects
 	// generation rate rather than end-to-end latency — consistent with the live
 	// EWMA fed by observe().
@@ -2818,6 +2876,12 @@ func (r *Router) backfillCachedProfile(id string, backend *Backend, prof *Worker
 		}
 	}
 
+	// ProfilePromptTokens/ProfileOutputTokens/ProfileCost get NO clause, and that
+	// is the answer rather than an omission: they describe a run that has already
+	// happened, and the only way to re-derive them is to pay for another one. A
+	// profile cached before they existed keeps its zero, which reads as "not
+	// measured" and never as "free" — see the field comment for why the token
+	// count is what carries that distinction.
 	if prof.PrefillTPS != 0 {
 		return
 	}
@@ -2929,6 +2993,7 @@ func (r *Router) prefillProbeOnce(backend *Backend, salt uint32) (float64, error
 		return 0, err
 	}
 	elapsed := time.Since(start).Seconds()
+	r.meterProfileUsage(backend.ID, raw) // dials the endpoint itself, so it meters itself
 	// Trust the worker's OWN prompt_tokens rather than a word-count estimate:
 	// tokenisers differ enough between model families to bias the rate systematically.
 	promptTokens := 0.0
@@ -3169,6 +3234,10 @@ func (r *Router) doCompletion(ctx context.Context, client *http.Client, backend 
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, err
 	}
+	// Every non-streamed probe and every benchmark question funnels through here,
+	// so this one line is the whole cost accounting for a profiling run. A no-op
+	// unless that endpoint is being profiled right now (see profileMeter).
+	r.meterProfileUsage(backend.ID, raw)
 	return raw, nil
 }
 
@@ -3565,6 +3634,14 @@ func rankBackends(candidates []*Backend, job jobCost) []*Backend {
 		sa, sb := backendScore(a), backendScore(b)
 		if sa != sb {
 			return sa > sb
+		}
+		// 2.25 Equal score → take the free one. There is no quality bar on this
+		//      path (the classifier is unavailable), so cost only gets to separate
+		//      workers this ranker already considers interchangeable. Holding a
+		//      request off a paid endpoint entirely is the acquire step's job, not
+		//      this one — see qualityFloorPreference.
+		if af, bf := isFreeBackend(a), isFreeBackend(b); af != bf {
+			return af
 		}
 		// 2.5 Equal score → prefer the one expected to finish sooner under current
 		//     load (live prefill/decode rates + queue occupancy). Only breaks exact

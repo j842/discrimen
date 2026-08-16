@@ -1,9 +1,11 @@
 package router
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -315,5 +317,241 @@ func TestAdminProviderSeedsFromPriceData(t *testing.T) {
 	}
 	if ctx, _ := row["context_k"].(float64); ctx <= 0 {
 		t.Errorf("context window not seeded: %v", row["context_k"])
+	}
+}
+
+// ── Admin session ───────────────────────────────────────────────────────────
+
+// passwordRouter is a router whose admin password is set, without an admin key,
+// so the session path is the only way in.
+//
+// The stored hash is written at a low iteration count. verifyPassword reads the
+// cost out of the hash, so the production verification path is exercised
+// unchanged — this only avoids paying 600k rounds of PBKDF2 per test setup,
+// which under -race is most of the suite's runtime. TestPasswordHashing covers
+// the real cost.
+func passwordRouter(t *testing.T, password string) *Router {
+	t.Helper()
+	r := &Router{cfg: &Config{}, registry: newTestRegistry(), logs: newTestLogStore(t)}
+	hash, err := hashPasswordIter(password, 1000)
+	if err != nil {
+		t.Fatalf("hashPassword: %v", err)
+	}
+	if err := r.logs.SaveSetting(t.Context(), settingAdminPasswordHash, hash); err != nil {
+		t.Fatalf("SaveSetting: %v", err)
+	}
+	return r
+}
+
+func TestAdminSessionLifecycle(t *testing.T) {
+	const password = "a-long-enough-password"
+	r := passwordRouter(t, password)
+
+	// A wrong password gets nothing, in the OpenAI envelope.
+	rec := httptest.NewRecorder()
+	r.routes().ServeHTTP(rec, post("/admin/login", `{"password":"nope"}`, ""))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong password = %d, want 401", rec.Code)
+	}
+	if len(rec.Result().Cookies()) != 0 {
+		t.Error("a failed login set a cookie")
+	}
+	errorEnvelopeOf(t, rec)
+
+	// The right one issues a session.
+	rec = httptest.NewRecorder()
+	r.routes().ServeHTTP(rec, post("/admin/login", `{"password":"`+password+`"}`, ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("login = %d: %s", rec.Code, rec.Body.String())
+	}
+	cookies := rec.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("login set %d cookies", len(cookies))
+	}
+	session := cookies[0]
+	if session.Name != adminCookie {
+		t.Errorf("cookie name = %q", session.Name)
+	}
+	if !session.HttpOnly {
+		t.Error("the session cookie is readable from JavaScript")
+	}
+	if session.SameSite != http.SameSiteLaxMode {
+		t.Errorf("SameSite = %v, want Lax", session.SameSite)
+	}
+	if session.Secure {
+		t.Error("Secure was set on a plain-HTTP request, which makes the cookie unusable on a LAN deployment")
+	}
+	if session.MaxAge <= 0 || time.Duration(session.MaxAge)*time.Second != adminSessionTTL {
+		t.Errorf("MaxAge = %d, want the bounded %s", session.MaxAge, adminSessionTTL)
+	}
+	if session.Value == "" || strings.Contains(session.Value, password) {
+		t.Errorf("session token is empty or carries the password: %q", session.Value)
+	}
+
+	// The cookie is admin everywhere the bearer key would be.
+	withSession := func(method, path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, nil)
+		req.AddCookie(session)
+		rec := httptest.NewRecorder()
+		r.routes().ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := withSession(http.MethodGet, "/backends"); rec.Code != http.StatusOK {
+		t.Fatalf("session did not authorise /backends: %d", rec.Code)
+	}
+	if rec := withSession(http.MethodGet, "/admin/session"); !strings.Contains(rec.Body.String(), `"admin":true`) {
+		t.Errorf("/admin/session with a session = %s", rec.Body.String())
+	}
+
+	// Logout invalidates it SERVER-SIDE: a client that keeps the cookie is still
+	// locked out, which a cookie-clearing logout alone would not achieve.
+	req := httptest.NewRequest(http.MethodPost, "/admin/logout", nil)
+	req.AddCookie(session)
+	rec = httptest.NewRecorder()
+	r.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("logout = %d", rec.Code)
+	}
+	if rec := withSession(http.MethodGet, "/backends"); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("a revoked session still works: %d", rec.Code)
+	}
+}
+
+// TestAdminSessionSecureOverTLS: the cookie is Secure when — and only when — the
+// request arrived over TLS. Unconditional would break the plain-HTTP LAN
+// deployment outright; never would leak the session on a reverse-proxied one.
+func TestAdminSessionSecureOverTLS(t *testing.T) {
+	const password = "a-long-enough-password"
+	r := passwordRouter(t, password)
+	req := post("https://router.example.com/admin/login", `{"password":"`+password+`"}`, "")
+	req.TLS = &tls.ConnectionState{}
+	rec := httptest.NewRecorder()
+	r.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("login = %d: %s", rec.Code, rec.Body.String())
+	}
+	if c := rec.Result().Cookies(); len(c) != 1 || !c[0].Secure {
+		t.Fatalf("cookie over TLS is not Secure: %+v", c)
+	}
+}
+
+func TestAdminPasswordChange(t *testing.T) {
+	r := passwordRouter(t, "the-original-password")
+	issueKey(t, r, adminSecret, apiKey{Role: roleAdmin, Name: "admin"})
+
+	change := func(body string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		r.routes().ServeHTTP(rec, post("/admin/password", body, adminSecret))
+		return rec
+	}
+	// The current password is required even holding an admin credential: a
+	// session left open on a shared machine must not lock the operator out.
+	if rec := change(`{"current_password":"wrong","new_password":"a-new-long-password"}`); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong current password = %d, want 401", rec.Code)
+	}
+	if rec := change(`{"current_password":"the-original-password","new_password":"short"}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("short new password = %d, want 400", rec.Code)
+	}
+	if rec := change(`{"current_password":"the-original-password","new_password":"a-new-long-password"}`); rec.Code != http.StatusOK {
+		t.Fatalf("change = %d: %s", rec.Code, rec.Body.String())
+	}
+	hash, _ := r.logs.LoadSetting(t.Context(), settingAdminPasswordHash)
+	if !verifyPassword(hash, "a-new-long-password") || verifyPassword(hash, "the-original-password") {
+		t.Fatal("the stored password was not replaced")
+	}
+	// And unauthenticated callers never get there.
+	rec := httptest.NewRecorder()
+	r.routes().ServeHTTP(rec, post("/admin/password", `{"current_password":"a-new-long-password","new_password":"another-long-one"}`, ""))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated password change = %d, want 401", rec.Code)
+	}
+}
+
+// ── Key CRUD ────────────────────────────────────────────────────────────────
+
+func TestAdminKeyCRUD(t *testing.T) {
+	r := adminRouter(t)
+
+	rec := serveAdmin(r, adminReq(http.MethodPost, "/admin/keys",
+		`{"name":"harness","role":"client","models":["gemma4"],"token_budget":5000}`))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create = %d: %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		Key    apiKey `json:"key"`
+		Secret string `json:"secret"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("create response is not JSON: %v", err)
+	}
+	if !strings.HasPrefix(created.Secret, keyPrefix) {
+		t.Fatalf("no secret in the create response: %s", rec.Body.String())
+	}
+	if created.Key.Role != roleClient || created.Key.TokenBudget != 5000 || len(created.Key.Models) != 1 {
+		t.Errorf("stored key wrong: %+v", created.Key)
+	}
+
+	// Shown ONCE: the list never carries it.
+	rec = serveAdmin(r, adminReq(http.MethodGet, "/admin/keys", ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list = %d", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), created.Secret) {
+		t.Fatal("the key list carries the plaintext secret")
+	}
+	if !strings.Contains(rec.Body.String(), created.Key.Prefix) {
+		t.Error("the key list does not show the prefix, so a key cannot be identified")
+	}
+
+	// The role is immutable.
+	id := strconv.FormatInt(created.Key.ID, 10)
+	if rec := serveAdmin(r, adminReq(http.MethodPatch, "/admin/keys/"+id, `{"role":"admin"}`)); rec.Code != http.StatusConflict {
+		t.Fatalf("re-roling a key = %d, want 409: %s", rec.Code, rec.Body.String())
+	}
+
+	// Disabling is a revoke, and it takes effect immediately.
+	if _, ok := r.logs.LookupAPIKey(t.Context(), created.Secret); !ok {
+		t.Fatal("the new key does not authenticate")
+	}
+	if rec := serveAdmin(r, adminReq(http.MethodPatch, "/admin/keys/"+id, `{"enabled":false}`)); rec.Code != http.StatusOK {
+		t.Fatalf("disable = %d: %s", rec.Code, rec.Body.String())
+	}
+	if _, ok := r.logs.LookupAPIKey(t.Context(), created.Secret); ok {
+		t.Fatal("a disabled key still authenticates")
+	}
+
+	if rec := serveAdmin(r, adminReq(http.MethodDelete, "/admin/keys/"+id, "")); rec.Code != http.StatusOK {
+		t.Fatalf("delete = %d", rec.Code)
+	}
+	if rec := serveAdmin(r, adminReq(http.MethodDelete, "/admin/keys/"+id, "")); rec.Code != http.StatusNotFound {
+		t.Fatalf("deleting twice = %d, want 404", rec.Code)
+	}
+}
+
+func TestAdminKeyValidation(t *testing.T) {
+	r := adminRouter(t)
+	for _, tc := range []struct {
+		name, body string
+		status     int
+	}{
+		{"unknown role", `{"role":"superuser"}`, http.StatusBadRequest},
+		{"negative budget", `{"role":"client","token_budget":-1}`, http.StatusBadRequest},
+		{"bad json", `{`, http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := serveAdmin(r, adminReq(http.MethodPost, "/admin/keys", tc.body))
+			if rec.Code != tc.status {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, tc.status, rec.Body.String())
+			}
+			errorEnvelopeOf(t, rec)
+		})
+	}
+	// Role defaults to client, which is the one anybody wants most of the time.
+	rec := serveAdmin(r, adminReq(http.MethodPost, "/admin/keys", `{"name":"unspecified"}`))
+	if rec.Code != http.StatusCreated || !strings.Contains(rec.Body.String(), `"role":"client"`) {
+		t.Fatalf("default role: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := serveAdmin(r, adminReq(http.MethodPatch, "/admin/keys/not-a-number", `{}`)); rec.Code != http.StatusNotFound {
+		t.Errorf("non-numeric key id = %d, want 404", rec.Code)
 	}
 }

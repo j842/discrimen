@@ -605,6 +605,20 @@ func rankByDifficulty(candidates []*Backend, target int, job jobCost) []*Backend
 		if !am && a.Quality != b.Quality {
 			return a.Quality > b.Quality
 		}
+		// 3.5 Among those that CLEAR the bar, prefer the free ones (PLAN.md, P4).
+		//     Deliberately scoped to the above-bar group: below the bar the router
+		//     has already missed the quality it wanted, and buying a worse answer
+		//     to save money there is not a trade anyone asked for. Above it every
+		//     survivor is good enough by construction, so cost is free to decide.
+		//
+		//     This is only the ORDER. Refusing to spend is the acquire step's job:
+		//     qualityFloorPreference holds the request on the free set for the
+		//     existing grace before it will touch a paid endpoint at all.
+		if am {
+			if af, bf := isFreeBackend(a), isFreeBackend(b); af != bf {
+				return af
+			}
+		}
 		// 4. Otherwise pick whichever will FINISH FIRST — expected completion time
 		//    for THIS job from live prefill/decode rates + queue occupancy. For
 		//    backends that clear the bar this replaces "cheapest tier": slow workers

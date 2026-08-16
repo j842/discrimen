@@ -3,11 +3,12 @@ package router
 // benchmarkQuestions grades a worker's quality and — crucially — SPREADS the fleet,
 // so difficulty routing has real signal to work with (autoTargetQuality reads the
 // score as an absolute 0–100 bar; if every worker scores the same the bar stops
-// distinguishing them and routing is pure speed). Quality is a WEIGHTED score (v34): tiers 1–10
-// share 70 points pro-rata, tier 11+ shares 30 — so a model that sweeps 1–10 but cannot
-// touch the insight tier caps at 70, and the top 30 points are earned only where top
-// models actually differ. Each bucket is count-independent, so questions can be added
-// freely within a bucket without rescaling (see runQualityBenchmark in benchmark.go).
+// distinguishing them and routing is pure speed). Quality is a WEIGHTED score (v34/v35):
+// tiers 1–10 share 60 points pro-rata, tier 11 shares 20, tier 12+ shares 20 — so a model
+// that sweeps 1–10 but can touch neither hard band caps at 60, and the top 40 points are
+// earned only where top models actually differ. Each bucket is count-independent, so
+// questions can be added freely within a bucket without rescaling (see benchWeightedScore
+// in benchmark.go).
 //
 // Each question is graded in the MODE THE ROUTER SERVES THAT DIFFICULTY IN: the easy
 // tiers (below benchHardTier) thinking-off, the hard tiers thinking-on — so a worker is
@@ -51,6 +52,11 @@ package router
 //	         closed-form shortcut; grinding exceeds the 16k thinking budget, insight answers
 //	         in ~1k tokens. The first tier that separates a 27B from a 284B (see the tier's
 //	         own comment block for the measured spread and everything that DIDN'T work).
+//	Tier 12 — programming (thinking-on): trace a short program, give its exact output. The
+//	         only tier that measures whether a worker can be handed a codebase rather than
+//	         a puzzle; every tier above measures reasoning in the abstract. Answers are
+//	         facts about the language, so they grade exactly with no execution. Sourced by
+//	         abstracting real production bugs (see the tier's own comment block).
 //
 // WHAT ACTUALLY SPREADS THE TOP, MEASURED. Two whole tiers have been built and thrown away
 // getting to the current 9 and 10, and the per-tier numbers off the live fleet
@@ -382,4 +388,132 @@ var benchmarkQuestions = []benchmarkQ{
 	{Tier: 11, Prompt: "Consider the positive integers whose base-8 (octal) representation contains no digit 5, listed in increasing order. What is the 300th such integer, expressed in ordinary base 10? Give the number only.", Expect: "455", Match: "numeric"},
 	{Tier: 11, Prompt: "Consider the positive integers whose base-7 representation contains no digit 3, listed in increasing order. What is the SUM of the first 40 such integers (the sum expressed in ordinary base 10)? Give the number only.", Expect: "1121", Match: "numeric"},
 	{Tier: 11, Prompt: "How many positive integers less than 1,000,000 have digits whose PRODUCT is exactly 96? Give the number only.", Expect: "1462", Match: "numeric"},
+
+	// TIER 12 — PROGRAMMING / CODING-AGENT FITNESS (thinking-on).
+	//
+	// Every tier above measures reasoning in the abstract. None of them answer the
+	// question actually being asked when a worker is handed a codebase: can it read code
+	// exactly? benchgen.go deliberately excludes LiveBench's coding and agentic_coding
+	// categories because they need execution, so this gap does not close by itself.
+	//
+	// The shape that works here is a TRACE: a short program with one counter-intuitive
+	// interaction, answered by its exact output. The answer is a fact about the language,
+	// so checkAnswer can grade it exactly and no execution is needed at profiling time.
+	//
+	// SOURCED FROM REAL BUGS, then abstracted. Each item shares its failure mode with a
+	// commit from two months of production work across a Go router, an agent platform, a
+	// deploy tool and its bash templates, a Python portal and a Kotlin app — mined for the
+	// shape of the trap rather than the code. Nothing here names a real host, repo or
+	// service. The recurring class across all of it, and the one this tier keeps hitting:
+	// absent/unknown is a distinct third state from negative.
+	//
+	// WHAT DIDN'T WORK, recorded so it isn't retried. 47 multiple-choice questions were
+	// authored alongside these and ALL were cut. In every one the correct option was the
+	// longest (chance ~20%): the answer had been written with its full justification and
+	// the distractors as one-liners. Measured against the fleet, an 8B with no thinking
+	// mode scored 79% on them versus 45% on the traces, and the q94 worker scored 100% —
+	// 21 points of spread against the traces' 51. They were measuring option length. If
+	// MCQ is ever revisited here, length-match every option first and re-calibrate.
+	//
+	// CALIBRATION. 95 candidates were graded against 4 live workers spanning q59-q94 and
+	// cut by item analysis (D = top-half pass rate minus bottom-half, the same statistic
+	// benchgen_emit.go uses); 28 survived with D > 0. Answer keys were verified by
+	// EXECUTING every program, which is how the negative-number grader fault in
+	// benchNumberRe was found. Measured spread: 39.6 / 68.8 / 87.5 / 97.9 percent, and
+	// Spearman rho against the existing q is +1.00 — this tier ranks the fleet the same
+	// way tiers 1-11 do, so it is measuring capability rather than an artefact; its value
+	// is holding a programming-specific measurement where the general tiers saturate.
+	//
+	// NOISE, stated honestly: 6 of 33 re-answered cells (18%) flipped verdict at
+	// temperature 0. With two workers per half a single flip moves D by 0.50, so the
+	// [11..] items are the trustworthy ones and the rest are one flip from D=0. Items
+	// whose verdict was directly observed to flip are marked UNSTABLE below. Anything
+	// re-calibrated here should be run several times and kept by majority verdict.
+	//
+	// The per-item comments are: the trap, then p (pass rate) and D (discrimination) with
+	// the observed pass pattern across the four workers, best-quality first.
+	// deferred functions run after the return VALUE is copied, so mutating a non-named local changes nothing
+	// p=0.50 D=+1.00 [11..]
+	{Tier: 12, Prompt: "This Go program prints one number. What is it?\n\npackage main\n\nimport \"fmt\"\n\nfunc f() int {\n\tn := 0\n\tfor i := 0; i < 3; i++ {\n\t\tdefer func() { n++ }()\n\t}\n\treturn n\n}\n\nfunc main() { fmt.Println(f()) }\n\nGive the number only.", Expect: "0", Match: "numeric"},
+	// declaring and assigning on one line makes the declaration's status the exit status, hiding the command's failure
+	// p=0.50 D=+1.00 [11..]
+	{Tier: 12, Prompt: "What does this bash script print?\n\nf() { local x=$(false); echo \"$?\"; }\nf\n\nGive the number only.", Expect: "0", Match: "numeric"},
+	// a nil *T stored in an error interface is not equal to nil; the happy path reports failure
+	// p=0.50 D=+1.00 [11..]
+	{Tier: 12, Prompt: "This Go program prints one number. What is it?\n\npackage main\n\nimport \"fmt\"\n\ntype MyErr struct{}\n\nfunc (e *MyErr) Error() string { return \"boom\" }\n\nfunc mayFail(ok bool) error {\n\tvar p *MyErr\n\tif !ok {\n\t\tp = &MyErr{}\n\t}\n\treturn p\n}\n\nfunc main() {\n\tn := 0\n\tif mayFail(true) != nil {\n\t\tn++\n\t}\n\tfmt.Println(n)\n}\n\nGive the number only.", Expect: "1", Match: "numeric"},
+	// errexit is disabled inside a function used as a condition; the function runs to completion
+	// p=0.50 D=+1.00 [11..]
+	{Tier: 12, Prompt: "How many lines does this bash script print in total?\n\nset -e\nf() { false; echo reached; }\nif f; then echo yes; else echo no; fi\necho end\n\nGive the number only.", Expect: "3", Match: "numeric"},
+	// a narrowing integer conversion wraps silently; Go will not warn and the value is not clamped
+	// p=0.50 D=+1.00 [11..]
+	{Tier: 12, Prompt: "This Go program prints one number. What is it?\n\npackage main\n\nimport \"fmt\"\n\nfunc main() {\n\tvar x int32 = 300\n\tfmt.Println(int8(x))\n}\n\nGive the number only.", Expect: "44", Match: "numeric"},
+	// an early-exiting pipe consumer SIGPIPEs the producer; pipefail surfaces it as 141
+	// p=0.50 D=+1.00 [11..]
+	{Tier: 12, Prompt: "What does this bash script print?\n\nset -o pipefail\nseq 1 200000 | head -1 > /dev/null\necho $?\n\nGive the number only.", Expect: "141", Match: "numeric"},
+	// append into spare capacity writes through the shared backing array, mutating the original slice
+	// p=0.50 D=+1.00 [11..]
+	{Tier: 12, Prompt: "This Go program prints one number. What is it?\n\npackage main\n\nimport \"fmt\"\n\nfunc main() {\n\ta := make([]int, 3, 5)\n\ta[0], a[1], a[2] = 1, 2, 3\n\t_ = append(a[:2], 9)\n\tfmt.Println(a[2])\n}\n\nGive the number only.", Expect: "9", Match: "numeric"},
+	// defining __eq__ sets __hash__ to None, so the class silently stops being usable in a set or as a dict key
+	// p=0.50 D=+1.00 [11..]  UNSTABLE
+	{Tier: 12, Prompt: "In Python 3, what happens when this runs? Answer in one short phrase.\n\nclass A:\n    def __eq__(self, other):\n        return True\n\nprint(len({A(), A()}))\n", Expect: "unhashable", Match: "contains"},
+	// grep -c prints 0 AND exits 1 on no match, so the || fallback appends a second line
+	// p=0.50 D=+1.00 [11..]
+	{Tier: 12, Prompt: "What does this bash script print?\n\nn=$(printf 'x\\ny\\n' | grep -c 'ZZZ' || echo 0)\necho \"${#n}\"\n\nGive the number only.", Expect: "3", Match: "numeric"},
+	// a comprehension's first iterable is evaluated in the enclosing scope, but its body and conditions cannot see class scope
+	// p=0.25 D=+0.50 [1...]
+	{Tier: 12, Prompt: "In Python 3, this class body raises NameError. Which LINE raises it? Count the \"class C:\" line as line 1.\n\nclass C:\n    xs = [1, 2, 3]\n    ys = [x * 2 for x in xs]\n    ws = [y for y in range(3) if y in xs]\n\nGive the line number only.", Expect: "4", Match: "numeric"},
+	// the exception name is deleted at the end of the except block; inside a function that is UnboundLocalError, not NameError
+	// p=0.25 D=+0.50 [1...]
+	{Tier: 12, Prompt: "In Python 3, running this raises an exception. Name the exception type exactly (one word).\n\ndef f():\n    try:\n        1 / 0\n    except Exception as e:\n        pass\n    return e\n\nf()\n", Expect: "UnboundLocalError", Match: "contains"},
+	// IFS whitespace collapses consecutive delimiters; a legitimately-empty middle field shifts every later field left
+	// p=0.25 D=+0.50 [1...]
+	{Tier: 12, Prompt: "What does this bash script print?\n\nprintf 'a\\t\\tc\\n' | while IFS=$'\\t' read -r x y z; do echo \"${#x}${#y}${#z}\"; done\n\nGive only the output.", Expect: "110", Match: "numeric"},
+	// the `in` operator tests identity before equality, so a NaN already in the list is found but a fresh one is not
+	// p=0.75 D=+0.50 [111.]
+	{Tier: 12, Prompt: "In Python, this program prints one number. What is it?\n\nn = float('nan')\nvalues = [n]\ncount = 0\nif n in values: count += 1\nif float('nan') in values: count += 1\nprint(count)\n\nGive the number only.", Expect: "1", Match: "numeric"},
+	// len() on a string is bytes; converting to []rune gives characters — mixing them corrupts any non-ASCII slice offset
+	// p=0.75 D=+0.50 [111.]
+	{Tier: 12, Prompt: "This Go program prints one number. What is it?\n\npackage main\n\nimport \"fmt\"\n\nfunc main() {\n\ts := \"\\u65e5\\u672c\"\n\tfmt.Println(len(s) + len([]rune(s)))\n}\n\nGive the number only.", Expect: "8", Match: "numeric"},
+	// an unquoted empty variable vanishes by word-splitting, leaving a one-argument test that is always true
+	// p=0.75 D=+0.50 [111.]
+	{Tier: 12, Prompt: "This bash script prints one number. What is it?\n\nv=\"\"\nn=0\nif [ -n $v ]; then n=$((n+1)); fi\nif [ -n \"$v\" ]; then n=$((n+1)); fi\necho \"$n\"\n\nGive the number only.", Expect: "1", Match: "numeric"},
+	// strings.TrimLeft takes a cutset, not a prefix — Go's mirror of Python's str.strip trap
+	// p=0.75 D=+0.50 [11.1]  UNSTABLE
+	{Tier: 12, Prompt: "This Go program prints one number. What is it?\n\npackage main\n\nimport (\"fmt\"; \"strings\")\n\nfunc main() {\n\tfmt.Println(len(strings.TrimLeft(\"filename.tar\", \"fil\")))\n}\n\nGive the number only.", Expect: "9", Match: "numeric"},
+	// yielding from a finally block during close() refuses the GeneratorExit; cleanup that awaits or yields is not cleanup
+	// p=0.75 D=+0.50 [111.]
+	{Tier: 12, Prompt: "In Python 3, this raises an exception. Quote the exception MESSAGE exactly (not the type).\n\ndef g():\n    try:\n        yield 1\n    finally:\n        yield 2\n\nit = g()\nnext(it)\nit.close()\n", Expect: "ignored GeneratorExit", Match: "contains"},
+	// len() counts bytes while range counts runes; any offset arithmetic mixing the two corrupts non-ASCII input
+	// p=0.75 D=+0.50 [111.]
+	{Tier: 12, Prompt: "This Go program prints one number. What is it?\n\npackage main\n\nimport \"fmt\"\n\nfunc main() {\n\ts := \"h\\u00e9llo\"\n\tn := 0\n\tfor range s {\n\t\tn++\n\t}\n\tfmt.Println(len(s) + n)\n}\n\nGive the number only.", Expect: "11", Match: "numeric"},
+	// os.path.join discards everything before an absolute component, so a base directory is not a sandbox
+	// p=0.75 D=+0.50 [111.]
+	{Tier: 12, Prompt: "In Python, what does this print?\n\nimport os\nprint(len(os.path.join(\"/var/data/uploads\", \"/etc/passwd\")))\n\nGive the number only.", Expect: "11", Match: "numeric"},
+	// list multiplication copies the reference, not the object, so all rows are the same list
+	// p=0.75 D=+0.50 [111.]
+	{Tier: 12, Prompt: "In Python, this program prints one number. What is it?\n\ngrid = [[]] * 3\ngrid[0].append(1)\nprint(sum(len(row) for row in grid))\n\nGive the number only.", Expect: "3", Match: "numeric"},
+	// True, 1 and 1.0 hash and compare equal, so they are one key
+	// p=0.75 D=+0.50 [111.]
+	{Tier: 12, Prompt: "In Python 3, what does this print?\n\nprint(len({1: 'a', True: 'b', 1.0: 'c'}))\n\nGive the number only.", Expect: "1", Match: "numeric"},
+	// cp -a SRC DST copies INTO DST when DST already exists, producing a nested tree a fallback path then deploys
+	// p=0.75 D=+0.50 [111.]
+	{Tier: 12, Prompt: "In bash, directory src/ contains one file f, and an empty directory dst/ already exists. After running:\n\ncp -a src dst\n\nwhat is the full path of file f's copy? Give only the path.", Expect: "dst/src/f", Match: "contains"},
+	// lexicographic sort of numerically-indexed names; only breaks once there are 10 or more, which is why it ships
+	// p=0.75 D=+0.50 [111.]
+	{Tier: 12, Prompt: "In Python, what does this print?\n\nnames = [\"part2\", \"part10\", \"part1\"]\nprint(sorted(names).index(\"part2\"))\n\nGive the number only.", Expect: "2", Match: "numeric"},
+	// the right-hand side of a pipeline runs in a subshell, so accumulated state is lost
+	// p=0.75 D=+0.50 [111.]
+	{Tier: 12, Prompt: "What does this bash script print?\n\nn=0\nprintf 'a\\nb\\nc\\n' | while read -r l; do n=$((n+1)); done\necho \"$n\"\n\nGive the number only.", Expect: "0", Match: "numeric"},
+	// comparison operators chain, so `a in b == c` means `(a in b) and (b == c)` — not what it reads like
+	// p=0.75 D=+0.50 [111.]  UNSTABLE
+	{Tier: 12, Prompt: "In Python 3, what does this print?\n\nprint(int(1 in [1] == True))\n\nGive the number only.", Expect: "0", Match: "numeric"},
+	// a sub-slice shares the backing array; appending to it overwrites the parent's later element
+	// p=0.75 D=+0.50 [111.]
+	{Tier: 12, Prompt: "This Go program prints one number. What is it?\n\npackage main\n\nimport \"fmt\"\n\nfunc main() {\n\ts := []int{1, 2, 3, 4}\n\tt := s[1:3]\n\t_ = append(t, 99)\n\tfmt.Println(s[3])\n}\n\nGive the number only.", Expect: "99", Match: "numeric"},
+	// printf %d parses a leading zero as octal, so a zero-padded counter or date field silently changes value
+	// p=0.75 D=+0.50 [11.1]  UNSTABLE
+	{Tier: 12, Prompt: "What does this bash command print?\n\nprintf '%d\\n' 010\n\nGive the number only.", Expect: "8", Match: "numeric"},
+	// Python floors toward negative infinity and modulo takes the divisor's sign, unlike C/Go/Java. (+10 keeps the answer positive: the router's numeric grader cannot match a negative expect.)
+	// p=0.75 D=+0.50 [111.]
+	{Tier: 12, Prompt: "In Python 3, what does this print?\n\nprint((-5 // 2) + (-5 % 2) + 10)\n\nGive the number only.", Expect: "8", Match: "numeric"},
 }

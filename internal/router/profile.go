@@ -57,8 +57,8 @@ type WorkerProfile struct {
 	ProfileMillis   int64            `json:"profile_ms,omitempty"` // wall time of the full cold-start profile (capacity ramp + quality benchmark)
 	// What the run that produced this profile consumed, and what that cost at the
 	// endpoint's declared prices. Profiling a paid model spends real money — the
-	// set is 102 questions, 94 of them graded thinking-on with a 16k ceiling, so a
-	// cold profile lands near 200-300k output tokens — and a number nobody can see
+	// set is 130 questions, 122 of them graded thinking-on with a 16k ceiling, so a
+	// cold profile lands near 250-400k output tokens — and a number nobody can see
 	// is a number nobody can budget for (PLAN.md, "Known costs").
 	//
 	// A ZERO token count means NOT MEASURED, not free: every profile cached before

@@ -119,9 +119,9 @@ The result is cached per `(endpoint id, model)` in SQLite, so a restart is
 **instant**: same id, same model, profile reloaded, no re-measurement. Only a
 brand-new endpoint or a changed model pays the cost again.
 
-On a paid endpoint, that cost is money. The benchmark is 102 questions, most of
+On a paid endpoint, that cost is money. The benchmark is 130 questions, 122 of
 them graded thinking-on with a 16k token ceiling, so a cold profile lands
-somewhere near 200-300k output tokens. Once. See
+somewhere near 250-400k output tokens. Once. See
 [docs/benchmark.md](docs/benchmark.md) for the whole question set and its answer
 key.
 

@@ -74,12 +74,15 @@ import (
 // absolute 0-100 scale, so pre-v33 and post-v34 workers were being compared on scales that
 // no longer meant the same thing. Bumped here to 34 to invalidate them and re-measure.
 // TestBenchmarkVersionCoversScoringChanges now fails CI if this happens again.
-const benchmarkVersion = 34
+// v35: tier 12 (programming / coding-agent fitness) added, and the weighted score grew a
+// THIRD bucket for it. Also: the numeric grader now keeps the sign (benchNumberRe), which
+// silently mis-graded any negative answer in both directions — see the var block.
+const benchmarkVersion = 35
 
 // benchmarkQ is one graded question in the cold-start quality benchmark. The
 // question set lives in benchmark_data.go.
 type benchmarkQ struct {
-	Tier   int    // difficulty band 1 (control) … 11 (budget-bounded insight); also sets grading mode — tiers >= benchHardTier are graded thinking-on (see benchmark_data.go)
+	Tier   int    // difficulty band 1 (control) … 11 (budget-bounded insight) … 12 (programming); also sets grading mode — tiers >= benchHardTier are graded thinking-on (see benchmark_data.go)
 	Prompt string // user prompt sent to the worker
 	Expect string // expected answer token (see Match)
 	Match  string // "contains" | "numeric" | "mcq" | "final-contains" (see checkAnswer)
@@ -100,7 +103,15 @@ type BenchResult struct {
 }
 
 var (
-	benchNumberRe = regexp.MustCompile(`[0-9]+(?:\.[0-9]+)?`)
+	// v35: the sign is part of the number. Without `-?` a question whose Expect is
+	// negative could never match — every extraction tier dropped the minus before
+	// numericMatches compared — and, worse, the reverse graded as a PASS: Expect "2"
+	// against an answer of "-2" read as 2. Nothing in tiers 1–11 has a negative answer,
+	// so the fault was dormant and would have surfaced as a model getting an easy
+	// question wrong rather than as a grader fault. The sign is only taken when it is
+	// adjacent to the digits, so a spaced subtraction ("10 - 3 = 7") still reads its
+	// operands unsigned.
+	benchNumberRe = regexp.MustCompile(`-?[0-9]+(?:\.[0-9]+)?`)
 	// mcq pick extraction, tried in priority order by checkAnswer: an explicit
 	// declaration ("the answer is B", "Answer: C"), a letter leading the answer
 	// ("C. because…", "(B)"), then the last standalone letter. The fallback class
@@ -139,7 +150,9 @@ var (
 	// "total: 16", "5 is the answer") is graded first — the LAST declaration, so a
 	// self-correction ("…= 2 … wait, actually the answer is 1") grades by its final
 	// claim — then a leading-clause assertion (benchLeadNumber), then the last number.
-	benchNumDeclaredRe = regexp.MustCompile(`\b(?:answers?\s*(?:is|are|was)?\s*[:=]?\s*|(?:totals?|results?)\s*(?:is|are|was|:|=)\s*)\(?([0-9]+(?:\.[0-9]+)?)\b|\b([0-9]+(?:\.[0-9]+)?)\s+is\s+the\s+answer\b`)
+	// v35: both capture groups take an optional sign, for the same reason as
+	// benchNumberRe — "the answer is -2" must grade as -2, not 2.
+	benchNumDeclaredRe = regexp.MustCompile(`\b(?:answers?\s*(?:is|are|was)?\s*[:=]?\s*|(?:totals?|results?)\s*(?:is|are|was|:|=)\s*)\(?(-?[0-9]+(?:\.[0-9]+)?)\b|\b(-?[0-9]+(?:\.[0-9]+)?)\s+is\s+the\s+answer\b`)
 	// benchThousandsRe collapses thousands separators ("1,024" → "1024") so a comma
 	// inside a number is never read as a clause break by benchLeadNumber.
 	benchThousandsRe = regexp.MustCompile(`[0-9]+(?:,[0-9]{3})+`)
@@ -199,11 +212,27 @@ const (
 	benchFrontierTier           = 9
 	benchAnswerDeadlineFrontier = 6 * time.Minute
 
-	// v34: weighted scoring split (see runQualityBenchmark). Tiers below benchInsightTier
-	// share benchBaseWeight points pro-rata; tiers at/above it share benchInsightWeight.
+	// v34/v35: weighted scoring split (see runQualityBenchmark). Three buckets now, each
+	// internally count-independent so questions can still be added freely within one:
+	//
+	//	base    tiers 1 .. benchInsightTier-1   benchBaseWeight    (general reasoning)
+	//	insight tier  benchInsightTier          benchInsightWeight (budget-bounded insight)
+	//	coding  tiers benchCodingTier and up    benchCodingWeight  (programming)
+	//
+	// v34 used two buckets with the insight one open-ended (`t >= benchInsightTier`).
+	// Appending tier 12 to that would have put 28 coding questions in the same 30-point
+	// bucket as tier 11's 5, cutting tier 11's contribution from 30 points to 4.5 and
+	// undoing exactly what v34 was for — the top 30 points existed to separate models
+	// that tiers 1–10 cannot. Coding therefore gets its own weight rather than sharing.
+	//
+	// The split is 60/20/20 rather than 70/30 plus an extra: a worker that sweeps the
+	// general tiers but cannot read code now caps at 80, and one that cannot do either
+	// hard band caps at 60.
 	benchInsightTier   = 11
-	benchBaseWeight    = 70
-	benchInsightWeight = 30
+	benchCodingTier    = 12
+	benchBaseWeight    = 60
+	benchInsightWeight = 20
+	benchCodingWeight  = 20
 )
 
 // runQualityBenchmark grades the worker against benchmarkQuestions and scores it as the
@@ -385,42 +414,25 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 	if errored*2 > len(benchmarkQuestions) {
 		return 0, false, "", nil, nil
 	}
-	// v34: quality is a WEIGHTED two-bucket score. Tiers 1–10 share benchBaseWeight (70)
-	// points pro-rata; tier 11+ (budget-bounded insight, benchInsightTier) shares
-	// benchInsightWeight (30). Under the old flat percentage the 5 insight questions were
-	// ~5% of the score, so a model that swept tiers 1–10 but couldn't touch tier 11 still
-	// read ~96 — indistinguishable from one that could. Weighted, a full sweep of 1–10
-	// with zero insight caps at 70, and the top 30 points are earned only where the top
-	// models actually differ. Each bucket is internally count-independent (questions can
-	// still be added freely within a bucket without rescaling), and if the set carries no
-	// insight-tier questions the base bucket expands to 100 so the score stays comparable.
+	// v34/v35: quality is a WEIGHTED three-bucket score — base 60 / insight 20 / coding 20
+	// (see the const block for the tier boundaries and why coding is not folded in with
+	// insight). Under the old flat percentage the 5 insight questions were ~5% of the
+	// score, so a model that swept tiers 1–10 but couldn't touch tier 11 still read ~96 —
+	// indistinguishable from one that could. Weighted, a full sweep of the general tiers
+	// with neither hard band caps at 60, and the top 40 points are earned only where the
+	// top models actually differ. Each bucket is internally count-independent (questions
+	// can still be added freely within a bucket without rescaling), and an empty bucket's
+	// weight is redistributed proportionally so the score stays comparable across sets.
 	// Every question stays in its bucket's denominator: a length-truncated answer (ran out
 	// of token budget without concluding), a question that exceeded the usability deadline
 	// (too slow), and a request that still errors after every retry all yielded no usable
 	// answer and count as a failure, the same as a wrong answer — matching what the runtime
 	// adapter penalizes.
-	var baseP, baseC, insP, insC int
-	for t := 1; t <= maxTier; t++ {
-		if t >= benchInsightTier {
-			insP += pass[t]
-			insC += count[t]
-		} else {
-			baseP += pass[t]
-			baseC += count[t]
-		}
+	ok2, score2 := benchWeightedScore(pass, count, maxTier)
+	if !ok2 {
+		return 0, false, "", nil, nil
 	}
-	baseWeight := benchBaseWeight
-	if insC == 0 {
-		baseWeight = 100
-	}
-	weighted := 0.0
-	if baseC > 0 {
-		weighted += float64(baseWeight) * float64(baseP) / float64(baseC)
-	}
-	if insC > 0 {
-		weighted += float64(benchInsightWeight) * float64(insP) / float64(insC)
-	}
-	score = int(math.Round(weighted))
+	score = score2
 	// Per-tier breakdown (+ any truncations) so the spread is visible and a
 	// truncation problem shows up explicitly rather than as fake low quality.
 	var bd strings.Builder
@@ -441,6 +453,57 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 	breakdown = strings.TrimSpace(bd.String())
 	log.Printf("benchmark %s: q=%d%% (errored=%d, slow=%d, conc=%d) %s", b.ID, score, errored, slowFailed, concurrency, breakdown)
 	return score, true, breakdown, failed, details
+}
+
+// benchWeightedScore turns the per-tier tallies into the 0-100 quality score, split
+// across the three weighted buckets described in the const block. Extracted from
+// runQualityBenchmark so the arithmetic can be tested directly: a second copy written
+// for the test would drift from the one that actually scores workers, which is the
+// failure mode the preview endpoint's shared-plan design exists to avoid.
+//
+// An empty bucket's weight is redistributed across the buckets that DO have questions,
+// in proportion to their nominal weights, so the score stays a comparable 0-100 whatever
+// the set carries. This generalises v34's `if insC == 0 { baseWeight = 100 }`: a set with
+// no coding questions scores 75/25 base/insight rather than leaving 20 points unreachable,
+// which would make every worker measured on it look 20 points worse than the same worker
+// measured on the full set — and autoTargetQuality reads all of them on one absolute scale.
+//
+// Reports false when the set has no questions at all, which the caller treats as an
+// unmeasurable worker rather than as a zero.
+func benchWeightedScore(pass, count []int, maxTier int) (bool, int) {
+	buckets := []struct{ weight, pass, count int }{
+		{weight: benchBaseWeight},
+		{weight: benchInsightWeight},
+		{weight: benchCodingWeight},
+	}
+	for t := 1; t <= maxTier && t < len(count); t++ {
+		i := 0
+		switch {
+		case t >= benchCodingTier:
+			i = 2
+		case t >= benchInsightTier:
+			i = 1
+		}
+		buckets[i].pass += pass[t]
+		buckets[i].count += count[t]
+	}
+	liveWeight := 0
+	for _, b := range buckets {
+		if b.count > 0 {
+			liveWeight += b.weight
+		}
+	}
+	if liveWeight == 0 {
+		return false, 0
+	}
+	weighted := 0.0
+	for _, b := range buckets {
+		if b.count > 0 {
+			share := 100 * float64(b.weight) / float64(liveWeight)
+			weighted += share * float64(b.pass) / float64(b.count)
+		}
+	}
+	return true, int(math.Round(weighted))
 }
 
 // isTimeout reports whether err is the request deadline firing — the benchAnswerDeadline

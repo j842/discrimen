@@ -328,9 +328,9 @@ the models have not seen. Publishing is the right call anyway, because a
 quality score nobody can inspect is a number you have to take on faith, and
 the whole point of this router is not taking numbers on faith.
 
-Profiling a paid model costs real money. The set is 102 questions, 94 of them
+Profiling a paid model costs real money. The set is 130 questions, 122 of them
 graded thinking-on with a 16k token ceiling, so a cold profile lands somewhere
-near 200-300k output tokens. That is once per (worker id, model), and warm
+near 250-400k output tokens. That is once per (worker id, model), and warm
 restarts reuse the cache, but a benchmark version bump re-runs it across the
 whole fleet including the paid endpoints. Profiling stays aggressive by
 choice. The UI should show what a run cost once it has finished, so the number

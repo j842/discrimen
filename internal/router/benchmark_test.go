@@ -354,6 +354,124 @@ func TestCheckAnswerNumericLast(t *testing.T) {
 	}
 }
 
+// v35: the three-bucket weighted score. The cases that matter are the caps — what a
+// worker reads when it can do the general tiers and neither hard band, then one, then
+// both — because that spread is the whole reason the weighting exists, and the empty-
+// bucket redistribution, which is what keeps a score measured on a set WITHOUT coding
+// questions comparable with one measured on the full set.
+func TestBenchWeightedScoreBuckets(t *testing.T) {
+	// tiers is a helper: tally[t] = {pass, count} for tier t.
+	build := func(tally map[int][2]int) (pass, count []int, maxTier int) {
+		for tr := range tally {
+			if tr > maxTier {
+				maxTier = tr
+			}
+		}
+		pass, count = make([]int, maxTier+1), make([]int, maxTier+1)
+		for tr, pc := range tally {
+			pass[tr], count[tr] = pc[0], pc[1]
+		}
+		return
+	}
+	cases := []struct {
+		name  string
+		tally map[int][2]int
+		want  int
+	}{
+		{"sweeps general, no insight, no coding", map[int][2]int{5: {10, 10}, 11: {0, 5}, 12: {0, 28}}, 60},
+		{"general + coding, no insight", map[int][2]int{5: {10, 10}, 11: {0, 5}, 12: {28, 28}}, 80},
+		{"general + insight, no coding", map[int][2]int{5: {10, 10}, 11: {5, 5}, 12: {0, 28}}, 80},
+		{"everything", map[int][2]int{5: {10, 10}, 11: {5, 5}, 12: {28, 28}}, 100},
+		{"nothing", map[int][2]int{5: {0, 10}, 11: {0, 5}, 12: {0, 28}}, 0},
+		{"half of each", map[int][2]int{5: {5, 10}, 11: {2, 4}, 12: {14, 28}}, 50},
+		// A bucket with no questions must not silently cost its weight: without
+		// redistribution these would read 60 and 80 rather than 75 and 100.
+		{"no coding questions at all: base+insight rescale to 75/25", map[int][2]int{5: {10, 10}, 11: {0, 5}}, 75},
+		{"no coding questions, all passed", map[int][2]int{5: {10, 10}, 11: {5, 5}}, 100},
+		{"only general tiers present", map[int][2]int{5: {10, 10}}, 100},
+		// Tier 12 and anything above it share the coding bucket, so a future tier 13
+		// joins coding rather than silently reopening the insight bucket.
+		{"tier 13 counts as coding", map[int][2]int{5: {10, 10}, 11: {5, 5}, 13: {0, 4}}, 80},
+	}
+	for _, c := range cases {
+		pass, count, maxTier := build(c.tally)
+		ok, got := benchWeightedScore(pass, count, maxTier)
+		if !ok {
+			t.Errorf("%s: reported unmeasurable, want score %d", c.name, c.want)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("%s: score = %d, want %d", c.name, got, c.want)
+		}
+	}
+	if ok, _ := benchWeightedScore([]int{0}, []int{0}, 0); ok {
+		t.Error("an empty question set must report unmeasurable, not a zero score")
+	}
+}
+
+// Tier 12 is the coding tier. It is graded thinking-on (>= benchHardTier) and gets the
+// frontier answer deadline (>= benchFrontierTier), and it must stay TRACE-shaped: the 47
+// multiple-choice candidates written alongside these were all cut, because in every one
+// the correct option was the longest and an 8B with no thinking mode scored 79% on them
+// by picking the elaborate one. A trace question cannot be gamed that way — its answer is
+// a fact about the language. This guards the set against drifting back to MCQ.
+func TestCodingTierShape(t *testing.T) {
+	n := 0
+	for _, q := range benchmarkQuestions {
+		if q.Tier < benchCodingTier {
+			continue
+		}
+		n++
+		if q.Match == "mcq" || q.Match == "mcq-repeat" {
+			t.Errorf("tier-%d question is multiple choice, which measures option length here: %q", q.Tier, benchSnippet(q.Prompt))
+		}
+		if q.Expect == "" {
+			t.Errorf("tier-%d question has an empty Expect: %q", q.Tier, benchSnippet(q.Prompt))
+		}
+		if strings.HasPrefix(q.Expect, "-") {
+			t.Errorf("tier-%d question has a negative Expect (%q); grading it needs the signed benchNumberRe and a test proving it: %q", q.Tier, q.Expect, benchSnippet(q.Prompt))
+		}
+	}
+	if n == 0 {
+		t.Fatal("no tier-12 questions found — the coding bucket would silently redistribute its weight away")
+	}
+	if benchCodingTier <= benchInsightTier {
+		t.Fatalf("benchCodingTier (%d) must sit above benchInsightTier (%d), or coding and insight share a bucket", benchCodingTier, benchInsightTier)
+	}
+	if benchCodingTier < benchFrontierTier {
+		t.Errorf("benchCodingTier (%d) is below benchFrontierTier (%d), so coding questions would get the short answer deadline", benchCodingTier, benchFrontierTier)
+	}
+}
+
+// v35: the sign belongs to the number. Before this, benchNumberRe and both of
+// benchNumDeclaredRe's groups matched digits only, so a negative Expect could never
+// be matched and — the silent direction, which is why this test exists — a positive
+// Expect graded a negative answer as CORRECT. The last two cases are the regression
+// guard: an unsigned subtraction must still read its operands unsigned, or every
+// arithmetic chain in tiers 4–8 would start grading by a negated operand.
+func TestCheckAnswerNumericSigned(t *testing.T) {
+	cases := []struct {
+		expect string
+		ans    string
+		want   bool
+	}{
+		{"-2", "-2", true},
+		{"-2", "The answer is -2", true},
+		{"-2", "(-5 // 2) is -3 and (-5 % 2) is 1, so the total is -2", true},
+		{"-3", "-3.0", true}, // value compare, not string compare
+		{"2", "-2", false},   // the sign error must NOT grade as correct
+		{"-2", "2", false},   // and not in the other direction either
+		{"7", "10 - 3 = 7", true},
+		{"7", "The answer is 7, since 10 - 3 = 7.", true},
+	}
+	for i, c := range cases {
+		q := benchmarkQ{Match: "numeric", Expect: c.expect}
+		if got := checkAnswer(q, c.ans); got != c.want {
+			t.Errorf("case %d: numeric %q on %q = %v, want %v", i, c.expect, c.ans, got, c.want)
+		}
+	}
+}
+
 // Numeric's declared/leading tiers: an answer-then-breakdown reply must grade by its
 // asserted value, not by whichever component of the breakdown comes last — while
 // declared self-corrections and intermediate-showing chains keep grading by their

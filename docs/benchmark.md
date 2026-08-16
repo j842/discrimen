@@ -8,7 +8,7 @@ is a number you have to take on faith, and this one decides where requests go.
 
 When a worker joins the fleet the router knows nothing about it except what its
 configuration claims. Cold-start profiling replaces that claim with a
-measurement: the router asks the worker all 102 questions below, grades the
+measurement: the router asks the worker all 130 questions below, grades the
 answers, and stores a score from 0 to 100 on the worker's profile. Difficulty
 routing then maps a request's estimated difficulty onto that measured scale, so
 a hard prompt goes to a worker that has actually demonstrated it can handle hard
@@ -17,12 +17,14 @@ prompts rather than to one that declared itself capable.
 That is also why the questions are chosen to **spread** the fleet rather than to
 be uniformly hard. If every worker scores the same, the score stops
 distinguishing them and routing collapses to pure speed. Tiers 9, 10 and 11 — 29
-of the 102 questions — exist only because the tier below each of them saturated,
-and two further tiers were built, measured and deleted along the way.
+of the 130 questions — exist only because the tier below each of them saturated,
+and two further tiers were built, measured and deleted along the way. Tier 12 is
+there for a different reason: it is the only tier that asks whether a worker can
+read code rather than solve a puzzle.
 
 ## Versioning
 
-`benchmarkVersion` (in `internal/router/benchmark.go`) is currently **32**. It is
+`benchmarkVersion` (in `internal/router/benchmark.go`) is currently **35**. It is
 part of the profile cache key: a stored profile is reused only if its
 `BenchVersion` matches the running binary's. Changing a question, adding a tier,
 or altering how answers are graded means bumping that constant, which invalidates
@@ -41,7 +43,7 @@ silently, with every number still looking plausible.
 
 ## Grading
 
-**Size.** 102 questions across 11 tiers.
+**Size.** 130 questions across 12 tiers.
 
 | Tier | Questions | Mode | Deadline |
 |------|-----------|------|----------|
@@ -56,6 +58,7 @@ silently, with every number still looking plausible.
 | 9 — unrecallable | 12 | thinking-on | 6 min |
 | 10 — ceiling | 12 | thinking-on | 6 min |
 | 11 — insight | 5 | thinking-on | 6 min |
+| 12 — programming | 28 | thinking-on | 6 min |
 
 **Thinking mode.** Every question is graded in the mode the router would serve
 it in. `benchHardTier` is **3**: tiers below it are graded thinking-off, tiers at
@@ -85,27 +88,39 @@ numeric grading is fooled by a verbose reply, where an intermediate value or a
 trailing restatement can be read as the answer; `mcq` and `contains` grade fine
 through a long reply and are sent unchanged.
 
-**Weighted scoring.** The score is a two-bucket weighted percentage, not a flat
+**Weighted scoring.** The score is a three-bucket weighted percentage, not a flat
 one:
 
-- Tiers 1 to 10 (below `benchInsightTier` = **11**) share `benchBaseWeight` =
-  **70** points pro rata. With the current set that is 97 questions, so each is
-  worth about 0.72 points.
-- Tier 11 and above share `benchInsightWeight` = **30** points pro rata. With the
-  current set that is 5 questions, so each is worth 6 points.
+- **Base**, tiers 1 to 10 (below `benchInsightTier` = **11**), shares
+  `benchBaseWeight` = **60** points pro rata. With the current set that is 97
+  questions, so each is worth about 0.62 points.
+- **Insight**, tier 11, shares `benchInsightWeight` = **20** points pro rata.
+  With the current set that is 5 questions, so each is worth 4 points.
+- **Coding**, tier 12 and above (`benchCodingTier` = **12**), shares
+  `benchCodingWeight` = **20** points pro rata. With the current set that is 28
+  questions, so each is worth about 0.71 points.
 
-So `score = round(70 × base_correct / 97 + 30 × insight_correct / 5)`.
+So `score = round(60 × base/97 + 20 × insight/5 + 20 × coding/28)`.
 
-A model that sweeps tiers 1 to 10 and cannot touch tier 11 caps at **70**. Under
-the flat percentage this file used previously, those same 5 insight questions
-were about 5% of the score and such a model read about 96 — indistinguishable
-from one that could solve them. The top 30 points are now earned only where the
-top models actually differ.
+A model that sweeps tiers 1 to 10 and can touch neither hard band caps at **60**;
+one that can also read code but not find the insight shortcut reads **80**. Under
+the flat percentage this file used before v34, the 5 insight questions were about
+5% of the score and a model that could not solve them read about 96 —
+indistinguishable from one that could. The top 40 points are now earned only
+where the top models actually differ.
+
+Coding gets its own bucket rather than joining insight, which is what appending
+tier 12 to the old `t >= benchInsightTier` rule would have done. That would have
+put 28 coding questions in the same 30-point bucket as tier 11's 5 and cut tier
+11's contribution from 30 points to 4.5 — undoing exactly what the weighting was
+introduced for.
 
 Each bucket is internally count-independent, so questions can be added within a
-bucket without rescaling anything downstream. If the set ever carries no
-insight-tier questions, the base bucket expands to 100 so the score stays
-comparable.
+bucket without rescaling anything downstream. An empty bucket's weight is
+redistributed across the buckets that do have questions, in proportion to their
+nominal weights, so a score measured on a set without coding questions stays
+comparable with one measured on the full set — `autoTargetQuality` reads all of
+them on a single absolute 0 to 100 scale. See `benchWeightedScore`.
 
 **Failures.** Everything that produces no usable answer counts as wrong and
 stays in the denominator:
@@ -249,8 +264,9 @@ actually it was K2.") does not count.
 **`contains`** — case-insensitive substring. The default, used where the expected
 answer is a distinctive word or token that cannot plausibly appear by accident.
 
-Across the 102 questions: 66 `numeric`, 24 `mcq`, 9 `contains`, 3
-`final-contains`.
+Across the 130 questions: 90 `numeric`, 24 `mcq`, 13 `contains`, 3
+`final-contains`. Tier 12 is deliberately all `numeric` and `contains` — see
+that tier's comment block for why multiple choice was cut from it.
 
 ## What actually spreads the fleet
 

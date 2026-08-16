@@ -41,6 +41,35 @@ silently, with every number still looking plausible.
 > `internal/router/benchmark.go` (the grading). This document is a derived
 > snapshot. If the two disagree, the Go files win.
 
+### Version history
+
+Every entry below is a change that made an older score mean something different,
+which is the only kind of change that belongs in this list.
+
+| Version | Change |
+|---------|--------|
+| v24 | A question the worker cannot answer within `benchAnswerDeadline` is scored a speed fail, counted wrong and not retried, instead of a retried transport error. |
+| v25 | Length truncation counts as a failure. It used to be excluded from the denominator; now it matches `responseInadequate`, which treats a length finish as inadequate at runtime. |
+| v26 | `benchAnswerDeadline` cut from 5 minutes to 2, so a model too slow to answer inside 2 minutes fails at that difficulty. This is what spread the slow reasoning models down the quality range. |
+| v27 | `thinkingProbe` recognises the `reasoning` field. vLLM 0.23 renamed `reasoning_content` to `reasoning`, and until this landed vLLM workers false-negatived as thinking-incapable and were routed around in favour of CPU fallbacks. |
+| v28 | All response extraction unified on `extract.go`: reasoning-aware speed and chat probes, benchmark grading falls back to the reasoning field, the `"<nil>"` content bug fixed, and capability probes retry transients. |
+| v29 | Tier 9 added: twelve GPQA-Diamond-style expert-knowledge questions. The mcq grader widened from A-D to A-J to read ten-option picks. |
+| v30 | Tier 10 added, after a 27B scored 100% on tier 9. |
+| v31 | The expert-recall tier cut outright at 17 points of measured spread, the unrecallable tier promoted to 9, and tier 10 rebuilt as SimpleBench-style world-model traps. Question count unchanged at 97. |
+| v32 | The train/tunnel and Mary's-father traps moved from tier 2 to tier 3, so both are graded thinking-on. A trap graded thinking-off measures one-shot reflex, not capability. |
+| v33 | Tier 11 added, and the frontier tiers (at or above `benchFrontierTier`) given the longer 6-minute deadline. |
+| v34 | Quality became a weighted two-bucket score instead of a flat percentage. |
+| v35 | Tier 12 added and the weighted score grew a third bucket for it. The numeric grader now keeps the sign (`benchNumberRe`). |
+
+v33 and v34 both landed **without** bumping the constant, which is exactly the
+failure the constant exists to prevent. Profiles measured under the flat
+percentage stayed in `worker_profiles` marked current, and `autoTargetQuality`
+reads every cached score as one absolute 0-100 scale, so pre-v33 and post-v34
+workers were being compared on scales that no longer meant the same thing.
+`TestBenchmarkVersionCoversScoringChanges` fails CI if it happens again: it
+finds the highest `vNN:` marker in `benchmark.go` and `benchmark_data.go` and
+requires `benchmarkVersion` to be at least that.
+
 ## Grading
 
 **Size.** 130 questions across 12 tiers.
@@ -146,6 +175,17 @@ stays in the denominator:
   the race for quick prompts without having its quality falsified first. Tiers 3
   to 8 keep the tight bound on purpose, because that spread of slow mid-tier
   reasoners is real and wanted.
+
+  The test is `q.Tier >= benchFrontierTier`, so **tier 12 inherits the 6-minute
+  deadline** even though nothing about it was considered when the bound was
+  chosen. That rationale was written in v33 for long-form frontier reasoning,
+  where a 284B MoE running at 18 tok/s was scoring below a saturated 27B on
+  nothing but tier-10 speed fails. Tier 12 is 28 short code traces whose answers
+  are single numbers or single words. Six minutes each is far more patience than
+  those questions need, and the effect is that a worker slow enough to be
+  unusable on code tracing is not caught by the deadline on this tier. If a
+  narrower bound is wanted for tier 12, it needs its own constant rather than a
+  change to `benchFrontierTier`, which would also move tiers 9 to 11.
 - **Errored.** Any other request failure is treated as transient — a dropped
   request under concurrent profiling load — and retried up to
   `benchMaxAttempts` = **3** times with a backoff of 1 second times the attempt
@@ -204,6 +244,28 @@ Comparison is by numeric **value**, not string, so `50.40` matches `50.4` and
 "twenty-two" would read as 20 and 2 and the last-number rule would grade the 2).
 Thousands separators are collapsed first, so a comma inside `1,024` is never read
 as a clause break.
+
+**The sign is part of the number (v35).** `benchNumberRe` is `-?[0-9]+(?:\.[0-9]+)?`,
+and both capture groups in `benchNumDeclaredRe` take an optional sign too. Before
+v35 there was no `-?` anywhere, and the extraction stages dropped the minus before
+`numericMatches` ever compared, which broke grading in both directions:
+
+- A question whose expected answer was negative **could never pass**. Every
+  extraction stage handed `numericMatches` an unsigned number, so an expected
+  `-2` had nothing that could match it.
+- Worse, the reverse graded as a **false pass**. An expected `2` against a model
+  answer of `-2` read as `2` and was marked correct, so a model that got the
+  sign wrong scored as if it had got the question right.
+
+Nothing in tiers 1 to 11 has a negative answer, so the fault was dormant. It
+surfaced while the answer keys for tier 12 were being verified by executing every
+program, which is the only reason it was found at all: a grader fault of this
+shape presents as a model getting an easy question wrong, not as a bug in the
+grader. Tier 12 question 130 still carries a `+ 10` in its expression, added by
+its author to keep the expected answer positive before the fix landed.
+
+The sign is taken only when it is adjacent to the digits, so a spaced subtraction
+("10 - 3 = 7") still reads its operands unsigned.
 
 **`mcq`** — a letter answer, tried in three stages:
 
@@ -271,7 +333,7 @@ that tier's comment block for why multiple choice was cut from it.
 ## What actually spreads the fleet
 
 Two whole tiers have been built, measured and deleted getting to the current
-eleven. The per-tier numbers off the live fleet (Qwen3.6-27B / Granite-8B /
+twelve. The per-tier numbers off the live fleet (Qwen3.6-27B / Granite-8B /
 Gemma-26B-A4B) overturn the obvious intuitions and are worth recording:
 
 | Tier | 27B | 8B | 26B-A4B | Spread |
@@ -298,6 +360,14 @@ token budget while the closed form fits in a thousand tokens (tier 11). So the
 standing rule for adding a tier: do not pick a limit that is the model's memory,
 and do not pick one that is its token budget. Pick one that is its world model.
 
+Tier 12 is the exception to that rule, and it is there for a different purpose.
+It measures 51 points of spread across four live workers (39.6 / 68.8 / 87.5 /
+97.9 percent), and its Spearman rho against the existing quality score is
+**+1.00**, so it ranks the fleet the same way tiers 1 to 11 already do. It is
+therefore not buying new discrimination. What it buys is a programming-specific
+measurement in a set that is otherwise entirely puzzles, so a worker's score says
+something about whether it can be handed a codebase rather than a riddle.
+
 All hand-authored questions here are original rather than lifted from the
 benchmarks they are modelled on. GPQA in particular is gated behind an agreement
 not to reproduce its items in plain text, precisely to keep them out of training
@@ -309,7 +379,7 @@ trap tiers are built in the spirit of.
 
 # The questions
 
-Questions are numbered 1 to 102 in the order they appear in
+Questions are numbered 1 to 130 in the order they appear in
 `benchmark_data.go`. Multi-line prompts are shown in code blocks so the exact
 text sent to the worker is reproduced; the router sends each as a single string.
 
@@ -1073,11 +1143,12 @@ Answer with just the letter.
 
 ## Tier 11 — budget-bounded insight (5 questions, thinking-on)
 
-*The insight bucket: 30 of the 100 points. Enumeration problems with a hidden
-closed-form shortcut. A model that sees the shortcut answers in about 1000
-tokens; a model that grinds the list out dies at the 16k cap with no answer at
-all, which the grader scores as a failure. This is the first tier that separated a
-27B from a 284B.*
+*The insight bucket: 20 of the 100 points, so each of these five questions is
+worth 4 points, more than six times what a base-bucket question is worth.
+Enumeration problems with a hidden closed-form shortcut. A model that sees the
+shortcut answers in about 1000 tokens; a model that grinds the list out dies at
+the 16k cap with no answer at all, which the grader scores as a failure. This is
+the first tier that separated a 27B from a 284B.*
 
 *Four of the five are digit or base enumeration, which is one trick family. It
 was chosen because it was the only family of seven tried that spread that pair.
@@ -1109,6 +1180,447 @@ rather than by hand.*
 | 101 | **1121** | numeric | The sum of the first 40 terms of the sequence in question 99. The bijection produces each term directly; scanning for them does not fit the budget. |
 | 102 | **1462** | numeric | 96 = 2⁵ × 3, so the digits are drawn from {2,3,4,6,8} with 1s padding to six places. The one item in this tier without the base bijection. |
 
+## Tier 12 — programming (28 questions, thinking-on)
+
+*The coding bucket: 20 of the 100 points, shared pro rata, so each question is
+worth about 0.71 points. The only tier that asks whether a worker can read code
+exactly rather than solve a puzzle. Every question is a **trace**: a short program
+with one counter-intuitive interaction, answered by its exact output. The answer
+is a fact about the language, so the grader compares it exactly and nothing has
+to be executed at profiling time. This gap does not close by itself, because
+`benchgen.go` deliberately excludes LiveBench's `coding` and `agentic_coding`
+categories for needing execution.*
+
+*Every item is abstracted from a real bug: a commit from two months of
+production work across a Go router, an agent platform, a deploy tool and its bash
+templates, a Python portal and a Kotlin app, mined for the shape of the trap
+rather than the code. Nothing here names a real host, repository or service. The
+recurring class across all of it, and the one this tier keeps hitting: absent or
+unknown is a distinct third state from negative.*
+
+*Calibration. 95 candidates were graded against 4 live workers spanning q59 to
+q94 and cut by item analysis (D = top-half pass rate minus bottom-half, the same
+statistic `benchgen_emit.go` uses). 28 survived with D > 0. Every answer key was
+verified by executing the program, which is how the sign fault in `benchNumberRe`
+was found. Each row below carries its measured p (pass rate) and D.*
+
+*Noise, stated honestly: 6 of 33 re-answered cells, 18%, flipped verdict at
+temperature 0. With two workers per half, one flip moves D by 0.50, so the
+p=0.50 D=+1.00 items are the trustworthy ones and the rest are one flip from
+D=0. Rows whose verdict was directly observed to flip say so.*
+
+*Multiple choice was tried here and cut. 47 MCQ items were authored alongside
+these and all 47 were dropped: in every one the correct option was the longest,
+because the answer had been written with its full justification and the
+distractors as one-liners. An 8B with no thinking mode scored 79% on them against
+45% on the traces, and the q94 worker scored 100%, giving 21 points of spread
+against the traces' 51. They were measuring option length. If MCQ is revisited
+here, length-match every option first and re-calibrate.*
+
+**103.**
+```
+This Go program prints one number. What is it?
+
+package main
+
+import "fmt"
+
+func f() int {
+	n := 0
+	for i := 0; i < 3; i++ {
+		defer func() { n++ }()
+	}
+	return n
+}
+
+func main() { fmt.Println(f()) }
+
+Give the number only.
+```
+
+**104.**
+```
+What does this bash script print?
+
+f() { local x=$(false); echo "$?"; }
+f
+
+Give the number only.
+```
+
+**105.**
+```
+This Go program prints one number. What is it?
+
+package main
+
+import "fmt"
+
+type MyErr struct{}
+
+func (e *MyErr) Error() string { return "boom" }
+
+func mayFail(ok bool) error {
+	var p *MyErr
+	if !ok {
+		p = &MyErr{}
+	}
+	return p
+}
+
+func main() {
+	n := 0
+	if mayFail(true) != nil {
+		n++
+	}
+	fmt.Println(n)
+}
+
+Give the number only.
+```
+
+**106.**
+```
+How many lines does this bash script print in total?
+
+set -e
+f() { false; echo reached; }
+if f; then echo yes; else echo no; fi
+echo end
+
+Give the number only.
+```
+
+**107.**
+```
+This Go program prints one number. What is it?
+
+package main
+
+import "fmt"
+
+func main() {
+	var x int32 = 300
+	fmt.Println(int8(x))
+}
+
+Give the number only.
+```
+
+**108.**
+```
+What does this bash script print?
+
+set -o pipefail
+seq 1 200000 | head -1 > /dev/null
+echo $?
+
+Give the number only.
+```
+
+**109.**
+```
+This Go program prints one number. What is it?
+
+package main
+
+import "fmt"
+
+func main() {
+	a := make([]int, 3, 5)
+	a[0], a[1], a[2] = 1, 2, 3
+	_ = append(a[:2], 9)
+	fmt.Println(a[2])
+}
+
+Give the number only.
+```
+
+**110.**
+```
+In Python 3, what happens when this runs? Answer in one short phrase.
+
+class A:
+    def __eq__(self, other):
+        return True
+
+print(len({A(), A()}))
+```
+
+**111.**
+```
+What does this bash script print?
+
+n=$(printf 'x\ny\n' | grep -c 'ZZZ' || echo 0)
+echo "${#n}"
+
+Give the number only.
+```
+
+**112.**
+```
+In Python 3, this class body raises NameError. Which LINE raises it? Count the "class C:" line as line 1.
+
+class C:
+    xs = [1, 2, 3]
+    ys = [x * 2 for x in xs]
+    ws = [y for y in range(3) if y in xs]
+
+Give the line number only.
+```
+
+**113.**
+```
+In Python 3, running this raises an exception. Name the exception type exactly (one word).
+
+def f():
+    try:
+        1 / 0
+    except Exception as e:
+        pass
+    return e
+
+f()
+```
+
+**114.**
+```
+What does this bash script print?
+
+printf 'a\t\tc\n' | while IFS=$'\t' read -r x y z; do echo "${#x}${#y}${#z}"; done
+
+Give only the output.
+```
+
+**115.**
+```
+In Python, this program prints one number. What is it?
+
+n = float('nan')
+values = [n]
+count = 0
+if n in values: count += 1
+if float('nan') in values: count += 1
+print(count)
+
+Give the number only.
+```
+
+**116.**
+```
+This Go program prints one number. What is it?
+
+package main
+
+import "fmt"
+
+func main() {
+	s := "\u65e5\u672c"
+	fmt.Println(len(s) + len([]rune(s)))
+}
+
+Give the number only.
+```
+
+**117.**
+```
+This bash script prints one number. What is it?
+
+v=""
+n=0
+if [ -n $v ]; then n=$((n+1)); fi
+if [ -n "$v" ]; then n=$((n+1)); fi
+echo "$n"
+
+Give the number only.
+```
+
+**118.**
+```
+This Go program prints one number. What is it?
+
+package main
+
+import ("fmt"; "strings")
+
+func main() {
+	fmt.Println(len(strings.TrimLeft("filename.tar", "fil")))
+}
+
+Give the number only.
+```
+
+**119.**
+```
+In Python 3, this raises an exception. Quote the exception MESSAGE exactly (not the type).
+
+def g():
+    try:
+        yield 1
+    finally:
+        yield 2
+
+it = g()
+next(it)
+it.close()
+```
+
+**120.**
+```
+This Go program prints one number. What is it?
+
+package main
+
+import "fmt"
+
+func main() {
+	s := "h\u00e9llo"
+	n := 0
+	for range s {
+		n++
+	}
+	fmt.Println(len(s) + n)
+}
+
+Give the number only.
+```
+
+**121.**
+```
+In Python, what does this print?
+
+import os
+print(len(os.path.join("/var/data/uploads", "/etc/passwd")))
+
+Give the number only.
+```
+
+**122.**
+```
+In Python, this program prints one number. What is it?
+
+grid = [[]] * 3
+grid[0].append(1)
+print(sum(len(row) for row in grid))
+
+Give the number only.
+```
+
+**123.**
+```
+In Python 3, what does this print?
+
+print(len({1: 'a', True: 'b', 1.0: 'c'}))
+
+Give the number only.
+```
+
+**124.**
+```
+In bash, directory src/ contains one file f, and an empty directory dst/ already exists. After running:
+
+cp -a src dst
+
+what is the full path of file f's copy? Give only the path.
+```
+
+**125.**
+```
+In Python, what does this print?
+
+names = ["part2", "part10", "part1"]
+print(sorted(names).index("part2"))
+
+Give the number only.
+```
+
+**126.**
+```
+What does this bash script print?
+
+n=0
+printf 'a\nb\nc\n' | while read -r l; do n=$((n+1)); done
+echo "$n"
+
+Give the number only.
+```
+
+**127.**
+```
+In Python 3, what does this print?
+
+print(int(1 in [1] == True))
+
+Give the number only.
+```
+
+**128.**
+```
+This Go program prints one number. What is it?
+
+package main
+
+import "fmt"
+
+func main() {
+	s := []int{1, 2, 3, 4}
+	t := s[1:3]
+	_ = append(t, 99)
+	fmt.Println(s[3])
+}
+
+Give the number only.
+```
+
+**129.**
+```
+What does this bash command print?
+
+printf '%d\n' 010
+
+Give the number only.
+```
+
+**130.**
+```
+In Python 3, what does this print?
+
+print((-5 // 2) + (-5 % 2) + 10)
+
+Give the number only.
+```
+
+| # | Answer | Match | Why |
+|---|--------|-------|-----|
+| 103 | **0** | numeric | A `defer` runs after the return value has been copied, so incrementing a local that is not a named result changes nothing the caller sees. p=0.50, D=+1.00. |
+| 104 | **0** | numeric | `local x=$(false)` declares and assigns on one line, so `$?` is the exit status of `local`, not of the command substitution. The failure is hidden. p=0.50, D=+1.00. |
+| 105 | **1** | numeric | A nil `*MyErr` stored in an `error` interface is non-nil: the interface carries a type. `mayFail(true)` returns a typed nil, the check fires, and the happy path reports failure. p=0.50, D=+1.00. |
+| 106 | **3** | numeric | `errexit` is suspended inside a function used as an `if` condition, so `f` runs past the failing `false` and prints `reached`. Three lines: `reached`, `yes`, `end`. p=0.50, D=+1.00. |
+| 107 | **44** | numeric | A narrowing conversion wraps rather than clamping, and Go issues no warning. 300 mod 256 is 44. p=0.50, D=+1.00. |
+| 108 | **141** | numeric | `head -1` exits after one line, so `seq` takes SIGPIPE. `pipefail` reports the pipeline as 128 + 13. p=0.50, D=+1.00. |
+| 109 | **9** | numeric | `a` has length 3 and capacity 5, so appending to `a[:2]` writes into the shared backing array at index 2 and overwrites the 3 that was there. p=0.50, D=+1.00. |
+| 110 | **unhashable** | contains | Defining `__eq__` without `__hash__` sets `__hash__` to `None`, so the instances cannot go in a set at all. Graded `contains` on the word in the TypeError, not on a count. p=0.50, D=+1.00. Verdict observed to flip at temperature 0. |
+| 111 | **3** | numeric | `grep -c` prints `0` and exits 1 when nothing matches, so the `|| echo 0` fallback fires as well and `n` is the two-line string `0\n0`, which is 3 characters. p=0.50, D=+1.00. |
+| 112 | **4** | numeric | A comprehension's first iterable is evaluated in the enclosing scope, so line 3 sees `xs`. The body and the conditions get their own scope, which cannot see class scope, so the `if y in xs` on line 4 raises. p=0.25, D=+0.50. |
+| 113 | **UnboundLocalError** | contains | The `except ... as e` name is deleted when the block ends. Inside a function that makes `e` an unbound local, so the exception is `UnboundLocalError`, not `NameError`. p=0.25, D=+0.50. |
+| 114 | **110** | numeric | `IFS=$'\t'` is still IFS whitespace, so the two consecutive tabs collapse into one separator. The legitimately empty middle field vanishes and every later field shifts left: `x`="a", `y`="c", `z`="". p=0.25, D=+0.50. |
+| 115 | **1** | numeric | `in` tests identity before equality, so the NaN already in the list matches itself, while a freshly built NaN is a different object and matches nothing. p=0.75, D=+0.50. |
+| 116 | **8** | numeric | `len` on a string counts bytes and `[]rune` counts characters. Two CJK characters are 6 bytes and 2 runes. p=0.75, D=+0.50. |
+| 117 | **1** | numeric | Unquoted, the empty `$v` disappears by word splitting, leaving `[ -n ]`, a one-argument test that is true because the argument `-n` is non-empty. Quoted, it is correctly false. p=0.75, D=+0.50. |
+| 118 | **9** | numeric | `TrimLeft` takes a cutset, not a prefix, so it strips every leading `f`, `i` or `l` and removes `fil`, leaving the 9-character `ename.tar`. Go's mirror of the `str.strip` trap. p=0.75, D=+0.50. Verdict observed to flip at temperature 0. |
+| 119 | **ignored GeneratorExit** | contains | Yielding from a `finally` during `close()` refuses the `GeneratorExit`, which Python reports as `RuntimeError: generator ignored GeneratorExit`. Cleanup that yields is not cleanup. p=0.75, D=+0.50. |
+| 120 | **11** | numeric | `len` counts bytes and `range` counts runes. `h\u00e9llo` is 6 bytes and 5 runes. Any offset arithmetic that mixes the two corrupts non-ASCII input. p=0.75, D=+0.50. |
+| 121 | **11** | numeric | `os.path.join` discards everything before an absolute component, so the result is `/etc/passwd`, 11 characters. A base directory prefix is not a sandbox. p=0.75, D=+0.50. |
+| 122 | **3** | numeric | `[[]] * 3` copies the reference three times, not the list, so all three rows are the same object and appending once makes every row length 1. p=0.75, D=+0.50. |
+| 123 | **1** | numeric | `True`, `1` and `1.0` hash equal and compare equal, so all three are one key and the later values overwrite the earlier ones. p=0.75, D=+0.50. |
+| 124 | **dst/src/f** | contains | `cp -a SRC DST` copies INTO `DST` when `DST` already exists, so the file lands at `dst/src/f` rather than `dst/f`. Graded `contains`. p=0.75, D=+0.50. |
+| 125 | **2** | numeric | Sorting is lexicographic, so `part1`, `part10`, `part2` and the index of `part2` is 2. The bug only appears once there are ten or more, which is why it ships. p=0.75, D=+0.50. |
+| 126 | **0** | numeric | The right-hand side of a pipeline runs in a subshell, so the increments are lost and the outer `n` is still 0. p=0.75, D=+0.50. |
+| 127 | **0** | numeric | Comparison operators chain: `1 in [1] == True` means `(1 in [1]) and ([1] == True)`. The second half is false, so the whole thing is false and `int(...)` is 0. p=0.75, D=+0.50. Verdict observed to flip at temperature 0. |
+| 128 | **99** | numeric | `t := s[1:3]` shares the backing array, so appending to `t` writes at index 3 of `s` and replaces the 4 with 99. p=0.75, D=+0.50. |
+| 129 | **8** | numeric | `printf %d` reads a leading zero as octal, so `010` is 8. A zero-padded counter or date field silently changes value. p=0.75, D=+0.50. Verdict observed to flip at temperature 0. |
+| 130 | **8** | numeric | Python floors toward negative infinity and its modulo takes the divisor's sign, unlike C, Go and Java: `-5 // 2` is -3 and `-5 % 2` is 1. The `+ 10` is the author keeping the expected answer positive; see the note on the sign fix under `numeric` above. p=0.75, D=+0.50. |
+
 ---
 
 ## Contamination
@@ -1134,9 +1646,12 @@ Two honest limits on that mitigation.
 
 First, it only covers the sourced arithmetic tiers. LiveBench cannot supply the
 trap, unrecallable and world-model tiers (6, 9, 10 and 11), because their whole
-value is being absent from any training corpus. Those are the tiers with the best
-measured spread and the ones publication damages most, and refreshing them means
-authoring new ones by hand.
+value is being absent from any training corpus. Nor can it supply tier 12:
+`benchgen.go` excludes LiveBench's `coding` and `agentic_coding` categories
+because grading them needs execution, which the router does not do at profiling
+time. That is 65 of the 130 questions the generator can never refresh, and they
+are the tiers with the best measured spread, so they are the ones publication
+damages most. Refreshing them means authoring new ones by hand.
 
 Second, saturation arrives on its own schedule regardless of contamination. Tier
 9 was added because a 27B scored 100% on the tier before it; tier 10 was added

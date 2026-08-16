@@ -54,8 +54,13 @@ If you left the tokens empty in `.env`, discrimen generates them on first run
 and prints them to its log. Grab them before you do anything else:
 
 ```bash
-docker compose logs discrimen | grep -i bootstrap
+docker compose logs discrimen | grep -i -A4 -E 'bootstrap|GENERATED'
 ```
+
+There are three banners, one each for the client token, the worker token and the
+admin password. The credential sits three lines below the heading it belongs to,
+so the `-A4` is doing the real work here. Without it you match three headings and
+print no secrets.
 
 Leaving them empty and ignoring the log means no authentication at all: fine
 on a trusted LAN, wrong anywhere else.
@@ -110,7 +115,7 @@ properly, and that takes a while.
 
 Profiling splits in two so a fresh deployment does not black out the fleet. The
 quick half (capabilities, speed, context) makes the endpoint routable in
-**seconds**. The slow half, a concurrency ramp and a 102-question graded
+**seconds**. The slow half, a concurrency ramp and a 130-question graded
 benchmark, runs in the background and then refines the live values. Until the
 benchmark finishes, an unproven endpoint holds a conservative provisional
 quality of 30, so it only draws easy traffic.
@@ -119,11 +124,14 @@ The result is cached per `(endpoint id, model)` in SQLite, so a restart is
 **instant**: same id, same model, profile reloaded, no re-measurement. Only a
 brand-new endpoint or a changed model pays the cost again.
 
-On a paid endpoint, that cost is money. The benchmark is 130 questions, 122 of
-them graded thinking-on with a 16k token ceiling, so a cold profile lands
-somewhere near 250-400k output tokens. Once. See
-[docs/benchmark.md](docs/benchmark.md) for the whole question set and its answer
-key.
+On a paid endpoint, that cost is money. The benchmark is 130 questions: 122 of
+them graded thinking-on against a 16384-token ceiling, and 8 graded thinking-off
+against a 1024-token one. A reasoning answer on this set runs roughly 2000 to
+3000 output tokens, well short of the ceiling, which puts a cold profile near
+**250-370k output tokens**. Once. The worst case, every thinking-on answer
+running to its ceiling, is 2.0M, but a model doing that is being scored as
+truncated on most of the set anyway. See [docs/benchmark.md](docs/benchmark.md)
+for the whole question set and its answer key.
 
 ## How a request is routed
 
@@ -337,17 +345,37 @@ automatic decision off.
 | POST | `/backends/register` | worker | Endpoint self-registration. Frozen interface |
 | DELETE | `/backends/{id}` | worker or admin | Remove an entry, its persisted row and its cached profile |
 | GET | `/backends` | admin | The fleet: quality, throughput, features, status |
+| GET | `/backends/{id}` | admin | One endpoint's row in full |
+| GET | `/backends/{id}/benchmark` | admin | Per-question results from that endpoint's last profiling run |
+| POST | `/debug/backends/{id}/certify`, `/debug/backends/{id}/chat` | admin | Re-profile one endpoint, or prompt it directly |
 | GET | `/logs` | admin | Stored request logs |
 | any | `/admin/providers[/{id}]` | admin | CRUD over manually-entered endpoints |
 | any | `/admin/keys[/{id}]` | admin | Issue, list, disable and delete API keys |
 | any | `/admin/groups[/{id}]` | admin | CRUD over named groups |
 | POST | `/admin/login`, `/admin/logout` | password | Session cookie |
-| GET | `/` | none | Dashboard shell. Discloses nothing; the fleet table is fetched client-side with a token |
+| GET | `/` | none | Dashboard shell. Discloses nothing; the fleet table is fetched client-side with the admin session cookie |
 
-`/logs` and `/backends` are admin-scoped, not client-scoped. Any client token
-used to read every stored prompt and response in the log, which is acceptable
-for a private fleet and not acceptable the moment tokens go to people you do not
-administer.
+The dashboard holds no bearer token. It signs in through `POST /admin/login`,
+which sets an HttpOnly session cookie, and every fetch it makes is same-origin so
+the browser attaches the cookie by itself. The previous version prompted for a
+key and kept it in `sessionStorage`; the current page deletes any key that
+version left behind rather than migrating it.
+
+`GET /backends`, `GET /workers`, `GET /backends/{id}`,
+`GET /backends/{id}/benchmark`, `GET /logs` and
+`POST /debug/backends/{id}/{certify,chat}` are **admin** scope, not client scope.
+A client token could previously read every stored prompt and response in the log,
+which was acceptable for a private fleet and stops being acceptable the moment
+tokens go to people you do not administer. `DELETE /backends/{id}` takes a worker
+credential or admin, and no longer a client token.
+
+That does not mean carrying two credentials. **One admin-role API key satisfies
+both scopes.** Issue it by POSTing `{"name": "ops", "role": "admin"}` to
+`/admin/keys`, and that single key covers `/v1/chat/completions` and the rest of
+the OpenAI surface, `/backends`, `/logs`, `/admin/*` and worker registration.
+There is no authority a client has that an admin does not, so the OpenAI surface
+accepts an admin key rather than making an operator hold a second credential to
+test what they just configured.
 
 `/workers` and `/workers/register` are accepted as aliases of the `/backends`
 spellings. Both are frozen: a worker deployed against an older version must keep
@@ -366,7 +394,7 @@ problem the router exists to solve. They are constants in the binary.
 |---|---|---|
 | `ROUTER_PORT` | `8585` | |
 | `LOG_DB_PATH` | `/data/llm-router/logs.sqlite` | Also where the adapter state and the persistence keyfile land |
-| `ROUTER_ADMIN_PASSWORD` | *(empty)* | Bootstrap only. The database is canonical afterwards |
+| `ROUTER_ADMIN_PASSWORD` | *(empty)* | Seeds the admin password, and resets it on any start where it is set. Unset leaves a stored password alone |
 | `ROUTER_WORKER_TOKEN` | *(empty)* | Bearer token an endpoint presents to register |
 | `ROUTER_CLIENT_TOKENS` | *(empty)* | Comma-separated client bearer tokens |
 | `ROUTER_PERSIST_SECRET` | *(empty)* | Encrypts stored endpoint API keys at rest. Blank generates a keyfile |
@@ -436,6 +464,11 @@ where the answer was wrong and some endpoint had it. Grading uses the production
 ## Deploying
 
 The compose file is the supported path and it is enough for most people.
+
+Upgrading an existing `llm-router` deployment: read
+[docs/upgrading.md](docs/upgrading.md) first. It upgrades in place on the same
+database, but 29 environment variables stop being read, seven endpoints move to
+admin scope, and the whole fleet re-benchmarks once.
 
 If you use [dropshell](https://github.com/j842/dropshell), there is a template
 at [`deploy/dropshell/discrimen`](deploy/dropshell/discrimen) that pulls the

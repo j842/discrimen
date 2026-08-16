@@ -330,10 +330,12 @@ func slugify(s string) string {
 // identity system that could be added here would be a larger dependency than the
 // router itself.
 //
-// The DATABASE is canonical. ROUTER_ADMIN_PASSWORD seeds it on a database that
-// has none and does nothing afterwards, so rotating the password is an admin
-// action rather than a redeploy, and an operator who changes it in the UI does
-// not find it silently reverted on the next restart.
+// The DATABASE is canonical while ROUTER_ADMIN_PASSWORD is unset, so rotating
+// the password is an admin action rather than a redeploy and an operator who
+// changes it in the UI does not find it silently reverted on the next restart.
+// A variable that IS set overrides the stored password on every start, because
+// that is the only way back in for an operator who missed the generated one —
+// see bootstrapAdminPassword.
 
 // adminSessionTTL bounds how long a login lasts. Long enough that an operator
 // working through the fleet is not re-prompted mid-task; short enough that a
@@ -713,6 +715,10 @@ func (r *Router) updateKey(w http.ResponseWriter, req *http.Request, id int64) {
 		})
 		return
 	}
+	// Disabling is a revoke, so it reopens a gate exactly as a delete does.
+	if spec.Enabled != nil && !*spec.Enabled && current.Enabled && !r.refuseIfLastCredential(w, keys, id, "disabling") {
+		return
+	}
 	assign(&current.Name, spec.Name)
 	assign(&current.Enabled, spec.Enabled)
 	assign(&current.TokenBudget, spec.TokenBudget)
@@ -735,7 +741,43 @@ func (r *Router) updateKey(w http.ResponseWriter, req *http.Request, id int64) {
 	writeJSON(w, http.StatusOK, map[string]any{"key": current})
 }
 
+// refuseIfLastCredential answers 409 and returns false when losing this key
+// would leave an authentication gate requiring nothing at all.
+//
+// 409 rather than 403: nothing is wrong with the caller's authority — an admin
+// may delete any key — the request conflicts with the state of the collection,
+// which is exactly what a Conflict is for. The message names the replacement
+// that makes the delete legal, because a refusal an operator cannot act on is a
+// refusal they will work around.
+func (r *Router) refuseIfLastCredential(w http.ResponseWriter, keys []apiKey, id int64, action string) bool {
+	gates := r.reopenedGates(keys, id)
+	if len(gates) == 0 {
+		return true
+	}
+	names := make([]string, 0, len(gates))
+	envs := make([]string, 0, len(gates))
+	for _, g := range gates {
+		names = append(names, g.name)
+		envs = append(envs, g.envName)
+	}
+	writeJSON(w, http.StatusConflict, validationError{
+		Message: fmt.Sprintf(
+			"key %d is the last enabled credential for %s; %s it would leave that open to anyone who can reach this port. "+
+				"Issue a replacement key first (POST /admin/keys), or set %s and restart.",
+			id, strings.Join(names, " and "), action, strings.Join(envs, " / ")),
+	})
+	return false
+}
+
 func (r *Router) deleteKey(w http.ResponseWriter, req *http.Request, id int64) {
+	keys, err := r.logs.ListAPIKeys(req.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, validationError{Message: err.Error()})
+		return
+	}
+	if !r.refuseIfLastCredential(w, keys, id, "deleting") {
+		return
+	}
 	if err := r.logs.DeleteAPIKey(req.Context(), id); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeJSON(w, http.StatusNotFound, validationError{Message: fmt.Sprintf("no key %d", id)})

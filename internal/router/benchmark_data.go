@@ -513,7 +513,7 @@ var benchmarkQuestions = []benchmarkQ{
 	// printf %d parses a leading zero as octal, so a zero-padded counter or date field silently changes value
 	// p=0.75 D=+0.50 [11.1]  UNSTABLE
 	{Tier: 12, Prompt: "What does this bash command print?\n\nprintf '%d\\n' 010\n\nGive the number only.", Expect: "8", Match: "numeric"},
-	// Python floors toward negative infinity and modulo takes the divisor's sign, unlike C/Go/Java. (+10 keeps the answer positive: the router's numeric grader cannot match a negative expect.)
+	// Python floors toward negative infinity and modulo takes the divisor's sign, unlike C/Go/Java. (+10 keeps the answer positive. That was once a requirement — the numeric grader dropped the sign before comparing — but v35 taught benchNumberRe to keep it, so the offset is now only here to keep the question about floor division rather than about sign handling.)
 	// p=0.75 D=+0.50 [111.]
 	{Tier: 12, Prompt: "In Python 3, what does this print?\n\nprint((-5 // 2) + (-5 % 2) + 10)\n\nGive the number only.", Expect: "8", Match: "numeric"},
 }

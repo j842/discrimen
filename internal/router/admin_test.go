@@ -581,6 +581,153 @@ func TestAdminKeyCRUD(t *testing.T) {
 	}
 }
 
+// ── The credential floor ────────────────────────────────────────────────────
+
+// bootstrappedRouter is a router in the state a fresh `docker run` leaves it:
+// one generated client key, one generated worker key, an admin password, and no
+// environment tokens.
+//
+// The admin surface is driven through the session COOKIE because that is the
+// only admin credential such a router has — and, more to the point, because an
+// admin key in the table would satisfy both gates by itself and quietly make
+// every assertion below vacuous.
+func bootstrappedRouter(t *testing.T, cfg *Config) (*Router, *http.Cookie, map[string]int64) {
+	t.Helper()
+	const password = "the-bootstrap-admin-password"
+	if cfg == nil {
+		cfg = &Config{}
+	}
+	cfg.AdminPassword = password
+	r := &Router{
+		cfg: cfg, registry: newTestRegistry(), logs: newTestLogStore(t),
+		client: &http.Client{Timeout: time.Second},
+	}
+	if err := r.bootstrapCredentials(t.Context()); err != nil {
+		t.Fatalf("bootstrapCredentials: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	r.routes().ServeHTTP(rec, post("/admin/login", `{"password":"`+password+`"}`, ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin login = %d: %s", rec.Code, rec.Body.String())
+	}
+	cookies := rec.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("login set %d cookies", len(cookies))
+	}
+	keys, err := r.logs.ListAPIKeys(t.Context())
+	if err != nil {
+		t.Fatalf("ListAPIKeys: %v", err)
+	}
+	ids := map[string]int64{}
+	for _, k := range keys {
+		ids[k.Role] = k.ID
+	}
+	return r, cookies[0], ids
+}
+
+// serveWithCookie drives the admin surface as a browser holding a session does.
+func serveWithCookie(r *Router, c *http.Cookie, method, path, body string) *httptest.ResponseRecorder {
+	var req *http.Request
+	if body == "" {
+		req = httptest.NewRequest(method, path, nil)
+	} else {
+		req = httptest.NewRequest(method, path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.AddCookie(c)
+	rec := httptest.NewRecorder()
+	r.routes().ServeHTTP(rec, req)
+	return rec
+}
+
+// TestLastCredentialCannotBeRemoved: no key edit may leave an authentication
+// gate requiring nothing at all.
+//
+// Bootstrap mints exactly one worker key when ROUTER_WORKER_TOKEN is empty. It
+// is called "bootstrap" and it looks like debris, and deleting it used to turn
+// /backends/register into an anonymous endpoint that anyone who could reach the
+// port could register a backend at. The client gate had the same shape: delete
+// the last client and admin key and the OpenAI surface stopped asking for
+// anything.
+func TestLastCredentialCannotBeRemoved(t *testing.T) {
+	registerClosed := func(t *testing.T, r *Router) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		r.routes().ServeHTTP(rec, post("/backends/register", `{"id":"x","url":"http://x","model":"m"}`, ""))
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("anonymous registration = %d, want 401 — the gate reopened", rec.Code)
+		}
+	}
+	clientClosed := func(t *testing.T, r *Router) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		r.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("anonymous /v1/models = %d, want 401 — the gate reopened", rec.Code)
+		}
+	}
+	cases := []struct {
+		name, role, method, body, wantIn string
+		stillShut                        func(*testing.T, *Router)
+	}{
+		{"deleting the last worker key", roleWorker, http.MethodDelete, "", "ROUTER_WORKER_TOKEN", registerClosed},
+		{"disabling the last worker key", roleWorker, http.MethodPatch, `{"enabled":false}`, "ROUTER_WORKER_TOKEN", registerClosed},
+		{"deleting the last client key", roleClient, http.MethodDelete, "", "ROUTER_CLIENT_TOKENS", clientClosed},
+		{"disabling the last client key", roleClient, http.MethodPatch, `{"enabled":false}`, "ROUTER_CLIENT_TOKENS", clientClosed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, cookie, ids := bootstrappedRouter(t, nil)
+			path := "/admin/keys/" + strconv.FormatInt(ids[tc.role], 10)
+			rec := serveWithCookie(r, cookie, tc.method, path, tc.body)
+			if rec.Code != http.StatusConflict {
+				t.Fatalf("%s = %d, want 409: %s", tc.method, rec.Code, rec.Body.String())
+			}
+			// The refusal has to name the way out, or an operator will work around it.
+			body := errorEnvelopeOf(t, rec)
+			if !strings.Contains(body.Message, tc.wantIn) {
+				t.Errorf("the refusal does not name %s: %q", tc.wantIn, body.Message)
+			}
+			tc.stillShut(t, r)
+		})
+	}
+
+	// A replacement makes it legal, which is what keeps the floor a floor rather
+	// than a key that can never be rotated.
+	t.Run("a replacement makes the delete legal", func(t *testing.T) {
+		r, cookie, ids := bootstrappedRouter(t, nil)
+		if rec := serveWithCookie(r, cookie, http.MethodPost, "/admin/keys", `{"name":"the real one","role":"worker"}`); rec.Code != http.StatusCreated {
+			t.Fatalf("create replacement = %d: %s", rec.Code, rec.Body.String())
+		}
+		path := "/admin/keys/" + strconv.FormatInt(ids[roleWorker], 10)
+		if rec := serveWithCookie(r, cookie, http.MethodDelete, path, ""); rec.Code != http.StatusOK {
+			t.Fatalf("delete with a replacement in place = %d, want 200: %s", rec.Code, rec.Body.String())
+		}
+		registerClosed(t, r)
+	})
+
+	// So does an environment token: the gate is required whatever the table says,
+	// so no row in it is the last credential.
+	t.Run("an environment token is a replacement too", func(t *testing.T) {
+		r, cookie, _ := bootstrappedRouter(t, &Config{WorkerToken: "env-worker"})
+		rec := serveWithCookie(r, cookie, http.MethodPost, "/admin/keys", `{"name":"spare","role":"worker"}`)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("create = %d: %s", rec.Code, rec.Body.String())
+		}
+		var created struct {
+			Key apiKey `json:"key"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+			t.Fatalf("create response is not JSON: %v", err)
+		}
+		path := "/admin/keys/" + strconv.FormatInt(created.Key.ID, 10)
+		if rec := serveWithCookie(r, cookie, http.MethodDelete, path, ""); rec.Code != http.StatusOK {
+			t.Fatalf("delete with ROUTER_WORKER_TOKEN set = %d, want 200: %s", rec.Code, rec.Body.String())
+		}
+		registerClosed(t, r)
+	})
+}
+
 func TestAdminKeyValidation(t *testing.T) {
 	r := adminRouter(t)
 	for _, tc := range []struct {

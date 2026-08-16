@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -786,6 +787,84 @@ func TestNorthboundErrorEnvelope(t *testing.T) {
 				t.Errorf("error type = %q, want %q", body.Type, tc.typ)
 			}
 		})
+	}
+}
+
+// TestClientCredentialIsNotForwardedDownstream: a caller's own key must never
+// leave this router.
+//
+// The proxy used to send the CLIENT's Authorization header verbatim to any
+// backend that had declared no api_key of its own. That was defensible while a
+// client token was one shared LAN secret held by services the operator ran. It
+// is not defensible now that callers hold their own `sk-` keys: every backend
+// that pushed itself to /backends/register — which is every beacon, and anything
+// a stranger managed to register — was handed each caller's live credential on
+// every request it served.
+//
+// All four upstream request paths are covered, because each built the header
+// separately and only one of them being right is the same as none of them being
+// right.
+func TestClientCredentialIsNotForwardedDownstream(t *testing.T) {
+	const callerSecret = "sk-the-callers-own-key"
+	routes := []struct {
+		name, path, body string
+	}{
+		{"buffered chat", "/v1/chat/completions", `{"messages":[{"role":"user","content":"hi"}]}`},
+		{"streamed chat", "/v1/chat/completions", `{"stream":true,"messages":[{"role":"user","content":"hi"}]}`},
+		{"passthrough completions", "/v1/completions", `{"prompt":"hi"}`},
+		{"passthrough embeddings", "/v1/embeddings", `{"input":"hi"}`},
+	}
+	cases := []struct {
+		name, backendKey, want string
+	}{
+		{"a backend with its own key is sent that key", "sk-the-backends-own-key", "Bearer sk-the-backends-own-key"},
+		{"a backend with none is sent no Authorization at all", "", ""},
+	}
+	for _, tc := range cases {
+		for _, route := range routes {
+			t.Run(tc.name+"/"+route.name, func(t *testing.T) {
+				var seen atomic.Value
+				seen.Store("")
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+					seen.Store(req.Header.Get("Authorization"))
+					if strings.Contains(route.body, `"stream":true`) {
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n")
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}],`+
+						`"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+				}))
+				t.Cleanup(srv.Close)
+
+				reg := newTestRegistry()
+				reg.upsert(BackendRegistration{
+					ID: "w", URL: srv.URL, Model: "gemma4", Quality: 50, APIKey: tc.backendKey,
+					TTLSeconds: 3600, Features: []string{"chat", "embeddings"},
+				})
+				reg.finishCertification("w", true, map[string]Check{}, 50, 10, "")
+				r := &Router{
+					cfg:      &Config{DefaultMaxTokens: 4096, HealthInterval: 15 * time.Second},
+					registry: reg, logs: newTestLogStore(t),
+					client: &http.Client{Timeout: 5 * time.Second}, streamClient: &http.Client{},
+				}
+				issueKey(t, r, callerSecret, apiKey{Role: roleClient, Name: "a stranger"})
+
+				rec := httptest.NewRecorder()
+				r.routes().ServeHTTP(rec, post(route.path, route.body, callerSecret))
+				if rec.Code != http.StatusOK {
+					t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+				}
+				got, _ := seen.Load().(string)
+				if strings.Contains(got, callerSecret) {
+					t.Fatalf("the backend was handed the caller's own credential: %q", got)
+				}
+				if got != tc.want {
+					t.Errorf("backend saw Authorization %q, want %q", got, tc.want)
+				}
+			})
+		}
 	}
 }
 

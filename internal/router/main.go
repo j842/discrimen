@@ -474,8 +474,18 @@ func Main() {
 	// supply and print them once. An empty ROUTER_CLIENT_TOKENS used to mean no
 	// client authentication at all, which is right on a trusted LAN and wrong for
 	// a public image — .env.example already promises operators this behaviour.
+	//
+	// Failing here is fatal, and deliberately so: this step is also what switches
+	// the credential checks ON (refreshAuthRequired runs at the end of it), so a
+	// router that logged the error and carried on would serve with client AND
+	// worker authentication off — an open fleet, the exact failure the bootstrap
+	// exists to prevent. The usual cause is a data volume that is read-only or
+	// full, so the message says which volume and what to do with it.
 	if err := router.bootstrapCredentials(context.Background()); err != nil {
-		log.Fatalf("bootstrap credentials: %v", err)
+		log.Fatalf("bootstrap credentials: %v\n"+
+			"  discrimen will not start without them: this step is what switches the credential checks on, "+
+			"so serving anyway would leave the fleet open to anyone who can reach the port.\n"+
+			"  Check that %s is on a writable volume with free space, then restart.", err, cfg.LogDBPath)
 	}
 	if cfg.AutoDifficulty || cfg.AutoThinking {
 		router.classifier = newDifficultyClassifier(cfg, router.embedTexts)
@@ -1328,13 +1338,24 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request)
 		// auto-thinking is skipped (only explicit thinking signals apply), there is
 		// no quality floor, and no session affinity — the caller has already made
 		// every one of those decisions.
+		//
+		// What the caller has NOT made is the access-control decision.
+		// enforceKeyLimits above only saw the body's model, and a pinned request
+		// need not name one at all, so the allow-list is re-checked here against the
+		// worker itself. Same reasoning that put /debug/backends/{id}/chat behind
+		// admin: a way of naming a worker that skips the per-key controls makes them
+		// decorative.
 		backend := r.registry.get(pinID)
-		if backend == nil {
-			writeJSON(w, http.StatusNotFound, validationError{Message: fmt.Sprintf("backend %q not found", pinID)})
+		switch {
+		case backend == nil:
+			r.refusePin(w, ident, pinID, "no backend is registered with that id")
 			return
-		}
-		if !backend.Healthy || !backend.Certification.Ready || isExpired(backend) {
-			writeUnavailable(w, r.retryAfterUnavailable(), fmt.Sprintf("backend %q not available (healthy=%v, ready=%v, expired=%v)", pinID, backend.Healthy, backend.Certification.Ready, isExpired(backend)))
+		case !ident.allowsBackend(backend):
+			r.refusePin(w, ident, pinID, fmt.Sprintf("serves no model on this key's allow-list (%s)", strings.Join(ident.Models, ", ")))
+			return
+		case !backend.Healthy || !backend.Certification.Ready || isExpired(backend):
+			r.refusePin(w, ident, pinID, fmt.Sprintf("not available (healthy=%v, ready=%v, expired=%v)",
+				backend.Healthy, backend.Certification.Ready, isExpired(backend)))
 			return
 		}
 		plan = &routePlan{candidates: []*Backend{backend}, route: "pinned"}
@@ -1349,9 +1370,72 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request)
 			writeUnavailable(w, r.retryAfterUnavailable(), err.Error())
 			return
 		}
+		kept, ok := r.restrictToAllowList(w, ident, plan.route, plan.candidates)
+		if !ok {
+			return
+		}
+		plan.candidates = kept
 	}
 
 	r.proxyToBackend(w, req, ident, plan, body, chatReq)
+}
+
+// refusePin answers a pin the router will not serve.
+//
+// Every reason — no such id, a worker that is not ready, a worker off this key's
+// allow-list — is the SAME 404 to a non-admin caller, and only an admin is told
+// which. The three used to be distinguishable, and that turned X-LLM-Backend-ID
+// into a fleet-enumeration oracle: any client key could walk a list of guesses
+// and read back every registered worker id and whether it was alive, which is
+// precisely what moving /backends behind the admin gate was meant to stop.
+//
+// 404 rather than the old 503 because a 404 is already the answer for a model
+// this router will not serve the caller (see unknownModelError), and "the thing
+// you named is not something you can have" is the same answer whether it was
+// named in the model field or in this header. It costs a pinning client the
+// Retry-After it used to get for a busy worker; a caller that wants the router
+// to wait for a worker should be using the auto route, which does.
+func (r *Router) refusePin(w http.ResponseWriter, ident *identity, pinID, reason string) {
+	message := fmt.Sprintf("backend %q not found", pinID)
+	if ident != nil && ident.Role == roleAdmin {
+		message = fmt.Sprintf("backend %q: %s", pinID, reason)
+	}
+	writeJSON(w, http.StatusNotFound, validationError{Message: message})
+}
+
+// restrictToAllowList narrows a candidate set to the workers a key's allow-list
+// names, for the routes where the ROUTER picked the model rather than the
+// caller. Writes the refusal and returns ok=false when nothing survives.
+//
+// This is the other half of the allow-list, and without it the list was not an
+// access control at all. allowsModel refuses nothing to a caller who named
+// nothing, which is right for a name and useless as a gate: "default", "auto",
+// "router" and an absent model field all mean the auto route (see
+// autoModelNames), and the auto route ranks the WHOLE fleet — so a key issued
+// for one local worker could reach every metered endpoint by asking for
+// "default". A named group that no member could serve lands here too: group
+// resolution clears the model filter on fallback precisely so a group is never a
+// refusal, and that fallback was likewise unfiltered.
+//
+// The trigger is the route string rather than the model field because the route
+// string is the router's own record of who chose: routeKind writes "route" when
+// it chose and "model" when the client did, and the group fallback deliberately
+// rewrites itself to "route" for exactly that reason.
+func (r *Router) restrictToAllowList(w http.ResponseWriter, ident *identity, route string, candidates []*Backend) ([]*Backend, bool) {
+	if ident == nil || len(ident.Models) == 0 || !strings.HasPrefix(route, "route") {
+		return candidates, true
+	}
+	kept := filterCandidates(candidates, ident.allowsBackend)
+	if len(kept) == 0 {
+		// 503, not 403: the key is allowed these models, and the reason none is a
+		// candidate right now may be that they are all busy, unhealthy or not yet
+		// certified. Naming the allow-list back tells the caller nothing it did not
+		// supply, so this leaks no more of the fleet than the key already knows.
+		writeUnavailable(w, r.retryAfterUnavailable(), fmt.Sprintf(
+			"no worker this key may use is available (allowed: %s)", strings.Join(ident.Models, ", ")))
+		return nil, false
+	}
+	return kept, true
 }
 
 // completionRequest is the legacy /v1/completions shape. We don't rewrite
@@ -1399,12 +1483,17 @@ func (r *Router) handleCompletions(w http.ResponseWriter, req *http.Request) {
 	if !r.enforceKeyLimits(w, ident, requestedModel(chatReq)) {
 		return
 	}
-	candidates, _, _, _, err := r.selectBackends(chatReq, callerBudget(req, chatReq))
+	candidates, route, _, _, err := r.selectBackends(chatReq, callerBudget(req, chatReq))
 	if err != nil {
 		writeUnavailable(w, r.retryAfterUnavailable(), err.Error())
 		return
 	}
-	r.proxyPassthrough(w, req, ident, candidates, body, "/v1/completions", "completions")
+	// Same gate as the chat path: an auto route here reaches the whole fleet too.
+	candidates, ok = r.restrictToAllowList(w, ident, route, candidates)
+	if !ok {
+		return
+	}
+	r.proxyPassthrough(w, req, ident, candidates, body, "/v1/completions", routeCompletions)
 }
 
 func (r *Router) handleEmbeddings(w http.ResponseWriter, req *http.Request) {
@@ -1431,7 +1520,7 @@ func (r *Router) handleEmbeddings(w http.ResponseWriter, req *http.Request) {
 		writeUnavailable(w, r.retryAfterUnavailable(), err.Error())
 		return
 	}
-	r.proxyPassthrough(w, req, ident, candidates, body, "/v1/embeddings", "embeddings")
+	r.proxyPassthrough(w, req, ident, candidates, body, "/v1/embeddings", routeEmbeddings)
 }
 
 // callerBudget reports how long the caller will still wait for a response, from
@@ -1481,6 +1570,104 @@ func (r *Router) selectBackendsByFeature(feature string) ([]*Backend, error) {
 	return rankBackends(filtered, nominalJob()), nil
 }
 
+// The two passthrough routes, named so the budgeting fallback can tell them
+// apart without matching a string literal written somewhere else.
+const (
+	routeCompletions = "completions"
+	routeEmbeddings  = "embeddings"
+)
+
+// setBackendCredential puts the BACKEND's own credential on a forwarded request,
+// and nothing at all when it has none.
+//
+// It used to fall back to relaying the CLIENT's Authorization header verbatim.
+// That was defensible while a client token was one shared LAN secret held by
+// services the operator ran; it stopped being defensible the moment callers hold
+// their own `sk-` keys. Every backend that declares no api_key — which includes
+// anything that pushed itself to /backends/register, and therefore anything a
+// stranger registered — was handed each caller's live credential on every
+// request it served. Nothing needs it: a worker that wants a bearer token
+// registers the one it wants (api_key in the registration payload), and a worker
+// that registers none is running without authentication, so there is nothing for
+// the header to satisfy. The router's own probes never had the fallback either,
+// so a worker relying on it could not have passed certification.
+func setBackendCredential(proxyReq *http.Request, backend *Backend) {
+	if backend.APIKey != "" {
+		proxyReq.Header.Set("Authorization", "Bearer "+backend.APIKey)
+	}
+}
+
+// genCharsPerToken is the chars-per-token divisor the budgeting fallbacks use.
+// The same 4.8 sseStats.genTokens applies to a streamed generation, so the
+// buffered and streamed estimates cannot drift apart.
+const genCharsPerToken = 4.8
+
+// estimateGenTokens turns a reply's size in bytes into a generated-token
+// estimate. It over-counts by the JSON envelope — a couple of hundred bytes, so
+// perhaps forty tokens on a one-word answer — which is the safe direction: it
+// only ever runs for an endpoint that declined to say what it charged, and a
+// spending bound that errs low is not a bound.
+func estimateGenTokens(n int64) int {
+	if n <= 0 {
+		return 0
+	}
+	return int(float64(n) / genCharsPerToken)
+}
+
+// estimatePromptTokens sizes a passthrough request the router deliberately never
+// parses. chars/3 is the divisor promptTokensFor uses on the chat path; applied
+// to the whole raw body it also charges the JSON scaffolding, which is a
+// rounding error beside a prompt.
+func estimatePromptTokens(body []byte) int {
+	return len(body) / 3
+}
+
+// replyMeter measures a passthrough reply as it is relayed, for the budgeting
+// fallback that runs when the endpoint reported no usage block of its own.
+//
+// Two numbers, because there are two reply shapes and neither can be read off
+// the other. A streamed reply is one `data:` frame per generated token in both
+// dialects, so the frame count IS the token count; a buffered reply has no
+// frames, and then its size is the only signal left. Measured on the wire rather
+// than from the capture beside it: that capture keeps 4KB of a stream which may
+// be megabytes.
+type replyMeter struct {
+	bytes   int64
+	frames  int
+	partial []byte // bytes after the last newline, held over for the next Write
+}
+
+func (m *replyMeter) Write(p []byte) (int, error) {
+	m.bytes += int64(len(p))
+	m.partial = append(m.partial, p...)
+	for {
+		i := bytes.IndexByte(m.partial, '\n')
+		if i < 0 {
+			break
+		}
+		line := m.partial[:i]
+		if bytes.HasPrefix(line, []byte("data: ")) && !bytes.Contains(line, []byte("[DONE]")) {
+			m.frames++
+		}
+		m.partial = m.partial[i+1:]
+	}
+	// Safety valve: a reply that never sends a newline (not SSE, and large) must
+	// not accumulate unboundedly. Same 1MB bound as sseStats.
+	if len(m.partial) > 1<<20 {
+		m.partial = nil
+	}
+	return len(p), nil
+}
+
+// genTokens is this reply's generated-token estimate: its frames when it
+// streamed, its size otherwise.
+func (m *replyMeter) genTokens() int {
+	if m.frames > 0 {
+		return m.frames
+	}
+	return estimateGenTokens(m.bytes)
+}
+
 // proxyPassthrough forwards a request body verbatim to openAIPath on the
 // best available backend from candidates. Used by /v1/completions and
 // /v1/embeddings, where the router does not interpret or rewrite the request
@@ -1517,13 +1704,33 @@ func (r *Router) proxyPassthrough(w http.ResponseWriter, req *http.Request, iden
 	// budgeting. Head-and-tail bounded, and usage sits at the tail in both the
 	// buffered and the SSE shape.
 	usage := newBoundedCapture(usageCaptureBytes)
+	// The meter measures the WHOLE reply as it goes past, which the capture
+	// cannot: it keeps 4KB of a stream that may be megabytes. Only read when the
+	// endpoint reported no usage of its own.
+	meter := &replyMeter{}
 	defer func() {
 		logEntry.DurationMillis = time.Since(start).Milliseconds()
-		r.recordKeyUse(ident, usageTotalTokens(usage.Bytes()))
-		// Async: this defer runs before releaseSlot (LIFO) and a synchronous
-		// SQLite write here would extend the worker's busy window.
-		entry := logEntry
+		// Charge what the endpoint said it charged, and estimate when it said
+		// nothing. stream_options.include_usage is off by default, so "nothing" is
+		// the ordinary case for a streamed /v1/completions — and charging zero for
+		// it meant a budgeted key could stream this endpoint in a loop without
+		// tokens_used moving at all. The chat path has had this fallback all along.
+		charged := usageTotalTokens(usage.Bytes())
+		if charged == 0 {
+			charged = estimatePromptTokens(body)
+			// An embeddings reply generates nothing — its whole cost is the input,
+			// and its body is a float array that would price like an epic poem.
+			if route != routeEmbeddings {
+				charged += meter.genTokens()
+			}
+		}
+		// Async, and BOTH writes: this defer runs before releaseSlot (LIFO), so a
+		// synchronous SQLite write here — against a pool capped at one connection —
+		// extends the busy window of a max_concurrency=1 worker after every request.
+		// recordKeyUse was that write; the log insert next to it always knew better.
+		caller, entry := ident, logEntry
 		go func() {
+			r.recordKeyUse(caller, charged)
 			if err := r.logs.Insert(context.Background(), entry); err != nil {
 				log.Printf("persist request log failed: %v", err)
 			}
@@ -1541,11 +1748,7 @@ func (r *Router) proxyPassthrough(w http.ResponseWriter, req *http.Request, iden
 		return
 	}
 	proxyReq.Header.Set("Content-Type", "application/json")
-	if backend.APIKey != "" {
-		proxyReq.Header.Set("Authorization", "Bearer "+backend.APIKey)
-	} else if auth := req.Header.Get("Authorization"); auth != "" {
-		proxyReq.Header.Set("Authorization", auth)
-	}
+	setBackendCredential(proxyReq, backend)
 
 	resp, err := r.client.Do(proxyReq)
 	if err != nil {
@@ -1580,6 +1783,7 @@ func (r *Router) proxyPassthrough(w http.ResponseWriter, req *http.Request, iden
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
 			_, _ = usage.Write(buf[:n])
+			_, _ = meter.Write(buf[:n])
 			if _, werr := w.Write(buf[:n]); werr != nil {
 				logEntry.Error = werr.Error()
 				return
@@ -1853,6 +2057,14 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 		writeUnavailable(w, r.retryAfterUnavailable(), "no backend available")
 		return
 	}
+	// The caller has been identified; their credential is of no further use to
+	// this router and must not leave it. Dropping it here rather than only at each
+	// point an upstream request is built makes the property structural: the whole
+	// dispatch subtree below — streaming, buffered, the strip-and-retry, an inline
+	// escalation — can only send what setBackendCredential gives it, whichever
+	// file happens to build the request. See setBackendCredential for why the old
+	// relay-the-client's-header fallback had to go.
+	req.Header.Del("Authorization")
 	// Patch the forwarded body in a SINGLE pass: fill in max_tokens when the
 	// client omitted it (the backend needs an explicit limit) and write
 	// chat_template_kwargs.enable_thinking per the resolved decision. One
@@ -1995,6 +2207,14 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 			charged = job.promptTokens
 			if stats != nil {
 				charged += stats.genTokens()
+			} else {
+				// A BUFFERED reply has no per-token deltas to count, so the reply's own
+				// size stands in for the answer inside it. Charging the prompt alone
+				// made a generation of any length free on the one shape where every
+				// OpenAI-compatible endpoint does report usage — so this only runs for
+				// an endpoint that did not, and erring high there is the right way to
+				// err for a spending bound.
+				charged += estimateGenTokens(capture.total)
 			}
 		}
 		entry := logEntry
@@ -2098,11 +2318,7 @@ func (r *Router) dispatchStreaming(w http.ResponseWriter, req *http.Request, bac
 		return
 	}
 	proxyReq.Header.Set("Content-Type", "application/json")
-	if backend.APIKey != "" {
-		proxyReq.Header.Set("Authorization", "Bearer "+backend.APIKey)
-	} else if auth := req.Header.Get("Authorization"); auth != "" {
-		proxyReq.Header.Set("Authorization", auth)
-	}
+	setBackendCredential(proxyReq, backend)
 
 	idle := r.cfg.BackendIdleTimeout
 	var watchdog *time.Timer

@@ -1,15 +1,19 @@
 package router
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -382,6 +386,84 @@ func TestIdentityLimits(t *testing.T) {
 	}
 }
 
+// TestReopenedGates is the rule behind the 409, stated on its own: a key edit
+// may never flip a gate from "credential required" to "credential not required",
+// and it may never refuse an edit for any other reason.
+func TestReopenedGates(t *testing.T) {
+	const (
+		clientGate = "the OpenAI API (/v1/chat/completions and friends)"
+		workerGate = "worker registration (/backends/register)"
+	)
+	cases := []struct {
+		name string
+		cfg  *Config
+		keys []apiKey
+		id   int64
+		want []string
+	}{
+		{
+			name: "the bootstrap pair: each key is the last of its kind",
+			keys: []apiKey{{ID: 1, Role: roleClient, Enabled: true}, {ID: 2, Role: roleWorker, Enabled: true}},
+			id:   2, want: []string{workerGate},
+		},
+		{
+			name: "an admin key holds BOTH gates open on its own",
+			keys: []apiKey{{ID: 1, Role: roleAdmin, Enabled: true}},
+			id:   1, want: []string{clientGate, workerGate},
+		},
+		{
+			// An admin key satisfies the client gate, so the client key is spare.
+			name: "an admin key covers a client key",
+			keys: []apiKey{{ID: 1, Role: roleAdmin, Enabled: true}, {ID: 2, Role: roleClient, Enabled: true}},
+			id:   2, want: nil,
+		},
+		{
+			name: "a second key of the same role is a replacement",
+			keys: []apiKey{{ID: 1, Role: roleWorker, Enabled: true}, {ID: 2, Role: roleWorker, Enabled: true}},
+			id:   1, want: nil,
+		},
+		{
+			name: "a disabled key is not a credential and does not hold a gate",
+			keys: []apiKey{{ID: 1, Role: roleWorker, Enabled: true}, {ID: 2, Role: roleWorker}},
+			id:   1, want: []string{workerGate},
+		},
+		{
+			// Nothing is being reopened, so nothing is refused: an open deployment
+			// must still be able to tidy up its keys table.
+			name: "a gate that is already open is not defended",
+			keys: []apiKey{{ID: 1, Role: roleClient}},
+			id:   1, want: nil,
+		},
+		{
+			name: "the environment requires a credential whatever the table says",
+			cfg:  &Config{ClientTokens: []string{"env"}, WorkerToken: "env"},
+			keys: []apiKey{{ID: 1, Role: roleAdmin, Enabled: true}},
+			id:   1, want: nil,
+		},
+		{
+			name: "deleting a key that is not there reopens nothing",
+			keys: []apiKey{{ID: 1, Role: roleAdmin, Enabled: true}},
+			id:   99, want: nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.cfg
+			if cfg == nil {
+				cfg = &Config{}
+			}
+			got := (&Router{cfg: cfg}).reopenedGates(tc.keys, tc.id)
+			names := make([]string, 0, len(got))
+			for _, g := range got {
+				names = append(names, g.name)
+			}
+			if strings.Join(names, "|") != strings.Join(tc.want, "|") {
+				t.Errorf("reopenedGates = %v, want %v", names, tc.want)
+			}
+		})
+	}
+}
+
 func TestUsageTotalTokens(t *testing.T) {
 	cases := []struct {
 		name string
@@ -588,22 +670,168 @@ func TestBootstrapGeneratesOnceAndOnlyWhenMissing(t *testing.T) {
 			t.Fatalf("generated %d keys despite the environment supplying them", len(keys))
 		}
 		// The admin password IS seeded from the environment, because there is
-		// nowhere else for it to live — but the database is canonical from then on.
+		// nowhere else for it to live.
 		hash, _ := fresh.LoadSetting(ctx, settingAdminPasswordHash)
 		if !verifyPassword(hash, "a-seeded-admin-password") {
 			t.Fatal("ROUTER_ADMIN_PASSWORD did not seed the database")
 		}
 
-		// A later start with a DIFFERENT environment password must not overwrite it.
-		r.cfg.AdminPassword = "a-completely-different-one"
+		// A start with the SAME password rewrites nothing: bootstrap compares before
+		// it hashes, so the stored row is left byte-identical.
 		if err := r.bootstrapCredentials(ctx); err != nil {
 			t.Fatalf("second bootstrap: %v", err)
 		}
-		hash, _ = fresh.LoadSetting(ctx, settingAdminPasswordHash)
-		if !verifyPassword(hash, "a-seeded-admin-password") {
-			t.Fatal("the environment overwrote the stored admin password — the database is meant to be canonical")
+		again, _ := fresh.LoadSetting(ctx, settingAdminPasswordHash)
+		if again != hash {
+			t.Error("an unchanged ROUTER_ADMIN_PASSWORD re-hashed the stored password on restart")
 		}
 	})
+}
+
+// TestAdminPasswordRecovery is the lockout fix.
+//
+// ROUTER_ADMIN_PASSWORD used to seed a database that had none and do nothing
+// afterwards. Every operator surface is behind the admin gate — /backends,
+// /logs, the keys tab, /debug/backends/* — and the generated password is printed
+// exactly once, to a container log. An operator who missed that line had no way
+// back into their own router short of editing SQLite inside the data volume.
+//
+// So: a SET variable is authoritative on every start, an UNSET one changes
+// nothing, and the login endpoint has to agree with both.
+func TestAdminPasswordRecovery(t *testing.T) {
+	const (
+		generatedEra = "the-password-nobody-wrote-down"
+		uiChosen     = "the-one-set-in-the-ui"
+		recovery     = "the-recovery-password"
+	)
+	logs := newTestLogStore(t)
+	ctx := t.Context()
+	newRouter := func(envPassword string) *Router {
+		return &Router{
+			cfg:      &Config{AdminPassword: envPassword},
+			registry: newTestRegistry(),
+			logs:     logs,
+		}
+	}
+	login := func(t *testing.T, r *Router, password string) int {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		r.routes().ServeHTTP(rec, post("/admin/login", `{"password":`+jsonOf(t, password)+`}`, ""))
+		return rec.Code
+	}
+
+	// A database with a password already in it, as an upgrading deployment has.
+	hash, err := hashPasswordIter(generatedEra, 1000)
+	if err != nil {
+		t.Fatalf("hashPasswordIter: %v", err)
+	}
+	if err := logs.SaveSetting(ctx, settingAdminPasswordHash, hash); err != nil {
+		t.Fatalf("SaveSetting: %v", err)
+	}
+
+	cases := []struct {
+		name        string
+		envPassword string
+		wantIn      string // the password that must now work
+		wantOut     string // one that must not
+	}{
+		// The recovery path itself: set the variable, restart, you are back in.
+		{"a set variable takes over an existing password", recovery, recovery, generatedEra},
+		// And it is idempotent — a second restart with the same variable is a no-op
+		// that still leaves the operator able to log in.
+		{"the same variable again is a no-op", recovery, recovery, generatedEra},
+		// An UNSET variable must never wipe a password. This is the property the old
+		// early return was protecting, and it is the one that has to survive.
+		{"an unset variable leaves the stored password alone", "", recovery, generatedEra},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRouter(tc.envPassword)
+			if err := r.bootstrapCredentials(ctx); err != nil {
+				t.Fatalf("bootstrap: %v", err)
+			}
+			if code := login(t, r, tc.wantIn); code != http.StatusOK {
+				t.Errorf("login with %q = %d, want 200", tc.wantIn, code)
+			}
+			if code := login(t, r, tc.wantOut); code != http.StatusUnauthorized {
+				t.Errorf("login with the superseded %q = %d, want 401", tc.wantOut, code)
+			}
+		})
+	}
+
+	// A password rotated through the UI while the variable is unset is canonical,
+	// and the next restart does not revert it.
+	r := newRouter("")
+	rec := httptest.NewRecorder()
+	req := post("/admin/password", `{"current_password":`+jsonOf(t, recovery)+`,"new_password":`+jsonOf(t, uiChosen)+`}`, "")
+	issueKey(t, r, adminSecret, apiKey{Role: roleAdmin, Name: "admin"})
+	req.Header.Set("Authorization", "Bearer "+adminSecret)
+	r.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("password change = %d: %s", rec.Code, rec.Body.String())
+	}
+	if err := newRouter("").bootstrapCredentials(ctx); err != nil {
+		t.Fatalf("bootstrap after a UI rotation: %v", err)
+	}
+	if code := login(t, r, uiChosen); code != http.StatusOK {
+		t.Errorf("a restart reverted a password set in the UI: login = %d, want 200", code)
+	}
+}
+
+// TestBootstrapBannerIsGreppable: the setup instructions tell an operator to
+// find a generated credential with `docker compose logs discrimen | grep -i
+// bootstrap`. The banner is the only place it is ever printed, so a banner that
+// does not carry that word makes the one documented recovery find nothing.
+func TestBootstrapBannerIsGreppable(t *testing.T) {
+	var buf bytes.Buffer
+	prevOut, prevFlags := log.Writer(), log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	t.Cleanup(func() { log.SetOutput(prevOut); log.SetFlags(prevFlags) })
+
+	r := &Router{cfg: &Config{}, registry: newTestRegistry(), logs: newTestLogStore(t)}
+	if err := r.bootstrapCredentials(t.Context()); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	out := buf.String()
+	// Case-insensitively, exactly as the documented grep would match it.
+	for _, want := range []string{"bootstrap client token", "bootstrap worker token", "bootstrap admin password"} {
+		if !strings.Contains(strings.ToLower(out), want) {
+			t.Errorf("the startup banner has no %q line for `grep -i bootstrap` to find:\n%s", want, out)
+		}
+	}
+}
+
+// TestEnvPasswordIsNotLogged: the reset line says that it happened, never what
+// it was. The operator supplied this password, so they already have it, and
+// printing it would put a live credential in the log on every start.
+func TestEnvPasswordIsNotLogged(t *testing.T) {
+	const secret = "an-environment-password"
+	logs := newTestLogStore(t)
+	ctx := t.Context()
+	if hash, err := hashPasswordIter("something-else", 1000); err != nil {
+		t.Fatal(err)
+	} else if err := logs.SaveSetting(ctx, settingAdminPasswordHash, hash); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	prevOut, prevFlags := log.Writer(), log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	t.Cleanup(func() { log.SetOutput(prevOut); log.SetFlags(prevFlags) })
+
+	r := &Router{cfg: &Config{AdminPassword: secret}, registry: newTestRegistry(), logs: logs}
+	if err := r.bootstrapCredentials(ctx); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	out := buf.String()
+	if strings.Contains(out, secret) {
+		t.Errorf("ROUTER_ADMIN_PASSWORD was printed to the log:\n%s", out)
+	}
+	if !strings.Contains(strings.ToUpper(out), "RESET") {
+		t.Errorf("replacing a stored password said nothing about it:\n%s", out)
+	}
 }
 
 // jsonOf renders a value the way the API would, for "this must not appear
@@ -744,6 +972,355 @@ func waitForTokens(t *testing.T, r *Router, secret string, want int64) int64 {
 			t.Fatalf("tokens_used did not reach %d (got %d)", want, key.TokensUsed)
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// ── The allow-list as an access control ─────────────────────────────────────
+
+// allowListRouter builds a two-model fleet — one local worker and one standing
+// in for a metered endpoint — plus a third worker that is registered but never
+// certified, so a test has a live id that is not routable.
+//
+// The metered worker is the HIGHER quality of the two, so the unrestricted auto
+// route ranks it first. That is what makes the assertions sharp: a restricted
+// key landing on the local worker has been steered there, not merely lucky.
+func allowListRouter(t *testing.T, models []string) (*Router, map[string]*atomic.Int64) {
+	t.Helper()
+	hits := map[string]*atomic.Int64{}
+	reg := newTestRegistry()
+	for _, w := range []struct {
+		id, model string
+		quality   int
+		certify   bool
+	}{
+		{"local", "local-8b", 40, true},
+		{"metered", "gpt-4o", 90, true},
+		{"dormant", "some-model", 60, false},
+	} {
+		counter := &atomic.Int64{}
+		hits[w.id] = counter
+		srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+			counter.Add(1)
+			rw.Header().Set("Content-Type", "application/json")
+			_, _ = rw.Write([]byte(`{"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}],` +
+				`"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+		}))
+		t.Cleanup(srv.Close)
+		reg.upsert(BackendRegistration{
+			ID: w.id, URL: srv.URL, Model: w.model, Quality: w.quality,
+			TTLSeconds: 3600, Features: []string{"chat"},
+		})
+		if w.certify {
+			reg.finishCertification(w.id, true, map[string]Check{}, 50, 10, "")
+		}
+	}
+	r := &Router{
+		cfg:      &Config{DefaultMaxTokens: 4096, HealthInterval: 15 * time.Second},
+		registry: reg, logs: newTestLogStore(t),
+		client: &http.Client{Timeout: 5 * time.Second}, streamClient: &http.Client{},
+	}
+	issueKey(t, r, clientSecret, apiKey{Role: roleClient, Name: "limited", Models: models})
+	issueKey(t, r, adminSecret, apiKey{Role: roleAdmin, Name: "admin"})
+	return r, hits
+}
+
+const chatBody = `"messages":[{"role":"user","content":"hi"}]`
+
+// TestAllowListRestrictsTheAutoRoute: a key with an allow-list must not reach
+// the whole fleet by declining to name a model.
+//
+// allowsModel refuses nothing to a caller who named nothing, and autoModelNames
+// maps "", "default", "auto" and "router" onto the auto route — which ranks
+// every registered worker. So a key issued for one local model could reach every
+// metered endpoint by asking for "default", and the allow-list was a label
+// rather than a control.
+func TestAllowListRestrictsTheAutoRoute(t *testing.T) {
+	cases := []struct {
+		name, body string
+	}{
+		{"no model field at all", `{` + chatBody + `}`},
+		{"model:default", `{"model":"default",` + chatBody + `}`},
+		{"model:auto", `{"model":"auto",` + chatBody + `}`},
+		{"model:router", `{"model":"router",` + chatBody + `}`},
+		{"model: empty string", `{"model":"",` + chatBody + `}`},
+		{"the allow-listed model by name", `{"model":"local-8b",` + chatBody + `}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, hits := allowListRouter(t, []string{"local-8b"})
+			rec := httptest.NewRecorder()
+			r.routes().ServeHTTP(rec, post("/v1/chat/completions", tc.body, clientSecret))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+			}
+			if got := rec.Header().Get("X-LLM-Backend-ID"); got != "local" {
+				t.Errorf("served by %q, want the allow-listed worker", got)
+			}
+			if n := hits["metered"].Load(); n != 0 {
+				t.Errorf("a key restricted to local-8b reached the metered endpoint %d time(s)", n)
+			}
+		})
+	}
+
+	// Control: the SAME request from an unrestricted key does reach the metered
+	// worker. Without this the assertions above would also pass on a fleet that
+	// could never route there in the first place.
+	t.Run("an empty allow-list is unrestricted", func(t *testing.T) {
+		r, hits := allowListRouter(t, nil)
+		rec := httptest.NewRecorder()
+		r.routes().ServeHTTP(rec, post("/v1/chat/completions", `{"model":"default",`+chatBody+`}`, clientSecret))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+		}
+		if hits["metered"].Load() == 0 {
+			t.Error("the unrestricted auto route did not prefer the higher-quality worker; the test proves nothing")
+		}
+	})
+
+	// Nothing on the list is routable: a 503, because the key IS allowed these
+	// models and the reason none is a candidate may be that they are all busy.
+	t.Run("nothing on the list is available", func(t *testing.T) {
+		r, _ := allowListRouter(t, []string{"a-model-nobody-serves"})
+		rec := httptest.NewRecorder()
+		r.routes().ServeHTTP(rec, post("/v1/chat/completions", `{"model":"default",`+chatBody+`}`, clientSecret))
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503: %s", rec.Code, rec.Body.String())
+		}
+		if body := errorEnvelopeOf(t, rec); !strings.Contains(body.Message, "a-model-nobody-serves") {
+			t.Errorf("the refusal does not name the key's own allow-list: %q", body.Message)
+		}
+	})
+
+	// And the same on /v1/completions, which reaches the fleet through
+	// selectBackends rather than planRoute.
+	t.Run("the legacy completions endpoint too", func(t *testing.T) {
+		r, hits := allowListRouter(t, []string{"local-8b"})
+		rec := httptest.NewRecorder()
+		r.routes().ServeHTTP(rec, post("/v1/completions", `{"prompt":"hi"}`, clientSecret))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+		}
+		if n := hits["metered"].Load(); n != 0 {
+			t.Errorf("/v1/completions reached the metered endpoint %d time(s)", n)
+		}
+	})
+}
+
+// TestGroupFallbackRespectsTheAllowList: a group whose members cannot serve the
+// request falls back to automatic routing, and that fallback used to clear the
+// model filter entirely — handing a restricted key the whole fleet through a
+// group name it was allowed to say.
+func TestGroupFallbackRespectsTheAllowList(t *testing.T) {
+	r, hits := allowListRouter(t, []string{"local-8b", "coding"})
+	r.groups.put(Group{Name: "coding", Members: []string{"a-worker-that-is-not-here"}})
+
+	rec := httptest.NewRecorder()
+	r.routes().ServeHTTP(rec, post("/v1/chat/completions", `{"model":"coding",`+chatBody+`}`, clientSecret))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-LLM-Group"); got != "fallback" {
+		t.Fatalf("X-LLM-Group = %q, want fallback — the test is not exercising the fallback", got)
+	}
+	if n := hits["metered"].Load(); n != 0 {
+		t.Errorf("a group fallback reached the metered endpoint %d time(s)", n)
+	}
+	if got := rec.Header().Get("X-LLM-Backend-ID"); got != "local" {
+		t.Errorf("the fallback served %q, want the allow-listed worker", got)
+	}
+}
+
+// TestPinIsCheckedAndIsNotAnOracle covers both halves of the X-LLM-Backend-ID
+// hole.
+//
+// The pin routes by worker id with nothing re-checking the allow-list, so a
+// restricted key could name any worker in the fleet and be served by it. And the
+// three refusals were distinguishable — 404 for an unknown id, 503 naming
+// healthy/ready/expired for a known one — which made the header a
+// fleet-enumeration oracle: walk a list of guesses and read back every
+// registered id and whether it was alive, the exact thing moving /backends
+// behind the admin gate was meant to prevent.
+func TestPinIsCheckedAndIsNotAnOracle(t *testing.T) {
+	cases := []struct {
+		name, pin string
+	}{
+		{"a worker off the allow-list", "metered"},
+		{"a registered but uncertified worker", "dormant"},
+		{"an id that does not exist", "no-such-worker"},
+	}
+	var bodies []string
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, hits := allowListRouter(t, []string{"local-8b"})
+			req := post("/v1/chat/completions", `{"model":"default",`+chatBody+`}`, clientSecret)
+			req.Header.Set("X-LLM-Backend-ID", tc.pin)
+			rec := httptest.NewRecorder()
+			r.routes().ServeHTTP(rec, req)
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("pin %q = %d, want 404: %s", tc.pin, rec.Code, rec.Body.String())
+			}
+			for id, n := range hits {
+				if n.Load() != 0 {
+					t.Errorf("a refused pin still reached worker %q", id)
+				}
+			}
+			// Compare with the id the CALLER supplied taken back out: echoing it is
+			// not a disclosure, and anything else that differs is.
+			bodies = append(bodies, strings.ReplaceAll(rec.Body.String(), tc.pin, "<pin>"))
+		})
+	}
+	for i := 1; i < len(bodies); i++ {
+		if bodies[i] != bodies[0] {
+			t.Errorf("a client can tell two pin refusals apart, so the header enumerates the fleet:\n  %s\n  %s", bodies[0], bodies[i])
+		}
+	}
+
+	// The pin still works for a worker the key may use.
+	t.Run("an allowed worker is still pinnable", func(t *testing.T) {
+		r, hits := allowListRouter(t, []string{"local-8b"})
+		req := post("/v1/chat/completions", `{"model":"default",`+chatBody+`}`, clientSecret)
+		req.Header.Set("X-LLM-Backend-ID", "local")
+		rec := httptest.NewRecorder()
+		r.routes().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("pinning an allowed worker = %d, want 200: %s", rec.Code, rec.Body.String())
+		}
+		if hits["local"].Load() != 1 {
+			t.Error("the pinned worker was not the one that served")
+		}
+	})
+
+	// An ADMIN is told which of the three it was: they can already read /backends,
+	// so there is nothing left to withhold, and a debugging operator needs it.
+	t.Run("an admin is told why", func(t *testing.T) {
+		r, _ := allowListRouter(t, nil)
+		seen := map[string]bool{}
+		for _, pin := range []string{"dormant", "no-such-worker"} {
+			req := post("/v1/chat/completions", `{"model":"default",`+chatBody+`}`, adminSecret)
+			req.Header.Set("X-LLM-Backend-ID", pin)
+			rec := httptest.NewRecorder()
+			r.routes().ServeHTTP(rec, req)
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("admin pin %q = %d, want 404: %s", pin, rec.Code, rec.Body.String())
+			}
+			seen[errorEnvelopeOf(t, rec).Message] = true
+		}
+		if len(seen) != 2 {
+			t.Errorf("an admin gets the same message for every refusal: %v", seen)
+		}
+	})
+}
+
+// ── Charging what was actually spent ────────────────────────────────────────
+
+// TestStreamedCompletionsAreCharged: /v1/completions with stream:true and no
+// stream_options.include_usage is the DEFAULT shape, it carries no usage block,
+// and it used to be charged nothing at all — so a budgeted key could stream this
+// endpoint in a loop while tokens_used stayed where it was.
+func TestStreamedCompletionsAreCharged(t *testing.T) {
+	const frames = 40
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl, _ := w.(http.Flusher)
+		for i := 0; i < frames; i++ {
+			_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"index\":0,\"text\":\" tok\",\"finish_reason\":null}]}\n\n")
+			if fl != nil {
+				fl.Flush()
+			}
+		}
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	t.Cleanup(srv.Close)
+
+	reg := newTestRegistry()
+	reg.upsert(BackendRegistration{ID: "w", URL: srv.URL, Model: "local-8b", Quality: 50, TTLSeconds: 3600, Features: []string{"chat"}})
+	reg.finishCertification("w", true, map[string]Check{}, 50, 10, "")
+	r := &Router{
+		cfg:      &Config{DefaultMaxTokens: 4096, HealthInterval: 15 * time.Second},
+		registry: reg, logs: newTestLogStore(t),
+		client: &http.Client{Timeout: 5 * time.Second}, streamClient: &http.Client{},
+	}
+	issueKey(t, r, clientSecret, apiKey{Role: roleClient, Name: "budgeted", TokenBudget: frames})
+
+	rec := httptest.NewRecorder()
+	r.routes().ServeHTTP(rec, post("/v1/completions", `{"prompt":"hi","stream":true}`, clientSecret))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("stream = %d: %s", rec.Code, rec.Body.String())
+	}
+	// One SSE frame is one generated token in both dialects, so the estimate is
+	// at least the frame count. Asynchronous by contract — see recordKeyUse.
+	used := waitForTokens(t, r, clientSecret, frames)
+	if used < frames {
+		t.Fatalf("charged %d tokens for a %d-frame stream", used, frames)
+	}
+	// And the budget it just spent now stops the next one, which is the whole
+	// point of charging it.
+	rec = httptest.NewRecorder()
+	r.routes().ServeHTTP(rec, post("/v1/completions", `{"prompt":"hi","stream":true}`, clientSecret))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("second stream = %d, want 429 — the budget never bit: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestChargingFallbacksByRoute: what each route charges when the endpoint
+// reports no usage of its own.
+func TestChargingFallbacksByRoute(t *testing.T) {
+	cases := []struct {
+		name, path, body string
+		reply            string
+		contentType      string
+		wantAtLeast      int64
+		wantAtMost       int64
+	}{
+		{
+			// A buffered chat reply with no usage block used to charge the prompt
+			// alone, so an answer of any length was free.
+			name: "buffered chat with no usage block", path: "/v1/chat/completions",
+			body:        `{"model":"local-8b","messages":[{"role":"user","content":"hi"}]}`,
+			reply:       `{"choices":[{"message":{"content":"` + strings.Repeat("word ", 200) + `"},"finish_reason":"stop"}]}`,
+			contentType: "application/json",
+			wantAtLeast: 150, wantAtMost: 400,
+		},
+		{
+			// An embeddings reply generates nothing — its whole cost is the input —
+			// and its body is a float array that must not be priced as prose.
+			name: "embeddings charges the input only", path: "/v1/embeddings",
+			body:        `{"input":"hi","model":"local-8b"}`,
+			reply:       `{"data":[{"embedding":[` + strings.TrimSuffix(strings.Repeat("0.0123456789,", 1000), ",") + `]}]}`,
+			contentType: "application/json",
+			wantAtLeast: 1, wantAtMost: 50,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", tc.contentType)
+				_, _ = io.WriteString(w, tc.reply)
+			}))
+			t.Cleanup(srv.Close)
+			reg := newTestRegistry()
+			reg.upsert(BackendRegistration{
+				ID: "w", URL: srv.URL, Model: "local-8b", Quality: 50,
+				TTLSeconds: 3600, Features: []string{"chat", "embeddings"},
+			})
+			reg.finishCertification("w", true, map[string]Check{}, 50, 10, "")
+			r := &Router{
+				cfg:      &Config{DefaultMaxTokens: 4096, HealthInterval: 15 * time.Second, LogMaxBodyBytes: 16384},
+				registry: reg, logs: newTestLogStore(t),
+				client: &http.Client{Timeout: 5 * time.Second}, streamClient: &http.Client{},
+			}
+			issueKey(t, r, clientSecret, apiKey{Role: roleClient, Name: "budgeted"})
+
+			rec := httptest.NewRecorder()
+			r.routes().ServeHTTP(rec, post(tc.path, tc.body, clientSecret))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+			}
+			used := waitForTokens(t, r, clientSecret, tc.wantAtLeast)
+			if used > tc.wantAtMost {
+				t.Errorf("charged %d tokens, want no more than %d", used, tc.wantAtMost)
+			}
+		})
 	}
 }
 

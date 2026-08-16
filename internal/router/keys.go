@@ -134,6 +134,37 @@ func (id *identity) allowsModel(name string) bool {
 	return false
 }
 
+// allowsBackend reports whether this key may be served by a particular WORKER,
+// which is the question every path that reaches a backend without naming a model
+// has to ask: the auto route, a group that fell back to it, and an
+// X-LLM-Backend-ID pin.
+//
+// allowsModel answers "may the caller say this word", and a caller who says
+// nothing is refused nothing — that is right for a name, and useless as an
+// access control, because the auto route and a pin both reach the whole fleet
+// without naming anything. This is the other half: it matches the allow-list
+// against what the worker ANSWERS TO, through the same backendServesModel the
+// model field resolves with, so an entry means what an operator reading
+// /v1/models would expect it to mean.
+//
+// A key restricted to a GROUP name has nothing here that can match, and that is
+// correct: a group is a spelling the client uses, not something a worker serves.
+// Such a key gets its group and nothing else, which is what it was issued for.
+func (id *identity) allowsBackend(b *Backend) bool {
+	if id == nil || len(id.Models) == 0 {
+		return true
+	}
+	if b == nil {
+		return false
+	}
+	for _, m := range id.Models {
+		if backendServesModel(b, m) {
+			return true
+		}
+	}
+	return false
+}
+
 // overBudget reports whether this key has spent its lifetime token allowance.
 func (id *identity) overBudget() bool {
 	return id != nil && id.TokenBudget > 0 && id.TokensUsed >= id.TokenBudget
@@ -546,9 +577,12 @@ func (r *Router) workerAuthRequired() bool {
 }
 
 // refreshAuthRequired re-reads whether any enabled key of each kind exists.
-// Called at startup and after every write to the keys table, so revoking the
-// last client key reopens the fleet exactly as deleting the environment variable
-// would — surprising, but the alternative is a router nobody can call.
+// Called at startup and after every write to the keys table.
+//
+// Both flags can fall back to false, and that is deliberate: a deployment with
+// no keys and no environment tokens is the historical trusted-LAN one, and it
+// has to keep working. What must not happen is REACHING that state by editing
+// one row, which is what reopenedGates refuses.
 func (r *Router) refreshAuthRequired(ctx context.Context) {
 	if r.logs == nil {
 		return
@@ -563,6 +597,78 @@ func (r *Router) refreshAuthRequired(ctx context.Context) {
 	} else {
 		log.Printf("check for enabled worker keys failed: %v", err)
 	}
+}
+
+// ── Never reopen a gate by editing one row ──────────────────────────────────
+
+// authGate is one of the two surfaces a credential can be the last holder of,
+// named the way an operator would name it and paired with the environment
+// variable that is the other way to require one.
+type authGate struct {
+	name    string
+	envName string
+}
+
+// reopenedGates reports which gates would stop requiring a credential at all if
+// key `id` were no longer an enabled row, given `keys` as the whole table.
+//
+// It exists because both gates are "required if anything requires it".
+// Bootstrap mints exactly ONE worker key when ROUTER_WORKER_TOKEN is empty, it
+// is called "bootstrap", and it looks like debris. Deleting it turns
+// /backends/register into an anonymous endpoint that anyone who can reach the
+// port may register a backend at — a backend the router will then send real
+// traffic to. The client gate has the same shape: delete the last client and
+// admin key and /v1/chat/completions stops asking for anything.
+//
+// The rule is a floor, not a latch. A latch ("worker auth was required once, so
+// it is required forever") is simpler and is the wrong trade: it leaves the gate
+// locked with no key in existence to open it, which is the same unrecoverable
+// state as an admin lockout and arrives just as silently. A floor fails at the
+// moment the operator can still do something about it, and the handler says
+// what: issue the replacement first. It also composes with the environment —
+// when ROUTER_WORKER_TOKEN is set, no row is the last worker credential, and the
+// delete goes through.
+//
+// A gate that is ALREADY open is never reported: nothing is being reopened, and
+// refusing to tidy up the keys table of an open deployment would be a rule with
+// no purpose left to serve.
+func (r *Router) reopenedGates(keys []apiKey, id int64) []authGate {
+	gates := []struct {
+		authGate
+		serves func(role string) bool
+		envSet bool
+	}{
+		{
+			authGate{"the OpenAI API (/v1/chat/completions and friends)", "ROUTER_CLIENT_TOKENS"},
+			func(role string) bool { return role == roleClient || role == roleAdmin },
+			r.cfg != nil && len(r.cfg.ClientTokens) > 0,
+		},
+		{
+			authGate{"worker registration (/backends/register)", "ROUTER_WORKER_TOKEN"},
+			func(role string) bool { return role == roleWorker || role == roleAdmin },
+			r.cfg != nil && r.cfg.WorkerToken != "",
+		},
+	}
+	var out []authGate
+	for _, g := range gates {
+		if g.envSet {
+			continue // the environment requires a credential whatever the table says
+		}
+		required, remaining := false, 0
+		for _, k := range keys {
+			if !k.Enabled || !g.serves(k.Role) {
+				continue
+			}
+			required = true
+			if k.ID != id {
+				remaining++
+			}
+		}
+		if required && remaining == 0 {
+			out = append(out, g.authGate)
+		}
+	}
+	return out
 }
 
 // ── Per-key limits on the request path ──────────────────────────────────────
@@ -731,18 +837,43 @@ func (r *Router) bootstrapKey(ctx context.Context, role string, envSet bool, env
 	return nil
 }
 
+// bootstrapAdminPassword settles the one credential that has nowhere else to
+// live.
+//
+// Two rules, and the split between them is the whole point:
+//
+//   - ROUTER_ADMIN_PASSWORD **unset** leaves the stored password alone. A
+//     password rotated in the UI must not be silently reverted by the next
+//     restart, and an operator who never set the variable has no expectation
+//     about it.
+//   - ROUTER_ADMIN_PASSWORD **set** is authoritative on EVERY start, not only on
+//     a virgin database. It used to seed and then do nothing, which made the
+//     generated password — printed once, to a container log — the only way in.
+//     Everything an operator does now lives behind the admin gate (/backends,
+//     /logs, the keys tab, /debug/backends/*), so an operator who scrolled past
+//     that line was locked out of their own router with no recovery short of
+//     hand-editing SQLite inside the data volume. Setting the variable and
+//     restarting is that recovery, and it can only be a recovery if it works on
+//     a database that already has a password.
 func (r *Router) bootstrapAdminPassword(ctx context.Context) error {
 	stored, err := r.logs.LoadSetting(ctx, settingAdminPasswordHash)
 	if err != nil {
 		return err
 	}
-	if stored != "" {
-		// The database is canonical. ROUTER_ADMIN_PASSWORD seeds a database that
-		// has none and does nothing afterwards, so a password rotated in the UI is
-		// not silently reverted by the next restart.
-		return nil
-	}
 	password := strings.TrimSpace(r.cfg.AdminPassword)
+	replacing := stored != ""
+	if replacing {
+		if password == "" {
+			return nil // nothing declared; the database stays canonical
+		}
+		if verifyPassword(stored, password) {
+			// Already what the environment says. Return before re-hashing: PBKDF2 at
+			// 600k iterations on every start is real time, and announcing a change
+			// that did not happen trains an operator to ignore the line that says one
+			// did.
+			return nil
+		}
+	}
 	generated := password == ""
 	if generated {
 		if password, err = randomToken(18); err != nil {
@@ -756,12 +887,19 @@ func (r *Router) bootstrapAdminPassword(ctx context.Context) error {
 	if err := r.logs.SaveSetting(ctx, settingAdminPasswordHash, hash); err != nil {
 		return err
 	}
-	if generated {
+	switch {
+	case generated:
 		announceCredential("ADMIN PASSWORD", password,
 			"For the admin UI and /admin/*.\nGenerated because ROUTER_ADMIN_PASSWORD is empty.\n"+
 				"Stored (hashed) in the database — this is the only time it is printed.")
-	} else {
-		log.Printf("admin password seeded from ROUTER_ADMIN_PASSWORD; the database is canonical from now on")
+	case replacing:
+		// Say loudly that it happened and never what it was. The operator supplied
+		// this one, so they already have it, and printing it would put a live
+		// credential in the log on every start that changes it.
+		log.Printf("admin password RESET from ROUTER_ADMIN_PASSWORD — it replaced a different stored password " +
+			"(one set in the UI, or an earlier generated one). Unset the variable to make the database canonical again.")
+	default:
+		log.Printf("admin password seeded from ROUTER_ADMIN_PASSWORD")
 	}
 	return nil
 }
@@ -769,11 +907,16 @@ func (r *Router) bootstrapAdminPassword(ctx context.Context) error {
 // announceCredential prints a generated secret so an operator scrolling
 // `docker logs` cannot miss it. Loud on purpose: this is the one line in the
 // whole startup sequence that cannot be recovered if it scrolls past.
+//
+// The banner carries the word BOOTSTRAP because that is the word the setup
+// instructions tell an operator to search for — `docker compose logs discrimen |
+// grep -i bootstrap`. It said GENERATED, which matched nothing, so the one
+// documented way to find a credential printed exactly once found nothing.
 func announceCredential(title, value, note string) {
 	const rule = "=================================================================="
 	var b strings.Builder
 	b.WriteString("\n" + rule + "\n")
-	b.WriteString("  GENERATED " + title + " — COPY IT NOW, IT IS NOT SHOWN AGAIN\n")
+	b.WriteString("  BOOTSTRAP " + title + " — GENERATED, COPY IT NOW, IT IS NOT SHOWN AGAIN\n")
 	b.WriteString(rule + "\n\n      " + value + "\n\n")
 	for _, line := range strings.Split(note, "\n") {
 		b.WriteString("  " + line + "\n")

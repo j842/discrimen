@@ -1,0 +1,73 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.24"
+          cache: true
+
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      # -count=1 is the documented way to disable the test cache. Without it a
+      # run can report "ok (cached)", which is a statement about some earlier
+      # commit — and the commit that just landed is the only one CI exists to
+      # judge.
+      - name: test
+        run: go test ./... -count=1
+
+      # gofmt exits 0 whether or not it found anything, so the check has to be on
+      # its output rather than its status. Printing the list matters: "gofmt
+      # failed" with nothing after it turns a ten-second fix into a search.
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+  images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      # Build only, never push. The image builds see things `go build` on the
+      # runner cannot — a missing go:embed asset, a broken pip pin — and a
+      # Dockerfile that no longer builds should fail the pull request rather than
+      # the publish job that runs once it has already merged.
+      #
+      # Single-platform here on purpose: the arm64 leg is qemu-emulated and slow,
+      # and publish.yml covers it. This job is about catching breakage early.
+      - name: router image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          push: false
+          cache-from: type=gha,scope=ci-discrimen
+          cache-to: type=gha,mode=max,scope=ci-discrimen
+
+      - name: embeddings image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./embeddings
+          file: embeddings/Dockerfile
+          push: false
+          cache-from: type=gha,scope=ci-discrimen-embeddings
+          cache-to: type=gha,mode=max,scope=ci-discrimen-embeddings

@@ -1,0 +1,52 @@
+# Trimming the build context is mostly about layer-cache stability: any file in
+# here that changes invalidates the COPY layers even when the build never reads
+# it.
+#
+# Deliberately NOT excluded: internal/router/dashboard.html, which go:embed
+# compiles into the binary, and internal/router/benchdata, which ships with it.
+# Excluding either produces a build that succeeds on a developer's host and
+# fails only inside the image.
+
+.git
+.gitignore
+.github
+
+# owned by other tooling; no build step reads them
+deploy/
+docs/
+PLAN.md
+README.md
+
+# runtime concerns. A copy baked into the image would only ever go stale, and
+# .env in particular would bake secrets into a published layer.
+.env
+.env.example
+docker-compose.yml
+Dockerfile
+.dockerignore
+
+# `go build ./...` ignores _test.go entirely, so tests are pure context weight.
+# Note the consequence: this image cannot run `go test` — the CI workflow tests
+# on the runner, not in the builder stage.
+#
+# The **/ prefix is required, not decoration: dockerignore matching is
+# filepath.Match, where * does not cross a path separator, so a bare *_test.go
+# would only ever match the context root and quietly ship every test under
+# internal/.
+**/*_test.go
+
+# compiled output, mirroring .gitignore. A host-built artefact copied into the
+# context can shadow or bloat the in-image build.
+discrimen
+**/*.exe
+**/*.exe~
+**/*.dll
+**/*.so
+**/*.dylib
+**/*.test
+**/*.out
+**/coverage.*
+**/*.coverprofile
+**/profile.cov
+go.work
+go.work.sum

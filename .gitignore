@@ -8,6 +8,15 @@
 *.so
 *.dylib
 
+# The router binary, when built in place. The private repo this was extracted
+# from had a 20MB compiled binary checked in.
+/discrimen
+
+# Calibration output from `discrimen bench calibrate`. It is a per-fleet
+# measurement, not a source artefact — pool.json and benchmark_data.go are the
+# committed halves of that pipeline.
+internal/router/benchdata/calibration.json
+
 # Test binary, built with `go test -c`
 *.test
 
@@ -30,3 +39,7 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Python bytecode from the embeddings worker
+__pycache__/
+*.pyc

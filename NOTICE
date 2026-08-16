@@ -1,0 +1,177 @@
+discrimen
+Copyright (c) 2026 j
+
+This product includes software developed by j, licensed under the MIT License
+(see LICENSE).
+
+It also redistributes third-party material that is NOT covered by that licence.
+This NOTICE records what that material is, where it came from, under what terms
+it is redistributed, and what was changed. Read it before reusing the repository
+in a context the MIT License alone would otherwise permit.
+
+
+================================================================================
+1. LiveBench question pool — internal/router/benchdata/pool.json
+================================================================================
+
+WHAT IT IS
+
+  internal/router/benchdata/pool.json is a 656,634-byte snapshot of 356
+  questions and their ground-truth answers taken from LiveBench (ICLR 2025,
+  https://livebench.ai, https://arxiv.org/abs/2406.19314,
+  https://huggingface.co/livebench).
+
+  The file records its own provenance in two top-level fields:
+
+      fetched_at   2026-08-08T04:28:04Z
+      source       https://huggingface.co/livebench — LiveBench, ICLR 2025
+                   (arxiv.org/abs/2406.19314)
+
+  The third top-level field, `questions`, holds the 356 records. Each carries
+  eight fields: id, category, task, match, prompt, expect, release_date,
+  retired. There is no per-question licence field and no per-question source
+  URL, so the terms below apply to the file as a whole and, where noted, to
+  named subsets of it.
+
+  The snapshot is used by the `bench` developer subcommands to calibrate and
+  select benchmark questions. It is committed rather than fetched at build time
+  because the question set is part of the worker profile cache key: if the
+  questions could change without the version changing, workers profiled on
+  different days would be graded on different sets and then compared on the same
+  0-100 scale.
+
+
+LICENCE, AND WHERE THAT GRANT IS ACTUALLY STATED
+
+  LiveBench's stated licence is the Apache License, Version 2.0. A full copy of
+  that licence is included at LICENSES/Apache-2.0.txt, as required by section
+  4(a).
+
+  The grant is worth citing precisely, because it is not where you would first
+  look for it. It appears in two places:
+
+    - The LiveBench paper, Appendix B.1 ("Author Responsibility and License").
+    - docs/DATASHEET.md in the LiveBench repository: "The benchmark suite is
+      public as of June 12, 2024, distributed under the Apache License 2.0."
+
+  It does NOT appear in the LiveBench repository's own LICENSE file. That file
+  contains copied FastChat and LiveCodeBench licences and is not a grant from
+  the LiveBench authors covering the benchmark data. GitHub's licence detector
+  reports NOASSERTION for the repository as a result, and the HuggingFace
+  dataset cards for livebench/math and livebench/reasoning carry no licence
+  field at all. Anyone auditing this repository who checks only those three
+  surfaces will conclude the data is unlicensed. It is licensed; the grant is in
+  the paper and the datasheet.
+
+
+MODIFICATIONS (Apache License 2.0, section 4(b))
+
+  This project modified the LiveBench material before redistributing it. The
+  changes are:
+
+    - SUBSET. Only the `math` and `reasoning` datasets were taken, and within
+      them only four tasks: math_comp, olympiad, zebra_puzzle and spatial.
+      LiveBench's other categories (coding, agentic coding, data analysis,
+      instruction following, language) are not present, nor is the AMPS_Hard
+      task. Rows whose prompt exceeds 6000 characters, rows with no ground
+      truth, and multi-turn rows were dropped.
+
+    - RESHAPE. Each row was flattened from LiveBench's dataset schema into the
+      eight-field JSON record described above: `question_id` becomes `id`, the
+      dataset name becomes `category`, `turns[0]` becomes `prompt`,
+      `ground_truth` becomes `expect`, `livebench_release_date` becomes
+      `release_date`, and the presence of `livebench_removal_date` becomes the
+      boolean `retired`. Upstream columns not listed here were dropped. A
+      `match` field naming this project's grader was added; it is not a
+      LiveBench field. Records are keyed by LiveBench's own `question_id`, a
+      64-character content hash, carried through unchanged, and the file is
+      sorted by it.
+
+  Question text and answer text are otherwise unaltered. No question was
+  rewritten, translated, truncated or re-answered.
+
+
+COMPOSITION OF THE SNAPSHOT
+
+  By task:
+
+      math       math_comp        146
+      math       olympiad          60
+      reasoning  zebra_puzzle     100
+      reasoning  spatial           50
+                                  ---
+                                  356
+
+  By LiveBench release date:
+
+      2024-06-24   176
+      2024-07-26    50
+      2024-08-31    80
+      2024-11-25    50
+
+  180 of the 356 are marked retired: LiveBench has rotated them out of its live
+  set, which makes them more likely to have leaked into training corpora. They
+  are kept because they roughly double the pool, and because a question's
+  measured difficulty is what this project uses it for.
+
+
+UPSTREAM RIGHTS THAT LIVEBENCH CANNOT GRANT
+
+  LiveBench's Apache-2.0 grant covers LiveBench's own contribution. Three of the
+  four subsets rest on someone else's material or someone else's tool, and that
+  party's terms travel with the questions. They are carried forward here.
+
+  math_comp (146 questions)
+      Derived from the American Mathematics Competitions AMC 12A and 12B 2023
+      and the American Invitational Mathematics Examination AIME I and II 2024,
+      copyright the Mathematical Association of America; and from the Senior
+      Mathematical Challenge 2023, copyright the United Kingdom Mathematics
+      Trust. LiveBench rewrote the prose and shuffled the answer order; the
+      mathematical content is the original competition content.
+      MAA permits copying of its competition problems after the contest for
+      non-commercial educational use, provided the MAA copyright notice is
+      retained. UKMT permits use of its challenge material within your own
+      school or college.
+
+  olympiad (60 questions)
+      Derived from the United States of America Mathematical Olympiad 2024
+      (copyright the Mathematical Association of America) and the International
+      Mathematical Olympiad 2024, including THEIR PUBLISHED SOLUTIONS, with
+      formulae masked out and presented as a reordering task.
+      This is the highest-exposure subset in the file: it reproduces substantial
+      third-party proof text, not merely problem statements. The MAA
+      non-commercial educational terms above apply to the USAMO material.
+
+  zebra_puzzle (100 questions)
+      Procedurally generated by LiveBench using
+      https://github.com/quint-t/Puzzle-Generator-and-Solver. That generator
+      carries no licence file and is marked "For non-commercial use only".
+
+  spatial (50 questions)
+      Written by the LiveBench authors. No third-party rights are involved, and
+      this subset is cleanly covered by the Apache-2.0 grant.
+
+
+COMMERCIAL USE
+
+  The math_comp and olympiad subsets carry non-commercial terms from their
+  upstream owners: the MAA and the UKMT for math_comp, the MAA for the USAMO
+  half of olympiad. LiveBench's Apache-2.0 grant does not override those terms,
+  because LiveBench never held the rights it would need to grant them away.
+  Anyone putting this repository to commercial use should delete those 206
+  records from pool.json. The 100 zebra_puzzle records should go with them: the
+  generator that produced them is marked non-commercial as well, on weaker
+  footing (a line in an unlicensed repository rather than a rights holder's
+  published policy) but pointing the same way. That leaves the 50 spatial
+  questions, which are the LiveBench authors' own work and carry no such
+  restriction. The router's code is MIT and is unaffected either way.
+
+
+CITATION
+
+  @inproceedings{livebench,
+    title={LiveBench: A Challenging, Contamination-Free {LLM} Benchmark},
+    author={Colin White and Samuel Dooley and Manley Roberts and Arka Pal and Benjamin Feuer and Siddhartha Jain and Ravid Shwartz-Ziv and Neel Jain and Khalid Saifullah and Sreemanti Dey and Shubh-Agrawal and Sandeep Singh Sandha and Siddartha Venkat Naidu and Chinmay Hegde and Yann LeCun and Tom Goldstein and Willie Neiswanger and Micah Goldblum},
+    booktitle={The Thirteenth International Conference on Learning Representations},
+    year={2025},
+  }

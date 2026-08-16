@@ -1,0 +1,112 @@
+# Both services, because auto-routing is not something the router can do alone.
+# The difficulty and thinking classifiers work by embedding the prompt, and the
+# only thing that can embed it is a registered embeddings worker. Without one
+# the router does not fail — it drops back to plain quality/speed ranking and
+# says so on /health as "auto_routing": "degraded". Running discrimen on its own
+# is a legitimate configuration (set ROUTER_AUTO_ROUTING=false and mean it);
+# running it on its own by accident is the failure this file exists to prevent.
+#
+# Values come from .env — see .env.example. The defaults below are what you get
+# with no .env at all.
+
+services:
+  discrimen:
+    image: ghcr.io/j842/discrimen:latest
+    # so `docker compose build` works from a checkout. `docker compose pull`
+    # still takes the published image above.
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: discrimen
+    restart: unless-stopped
+    # Both sides track ROUTER_PORT: it sets the port the router binds inside the
+    # container, so it is not just a host-side mapping.
+    ports:
+      - "${ROUTER_PORT:-8585}:${ROUTER_PORT:-8585}"
+    environment:
+      ROUTER_PORT: "${ROUTER_PORT:-8585}"
+      LOG_DB_PATH: "${LOG_DB_PATH:-/data/llm-router/logs.sqlite}"
+      # Empty disables auth. See the warning at the top of .env.example.
+      ROUTER_ADMIN_PASSWORD: "${ROUTER_ADMIN_PASSWORD:-}"
+      ROUTER_WORKER_TOKEN: "${ROUTER_WORKER_TOKEN:-}"
+      ROUTER_CLIENT_TOKENS: "${ROUTER_CLIENT_TOKENS:-}"
+      # Blank generates a keyfile in the data volume on first run.
+      ROUTER_PERSIST_SECRET: "${ROUTER_PERSIST_SECRET:-}"
+      LOG_RETENTION_DAYS: "${LOG_RETENTION_DAYS:-30}"
+      LOG_MAX_BODY_BYTES: "${LOG_MAX_BODY_BYTES:-16384}"
+      HEALTH_INTERVAL_SECONDS: "${HEALTH_INTERVAL_SECONDS:-15}"
+      BACKEND_TIMEOUT_SECONDS: "${BACKEND_TIMEOUT_SECONDS:-600}"
+      BACKEND_IDLE_TIMEOUT_SECONDS: "${BACKEND_IDLE_TIMEOUT_SECONDS:-120}"
+      ROUTER_SLOT_MAX_WAIT_SECONDS: "${ROUTER_SLOT_MAX_WAIT_SECONDS:-600}"
+      DEFAULT_MAX_TOKENS: "${DEFAULT_MAX_TOKENS:-4096}"
+      ROUTER_AUTO_ROUTING: "${ROUTER_AUTO_ROUTING:-true}"
+    volumes:
+      # The request log, the tier adapter state and the generated persist.key all
+      # live here. persist.key is the one you cannot regenerate: without it every
+      # stored endpoint api key has to be re-registered.
+      - discrimen-data:/data
+    depends_on:
+      discrimen-embeddings:
+        # Not service_started — the worker loads its model before it answers
+        # anything, and a router that starts ahead of that spends the gap
+        # degraded. The worker's first registration still lands while the router
+        # is coming up; it retries on a 1s-doubling ladder until the router
+        # answers rather than waiting out a keepalive interval, so /health
+        # reports "auto_routing": "ok" a second or two after the router binds.
+        condition: service_healthy
+    # healthcheck is inherited from the image; nothing gates on it here.
+
+  discrimen-embeddings:
+    image: ghcr.io/j842/discrimen-embeddings:latest
+    build:
+      context: ./embeddings
+      dockerfile: Dockerfile
+    container_name: discrimen-embeddings
+    restart: unless-stopped
+    ports:
+      - "${EMBEDDINGS_PORT:-8586}:${EMBEDDINGS_PORT:-8586}"
+    environment:
+      EMBEDDINGS_PORT: "${EMBEDDINGS_PORT:-8586}"
+      EMBEDDINGS_MODEL: "${EMBEDDINGS_MODEL:-BAAI/bge-small-en-v1.5}"
+      EMBEDDINGS_API_TOKENS: "${EMBEDDINGS_API_TOKENS:-}"
+
+      # The worker registers itself by POSTing to the router's
+      # /backends/register on startup, retrying until the router answers, then
+      # every 60s as a keepalive. Nothing about this worker is configured on the
+      # router side.
+      LLM_ROUTER_URL: "http://discrimen:${ROUTER_PORT:-8585}"
+      # Must match the router's ROUTER_WORKER_TOKEN or registration is rejected.
+      ROUTER_WORKER_TOKEN: "${ROUTER_WORKER_TOKEN:-}"
+
+      # READ THIS ONE. LLM_WORKER_URL is the address the ROUTER uses to call the
+      # worker, not the worker's view of itself. Inside compose that is the
+      # service name. Setting it to localhost or 127.0.0.1 points the router at
+      # its own container, registration still succeeds, and auto-routing then
+      # fails on every request — it is the most common way this deployment
+      # breaks, and it breaks quietly.
+      LLM_WORKER_URL: "${LLM_WORKER_URL:-http://discrimen-embeddings:8586}"
+
+      LLM_WORKER_ID: "${LLM_WORKER_ID:-discrimen-embeddings}"
+      LLM_WORKER_MODEL: "${LLM_WORKER_MODEL:-bge-small-en-v1.5}"
+      # How the router finds a worker that can embed. Anything else and
+      # auto-routing will not see it.
+      LLM_WORKER_FEATURES: embeddings
+      LLM_WORKER_TTL_SECONDS: "${LLM_WORKER_TTL_SECONDS:-86400}"
+    volumes:
+      # ONNX model weights (~65MB), fetched on first start. Without a volume here
+      # that download repeats every time the container is recreated. The path is
+      # only correct because the image sets FASTEMBED_CACHE_PATH to match.
+      - discrimen-embeddings-cache:/root/.cache/fastembed
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${EMBEDDINGS_PORT:-8586}/health > /dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # Nothing answers until the model is downloaded and warmed, and the router
+      # is waiting on this check. Declared here rather than left to the image so
+      # it can be tuned without rebuilding.
+      start_period: 300s
+
+volumes:
+  discrimen-data:
+  discrimen-embeddings-cache:

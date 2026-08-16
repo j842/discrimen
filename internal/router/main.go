@@ -1,0 +1,4682 @@
+package router
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"database/sql"
+	_ "embed"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"html/template"
+	"io"
+	"log"
+	"math"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unicode/utf8"
+
+	_ "modernc.org/sqlite"
+)
+
+type Config struct {
+	Port               string
+	WorkerToken        string   // single token; auths POST /backends/register* + DELETE /backends/{id}
+	ClientTokens       []string // any-of list; auths /v1/*, /backends GET, /logs, /debug/*
+	DefaultMaxTokens   int
+	HealthInterval     time.Duration
+	BackendHTTPTimeout time.Duration // whole-exchange cap for BUFFERED requests + probes (streams use the idle timeout instead)
+	BackendIdleTimeout time.Duration // streaming: abort when NO bytes arrive for this long (progress-based, no wall-clock cap)
+	LogDBPath          string
+	LogRetention       time.Duration
+	LogMaxBodyBytes    int    // cap on stored input/output body length per request log
+	PersistSecret      string // optional; encrypts persisted backend api keys at rest
+
+	// Auto difficulty routing (Phase 1). When enabled, a chat request with no
+	// explicit `requirements` is classified by prompt difficulty and routed to
+	// the cheapest sufficient backend (see difficulty.go).
+	AutoDifficulty      bool
+	DifficultyBands     string        // "score:quality" CSV, ascending, e.g. "0.40:2,0.70:7,1.0:9"
+	DifficultyTemp      float64       // softness of the simple↔hard margin → score map
+	DifficultyTimeout   time.Duration // per-classification embedding deadline
+	DifficultyCacheSize int           // bounded prompt→score cache size
+	DifficultyMaxChars  int           // cap on classified prompt text length
+
+	// Auto thinking (Phase 3a). When requirements.thinking is absent/"auto",
+	// deduce whether the prompt needs reasoning and inject
+	// chat_template_kwargs.enable_thinking accordingly.
+	AutoThinking       bool
+	ReasoningThreshold float64 // reasoning score ≥ this → enable thinking
+
+	// Online tier adapter (self-improving). Learns an upward score bias per
+	// difficulty region from inadequate (empty/truncated) responses.
+	AdaptOnline  bool
+	AdaptMaxBias float64
+	AdaptLRUp    float64
+	AdaptLRDown  float64
+	AdaptBins    int
+
+	// JudgeSampleRate is the fraction of cheaper-than-best answers graded in the
+	// background by the best model; a "bad" verdict raises that difficulty bin's
+	// tier bias. 0 disables. Requires the online adapter.
+	JudgeSampleRate float64
+
+	// AdminPassword bootstraps the admin session on a database that has no
+	// password set yet. The stored hash is canonical from then on, so changing
+	// this variable after first run does nothing.
+	AdminPassword string
+
+	// ProfileWorkers measures quality/speed/capacity/capabilities/context at cold
+	// start instead of trusting declared values (the worker declares ~nothing).
+	// CapacityProbeMax caps the concurrency ramp used for the capacity test.
+	ProfileWorkers   bool
+	CapacityProbeMax int
+
+	// EscalateInline re-dispatches an EMPTY non-streamed answer to a better worker
+	// before replying, instead of only teaching the adapter about the region (see
+	// escalate.go).
+	EscalateInline bool
+}
+
+type BackendRegistration struct {
+	ID             string   `json:"id"`
+	URL            string   `json:"url"`
+	Model          string   `json:"model"`
+	Quality        int      `json:"quality"`
+	Thinking       bool     `json:"thinking"`
+	ContextK       int      `json:"context_k"`
+	BaselineTPS    float64  `json:"baseline_tps"`
+	Features       []string `json:"features"`
+	HealthPath     string   `json:"health_path"`
+	TTLSeconds     int      `json:"ttl_seconds"`
+	MaxConcurrency int      `json:"max_concurrency"`
+	APIKey         string   `json:"api_key,omitempty"`
+}
+
+type Backend struct {
+	BackendRegistration
+	// What the runtime says it actually loaded, refreshed on every certification
+	// rather than cached with the profile — see queryModelInfo. Never persisted:
+	// only the registration survives a restart, so this is always re-measured.
+	ModelMeta
+	LastSeen           time.Time `json:"last_seen"`
+	LastHealthy        time.Time `json:"last_healthy,omitempty"`
+	Status             string    `json:"status"`
+	Profiling          bool      `json:"profiling,omitempty"` // a cold-start profile is in flight (quality/capacity still provisional)
+	Healthy            bool      `json:"healthy"`
+	ActiveRequests     int       `json:"active_requests"`
+	ObservedTPS        float64   `json:"observed_tps,omitempty"`         // live EWMA of DECODE throughput (TTFT excluded)
+	ObservedTTFTMillis float64   `json:"observed_ttft_ms,omitempty"`     // live EWMA of first-token latency (prefill + queue), ms
+	ObservedPrefillTPS float64   `json:"observed_prefill_tps,omitempty"` // live EWMA of PREFILL throughput (prompt tokens / TTFT), tok/s
+	ThinkingDialect    string    `json:"thinking_dialect,omitempty"`     // measured spelling of the thinking gate (see WorkerProfile.ThinkingDialect)
+	// RejectedFields are request fields this endpoint has refused as
+	// unrecognised; they are omitted from everything sent to it from then on (see
+	// stripAndRetry). Learned at runtime and deliberately not persisted, so a
+	// provider that starts accepting a field is forgiven on the next restart.
+	RejectedFields []string  `json:"rejected_fields,omitempty"`
+	QualityDetail  string    `json:"quality_detail,omitempty"`    // benchmark per-tier + truncation breakdown
+	Failed         []string  `json:"failed_benchmarks,omitempty"` // benchmark questions the worker missed
+	LastError      string    `json:"last_error,omitempty"`
+	Certification  CertState `json:"certification"`
+
+	// Scheduling/eviction bookkeeping. In-memory only — unexported so it is
+	// never serialized into the API or dashboard payloads.
+	certFailures  int       // consecutive certification failures; drives re-cert backoff
+	nextCertifyAt time.Time // earliest time the health loop may re-certify
+	proxyFailures int       // consecutive proxy failures; drives circuit-breaking
+	// lastReg is the registration content as last received, used to tell a pure
+	// keepalive (identical re-registration) from a real configuration change.
+	// profileGen identifies the registration generation a profile was measured
+	// against, so a profile finishing after a re-register/delete can't apply or
+	// persist stale results. The pointed-to registration is never mutated.
+	// lastModelCheck is when the health loop last fingerprinted the served
+	// model — keepalives with identical content no longer re-certify, so a
+	// model swap behind an unchanged registration is caught here instead.
+	lastReg        *BackendRegistration
+	profileGen     int64
+	lastModelCheck time.Time
+}
+
+// nextProfileGen issues registration generations. Globally unique (not per
+// backend) so a delete + re-register can't reuse a generation an in-flight
+// profile still holds.
+var nextProfileGen atomic.Int64
+
+type CertState struct {
+	Status       string           `json:"status"`
+	Ready        bool             `json:"ready"`
+	StartedAt    time.Time        `json:"started_at,omitempty"`
+	FinishedAt   time.Time        `json:"finished_at,omitempty"`
+	TTFTMillis   int64            `json:"ttft_ms,omitempty"`
+	TokensPerSec float64          `json:"tokens_per_sec,omitempty"`
+	Checks       map[string]Check `json:"checks,omitempty"`
+	LastError    string           `json:"last_error,omitempty"`
+}
+
+type Check struct {
+	OK      bool   `json:"ok"`
+	Message string `json:"message,omitempty"`
+}
+
+type Registry struct {
+	mu       sync.RWMutex
+	backends map[string]*Backend
+	// Per-backend concurrency slot channels, indexed by backend ID. A backend
+	// with max_concurrency=N has a channel of capacity N pre-filled with N
+	// tokens; callers acquire one via tryAcquireSlot before dispatching and put
+	// it back with releaseSlot. Backends with no declared cap have no entry,
+	// in which case tryAcquireSlot returns a nil slot that is always available
+	// and releaseSlot is a no-op (unbounded).
+	slots   map[string]chan struct{}
+	slotCap map[string]int
+}
+
+type ChatRequest struct {
+	Model    string          `json:"model,omitempty"`
+	Messages []Message       `json:"messages"`
+	Tools    json.RawMessage `json:"tools,omitempty"`
+	Stream   bool            `json:"stream,omitempty"`
+	// MaxTokens after parseAndValidateChatRequest is the EFFECTIVE completion
+	// budget used for routing bookkeeping (context estimation, band selection):
+	// the client's max_completion_tokens or max_tokens, else the router default.
+	// Whether the client actually set one is in ClientSetMaxTokens — the
+	// forwarded body is only patched when they didn't (see patchForwardedBody).
+	MaxTokens           int  `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int  `json:"max_completion_tokens,omitempty"` // newer OpenAI name; wins over max_tokens
+	ClientSetMaxTokens  bool `json:"-"`
+
+	// ReasoningEffort is the OpenAI-standard thinking control, and the one a
+	// coding harness (pi, hermes) emits without being taught anything about this
+	// router. Absent ⇒ auto: the reasoning classifier decides, which is what every
+	// clabtree guest gets. "none" ⇒ thinking off. Any other level is forwarded to
+	// the worker as chat_template_kwargs.reasoning_effort next to
+	// enable_thinking:true, which is what the DeepSeek V4 template branches on.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+
+	Requirements       *Requirements  `json:"requirements,omitempty"`
+	ChatTemplateKwargs map[string]any `json:"chat_template_kwargs,omitempty"`
+	// ClassifyText, when set, is the text the classifier scores instead of the
+	// last user turn — the client's GENUINE user message, before any
+	// agent-injected runtime context (date, memories, conversation summaries)
+	// that would otherwise dominate the embedding and mis-score difficulty/
+	// reasoning. Optional and additive: absent ⇒ fall back to classifyText over
+	// the messages. Router-only; rides through to the worker like requirements
+	// and is harmlessly ignored there. See classifyInput.
+	ClassifyText string `json:"classify_text,omitempty"`
+	// DeadlineMillis, when set, is how long the CALLER will still wait for this
+	// response. Purely advisory routing input: workers that can't finish the job
+	// inside it are deprioritised (see deadlineFilter), which turns "spend the
+	// caller's whole timeout on a worker that was never going to make it" into a
+	// correct placement. Go's net/http gives the server no client-timeout signal,
+	// so this has to be declared rather than inferred. Router-only; rides through
+	// to the worker and is harmlessly ignored there.
+	DeadlineMillis int `json:"deadline_ms,omitempty"`
+}
+
+type Message struct {
+	Role       string          `json:"role"`
+	Content    any             `json:"content,omitempty"`
+	Name       string          `json:"name,omitempty"`
+	ToolCallID string          `json:"tool_call_id,omitempty"`
+	ToolCalls  json.RawMessage `json:"tool_calls,omitempty"`
+}
+
+// Requirements carries only the orthogonal CAPABILITY hints a request may need
+// (context size, features, thinking). There are deliberately no quality/speed/
+// preference levers: model-tier selection is always automatic (difficulty-based,
+// see selectBackends). Any such field an old client still sends is ignored.
+type Requirements struct {
+	MinContextK      int      `json:"min_context_k,omitempty"`
+	Thinking         string   `json:"thinking,omitempty"`
+	RequiredFeatures []string `json:"required_features,omitempty"`
+}
+
+// validationError is one northbound error. It marshals through writeJSON into
+// the OpenAI envelope:
+//
+//	{"error":{"message":"…","type":"invalid_request_error","param":null,"code":null}}
+//
+// It used to serialise to a bare {"message":"…"}, which every client written
+// against the standard reads as an empty error — the SDKs look under
+// error.message and find nothing there. The envelope is applied by writeJSON
+// from the status code rather than by each of the ~20 construction sites, so
+// `validationError{Message: err.Error()}` still says everything they need to.
+type validationError struct {
+	Message string
+	// Param names the offending request field when the router knows it. Absent ⇒
+	// JSON null, which is what the standard shows.
+	Param string
+}
+
+// errorEnvelope is the wire form of validationError.
+type errorEnvelope struct {
+	Error errorBody `json:"error"`
+}
+
+type errorBody struct {
+	Message string  `json:"message"`
+	Type    string  `json:"type"`
+	Param   *string `json:"param"`
+	Code    *string `json:"code"`
+}
+
+// envelope renders the error for an HTTP status. param/code stay null rather
+// than being omitted: clients index into them, and a missing key reads
+// differently from an explicit null in several SDKs.
+func (e validationError) envelope(status int) errorEnvelope {
+	body := errorBody{Message: e.Message, Type: errorTypeForStatus(status)}
+	if e.Param != "" {
+		param := e.Param
+		body.Param = &param
+	}
+	return errorEnvelope{Error: body}
+}
+
+// errorTypeForStatus is the OpenAI error `type` for a status code. The names are
+// theirs, not ours: a client that switches on the type string is switching on
+// the vocabulary its SDK was written against.
+func errorTypeForStatus(status int) string {
+	switch status {
+	case http.StatusUnauthorized:
+		return "authentication_error"
+	case http.StatusForbidden:
+		return "permission_error"
+	case http.StatusNotFound:
+		return "not_found_error"
+	case http.StatusTooManyRequests:
+		return "rate_limit_error"
+	case http.StatusServiceUnavailable:
+		// Distinct from server_error on purpose: a 503 here means the fleet is
+		// busy or absent, which is retryable, and it is the one error the router
+		// pairs with a Retry-After (see writeUnavailable).
+		return "service_unavailable"
+	}
+	if status >= 500 {
+		return "server_error"
+	}
+	return "invalid_request_error"
+}
+
+// retryAfterCeiling caps the Retry-After hint at a minute.
+// ROUTER_SLOT_MAX_WAIT_SECONDS defaults to ten minutes, and telling a client to
+// sleep ten minutes is not a back-off hint, it is a hang-up: past a minute a
+// caller is better off re-queueing — where it is served the moment a slot frees
+// — than sitting idle while the fleet drains.
+const retryAfterCeiling = 60 * time.Second
+
+// writeUnavailable answers a 503 with a Retry-After the router can actually
+// justify. Every northbound 503 goes through here, so none can be added without
+// one: a 503 with no hint tells a client nothing about whether to come back in a
+// second or a minute, and clients that guess get it wrong in both directions.
+//
+// retry is a duration; the header carries whole seconds (its integer form —
+// an HTTP-date buys nothing when the interval is what matters), rounded UP so a
+// sub-second hint never renders as "0", which reads as "retry immediately".
+func writeUnavailable(w http.ResponseWriter, retry time.Duration, message string) {
+	secs := int64(1)
+	if retry > time.Second {
+		secs = int64(math.Ceil(retry.Seconds()))
+	}
+	w.Header().Set("Retry-After", strconv.FormatInt(secs, 10))
+	writeJSON(w, http.StatusServiceUnavailable, validationError{Message: message})
+}
+
+// retryAfterUnavailable is the hint for "the router had nothing to serve this
+// request": no healthy worker, none past the hard filters, a pinned worker that
+// is not ready. What the router knows about the fleet only changes when the
+// health loop next sweeps it — that is when a recovering worker is noticed, a
+// certification finishes, an expired registration is written off — so one health
+// interval is the soonest a retry can get a different answer. Sooner is a wasted
+// round trip; later leaves the caller idle after the fleet has recovered.
+func (r *Router) retryAfterUnavailable() time.Duration {
+	if r.cfg == nil || r.cfg.HealthInterval <= 0 {
+		return time.Second
+	}
+	return r.cfg.HealthInterval
+}
+
+// retryAfterSaturated is the hint for a request that found a worker but never
+// got a slot: every candidate stayed busy for the whole slotMaxWait queue. That
+// is a fleet which is oversubscribed rather than absent, and the evidence is
+// exactly how long the caller just spent queueing — so the queue is the hint,
+// capped (retryAfterCeiling) and floored at one health interval, below which a
+// retry cannot see a changed fleet anyway.
+func (r *Router) retryAfterSaturated() time.Duration {
+	d := slotMaxWait
+	if d > retryAfterCeiling {
+		d = retryAfterCeiling
+	}
+	if floor := r.retryAfterUnavailable(); d < floor {
+		d = floor
+	}
+	return d
+}
+
+// writeError sends an error in the OpenAI envelope with a JSON content type.
+// It exists for the paths that used http.Error, which stamps text/plain over a
+// JSON body — a combination that makes a strict client refuse to parse the very
+// message explaining what it did wrong.
+func writeError(w http.ResponseWriter, status int, format string, args ...any) {
+	writeJSON(w, status, validationError{Message: fmt.Sprintf(format, args...)})
+}
+
+// unauthorized is the single 401 answer. Every scope check uses it, so the
+// wording and the shape can't drift apart across twenty handlers.
+func unauthorized(w http.ResponseWriter) {
+	writeError(w, http.StatusUnauthorized, "unauthorized: supply a client token as `Authorization: Bearer <token>`")
+}
+
+// notFound is the 404 for a path this router does not serve.
+func notFound(w http.ResponseWriter, req *http.Request) {
+	writeError(w, http.StatusNotFound, "no route for %s %s", req.Method, req.URL.Path)
+}
+
+type RequestLog struct {
+	ID             int64     `json:"id"`
+	CreatedAt      time.Time `json:"created_at"`
+	BackendID      string    `json:"backend_id"`
+	BackendModel   string    `json:"backend_model"`
+	Route          string    `json:"route"`
+	ObservedTPS    float64   `json:"observed_tps,omitempty"`
+	CertifiedTPS   float64   `json:"certified_tps,omitempty"`
+	BaselineTPS    float64   `json:"baseline_tps,omitempty"`
+	SpeedScore     int       `json:"speed_score,omitempty"`
+	Stream         bool      `json:"stream"`
+	StatusCode     int       `json:"status_code"`
+	DurationMillis int64     `json:"duration_ms"`
+	Input          string    `json:"input"`
+	Output         string    `json:"output"`
+	Error          string    `json:"error,omitempty"`
+}
+
+type LogStore struct {
+	db      *sql.DB
+	maxBody int        // cap on stored input/output/error length per row
+	box     *secretBox // encrypts persisted backend api keys at rest
+}
+
+func Main() {
+	// `llm-router bench …` builds the generated half of the quality benchmark
+	// (see benchgen.go). It lives in this binary rather than a tools/ directory
+	// so calibration grades with the production checkAnswer — a second copy of
+	// the grader would diverge silently and mis-tier every question it touched.
+	if runBenchCommand(os.Args) {
+		return
+	}
+	// `llm-router arena …` measures the ROUTER against a graded dataset (see
+	// arena.go). Same reasoning as bench: it grades with the production
+	// checkAnswer, so it lives in this binary rather than beside it.
+	if runArenaCommand(os.Args) {
+		return
+	}
+
+	cfg := loadConfig()
+	registry := &Registry{
+		backends: make(map[string]*Backend),
+		slots:    make(map[string]chan struct{}),
+		slotCap:  make(map[string]int),
+	}
+	logs, err := openLogStore(cfg.LogDBPath, cfg.LogMaxBodyBytes, cfg.PersistSecret)
+	if err != nil {
+		log.Fatalf("open request log database: %v", err)
+	}
+	defer logs.Close()
+
+	router := &Router{cfg: cfg, registry: registry, client: &http.Client{Timeout: cfg.BackendHTTPTimeout}, streamClient: &http.Client{}, benchClient: &http.Client{}, logs: logs}
+	if cfg.AutoDifficulty || cfg.AutoThinking {
+		router.classifier = newDifficultyClassifier(cfg, router.embedTexts)
+		log.Printf("prompt auto-routing enabled (difficulty=%v bands=%q, thinking=%v threshold=%.2f)",
+			cfg.AutoDifficulty, cfg.DifficultyBands, cfg.AutoThinking, cfg.ReasoningThreshold)
+		go router.warnIfNoEmbeddings()
+	}
+	if cfg.AdaptOnline {
+		router.adapter = newTierAdapter(cfg, filepath.Join(filepath.Dir(cfg.LogDBPath), "tier_adapter.json"))
+		go router.adapter.persistLoop()
+		log.Printf("online tier adaptation enabled (max_bias=%.2f bins=%d)", cfg.AdaptMaxBias, cfg.AdaptBins)
+	}
+	if cfg.JudgeSampleRate > 0 {
+		router.judgeSem = make(chan struct{}, judgeMaxConcurrent)
+		log.Printf("background answer judging enabled (sample rate=%.2f, %d concurrent)", cfg.JudgeSampleRate, judgeMaxConcurrent)
+	}
+	if sessionSticky {
+		router.sessions = newSessionTracker(sessionTTL, sessionMax)
+		log.Printf("session affinity enabled (ttl=%s max=%d prefill_discount=%.2f lock_wait=%s)",
+			sessionTTL, sessionMax, sessionPrefillDiscount, sessionLockWait)
+	}
+	if cfg.EscalateInline {
+		log.Printf("inline escalation enabled (empty non-streamed answers are re-dispatched to a better worker)")
+	}
+	if saved, err := logs.LoadBackendRegistrations(context.Background()); err != nil {
+		log.Printf("load persisted backend registrations failed: %v", err)
+	} else {
+		for _, reg := range saved {
+			if err := normalizeRegistration(&reg); err != nil {
+				log.Printf("skip persisted backend registration id=%q: %v", reg.ID, err)
+				continue
+			}
+			backend, _ := registry.upsert(reg)
+			go router.certifyBackend(backend.ID)
+		}
+		if len(saved) > 0 {
+			log.Printf("loaded %d persisted backend registrations", len(saved))
+		}
+	}
+
+	go router.healthLoop()
+	go router.logRetentionLoop()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", router.handleDashboard)
+	mux.HandleFunc("/health", router.handleHealth)
+	mux.HandleFunc("/v1/health", router.handleHealth)
+	mux.HandleFunc("/backends", router.handleBackends)
+	mux.HandleFunc("/backends/register", router.handleRegisterBackend)
+	mux.HandleFunc("/backends/", router.handleBackendByID)
+	mux.HandleFunc("/workers", router.handleBackends)
+	mux.HandleFunc("/workers/register", router.handleRegisterBackend)
+	mux.HandleFunc("/workers/", router.handleBackendByID)
+	mux.HandleFunc("/v1/models", router.handleModels)
+	mux.HandleFunc("/v1/models/", router.handleModelByID)
+	mux.HandleFunc("/v1/chat/completions", router.handleChatCompletions)
+	mux.HandleFunc("/chat/completions", router.handleChatCompletions)
+	mux.HandleFunc("/v1/completions", router.handleCompletions)
+	mux.HandleFunc("/completions", router.handleCompletions)
+	mux.HandleFunc("/v1/embeddings", router.handleEmbeddings)
+	mux.HandleFunc("/embeddings", router.handleEmbeddings)
+	mux.HandleFunc("/logs", router.handleLogs)
+	mux.HandleFunc("/v1/route-feedback", router.handleRouteFeedback)
+	mux.HandleFunc("/route-feedback", router.handleRouteFeedback)
+	mux.HandleFunc("/v1/route-preview", router.handleRoutePreview)
+	mux.HandleFunc("/route-preview", router.handleRoutePreview)
+	mux.HandleFunc("/debug/backends/", router.handleDebugBackends)
+
+	server := &http.Server{
+		Addr:              ":" + cfg.Port,
+		Handler:           logRequests(mux),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	log.Printf("llm-router listening on :%s", cfg.Port)
+	log.Fatal(server.ListenAndServe())
+}
+
+type Router struct {
+	cfg          *Config
+	registry     *Registry
+	client       *http.Client
+	streamClient *http.Client // no client-level timeout — streaming proxies are bounded by an IDLE watchdog (BackendIdleTimeout), not wall clock, so a legit multi-minute generation isn't killed mid-stream while a silent backend still frees its slot quickly
+	benchClient  *http.Client // no client-level timeout — the cold-start benchmark bounds each request by benchAnswerDeadline via context instead
+	logs         *LogStore
+	classifier   *difficultyClassifier // nil unless auto difficulty routing is enabled
+	adapter      *tierAdapter          // nil unless online tier adaptation is enabled
+	judgeSem     chan struct{}         // bounds concurrent background judge calls; nil unless judging enabled
+	judgeCount   atomic.Uint64         // sample counter for background answer judging
+	profiling    sync.Map              // worker ids with a cold-start profile in flight (de-dups overlapping profiles)
+	gateAudited  atomic.Bool           // set once the thinking-gate-vs-tier audit has logged (model-independent)
+	sessions     *sessionTracker       // conversation → worker affinity; nil disables stickiness (see session.go)
+}
+
+// Routing constants. These were environment variables. They are not any more.
+//
+// The test for whether a setting deserves to be a variable is whether it
+// describes something only the operator can know. Hardware, network, ports,
+// credentials, retention and how long a caller is willing to queue are facts
+// about a site. Learning rates, classifier thresholds, latency estimates and
+// tier bands are not: they are the router's own decisions, and a site that has
+// to set them has been handed the problem the router exists to solve.
+const (
+	// difficultyTemp is the softness of the simple-vs-hard margin → score map.
+	difficultyTemp = 0.10
+	// difficultyCacheSize bounds the prompt → score cache.
+	difficultyCacheSize = 4096
+	// difficultyMaxChars caps how much of a prompt is classified. Past this the
+	// centroid distance stops moving and the embedding call just costs more.
+	difficultyMaxChars = 4000
+	// reasoningThreshold is the reasoning score at or above which thinking is
+	// enabled.
+	reasoningThreshold = 0.35
+
+	// The adapter's learning rates. Up is four times down because the signal it
+	// learns from is asymmetric: an inadequate answer is direct evidence the tier
+	// was too low, while an adequate one is only weak evidence it was too high.
+	adaptMaxBias = 0.30
+	adaptLRUp    = 0.04
+	adaptLRDown  = 0.01
+	adaptBins    = 10
+
+	// judgeSampleRate is the fraction of cheaper-than-best answers the best model
+	// grades in the background. This is the signal that makes a fast-but-dim
+	// worker safe to route to, so it is on whenever auto-routing is.
+	judgeSampleRate = 0.2
+
+	// capacityProbeMax caps the concurrency ramp during profiling. A declared
+	// max_concurrency on the registry row outranks it, which is better targeted
+	// than a global ceiling.
+	capacityProbeMax = 16
+
+	// difficultyTimeoutFallback is the classifier deadline used before the
+	// embeddings worker has been measured. Once it has, the deadline is derived
+	// from its observed latency instead: a fixed two seconds silently disabled
+	// classification on a slow box, and the health endpoint still reported the
+	// worker present, so the failure was invisible.
+	difficultyTimeoutFallback = 2 * time.Second
+)
+
+func loadConfig() *Config {
+	// Clamp the health interval to >=1s: time.NewTicker(0) panics, so a
+	// misconfigured HEALTH_INTERVAL_SECONDS=0 (or negative) must not reach it.
+	healthSecs := envInt("HEALTH_INTERVAL_SECONDS", 15)
+	if healthSecs < 1 {
+		log.Printf("HEALTH_INTERVAL_SECONDS=%d is invalid; clamping to 1", healthSecs)
+		healthSecs = 1
+	}
+
+	// One switch for the whole automatic layer: difficulty scoring, thinking
+	// detection, online adaptation and background judging. Off turns discrimen
+	// into a plain load balancer with no embeddings dependency, which is a
+	// legitimate thing to want and the only reason to touch any of this.
+	//
+	// On by default. It used to be off, with only the deployment template
+	// turning it on, so a bare `docker run` gave you the least interesting
+	// version of the product.
+	auto := envBool("ROUTER_AUTO_ROUTING", true)
+	judge := 0.0
+	if auto {
+		judge = judgeSampleRate
+	}
+
+	return &Config{
+		Port:               envOr("ROUTER_PORT", "8585"),
+		WorkerToken:        os.Getenv("ROUTER_WORKER_TOKEN"),
+		ClientTokens:       parseTokenList(os.Getenv("ROUTER_CLIENT_TOKENS")),
+		AdminPassword:      os.Getenv("ROUTER_ADMIN_PASSWORD"),
+		DefaultMaxTokens:   envInt("DEFAULT_MAX_TOKENS", 4096),
+		HealthInterval:     time.Duration(healthSecs) * time.Second,
+		BackendHTTPTimeout: time.Duration(envInt("BACKEND_TIMEOUT_SECONDS", 600)) * time.Second,
+		BackendIdleTimeout: time.Duration(envInt("BACKEND_IDLE_TIMEOUT_SECONDS", 120)) * time.Second,
+		// Frozen path. The deployment template derives its Docker volume name
+		// from the container name and this path lives inside it; moving either
+		// orphans the volume, which takes worker_profiles with it and
+		// re-benchmarks the whole fleet from cold.
+		LogDBPath:       envOr("LOG_DB_PATH", "/data/llm-router/logs.sqlite"),
+		LogRetention:    time.Duration(envInt("LOG_RETENTION_DAYS", 30)) * 24 * time.Hour,
+		LogMaxBodyBytes: envInt("LOG_MAX_BODY_BYTES", 16384),
+		PersistSecret:   os.Getenv("ROUTER_PERSIST_SECRET"),
+
+		AutoDifficulty: auto,
+		// Always fleet-derived. A hand-set band table is a claim about which
+		// worker is good enough for which prompt, which is the measurement the
+		// router already makes.
+		DifficultyBands:     "",
+		DifficultyTemp:      difficultyTemp,
+		DifficultyTimeout:   difficultyTimeoutFallback,
+		DifficultyCacheSize: difficultyCacheSize,
+		DifficultyMaxChars:  difficultyMaxChars,
+
+		AutoThinking:       auto,
+		ReasoningThreshold: reasoningThreshold,
+
+		AdaptOnline:  auto,
+		AdaptMaxBias: adaptMaxBias,
+		AdaptLRUp:    adaptLRUp,
+		AdaptLRDown:  adaptLRDown,
+		AdaptBins:    adaptBins,
+
+		JudgeSampleRate: judge,
+
+		ProfileWorkers:   true,
+		CapacityProbeMax: capacityProbeMax,
+
+		EscalateInline: true,
+	}
+}
+
+// parseTokenList splits ROUTER_CLIENT_TOKENS on commas, trims, drops empties.
+// Returns nil for an empty input — used by authorizedAsClient to mean
+// "no client auth required".
+func parseTokenList(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func (r *Router) handleHealth(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	backends := r.registry.snapshot()
+	healthy := 0
+	for _, b := range backends {
+		if b.Healthy && !isExpired(b) {
+			healthy++
+		}
+	}
+	resp := map[string]any{
+		"status":           "ok",
+		"healthy_backends": healthy,
+		"total_backends":   len(backends),
+	}
+	// Auto-routing requires an embeddings worker (the difficulty + thinking
+	// classifiers embed through it); surface its absence instead of silently
+	// degrading to plain quality/speed routing.
+	if r.classifier != nil {
+		if r.registry.hasBackendWithFeature("embeddings") {
+			resp["auto_routing"] = "ok"
+		} else {
+			resp["auto_routing"] = "degraded: no embeddings worker registered — difficulty/thinking classification disabled"
+		}
+		// The classification deadline is derived from the embeddings worker's
+		// measured latency (see observeEmbedLatency), so it is a number an operator
+		// cannot predict and needs to be able to read. It stays at
+		// difficultyTimeoutFallback until that worker has been certified once.
+		resp["classifier_deadline"] = r.classifier.deadline().String()
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// warnIfNoEmbeddings loudly and repeatedly warns when auto-routing is enabled
+// but no embeddings worker is registered — the classifiers can't run without
+// one, so routing silently falls back to plain quality/speed selection.
+func (r *Router) warnIfNoEmbeddings() {
+	time.Sleep(20 * time.Second) // grace for workers to register on startup
+	for {
+		if !r.registry.hasBackendWithFeature("embeddings") {
+			log.Printf("WARNING: auto-routing enabled but NO embeddings worker registered — " +
+				"difficulty + thinking classification disabled (routing falls back to quality/speed). " +
+				"Deploy llm-embeddings pointed at this router.")
+		}
+		time.Sleep(5 * time.Minute)
+	}
+}
+
+func (r *Router) handleBackends(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	if !authorizedAsClient(req, r.cfg.ClientTokens) {
+		unauthorized(w)
+		return
+	}
+	pub := publicBackends(r.registry.snapshot())
+	for _, b := range pub {
+		if _, ok := r.profiling.Load(b.ID); ok {
+			b.Profiling = true // background cold-start profile still running → values provisional
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"backends": pub})
+}
+
+// serveBenchmark returns the stored per-question results (questions, expected
+// answers, and the model's actual answers) from a worker's most recent profiling
+// run: GET /backends/{id}/benchmark. Read-only, client-token auth.
+func (r *Router) serveBenchmark(w http.ResponseWriter, req *http.Request, id string) {
+	if req.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	if !authorizedAsClient(req, r.cfg.ClientTokens) {
+		unauthorized(w)
+		return
+	}
+	prof, ok := r.logs.LoadWorkerProfileByID(req.Context(), id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, validationError{Message: fmt.Sprintf("no stored profiling run for %q", id)})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":            id,
+		"model":         prof.Model,
+		"quality":       prof.Quality,
+		"bench_version": prof.BenchVersion,
+		"measured_at":   prof.MeasuredAt,
+		"profile_ms":    prof.ProfileMillis,
+		"profiled_in":   fmtProfileDuration(prof.ProfileMillis),
+		"results":       prof.BenchResults,
+	})
+}
+
+// handleBackendByID serves DELETE /backends/{id} (and /workers/{id}). A live
+// backend with status="ready" is refused — only stale, expired, unhealthy or
+// failed-certification entries can be cleared — unless ?force=true is passed,
+// which clears it regardless (memory + persisted row). A real backend that's
+// still running its keepalive will re-register on its next cycle.
+func (r *Router) handleBackendByID(w http.ResponseWriter, req *http.Request) {
+	id := strings.TrimPrefix(req.URL.Path, "/backends/")
+	id = strings.TrimPrefix(id, "/workers/")
+	id = strings.Trim(id, "/")
+	if id == "" {
+		notFound(w, req)
+		return
+	}
+	// GET /backends/{id}/benchmark — stored per-question results from the most
+	// recent profiling run (questions, expected answers, and the model's answers).
+	if strings.HasSuffix(id, "/benchmark") {
+		r.serveBenchmark(w, req, strings.TrimSuffix(id, "/benchmark"))
+		return
+	}
+	switch req.Method {
+	case http.MethodDelete:
+		// DELETE accepts either a worker token (a worker de-registering itself
+		// on shutdown) or any client token (operator clearing a stale entry).
+		// Live ready+healthy backends are still refused below.
+		if !authorizedAsWorker(req, r.cfg.WorkerToken) && !authorizedAsClient(req, r.cfg.ClientTokens) {
+			unauthorized(w)
+			return
+		}
+		b := r.registry.get(id)
+		if b == nil {
+			writeJSON(w, http.StatusNotFound, validationError{Message: fmt.Sprintf("backend %q not found", id)})
+			return
+		}
+		force, _ := strconv.ParseBool(req.URL.Query().Get("force"))
+		if strings.EqualFold(b.Status, "ready") && b.Healthy && !isExpired(b) {
+			if !force {
+				writeJSON(w, http.StatusConflict, validationError{Message: fmt.Sprintf("backend %q is ready — refusing to delete a live backend (pass force=true to override)", id)})
+				return
+			}
+			log.Printf("force-deleting live backend %q (status=%s healthy=%t); it will re-register on its next keepalive", id, b.Status, b.Healthy)
+		}
+		removed := r.registry.remove(id)
+		if !removed {
+			writeJSON(w, http.StatusNotFound, validationError{Message: fmt.Sprintf("backend %q not found", id)})
+			return
+		}
+		// Also drop the persisted row, or a restart's LoadBackendRegistrations
+		// resurrects it. Best-effort: the in-memory removal already succeeded, so
+		// don't fail the request on a persist error.
+		if err := r.logs.DeleteBackendRegistration(req.Context(), id); err != nil {
+			log.Printf("delete persisted registration for %q: %v", id, err)
+		}
+		if err := r.logs.DeleteWorkerProfile(req.Context(), id); err != nil {
+			log.Printf("delete worker profile for %q: %v", id, err)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"status": "removed", "id": id})
+	case http.MethodGet:
+		if !authorizedAsClient(req, r.cfg.ClientTokens) {
+			unauthorized(w)
+			return
+		}
+		b := r.registry.get(id)
+		if b == nil {
+			notFound(w, req)
+			return
+		}
+		// Never expose the worker's bearer key (the /backends list scrubs it the
+		// same way — see publicBackends — and it's encrypted at rest).
+		b.APIKey = ""
+		writeJSON(w, http.StatusOK, b)
+	default:
+		methodNotAllowed(w)
+	}
+}
+
+func (r *Router) handleLogs(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	if !authorizedAsClient(req, r.cfg.ClientTokens) {
+		unauthorized(w)
+		return
+	}
+	limit := envBoundedInt(req.URL.Query().Get("limit"), 100, 1, 500)
+	offset := envBoundedInt(req.URL.Query().Get("offset"), 0, 0, 1000000)
+	backendID := strings.TrimSpace(req.URL.Query().Get("backend_id"))
+	rows, err := r.logs.List(req.Context(), backendID, limit, offset)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, validationError{Message: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"logs": rows})
+}
+
+func (r *Router) handleRegisterBackend(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !authorizedAsWorker(req, r.cfg.WorkerToken) {
+		unauthorized(w)
+		return
+	}
+
+	var reg BackendRegistration
+	if err := json.NewDecoder(http.MaxBytesReader(w, req.Body, 1<<20)).Decode(&reg); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json: %s", err)
+		return
+	}
+	if err := normalizeRegistration(&reg); err != nil {
+		writeError(w, http.StatusBadRequest, "%s", err)
+		return
+	}
+
+	backend, changed := r.registry.upsert(reg)
+	if err := r.logs.SaveBackendRegistration(req.Context(), reg); err != nil {
+		log.Printf("persist backend registration failed id=%s: %v", backend.ID, err)
+	}
+	// A keepalive (unchanged registration) of a ready backend is pure liveness —
+	// re-certifying would knock it out of rotation (startCertification sets
+	// "probing") for two worker round-trips every ~60s. Not-ready backends still
+	// get a certification kick; the guard in certifyBackend de-dups overlaps.
+	if changed || !backend.Certification.Ready {
+		go r.certifyBackend(backend.ID)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"status": "registered", "id": backend.ID})
+}
+
+// handleRouteFeedback records an explicit outcome for a previously auto-routed
+// request, feeding the online tier adapter a stronger signal than the passive
+// empty/truncated detection. A client (e.g. the agent on escalation) POSTs the
+// X-LLM-Route of the response it's grading plus a verdict. No-op when online
+// adaptation is disabled.
+func (r *Router) handleRouteFeedback(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !authorizedAsClient(req, r.cfg.ClientTokens) {
+		unauthorized(w)
+		return
+	}
+	var fb struct {
+		Route   string   `json:"route"`   // X-LLM-Route being graded, e.g. "route:d=0.42,q>=2"
+		Score   *float64 `json:"score"`   // alternative: the raw difficulty score directly
+		Verdict string   `json:"verdict"` // "inadequate"/"escalate"/"bad" → needs higher; else clean
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, req.Body, 1<<20)).Decode(&fb); err != nil {
+		writeJSON(w, http.StatusBadRequest, validationError{Message: fmt.Sprintf("invalid json: %s", err)})
+		return
+	}
+	if r.adapter == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ignored", "reason": "online adaptation disabled"})
+		return
+	}
+	var score float64
+	if fb.Score != nil {
+		score = *fb.Score
+	} else if s, ok := parseRouteScore(fb.Route); ok {
+		score = s
+	} else {
+		writeJSON(w, http.StatusBadRequest, validationError{Message: "feedback needs a difficulty `route` (route:d=…) or a `score`"})
+		return
+	}
+	needHigher := false
+	switch strings.ToLower(strings.TrimSpace(fb.Verdict)) {
+	case "inadequate", "escalate", "bad", "retry", "higher":
+		needHigher = true
+	}
+	r.adapter.observe(score, needHigher)
+	writeJSON(w, http.StatusOK, map[string]any{"status": "recorded"})
+}
+
+func (r *Router) handleModels(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	if !authorizedAsClient(req, r.cfg.ClientTokens) {
+		unauthorized(w)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": r.modelCatalogue()})
+}
+
+// handleModelByID serves GET /v1/models/{id} — the standard's single-model
+// object, and the call an OpenAI SDK makes to check a model exists before using
+// it. The path used to fall through to the dashboard handler, which answered
+// 404 in HTML.
+//
+// The object is taken from modelCatalogue rather than rebuilt, so it is
+// identical to the one /v1/models publishes for the same model; a client that
+// reads a field from the list can read it here. Both published spellings are
+// accepted — the menu id (the alias where there is one) and "root" (the raw
+// model id) — which are exactly the ids this endpoint advertises.
+func (r *Router) handleModelByID(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	if !authorizedAsClient(req, r.cfg.ClientTokens) {
+		unauthorized(w)
+		return
+	}
+	name := strings.TrimPrefix(req.URL.Path, "/v1/models/")
+	if name == "" {
+		r.handleModels(w, req) // a bare trailing slash is still the list
+		return
+	}
+	for _, m := range r.modelCatalogue() {
+		if m["id"] == name || m["root"] == name {
+			writeJSON(w, http.StatusOK, m)
+			return
+		}
+	}
+	writeJSON(w, http.StatusNotFound, validationError{
+		Message: unknownModelError{name: name}.Error(),
+		Param:   "model",
+	})
+}
+
+// modelCatalogue builds the /v1/models menu: one entry per servable model, plus
+// the "default" auto route at the head.
+func (r *Router) modelCatalogue() []map[string]any {
+	// This list is a MENU now, not a census: a client may name any id here and get
+	// it (see requestedModel). So publish each model ONCE, however many workers
+	// serve it — three identical gemma rows differing only by owned_by told a
+	// harness nothing and read as three choices. Workers serving the same model
+	// are pooled behind that one id and load-balanced by completion time.
+	byModel := map[string]map[string]any{}
+	order := []string{}
+	fleetFeatures := []string{"chat"}
+	aliasModels := map[string][]string{} // alias → distinct models claiming it
+	for _, b := range r.registry.snapshot() {
+		if isExpired(b) || isEmbeddingsOnly(b) {
+			continue
+		}
+		fleetFeatures = append(fleetFeatures, b.Features...)
+		entry, seen := byModel[b.Model]
+		if !seen {
+			byModel[b.Model] = map[string]any{
+				"id":       b.Model,
+				"object":   "model",
+				"owned_by": b.ID,
+				"features": append([]string(nil), b.Features...),
+				"workers":  1,
+			}
+			order = append(order, b.Model)
+			if a := backendAlias(b); a != "" {
+				aliasModels[a] = append(aliasModels[a], b.Model)
+			}
+			continue
+		}
+		entry["workers"] = entry["workers"].(int) + 1
+		// A feature is only claimable for the pooled id if every worker behind it
+		// has it — the router may send the request to any of them.
+		entry["features"] = intersectFeatures(entry["features"].([]string), b.Features)
+	}
+	// The menu id is the human spelling when it is unambiguous: the alias
+	// replaces the raw model id ("gemma4", not a quant-encrusted .gguf path),
+	// with the raw id preserved under "root" — both spellings, plus the worker
+	// id, are accepted by requestedModel/backendServesModel. Two distinct models
+	// reducing to the same alias keep their raw ids: an ambiguous menu row would
+	// silently pool different models.
+	for a, ms := range aliasModels {
+		if len(ms) != 1 || byModel[a] != nil {
+			continue
+		}
+		byModel[ms[0]]["root"] = ms[0]
+		byModel[ms[0]]["id"] = a
+	}
+	sort.Strings(order)
+	// "default" is the auto route, and listing it makes the automatic behaviour a
+	// visible choice rather than folklore: a harness can select it deliberately
+	// instead of guessing which concrete model to name. It advertises the UNION
+	// of the fleet's features — a tools request to default hard-filters to
+	// tools-capable workers, so default really does serve whatever any worker
+	// can — where a pooled concrete id advertises the intersection.
+	models := []map[string]any{{
+		"id":       "default",
+		"object":   "model",
+		"owned_by": "llm-router",
+		"features": normalizeFeatures(fleetFeatures),
+	}}
+	for _, name := range order {
+		models = append(models, byModel[name])
+	}
+	return models
+}
+
+func (r *Router) handleDashboard(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	if req.URL.Path != "/" {
+		notFound(w, req)
+		return
+	}
+	// GET / requires no auth, so the server render must disclose NOTHING about the
+	// fleet — no IDs, URLs, models, quality or load. The page is a static shell; the
+	// backend table and per-backend log tabs are populated CLIENT-SIDE from a
+	// token-gated /backends fetch (see renderBackends in dashboardTemplate).
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := dashboardTemplate.Execute(w, map[string]any{
+		"GeneratedAt": time.Now().Format(time.RFC3339),
+	}); err != nil {
+		log.Printf("dashboard render failed: %v", err)
+	}
+}
+
+func (r *Router) handleDebugBackends(w http.ResponseWriter, req *http.Request) {
+	path := strings.TrimPrefix(req.URL.Path, "/debug/backends/")
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) != 2 {
+		notFound(w, req)
+		return
+	}
+	id, action := parts[0], parts[1]
+	switch action {
+	case "chat":
+		r.handleDebugBackendChat(w, req, id)
+	case "certify":
+		r.handleDebugBackendCertify(w, req, id)
+	default:
+		notFound(w, req)
+	}
+}
+
+func (r *Router) handleDebugBackendCertify(w http.ResponseWriter, req *http.Request, id string) {
+	if req.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !authorizedAsClient(req, r.cfg.ClientTokens) {
+		unauthorized(w)
+		return
+	}
+	if r.registry.get(id) == nil {
+		writeJSON(w, http.StatusNotFound, validationError{Message: "backend not found"})
+		return
+	}
+	go r.certifyBackend(id)
+	writeJSON(w, http.StatusAccepted, map[string]any{"status": "probing", "id": id})
+}
+
+func (r *Router) handleDebugBackendChat(w http.ResponseWriter, req *http.Request, id string) {
+	if req.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !authorizedAsClient(req, r.cfg.ClientTokens) {
+		unauthorized(w)
+		return
+	}
+	body, err := readRequestBody(w, req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "read request: %s", err)
+		return
+	}
+	chatReq, err := parseAndValidateChatRequest(body, r.cfg.DefaultMaxTokens)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, validationError{Message: err.Error()})
+		return
+	}
+	backend := r.registry.get(id)
+	if backend == nil {
+		writeJSON(w, http.StatusNotFound, validationError{Message: "backend not found"})
+		return
+	}
+	// No classification on the debug path (nil) — auto-thinking is skipped, as on
+	// the pinned path; only explicit thinking signals apply. target=0 ⇒ no quality
+	// floor (the debug path pins one backend anyway).
+	r.proxyToBackend(w, req, &routePlan{candidates: []*Backend{backend}, route: "debug"}, body, chatReq)
+}
+
+func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !authorizedAsClient(req, r.cfg.ClientTokens) {
+		unauthorized(w)
+		return
+	}
+
+	body, err := readRequestBody(w, req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "read request: %s", err)
+		return
+	}
+
+	chatReq, err := parseAndValidateChatRequest(body, r.cfg.DefaultMaxTokens)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, validationError{Message: err.Error()})
+		return
+	}
+
+	var plan *routePlan
+
+	if pinID := req.Header.Get("X-LLM-Backend-ID"); pinID != "" {
+		// Pin to a specific backend by ID. No classification is computed here, so
+		// auto-thinking is skipped (only explicit thinking signals apply), there is
+		// no quality floor, and no session affinity — the caller has already made
+		// every one of those decisions.
+		backend := r.registry.get(pinID)
+		if backend == nil {
+			writeJSON(w, http.StatusNotFound, validationError{Message: fmt.Sprintf("backend %q not found", pinID)})
+			return
+		}
+		if !backend.Healthy || !backend.Certification.Ready || isExpired(backend) {
+			writeUnavailable(w, r.retryAfterUnavailable(), fmt.Sprintf("backend %q not available (healthy=%v, ready=%v, expired=%v)", pinID, backend.Healthy, backend.Certification.Ready, isExpired(backend)))
+			return
+		}
+		plan = &routePlan{candidates: []*Backend{backend}, route: "pinned"}
+	} else {
+		plan, err = r.planRoute(chatReq, callerBudget(req, chatReq), false)
+		if err != nil {
+			var unknown unknownModelError
+			if errors.As(err, &unknown) {
+				writeJSON(w, http.StatusNotFound, validationError{Message: err.Error(), Param: "model"})
+				return
+			}
+			writeUnavailable(w, r.retryAfterUnavailable(), err.Error())
+			return
+		}
+	}
+
+	r.proxyToBackend(w, req, plan, body, chatReq)
+}
+
+// completionRequest is the legacy /v1/completions shape. We don't rewrite
+// the body — vLLM and llama.cpp both serve /v1/completions natively, so the
+// router just selects a backend and passes the request through. The parsed
+// fields exist only to drive backend selection and slot accounting.
+type completionRequest struct {
+	Model        string          `json:"model,omitempty"`
+	Prompt       json.RawMessage `json:"prompt,omitempty"`
+	MaxTokens    int             `json:"max_tokens,omitempty"`
+	Stream       bool            `json:"stream,omitempty"`
+	Requirements *Requirements   `json:"requirements,omitempty"`
+}
+
+func (r *Router) handleCompletions(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !authorizedAsClient(req, r.cfg.ClientTokens) {
+		unauthorized(w)
+		return
+	}
+	body, err := readRequestBody(w, req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "read request: %s", err)
+		return
+	}
+
+	var compReq completionRequest
+	if err := json.Unmarshal(body, &compReq); err != nil {
+		writeJSON(w, http.StatusBadRequest, validationError{Message: fmt.Sprintf("invalid json: %s", err)})
+		return
+	}
+
+	// Re-use selectBackend by adapting to a minimal ChatRequest. No messages
+	// (selectBackend tolerates that) but Model / MaxTokens / Stream /
+	// Requirements all carry across.
+	chatReq := &ChatRequest{
+		Model:        compReq.Model,
+		MaxTokens:    compReq.MaxTokens,
+		Stream:       compReq.Stream,
+		Requirements: compReq.Requirements,
+	}
+	candidates, _, _, _, err := r.selectBackends(chatReq, callerBudget(req, chatReq))
+	if err != nil {
+		writeUnavailable(w, r.retryAfterUnavailable(), err.Error())
+		return
+	}
+	r.proxyPassthrough(w, req, candidates, body, "/v1/completions", "completions")
+}
+
+func (r *Router) handleEmbeddings(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !authorizedAsClient(req, r.cfg.ClientTokens) {
+		unauthorized(w)
+		return
+	}
+	body, err := readRequestBody(w, req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "read request: %s", err)
+		return
+	}
+	candidates, err := r.selectBackendsByFeature("embeddings")
+	if err != nil {
+		writeUnavailable(w, r.retryAfterUnavailable(), err.Error())
+		return
+	}
+	r.proxyPassthrough(w, req, candidates, body, "/v1/embeddings", "embeddings")
+}
+
+// callerBudget reports how long the caller will still wait for a response, from
+// the X-LLM-Deadline-MS header or the request's deadline_ms field (header wins).
+// The request context's own deadline is checked first, but net/http never sets one
+// for an inbound request, so in practice the budget has to be declared.
+// Zero means unknown — every deadline-aware behaviour is then skipped.
+func callerBudget(req *http.Request, chatReq *ChatRequest) time.Duration {
+	if dl, ok := req.Context().Deadline(); ok {
+		if d := time.Until(dl); d > 0 {
+			return d
+		}
+	}
+	ms := 0
+	if h := strings.TrimSpace(req.Header.Get("X-LLM-Deadline-MS")); h != "" {
+		if v, err := strconv.Atoi(h); err == nil {
+			ms = v
+		}
+	}
+	if ms <= 0 && chatReq != nil {
+		ms = chatReq.DeadlineMillis
+	}
+	if ms <= 0 {
+		return 0
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// selectBackendsByFeature returns eligible backends whose declared features
+// include the given feature flag (e.g. "embeddings"), ranked best-first. Used
+// by non-chat endpoints where the full chat-style selection (context, tools,
+// vision) doesn't apply. The caller spills across the list when the best
+// backend has no free slot (see pickAndAcquire).
+func (r *Router) selectBackendsByFeature(feature string) ([]*Backend, error) {
+	candidates := r.registry.eligible()
+	if len(candidates) == 0 {
+		return nil, errors.New("no healthy backends registered")
+	}
+	filtered := filterCandidates(candidates, func(b *Backend) bool {
+		return hasFeature(b, feature)
+	})
+	if len(filtered) == 0 {
+		return nil, fmt.Errorf("no healthy backends with feature %q", feature)
+	}
+	// Feature lookups (/v1/embeddings) carry no chat request to size, so rank on
+	// the nominal job — unchanged from before jobCost existed.
+	return rankBackends(filtered, nominalJob()), nil
+}
+
+// proxyPassthrough forwards a request body verbatim to openAIPath on the
+// best available backend from candidates. Used by /v1/completions and
+// /v1/embeddings, where the router does not interpret or rewrite the request
+// body (in contrast to /v1/chat/completions, which uses proxyToBackend for
+// retry + max_tokens patching). Honours backend slot accounting (spilling
+// across candidates), circuit-breaker feedback, and request logging.
+func (r *Router) proxyPassthrough(w http.ResponseWriter, req *http.Request, candidates []*Backend, body []byte, openAIPath, route string) {
+	if len(candidates) == 0 {
+		writeUnavailable(w, r.retryAfterUnavailable(), "no backend available")
+		return
+	}
+	start := time.Now()
+
+	backend, slot, slotErr := r.pickAndAcquire(req.Context(), candidates)
+	if slotErr != nil {
+		r.logSlotUnavailable(candidates[0], route, false, nil, start, slotErr)
+		writeUnavailable(w, r.retryAfterSaturated(), fmt.Sprintf("no backend slot available: %s", slotErr))
+		return
+	}
+	defer r.registry.releaseSlot(slot)
+
+	logEntry := RequestLog{
+		CreatedAt:    start.UTC(),
+		BackendID:    backend.ID,
+		BackendModel: backend.Model,
+		Route:        route,
+		ObservedTPS:  backend.ObservedTPS,
+		CertifiedTPS: backend.Certification.TokensPerSec,
+		BaselineTPS:  backend.BaselineTPS,
+		SpeedScore:   speedScore(backend),
+	}
+	defer func() {
+		logEntry.DurationMillis = time.Since(start).Milliseconds()
+		// Async: this defer runs before releaseSlot (LIFO) and a synchronous
+		// SQLite write here would extend the worker's busy window.
+		entry := logEntry
+		go func() {
+			if err := r.logs.Insert(context.Background(), entry); err != nil {
+				log.Printf("persist request log failed: %v", err)
+			}
+		}()
+	}()
+
+	r.registry.incActive(backend.ID, 1)
+	defer r.registry.incActive(backend.ID, -1)
+
+	proxyReq, err := http.NewRequestWithContext(req.Context(), http.MethodPost, upstreamPathURL(backend, openAIPath), bytes.NewReader(body))
+	if err != nil {
+		logEntry.StatusCode = http.StatusInternalServerError
+		logEntry.Error = err.Error()
+		writeJSON(w, http.StatusInternalServerError, validationError{Message: err.Error()})
+		return
+	}
+	proxyReq.Header.Set("Content-Type", "application/json")
+	if backend.APIKey != "" {
+		proxyReq.Header.Set("Authorization", "Bearer "+backend.APIKey)
+	} else if auth := req.Header.Get("Authorization"); auth != "" {
+		proxyReq.Header.Set("Authorization", auth)
+	}
+
+	resp, err := r.client.Do(proxyReq)
+	if err != nil {
+		// Client hangups (context canceled) aren't backend failures — see the
+		// matching guard in dispatchStreaming.
+		if req.Context().Err() == nil {
+			r.registry.setError(backend.ID, err.Error())
+			r.registry.noteProxyResult(backend.ID, false)
+		}
+		logEntry.StatusCode = http.StatusBadGateway
+		logEntry.Error = err.Error()
+		writeJSON(w, http.StatusBadGateway, validationError{Message: err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+	r.registry.noteProxyResult(backend.ID, resp.StatusCode < 500)
+
+	w.Header().Set("X-LLM-Backend-ID", backend.ID)
+	w.Header().Set("X-LLM-Backend-Model", backend.Model)
+	w.Header().Set("X-LLM-Backend-Model-Name", niceModelName(backend))
+	w.Header().Set("X-LLM-Backend-URL", backend.URL)
+	w.Header().Set("X-LLM-Route", route)
+	copyHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	logEntry.StatusCode = resp.StatusCode
+
+	// Flush per chunk: this path serves stream:true /v1/completions too, and a
+	// bare io.Copy buffers the whole generation before the client sees a byte.
+	fl, _ := w.(http.Flusher)
+	buf := make([]byte, 32*1024)
+	for {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				logEntry.Error = werr.Error()
+				return
+			}
+			if fl != nil {
+				fl.Flush()
+			}
+		}
+		if rerr != nil {
+			if rerr != io.EOF {
+				logEntry.Error = rerr.Error()
+				// stream:true /v1/completions runs through here too, so the same
+				// mid-stream rule applies: the status is spent, and a truncated
+				// stream reads as a short answer (see writeSSEError).
+				if req.Context().Err() == nil && isEventStream(w.Header()) {
+					writeSSEError(w, fmt.Sprintf("upstream stream from backend %q failed: %s", backend.ID, rerr))
+				}
+			}
+			return
+		}
+	}
+}
+
+// logSlotUnavailable records the 503 we return when no candidate backend had a
+// free slot before the deadline. Attributed to the primary (best-ranked)
+// candidate for context.
+func (r *Router) logSlotUnavailable(primary *Backend, route string, stream bool, input []byte, start time.Time, cause error) {
+	entry := RequestLog{
+		CreatedAt:      start.UTC(),
+		BackendID:      primary.ID,
+		BackendModel:   primary.Model,
+		Route:          route,
+		Stream:         stream,
+		Input:          string(input),
+		StatusCode:     http.StatusServiceUnavailable,
+		Error:          cause.Error(),
+		DurationMillis: time.Since(start).Milliseconds(),
+	}
+	if err := r.logs.Insert(context.Background(), entry); err != nil {
+		log.Printf("request log insert failed backend=%s: %v", primary.ID, err)
+	}
+}
+
+// slotMaxWait caps how long the router will block a request waiting for a
+// backend concurrency slot before returning 503. Callers' own timeouts
+// (via request context) take precedence; this is the fallback bound. Tune
+// via ROUTER_SLOT_MAX_WAIT_SECONDS: how long a caller queues before a 503 is a
+// promise to clients, not a routing decision, so it stays an operator setting.
+var slotMaxWait = envDuration("ROUTER_SLOT_MAX_WAIT_SECONDS", 10*time.Minute)
+
+// qualityFloorWait is the BOUNDED grace a request auto-classified as needing
+// quality >= target will wait for an above-target worker to free a slot before
+// it spills BELOW the floor (fix #2). Routing too cheap is the quality-risky
+// direction, so a HARD prompt shouldn't be instantly downgraded the instant the
+// sufficient workers are momentarily full. It MUST be << slotMaxWait: it only
+// briefly prefers the better tier, then falls through to the normal spill (up to
+// slotMaxWait).
+//
+// Ten seconds, measured rather than picked: with a fast GPU worker at
+// max_concurrency 1 backed by a slow CPU fallback, a shorter grace sent the
+// second concurrent chat to the CPU for a multi-minute generation. Ten covers
+// most in-flight GPU turns. This used to be an environment variable and was set
+// to two different values in two files of the same deployment, which is the
+// evidence that it is not a question an operator can answer.
+var qualityFloorWait = 10 * time.Second
+
+// proxyRetryDelays describes the backoff between 5xx/429 retries for
+// non-streaming requests. Streaming requests are forwarded once and never
+// retried (we've already started writing bytes to the client). Tune by
+// shadowing in env if needed; the constants are intentional defaults.
+var proxyRetryDelays = []time.Duration{
+	2 * time.Second,
+	5 * time.Second,
+	10 * time.Second,
+}
+
+// slotPollInterval is how often pickAndAcquire re-scans all candidate backends
+// for a freed slot while every candidate is momentarily saturated.
+const slotPollInterval = 50 * time.Millisecond
+
+// pickAndAcquire returns the highest-ranked candidate that has a free
+// concurrency slot, acquiring that slot. Candidates are tried best-first; a
+// backend with no declared cap is always immediately available (nil slot).
+// When every candidate is momentarily full it re-scans every slotPollInterval
+// until one frees, the caller's context is cancelled, or slotMaxWait elapses —
+// so a burst spills across idle backends instead of queueing on a single one.
+func (r *Router) pickAndAcquire(ctx context.Context, candidates []*Backend) (*Backend, chan struct{}, error) {
+	if len(candidates) == 0 {
+		return nil, nil, errors.New("no candidate backends")
+	}
+	// Fast path: take the best candidate with a slot free right now (covers
+	// uncapped backends and any idle one — no timer/ticker allocation).
+	if b, slot, ok := r.scanForSlot(candidates); ok {
+		return b, slot, nil
+	}
+	// Every candidate is momentarily saturated; wait, re-scanning each tick
+	// until one frees, the caller gives up, or slotMaxWait elapses.
+	deadline := time.NewTimer(slotMaxWait)
+	defer deadline.Stop()
+	poll := time.NewTicker(slotPollInterval)
+	defer poll.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		case <-deadline.C:
+			return nil, nil, fmt.Errorf("timed out after %s waiting for a free slot across %d backend(s)", slotMaxWait, len(candidates))
+		case <-poll.C:
+		}
+		if b, slot, ok := r.scanForSlot(candidates); ok {
+			return b, slot, nil
+		}
+	}
+}
+
+// scanForSlot tries each candidate best-first and returns the first that has a
+// free concurrency slot (acquiring it), or ok=false if all are full.
+func (r *Router) scanForSlot(candidates []*Backend) (*Backend, chan struct{}, bool) {
+	for _, b := range candidates {
+		if slot, ok := r.registry.tryAcquireSlot(b.ID); ok {
+			return b, slot, true
+		}
+	}
+	return nil, nil, false
+}
+
+// acquirePreference is a BOUNDED first-choice set for slot acquisition: try to
+// land inside `keep` for `wait`, then fall back to the whole ranked list. Two
+// unrelated policies want exactly this shape, so it is expressed once:
+//
+//   - the auto-difficulty quality floor (fix #2) — prefer a worker at or above
+//     the classified tier before serving cheaper, because routing too cheap is
+//     the quality-risky direction;
+//   - the session tool-loop lock (session.go) — prefer the worker that opened
+//     the loop before handing its tool result to a different model.
+//
+// A zero preference (nil keep) means no preference at all.
+type acquirePreference struct {
+	keep func(*Backend) bool
+	wait time.Duration
+	// why labels the preference for logging; it is also what tells the caller
+	// which "missed" story to tell.
+	why string
+}
+
+// qualityFloorPreference prefers workers at or above the classified tier.
+func qualityFloorPreference(target int) acquirePreference {
+	if target <= 0 {
+		return acquirePreference{}
+	}
+	return acquirePreference{
+		keep: func(b *Backend) bool { return b.Quality >= target },
+		wait: qualityFloorWait,
+		why:  "quality-floor",
+	}
+}
+
+// sessionLockPreference prefers the worker that served the previous turn. It
+// outranks the quality floor while a tool loop is open: continuity matters more
+// there than tier, because half a tool loop served by two models is worse than
+// all of it served by the cheaper one.
+func sessionLockPreference(incumbent string) acquirePreference {
+	if incumbent == "" {
+		return acquirePreference{}
+	}
+	return acquirePreference{
+		keep: func(b *Backend) bool { return b.ID == incumbent },
+		wait: sessionLockWait,
+		why:  "session-lock",
+	}
+}
+
+// pickAndAcquireWithFloor is pickAndAcquire under the quality-floor preference.
+// Retained as the named entry point for the floor policy (and its tests).
+func (r *Router) pickAndAcquireWithFloor(ctx context.Context, candidates []*Backend, target int) (*Backend, chan struct{}, bool, error) {
+	return r.pickAndAcquirePreferred(ctx, candidates, qualityFloorPreference(target))
+}
+
+// pickAndAcquirePreferred is pickAndAcquire plus a bounded first-choice set.
+//
+// It partitions candidates into the preferred set and the rest:
+//   - no preference, or the preferred set is empty (nothing to wait for): behave
+//     exactly like pickAndAcquire — no extra wait.
+//   - preferred set non-empty: try to acquire inside it first, polling up to
+//     pref.wait; if none frees in time, fall back to the full ranked list (normal
+//     spill, up to slotMaxWait). The bool result reports whether the request
+//     MISSED the preference, so the caller can make that observable.
+//
+// Best-effort: it never blocks longer than slotMaxWait / the caller's context and
+// never fails a request the un-preferred path would have served.
+func (r *Router) pickAndAcquirePreferred(ctx context.Context, candidates []*Backend, pref acquirePreference) (*Backend, chan struct{}, bool, error) {
+	if pref.keep == nil || pref.wait <= 0 {
+		b, slot, err := r.pickAndAcquire(ctx, candidates)
+		return b, slot, false, err
+	}
+	preferred := filterCandidates(candidates, pref.keep)
+	if len(preferred) == 0 {
+		// Nothing to wait for. Serve the best available immediately, exactly as
+		// without the preference (the ranked list already orders the fallback).
+		b, slot, err := r.pickAndAcquire(ctx, candidates)
+		return b, slot, false, err
+	}
+	// Fast path: a preferred worker has a slot free right now.
+	if b, slot, ok := r.scanForSlot(preferred); ok {
+		return b, slot, false, nil
+	}
+	// Every preferred worker is momentarily full. Wait a BOUNDED grace for one to
+	// free before spilling — but bail early if the caller's context is cancelled
+	// (don't outlive the request).
+	grace := time.NewTimer(pref.wait)
+	defer grace.Stop()
+	poll := time.NewTicker(slotPollInterval)
+	defer poll.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, nil, false, ctx.Err()
+		case <-grace.C:
+			// Grace elapsed: fall back to the full ranked list (normal spill, up to
+			// slotMaxWait). Re-check the preferred set one last time first so a slot
+			// that frees exactly at the deadline is still honoured.
+			if b, slot, ok := r.scanForSlot(preferred); ok {
+				return b, slot, false, nil
+			}
+			b, slot, err := r.pickAndAcquire(ctx, candidates)
+			return b, slot, err == nil, err
+		case <-poll.C:
+		}
+		if b, slot, ok := r.scanForSlot(preferred); ok {
+			return b, slot, false, nil
+		}
+	}
+}
+
+// proxyToBackend dispatches a chat request to the best available candidate in
+// plan. The plan carries the auto-difficulty quality floor (target 0 ⇒ no floor):
+// when non-zero, acquisition prefers to wait BRIEFLY (qualityFloorWait) for an
+// above-target worker before spilling below it (fix #2). The pinned/debug callers
+// pass a bare plan, so their behaviour is unchanged.
+func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, plan *routePlan, body []byte, chatReq *ChatRequest) {
+	candidates, route, target := plan.candidates, plan.route, plan.target
+	if len(candidates) == 0 {
+		writeUnavailable(w, r.retryAfterUnavailable(), "no backend available")
+		return
+	}
+	// Patch the forwarded body in a SINGLE pass: fill in max_tokens when the
+	// client omitted it (the backend needs an explicit limit) and write
+	// chat_template_kwargs.enable_thinking per the resolved decision. One
+	// unmarshal/marshal instead of two, so a multi-MB vision body is copied once.
+	// The thinking decision uses the SAME resolution that gated selection (plan.cl
+	// is the classification threaded from planRoute; nil on pinned/debug, where
+	// only explicit thinking signals apply) so the worker and the enable_thinking
+	// we forward can never disagree.
+	tr := r.resolveThinking(chatReq, route, plan.cl)
+	// Same job shape planRoute ranked with — session discount included — so the
+	// live prefill/TTFT samples are attributed to the right prompt size and skipped
+	// for thinking turns (see Registry.observe).
+	thinking := tr.hardThink || tr.softThink
+	job := costForRequest(chatReq, thinking).withIncumbent(plan.session.incumbent)
+	// Inject the default budget ONLY when the client set none (max_tokens and
+	// max_completion_tokens both absent/null/0) — never alongside a real client
+	// budget, where a second conflicting limit is resolved differently per
+	// backend dialect.
+	injectMaxTokens := 0
+	if !chatReq.ClientSetMaxTokens {
+		injectMaxTokens = chatReq.MaxTokens
+	}
+
+	start := time.Now()
+
+	// Acquire a concurrency slot before dispatching, spilling to the next-best
+	// backend when the best one is momentarily full (see pickAndAcquirePreferred).
+	// A backend with no declared cap is always immediately available. The request
+	// stays queued here — not consuming a vLLM worker — until a slot frees, the
+	// caller gives up, or slotMaxWait elapses.
+	//
+	// Which bounded preference applies: normally the quality floor (wait briefly
+	// for an above-target worker before serving below the tier). While a TOOL LOOP
+	// is open the session lock wins instead — handing a tool result to a model that
+	// never emitted the matching tool call breaks the loop outright, which is worse
+	// than serving that turn a tier low.
+	pref := qualityFloorPreference(target)
+	if plan.session.locked() {
+		pref = sessionLockPreference(plan.session.incumbent)
+	}
+	backend, slot, missedPref, slotErr := r.pickAndAcquirePreferred(req.Context(), candidates, pref)
+	if slotErr != nil {
+		r.logSlotUnavailable(candidates[0], route, chatReq.Stream, body, start, slotErr)
+		writeUnavailable(w, r.retryAfterSaturated(), fmt.Sprintf("no backend slot available: %s", slotErr))
+		return
+	}
+	// The slot and the active-request count belong to whichever worker is serving
+	// RIGHT NOW: inline escalation may hand both over to a better worker mid-request
+	// (see escalate.go), so unwind through the variables rather than capturing
+	// today's values in the defer.
+	defer func() { r.registry.releaseSlot(slot) }()
+	// Patch only now that the worker is known: the max_tokens clamp needs its
+	// context. logSlotUnavailable above logs the unpatched body, which is what it
+	// wants anyway — nothing was forwarded. Keep the client's original: an inline
+	// escalation re-patches from THAT rather than inheriting a clamp shaped by the
+	// worker it is replacing (see escalate.go).
+	rawBody := body
+	body = patchForwardedBody(body, injectMaxTokens, budgetCeiling(backend, job), tr.forBackend(backend), backend.ServedID)
+	// Fields this endpoint has already refused as unrecognised never go out
+	// again — see stripAndRetry. Usually empty, and then free.
+	body = stripBodyFields(body, backend.RejectedFields)
+	// Make a missed preference observable WITHOUT touching X-LLM-Route (its
+	// route:d=…,q>=… form is parsed by parseRouteScore): a dedicated response
+	// header plus a log line. The route header still records the target the prompt
+	// was classified to need; this records that we couldn't honour it within the
+	// grace and served elsewhere.
+	if missedPref {
+		switch pref.why {
+		case "session-lock":
+			log.Printf("session lock: %s tool loop moved off incumbent=%s to backend=%s after %s grace — no incumbent slot freed",
+				route, plan.session.incumbent, backend.ID, sessionLockWait)
+		default:
+			w.Header().Set("X-LLM-Quality-Floor", "downgraded")
+			log.Printf("quality floor: %s served below target q>=%d on backend=%s (q=%d) after %s grace — no above-bar slot freed",
+				route, target, backend.ID, backend.Quality, qualityFloorWait)
+		}
+	}
+	// TTFT base: measure first-token latency from the moment we hold a worker
+	// slot, NOT from request arrival — pickAndAcquire can block up to slotMaxWait,
+	// and folding that router-side queue wait into the worker's first-token
+	// latency would pollute the ObservedTTFTMillis EWMA expectedLatency relies on
+	// (fix #4). logEntry.DurationMillis below still measures total wall time from
+	// start (queue included).
+	ttftBase := time.Now()
+
+	r.registry.incActive(backend.ID, 1)
+	defer func() { r.registry.incActive(backend.ID, -1) }()
+
+	logEntry := RequestLog{
+		CreatedAt:    start.UTC(),
+		BackendID:    backend.ID,
+		BackendModel: backend.Model,
+		Route:        route,
+		ObservedTPS:  backend.ObservedTPS,
+		CertifiedTPS: backend.Certification.TokensPerSec,
+		BaselineTPS:  backend.BaselineTPS,
+		SpeedScore:   speedScore(backend),
+		Stream:       chatReq.Stream,
+		Input:        string(body),
+	}
+	capture := newBoundedCapture(r.cfg.LogMaxBodyBytes)
+	var stats *sseStats
+	if chatReq.Stream {
+		stats = &sseStats{}
+	}
+	// escalated records that an inline escalation happened, so the adapter still
+	// learns the region needed a better model even though the answer it finally
+	// returned was fine.
+	escalated := false
+	defer func() {
+		logEntry.DurationMillis = time.Since(start).Milliseconds()
+		logEntry.Output = capture.String()
+		// Session affinity: remember which worker served this conversation, so its
+		// next turn prefers the same one (its prefix is cached there). Only on a
+		// clean 2xx, and only for a route the ROUTER chose — a pinned request says
+		// nothing about where the conversation belongs.
+		if logEntry.Error == "" && logEntry.StatusCode >= 200 && logEntry.StatusCode < 300 && route != "pinned" && route != "debug" {
+			r.sessions.remember(plan.session.key, backend.ID)
+		}
+		// The adapter/judge/log-insert bookkeeping runs in a goroutine: this defer
+		// executes BEFORE releaseSlot (defer LIFO), and a synchronous SQLite insert
+		// here would extend the busy window of a max_concurrency=1 worker after
+		// every request.
+		entry := logEntry
+		served := backend
+		didEscalate := escalated
+		go func() {
+			// Self-improvement: feed this auto-routed request's outcome back to the
+			// online tier adapter (no-op unless enabled and this was a "route:d=" pick).
+			// A failed/aborted transfer (client hung up mid-stream, worker died) says
+			// nothing about answer quality — feeding it as "inadequate" ratcheted
+			// bins toward expensive workers on exactly the slow-prefill prompts
+			// clients abort most.
+			if r.adapter != nil && entry.Error == "" && entry.StatusCode >= 200 && entry.StatusCode < 300 {
+				if score, ok := parseRouteScore(route); ok {
+					// Streamed inadequacy comes from the full-stream stats; the capture
+					// may have truncated the middle away.
+					inadequate := false
+					if stats != nil {
+						inadequate = stats.inadequate()
+					} else {
+						inadequate = responseInadequate(capture.Bytes(), false)
+					}
+					// An escalation REPAIRED the answer, so the body now looks clean —
+					// but the tier the router originally picked was the wrong one, which
+					// is exactly what the adapter exists to learn. Without this the
+					// repair would teach it the opposite.
+					r.adapter.observe(score, inadequate || didEscalate)
+					// Judging parses the answer text back out of the capture — skip when
+					// truncation removed part of it (a half answer grades as garbage).
+					if capture.truncated() <= 0 {
+						r.maybeJudge(chatReq.Messages, chatReq.Stream, served, score, entry.Output)
+					}
+				}
+			}
+			if err := r.logs.Insert(context.Background(), entry); err != nil {
+				log.Printf("request log insert failed backend=%s: %v", served.ID, err)
+			}
+		}()
+	}()
+
+	if s := plan.session.outcome(backend.ID); s != "" {
+		w.Header().Set("X-LLM-Session", s)
+	}
+
+	// Streaming requests can't be retried — once headers are committed we
+	// can't rewind. Fall through to the single-shot path. ttftBase (slot
+	// acquisition), not start (request arrival), is the TTFT/decode measurement
+	// base so router-side queue wait doesn't pollute the latency EWMAs.
+	if chatReq.Stream {
+		r.dispatchStreaming(w, req, backend, body, route, &logEntry, capture, stats, ttftBase, job, thinking)
+		return
+	}
+	r.dispatchBuffered(w, req, &dispatch{
+		backend:   &backend,
+		slot:      &slot,
+		body:      body,
+		raw:       rawBody,
+		plan:      plan,
+		chatReq:   chatReq,
+		job:       job,
+		tr:        tr,
+		inject:    injectMaxTokens,
+		budget:    callerBudget(req, chatReq),
+		start:     start,
+		log:       &logEntry,
+		output:    capture,
+		escalated: &escalated,
+	})
+}
+
+// dispatchStreaming forwards a single SSE-style response from backend to
+// client. Used for streaming requests where retrying after partial writes
+// isn't possible.
+// ttftBase is when the worker slot was acquired (NOT request arrival); the
+// first chunk's arrival minus ttftBase is the worker's true first-token latency,
+// excluding any router-side queue wait (see proxyToBackend / fix #4).
+func (r *Router) dispatchStreaming(w http.ResponseWriter, req *http.Request, backend *Backend, body []byte, route string, logEntry *RequestLog, capture io.Writer, stats *sseStats, ttftBase time.Time, job jobCost, thinking bool) {
+	// Idle watchdog instead of a wall-clock cap: the old client-level
+	// BACKEND_TIMEOUT_SECONDS bounded the WHOLE stream, killing legitimate
+	// long generations mid-flow while still letting a silently hung backend
+	// pin its concurrency slot for the full 10 minutes. Progress (any bytes,
+	// heartbeats included) resets the timer; true silence cancels quickly.
+	ctx, cancel := context.WithCancel(req.Context())
+	defer cancel()
+	upstreamURL := upstreamChatURL(backend)
+	proxyReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(body))
+	if err != nil {
+		logEntry.StatusCode = http.StatusInternalServerError
+		logEntry.Error = err.Error()
+		writeJSON(w, http.StatusInternalServerError, validationError{Message: err.Error()})
+		return
+	}
+	proxyReq.Header.Set("Content-Type", "application/json")
+	if backend.APIKey != "" {
+		proxyReq.Header.Set("Authorization", "Bearer "+backend.APIKey)
+	} else if auth := req.Header.Get("Authorization"); auth != "" {
+		proxyReq.Header.Set("Authorization", auth)
+	}
+
+	idle := r.cfg.BackendIdleTimeout
+	var watchdog *time.Timer
+	if idle > 0 {
+		watchdog = time.AfterFunc(idle, cancel)
+		defer watchdog.Stop()
+	}
+	progress := func() {
+		if watchdog != nil {
+			watchdog.Reset(idle)
+		}
+	}
+
+	resp, err := r.streamClient.Do(proxyReq)
+	if err != nil {
+		// A client hangup surfaces here as context-canceled (ctx inherits
+		// req.Context()). That says nothing about the backend — with long prefills
+		// an abort storm (user spamming stop, agent retry loops) would otherwise
+		// trip the circuit breaker and eject a perfectly healthy worker. An idle
+		// watchdog cancellation, by contrast, IS the backend's fault and counts.
+		if req.Context().Err() == nil {
+			r.registry.setError(backend.ID, err.Error())
+			r.registry.noteProxyResult(backend.ID, false)
+		}
+		logEntry.StatusCode = http.StatusBadGateway
+		logEntry.Error = err.Error()
+		writeJSON(w, http.StatusBadGateway, validationError{Message: err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+	r.registry.noteProxyResult(backend.ID, resp.StatusCode < 500)
+
+	setRouteHeaders(w, backend, route, logEntry)
+	// Forward upstream headers — without Content-Type: text/event-stream, Go
+	// content-sniffs the first chunk to text/plain and strict SSE clients
+	// (EventSource, OpenAI SDKs) refuse the stream.
+	copyHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	logEntry.StatusCode = resp.StatusCode
+	progress() // headers arrived — the idle window now measures body silence
+	sink := capture
+	if stats != nil {
+		sink = io.MultiWriter(capture, stats)
+	}
+	// Strip nameless tool-call slots before any client sees them: one malformed
+	// delta poisons a whole agent conversation (see toolcalls.go).
+	guard := newToolCallGuard(resp.Body, backend)
+	firstByte, err := copyStreaming(w, guard, sink, progress)
+	guard.report()
+	if err != nil {
+		if ctx.Err() != nil && req.Context().Err() == nil {
+			err = fmt.Errorf("backend sent no bytes for %s (idle timeout): %w", idle, err)
+		}
+		logEntry.Error = err.Error()
+		log.Printf("proxy copy failed backend=%s: %v", backend.ID, err)
+		// The status code was committed with the preamble, so the failure can only
+		// be reported inside the stream. Skip it when the CLIENT is the one that
+		// went away (there is nobody to tell) or when what we forwarded was never a
+		// stream in the first place — see writeSSEError.
+		if req.Context().Err() == nil && isEventStream(w.Header()) {
+			writeSSEError(w, fmt.Sprintf("upstream stream from backend %q failed: %s", backend.ID, err))
+		}
+		return
+	}
+	// Measure decode throughput over the post-first-token window so TTFT/prefill
+	// don't deflate it (see observe). The first chunk's arrival minus ttftBase
+	// (slot acquisition) is ≈ TTFT — router-side queue wait is excluded. Token
+	// count comes from the full-stream stats, not the (possibly truncated) capture.
+	if !firstByte.IsZero() && stats != nil {
+		r.registry.observe(backend.ID, firstByte.Sub(ttftBase), time.Since(firstByte), stats.genTokens(), job.promptTokens, thinking)
+	}
+}
+
+func setRouteHeaders(w http.ResponseWriter, backend *Backend, route string, logEntry *RequestLog) {
+	w.Header().Set("X-LLM-Backend-ID", backend.ID)
+	w.Header().Set("X-LLM-Backend-Model", backend.Model)
+	w.Header().Set("X-LLM-Backend-Model-Name", niceModelName(backend))
+	w.Header().Set("X-LLM-Backend-URL", backend.URL)
+	w.Header().Set("X-LLM-Route", route)
+	w.Header().Set("X-LLM-Observed-TPS", fmt.Sprintf("%.3f", logEntry.ObservedTPS))
+	w.Header().Set("X-LLM-Certified-TPS", fmt.Sprintf("%.3f", logEntry.CertifiedTPS))
+	w.Header().Set("X-LLM-Baseline-TPS", fmt.Sprintf("%.3f", logEntry.BaselineTPS))
+	w.Header().Set("X-LLM-Speed-Score", strconv.Itoa(logEntry.SpeedScore))
+}
+
+// selectBackends returns the eligible backends that satisfy the request's hard
+// context/feature requirements, ranked best-first, alongside the prompt's
+// classification (nil when classification was unavailable or the request had no
+// messages) so the caller can thread it into the body patch without
+// re-classifying, and the auto-difficulty target QUALITY FLOOR (0 ⇒ no floor —
+// the fallback/feature paths and any non-auto request). The caller
+// (pickAndAcquireWithFloor) spills down the list when the top backend has no free
+// slot, so a burst spreads across the fleet instead of queueing on one backend;
+// a non-zero target additionally makes it wait BRIEFLY for an above-target worker
+// before spilling below the floor (fix #2). Model-tier selection is always
+// automatic (difficulty-based) — there are no client quality/speed overrides;
+// capability hints (thinking, required_features, min_context_k) only hard-filter,
+// they never pick a tier.
+//
+// The request is classified ONCE here; both axes are used: difficulty drives the
+// quality tier, and reasoning drives the thinking decision — which now also gates
+// SELECTION (fix #1), not just the body patch. A high-reasoning prompt prefers a
+// thinking-capable worker (soft for auto, hard for explicit "on"), so the
+// enable_thinking we later forward lands on a worker that can act on it instead of
+// being a no-op on a non-thinking model.
+// budget is how long the caller is still willing to wait (0 = unknown); when
+// known, workers that cannot finish the job inside it are filtered out first.
+func (r *Router) selectBackends(req *ChatRequest, budget time.Duration) ([]*Backend, string, *classification, int, error) {
+	plan, err := r.planRoute(req, budget, false)
+	if err != nil {
+		return nil, "", nil, 0, err
+	}
+	return plan.candidates, plan.route, plan.cl, plan.target, nil
+}
+
+// routePlan is everything selection decided about one request. selectBackends
+// returns the subset the proxy path needs; /v1/route-preview renders the whole
+// thing. They share ONE code path on purpose — a preview that re-derived the
+// decision would eventually explain a route the router didn't take.
+type routePlan struct {
+	candidates []*Backend
+	route      string
+	cl         *classification
+	target     int
+	job        jobCost
+	tr         thinkingResolution
+	session    sessionRoute
+	// rejected records why each eligible worker was hard-filtered out. Only
+	// populated when explain is set — the proxy path allocates nothing for it.
+	rejected []rejection
+}
+
+// rejection is one worker the hard filter dropped, and why.
+type rejection struct {
+	ID     string `json:"id"`
+	Reason string `json:"reason"`
+}
+
+// hardFilter is the set of non-negotiable requirements a worker must meet to
+// serve a request. Built once per request; applied through admitReason so
+// selection and the preview can never disagree about who was eligible.
+type hardFilter struct {
+	wantModel        string
+	neededContext    int
+	needTools        bool
+	requiredFeatures []string
+	hardThink        bool
+}
+
+// admitReason reports why b cannot serve the request, or "" if it can.
+func admitReason(b *Backend, f hardFilter) string {
+	if isEmbeddingsOnly(b) {
+		return "embeddings-only worker (cannot serve chat)"
+	}
+	if f.wantModel != "" && !backendServesModel(b, f.wantModel) {
+		return fmt.Sprintf("does not serve model %q", f.wantModel)
+	}
+	if f.neededContext > 0 && b.ContextK > 0 && b.ContextK < f.neededContext {
+		return fmt.Sprintf("context %dK < %dK required", b.ContextK, f.neededContext)
+	}
+	if f.needTools && !hasFeature(b, "tools") {
+		return "no tools support"
+	}
+	for _, feature := range f.requiredFeatures {
+		if !hasFeature(b, feature) {
+			return fmt.Sprintf("missing required feature %q", feature)
+		}
+	}
+	// An EXPLICIT thinking:"on" hard-filters to workers that can think — a user
+	// demand that may legitimately leave nothing (a 503). "off"/"auto" never hard-
+	// filter here: off is honoured by patching enable_thinking into the forwarded
+	// body, which any worker can serve; an auto "think" is applied as a SOFT
+	// preference, never a 503.
+	if f.hardThink && !b.Thinking {
+		return "cannot think (thinking explicitly required)"
+	}
+	return ""
+}
+
+// planRoute runs the full selection pipeline. explain=true additionally records
+// the hard-filter rejections for /v1/route-preview.
+func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool) (*routePlan, error) {
+	candidates := r.registry.eligible()
+	if len(candidates) == 0 {
+		return nil, errors.New("no healthy LLM backends registered")
+	}
+
+	reqs := req.Requirements
+	if reqs == nil {
+		reqs = &Requirements{}
+	}
+
+	// An explicitly named model is the OpenAI-standard way for a client to choose,
+	// and the only one a coding harness knows how to use. It constrains WHICH
+	// workers are candidates; everything downstream (context/feature filters,
+	// thinking, completion-time ranking, slot spilling) still runs, so naming a
+	// model that three workers serve still load-balances across those three.
+	// "default" — what every clabtree guest sends — and an absent model mean auto.
+	wantModel := requestedModel(req)
+	if wantModel != "" && len(filterCandidates(candidates, func(b *Backend) bool { return backendServesModel(b, wantModel) })) == 0 {
+		return nil, unknownModelError{name: wantModel}
+	}
+
+	// Classify ONCE (best-effort; cached by prompt). Reused for both the quality
+	// tier (difficulty) and the thinking decision (reasoning). A bare
+	// /v1/completions call carries no messages, so classifyText is empty and the
+	// classifier reports unavailable → cl stays nil and we fall through to the
+	// non-classified paths below.
+	var cl *classification
+	if r.classifier != nil && len(req.Messages) > 0 {
+		if c, ok := r.classifier.classify(req); ok {
+			cl = &c
+		}
+	}
+
+	// Resolve the SAME thinking decision the body patch will use, BEFORE the hard
+	// filter, so selection and the enable_thinking patch can never disagree. The
+	// auto path only fires on this normal "route" (selectBackends is never the
+	// pinned/debug path).
+	tr := r.resolveThinking(req, "route", cl)
+
+	neededContext := reqs.MinContextK
+	if neededContext <= 0 {
+		toolTokens := 0
+		if len(req.Tools) > 0 && string(req.Tools) != "null" {
+			toolTokens = len(req.Tools) / 3
+		}
+		neededContext = estimateContextK(req.Messages, contextReserveTokens(req)+toolTokens)
+	}
+	needTools := len(req.Tools) > 0 && string(req.Tools) != "null"
+	requiredFeatures := normalizeFeatures(reqs.RequiredFeatures)
+	if requestNeedsVision(req.Messages) {
+		requiredFeatures = append(requiredFeatures, "vision")
+		requiredFeatures = normalizeFeatures(requiredFeatures)
+	}
+
+	hf := hardFilter{
+		wantModel:        wantModel,
+		neededContext:    neededContext,
+		needTools:        needTools,
+		requiredFeatures: requiredFeatures,
+		hardThink:        tr.hardThink,
+	}
+	var rejected []rejection
+	filtered := filterCandidates(candidates, func(b *Backend) bool {
+		reason := admitReason(b, hf)
+		if reason != "" && explain {
+			rejected = append(rejected, rejection{ID: b.ID, Reason: reason})
+		}
+		return reason == ""
+	})
+	if len(filtered) == 0 {
+		if wantModel != "" {
+			return nil, fmt.Errorf("no worker serving model %q satisfies hard context/feature requirements", wantModel)
+		}
+		return nil, errors.New("no backend satisfies hard context/feature requirements")
+	}
+
+	// Auto-derived "think": prefer thinking-capable workers, but only if at least
+	// one survives the other hard filters — otherwise fall back to the full set.
+	// Auto-thinking must NEVER 503 a request on its own; it's best-effort steering,
+	// not a demand (that's what the explicit hard filter above is for).
+	if tr.softThink {
+		if thinkers := filterCandidates(filtered, func(b *Backend) bool { return b.Thinking }); len(thinkers) > 0 {
+			filtered = thinkers
+		}
+	}
+
+	// The job's real cost — prompt size plus the output length implied by the
+	// thinking decision resolved above — drives both the deadline filter and the
+	// completion-time ranking.
+	job := costForRequest(req, tr.hardThink || tr.softThink)
+
+	// Session affinity. Resolved AFTER the hard filter so an incumbent that no
+	// longer qualifies for this turn (died, too little context, wrong model) is
+	// simply not an incumbent. It discounts the incumbent's prefill inside the
+	// existing ranking rather than overriding it — see session.go.
+	sess := r.sessions.resolve(req, filtered)
+	if sess.incumbent != "" {
+		job = job.withIncumbent(sess.incumbent)
+	}
+
+	// Drop workers that can't finish inside the caller's declared budget.
+	// Best-effort: never empties the candidate set (see deadlineFilter).
+	if trimmed, applied := deadlineFilter(filtered, job, budget); applied {
+		log.Printf("deadline filter: budget=%s job=%dp/%dc — %d of %d workers can finish",
+			budget.Round(time.Second), job.promptTokens, job.outputTokens, len(trimmed), len(filtered))
+		filtered = trimmed
+	}
+
+	// Auto difficulty routing infers a target quality tier from the prompt, then
+	// lets rankByDifficulty pick the backend that clears it and will finish
+	// soonest. This is the ONLY model-tier mechanism — there are no client-tunable
+	// quality/speed levers. Best-effort: if the classifier is unavailable (no
+	// embeddings worker) or the request carries no messages (a bare /v1/completions
+	// call), fall through to the quality-ranked fallback below.
+	if cl != nil && r.cfg.AutoDifficulty {
+		target := r.classifier.targetForFleet(filtered, r.adapter.adjust(cl.difficulty))
+		// target is surfaced as the quality floor so the acquire step prefers to
+		// wait BRIEFLY for an above-target worker before spilling below it (fix #2);
+		// routing too cheap is the quality-risky direction.
+		//
+		// A client-named model reports as "model:…" rather than "route:…" on
+		// purpose: parseRouteScore only reads the "route:d=" form, so the online
+		// tier adapter and the background judge learn from tiers the ROUTER chose
+		// and not from ones a harness chose for it.
+		return &routePlan{
+			candidates: rankByDifficulty(filtered, target, job),
+			route:      fmt.Sprintf("%s:d=%.2f,q>=%d", routeKind(wantModel), cl.difficulty, target),
+			cl:         cl,
+			target:     target,
+			job:        job,
+			tr:         tr,
+			session:    sess,
+			rejected:   rejected,
+		}, nil
+	}
+
+	// Fallback when auto-tiering can't run: rank by quality, with speed and
+	// current load breaking ties. No hard filter — every eligible backend stays a
+	// candidate, so the request is always served. target=0 ⇒ no quality floor
+	// (everyone is above-bar), so the acquire step behaves exactly as before.
+	return &routePlan{
+		candidates: rankBackends(filtered, job),
+		route:      routeKind(wantModel),
+		cl:         cl,
+		job:        job,
+		tr:         tr,
+		session:    sess,
+		rejected:   rejected,
+	}, nil
+}
+
+// intersectFeatures keeps only the features present in both lists, preserving
+// the order of the first.
+func intersectFeatures(have []string, also []string) []string {
+	out := []string{}
+	for _, f := range have {
+		for _, g := range also {
+			if f == g {
+				out = append(out, f)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// budgetCeiling is the largest completion budget the chosen worker can still fit
+// after this request's prompt, or 0 when the worker never declared a context (⇒
+// don't clamp). The margin absorbs the difference between our chars/3 estimate
+// and the worker's real tokenizer: overshooting the clamp downward costs a few
+// tokens of answer, overshooting upward is a 400 on a strict engine.
+func budgetCeiling(b *Backend, job jobCost) int {
+	if b == nil || b.ContextK <= 0 {
+		return 0
+	}
+	room := b.ContextK*1024 - job.promptTokens - contextClampMargin
+	if room < contextClampFloor {
+		return contextClampFloor // let the worker itself reject a prompt this close to full
+	}
+	return room
+}
+
+const (
+	contextClampMargin = 1024
+	contextClampFloor  = 512
+)
+
+// autoModelNames are the model strings that mean "you choose" rather than naming
+// a model. "default" is what every clabtree guest sends, so it must never be
+// mistaken for a model id and 404'd.
+var autoModelNames = map[string]bool{"": true, "default": true, "auto": true, "router": true}
+
+// requestedModel returns the model the client explicitly asked for, or "" when
+// it left the choice to the router.
+func requestedModel(req *ChatRequest) string {
+	name := strings.TrimSpace(req.Model)
+	if autoModelNames[strings.ToLower(name)] {
+		return ""
+	}
+	return name
+}
+
+// backendServesModel reports whether a backend answers to a client-supplied
+// model name. All three spellings the fleet publishes are accepted: the model
+// itself (what several workers share), the worker id (what /v1/models lists as
+// "owned_by"), and the short alias (what /v1/models lists as "id" when it is
+// unambiguous) — so a harness can name the family it wants, the exact worker,
+// or the human spelling from the menu. The alias compares case-insensitively;
+// the raw ids stay exact.
+func backendServesModel(b *Backend, name string) bool {
+	if b.Model == name || b.ID == name {
+		return true
+	}
+	if a := backendAlias(b); a != "" && a == strings.ToLower(name) {
+		return true
+	}
+	return false
+}
+
+// routeKind is the X-LLM-Route prefix: "model" when the client named one,
+// "route" when the router chose.
+func routeKind(wantModel string) string {
+	if wantModel != "" {
+		return "model"
+	}
+	return "route"
+}
+
+// unknownModelError is a named model no registered worker serves. It is a 404 —
+// the OpenAI-standard answer, and the one a harness can act on — not the 503 an
+// exhausted filter produces.
+type unknownModelError struct{ name string }
+
+func (e unknownModelError) Error() string {
+	return fmt.Sprintf("model %q not found — GET /v1/models lists what this router serves", e.name)
+}
+
+// profileRetryDelay is how long after an aborted background profile (worker
+// blipped mid-benchmark) the router retries it. Short, because until the
+// retry succeeds the worker runs on a provisional quality that distorts the
+// fleet's tier range. A worker that's actually down fails the health check in
+// the retry and falls into the normal recert backoff instead.
+const profileRetryDelay = 2 * time.Minute
+
+// recertifyIfRegenerated re-certifies when a different registration generation
+// landed while a certification/profile held the guard: that registration's own
+// certifyBackend bailed on the guard, and the in-flight run may even have
+// stamped its stale-generation verdict over the new state — so status alone
+// can't detect it (a stale "ready" overwrites the new "probing"). The probing
+// check is a belt for paths that never reached finishCertification. Called
+// only after the guard is freed; the spawned certification re-captures the
+// current generation, so this converges instead of looping.
+func (r *Router) recertifyIfRegenerated(id string, gen int64) {
+	if b := r.registry.get(id); b != nil && (b.profileGen != gen || b.Certification.Status == "probing") {
+		go r.certifyBackend(id)
+	}
+}
+
+func (r *Router) certifyBackend(id string) {
+	// Single atomic guard for the whole certification + cold-profile span. The
+	// old Load-then-Store pair left a multi-second window (two worker HTTP
+	// round-trips wide) where two registrations triggered duplicate concurrent
+	// capacity ramps + benchmarks against the same GPU.
+	if _, busy := r.profiling.LoadOrStore(id, true); busy {
+		return // a certification/profile is already in flight for this worker
+	}
+	var gen int64
+	owned := true
+	defer func() {
+		if owned {
+			r.profiling.Delete(id)
+			r.recertifyIfRegenerated(id, gen)
+		}
+	}()
+	backend := r.registry.get(id)
+	if backend == nil {
+		return
+	}
+	gen = backend.profileGen
+	r.registry.startCertification(id)
+
+	checks := map[string]Check{}
+	if err := r.checkBackend(id); err != nil {
+		checks["health"] = Check{OK: false, Message: err.Error()}
+		r.registry.finishCertification(id, false, checks, 0, 0, err.Error())
+		return
+	}
+	checks["health"] = Check{OK: true}
+
+	// Embeddings-only workers don't serve chat, so the chat-oriented speed/json/
+	// tool probes don't apply. Certify them with an embeddings probe instead.
+	if isEmbeddingsOnly(backend) {
+		latency, err := r.embeddingsProbe(backend)
+		if err != nil {
+			checks["embeddings"] = Check{OK: false, Message: err.Error()}
+			r.registry.finishCertification(id, false, checks, 0, 0, err.Error())
+			return
+		}
+		// Measure-don't-trust applies to the classifier's own dependency too: the
+		// per-classification deadline comes from this worker's real latency, not a
+		// fixed two seconds that a slow box silently spends its whole budget on.
+		deadline := r.noteEmbedLatency(latency)
+		checks["embeddings"] = Check{OK: true, Message: fmt.Sprintf("%s round trip; classifier deadline %s",
+			latency.Round(time.Millisecond), deadline)}
+		r.registry.finishCertification(id, true, checks, 0, 0, "")
+		return
+	}
+
+	// Fingerprint what the worker is really serving before either path below
+	// needs it. The id keys the profile cache; the weights metadata is published
+	// straight onto the registry rather than carried in the profile, so a warm
+	// restart that short-circuits to a cached profile still reports current
+	// weights instead of whatever was measured months ago.
+	model, meta := r.queryModelInfo(backend)
+	r.registry.setModelMeta(id, meta)
+	// Re-read the backend now the served id is known: `backend` is a clone taken
+	// before the fingerprint, and every probe below names probeModel(backend) in
+	// its request. Without this they would all still be sending whatever the
+	// registration declared, which is the spelling an endpoint that validates
+	// model names is least likely to accept.
+	if fresh := r.registry.get(id); fresh != nil {
+		backend = fresh
+	}
+
+	// Measure-don't-trust: profile a chat worker (capabilities, context, speed,
+	// capacity, quality) at cold start and cache it per (id, model); a warm
+	// restart reuses the cached profile. The worker itself declares ~nothing.
+	if r.cfg.ProfileWorkers {
+		if prof, ok := r.logs.LoadWorkerProfile(context.Background(), id, model); ok && prof.BenchVersion == benchmarkVersion {
+			r.backfillCachedProfile(id, backend, prof)
+			r.registry.applyProfileIfGen(id, gen, prof)
+			for k, v := range prof.Checks { // surface cached per-probe results (incl. quality breakdown) in /backends
+				checks[k] = v
+			}
+			checks["profile"] = Check{OK: true, Message: fmt.Sprintf("cached: q=%d%%, %.0f tok/s, ctx %dk, conc %d (profiled in %s)", prof.Quality, prof.BaselineTPS, prof.ContextK, prof.MaxConcurrency, fmtProfileDuration(prof.ProfileMillis))}
+			r.registry.finishCertification(id, true, checks, prof.BaselineTPS, prof.TTFTMillis, "")
+			log.Printf("worker %s certified from cached profile (model=%s)", id, model)
+			return
+		}
+		// Cold start. Quick profile (capabilities + speed + context) makes the
+		// worker routable in seconds; the slow quality + capacity measurement runs
+		// in the background so a fresh deploy doesn't black out the fleet.
+		quick, err := r.profileQuick(backend, model)
+		if err != nil {
+			checks["profile"] = Check{OK: false, Message: err.Error()}
+			r.registry.finishCertification(id, false, checks, 0, 0, err.Error())
+			return
+		}
+		r.registry.applyProfileIfGen(id, gen, quick)
+		for k, v := range quick.Checks {
+			checks[k] = v
+		}
+		checks["profile"] = Check{OK: true, Message: "provisional — measuring quality+capacity in background"}
+		r.registry.finishCertification(id, true, checks, quick.BaselineTPS, quick.TTFTMillis, "")
+		log.Printf("worker %s provisionally ready (q~%d, %.0f tok/s, ctx %dk); profiling quality+capacity in background (model=%s)",
+			id, quick.Quality, quick.BaselineTPS, quick.ContextK, model)
+		owned = false // guard ownership moves to the background goroutine
+		go func() {
+			// LIFO: the guard is released first, THEN any registration that
+			// landed mid-profile (it bailed on the guard) gets its
+			// certification re-kicked.
+			defer r.recertifyIfRegenerated(id, gen)
+			defer r.profiling.Delete(id)
+			full, err := r.profileBackend(backend, model)
+			if err != nil {
+				// Worker likely blipped mid-profile. Keep the provisional profile
+				// (the worker stays routable) and retry on a timer — nothing else
+				// re-triggers a background profile for a ready backend.
+				log.Printf("background profile %s aborted: %v (keeping provisional; retrying in %s)", id, err, profileRetryDelay)
+				time.AfterFunc(profileRetryDelay, func() { r.certifyBackend(id) })
+				return
+			}
+			if !r.registry.applyProfileIfGen(id, gen, full) {
+				// The worker re-registered with new content (or was deleted) while
+				// we measured — these numbers describe the old generation. The new
+				// registration runs its own certification; persisting here would
+				// poison the profile cache (or resurrect a deleted row).
+				log.Printf("background profile %s finished for a stale registration generation — discarded", id)
+				return
+			}
+			if full.Incomplete {
+				// One or more capability probes never got a verdict (transient
+				// errors). Serve on these values but do NOT cache them — a persisted
+				// "not detected" from a blip would misroute traffic on every warm
+				// restart until the next benchmarkVersion bump.
+				log.Printf("worker %s profile has inconclusive capability probes — not persisting; will re-probe on next certification", id)
+			} else if err := r.logs.SaveWorkerProfile(context.Background(), id, full); err != nil {
+				log.Printf("persist worker profile %s failed: %v", id, err)
+			}
+			log.Printf("worker %s profiled in %s: q=%d, %.0f tok/s (ttft %dms), ctx %dk, conc %d, features=%v, thinking=%v",
+				id, fmtProfileDuration(full.ProfileMillis), full.Quality, full.BaselineTPS, full.TTFTMillis, full.ContextK, full.MaxConcurrency, full.Features, full.Thinking)
+		}()
+		return
+	}
+
+	// Legacy path (ROUTER_PROFILE_WORKERS=false): trust declared values, probe
+	// only declared features.
+	tps, ttft, err := r.speedProbe(backend)
+	if err != nil {
+		checks["speed"] = Check{OK: false, Message: err.Error()}
+		r.registry.finishCertification(id, false, checks, 0, 0, err.Error())
+		return
+	}
+	checks["speed"] = Check{OK: true, Message: fmt.Sprintf("%.1f tok/s", tps)}
+
+	if hasFeature(backend, "json") {
+		if err := r.jsonProbe(backend); err != nil {
+			checks["json"] = Check{OK: false, Message: err.Error()}
+			r.registry.finishCertification(id, false, checks, tps, ttft, err.Error())
+			return
+		}
+		checks["json"] = Check{OK: true}
+	}
+
+	if hasFeature(backend, "tools") {
+		if err := r.toolProbe(backend); err != nil {
+			checks["tools"] = Check{OK: false, Message: err.Error()}
+			r.registry.finishCertification(id, false, checks, tps, ttft, err.Error())
+			return
+		}
+		checks["tools"] = Check{OK: true}
+	}
+
+	r.registry.finishCertification(id, true, checks, tps, ttft, "")
+}
+
+// speedProbe measures decode throughput with a short prose generation.
+//
+// Prose-only is deliberate, not an oversight. On a worker running speculative
+// decoding the rate is workload-dependent — measured on llm-6000pro-deepseek-284B-q8
+// 2026-08-09, 17.4 tok/s on prose against 27.0 on code, because draft acceptance and
+// token density both differ — so there is no single true number to find. A fixed
+// prompt keeps the figure COMPARABLE across workers and engines, which is all
+// ranking needs, and prose is the slow end, so the estimate errs pessimistic: the
+// safe direction for a latency estimate (same call the prefill probe makes).
+func (r *Router) speedProbe(backend *Backend) (float64, int64, error) {
+	payload := map[string]any{
+		"model":      probeModel(backend),
+		"stream":     true,
+		"max_tokens": 64,
+		"messages": []map[string]string{
+			{"role": "system", "content": "You are a concise benchmark assistant. /no_think"},
+			{"role": "user", "content": "Write exactly four short sentences about reliable local LLM routing."},
+		},
+		"chat_template_kwargs": map[string]bool{"enable_thinking": false},
+		// Exact token count in the final chunk — delta-counting under-reads MTP
+		// workers ~2.5x (see readSSEStream). Both fleet dialects support this.
+		"stream_options": map[string]bool{"include_usage": true},
+	}
+	send := func(p map[string]any) (*http.Response, error) {
+		body, _ := json.Marshal(p)
+		req, err := http.NewRequest(http.MethodPost, upstreamChatURL(backend), bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if backend.APIKey != "" {
+			req.Header.Set("Authorization", "Bearer "+backend.APIKey)
+		}
+		return r.client.Do(req)
+	}
+	start := time.Now()
+	resp, err := send(payload)
+	if err != nil {
+		return 0, 0, err
+	}
+	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+		// A dialect that rejects stream_options must still get a baseline: retry
+		// once without it and let the delta-count fallback carry the measurement.
+		resp.Body.Close()
+		delete(payload, "stream_options")
+		start = time.Now()
+		if resp, err = send(payload); err != nil {
+			return 0, 0, err
+		}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return 0, 0, fmt.Errorf("speed probe returned %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	first := int64(0)
+	content, reasoning, tokenCount, err := readSSEStream(resp.Body, func() {
+		if first == 0 {
+			first = time.Since(start).Milliseconds()
+		}
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	// Reasoning tokens are generated output too: a model that ignores
+	// enable_thinking:false and spends the whole 64-token budget reasoning must
+	// still measure as producing tokens, not fail as "empty" (which would leave
+	// the worker uncertifiable — same failure class as the thinking-probe bug).
+	out := content + reasoning
+	if strings.TrimSpace(out) == "" {
+		return 0, first, errors.New("empty speed probe response")
+	}
+	// Count the tokens the worker actually emitted rather than estimating them from
+	// character length. len(out)/4 was wrong in BOTH directions and by a lot,
+	// because chars-per-token is a property of the text, not a constant: measured
+	// on the 284B worker 2026-08-09, prose ran 5.05 chars/token (so the estimate
+	// inflated 17.4 tok/s into ~21.9) and code ran 3.79 (deflating 27.0 into
+	// ~25.5). Since BaselineTPS feeds expectedLatency, that error went straight
+	// into which worker gets picked — and it disagreed with the live EWMA, which
+	// has always counted deltas.
+	tokens := math.Max(1, float64(tokenCount))
+	if tokenCount == 0 {
+		tokens = math.Max(1, float64(len(out))/4.0) // non-delta dialect: fall back
+	}
+	// Decode throughput = tokens / (total − TTFT), so the certified speed reflects
+	// generation rate rather than end-to-end latency — consistent with the live
+	// EWMA fed by observe().
+	decodeWindow := time.Since(start) - time.Duration(first)*time.Millisecond
+	if decodeWindow <= 0 {
+		decodeWindow = time.Since(start)
+	}
+	return tokens / decodeWindow.Seconds(), first, nil
+}
+
+// prefillProbeTokens is the prompt size used to measure prefill rate. Large enough
+// that fixed per-request overhead is noise (minPrefillTokens is 256 for the same
+// reason), small enough that the probe costs ~40s on the slowest CPU worker in the
+// fleet rather than the ~5 minutes an 8k prompt would.
+const prefillProbeTokens = 1024
+
+// backfillCachedProfile fills in measurements that a cached profile predates.
+//
+// A profile is only re-measured when benchmarkVersion changes, so a probe added
+// WITHOUT a version bump never runs on an already-profiled fleet. That is exactly what
+// happened to the prefill probe: it shipped, every worker stayed certified from its
+// cached profile, and 5 of 7 never acquired a prefill rate — including both 284B
+// workers, the ones whose TTFT is most sensitive to prompt length and the reason the
+// probe was written. Bumping benchmarkVersion is the wrong instrument: it discards the
+// quality benchmark too and costs ~14 min/worker to recover a 1-second probe.
+//
+// ANY future addition to WorkerProfile needs a clause here, or it inherits the same
+// silent failure — shipped, cached over, never measured.
+//
+// There is a SECOND class of staleness with the same cure: a field that can change on
+// the WORKER between restarts without changing the (id, model) cache key. Context is
+// the known one — CTX_SIZE is a deployment choice, not a property of the model — and
+// it is handled below. Anything else that a service.env edit can move belongs here
+// too, provided it is cheap enough to re-measure unconditionally.
+// speedProbeVersion is bumped when the DECODE measurement itself changes, so
+// cached profiles re-measure their BaselineTPS on load without paying for a full
+// BenchVersion re-profile.
+//
+//	1 — original: token count estimated as len(text)/4
+//	2 — count the deltas the worker actually emitted (see readSSEStream)
+//	3 — prefer usage.completion_tokens via stream_options.include_usage:
+//	    MTP workers pack ~2.5 tokens into each delta, so v2 certified the
+//	    fleet's spec-decode workers at ~40% of their real decode rate
+const speedProbeVersion = 3
+
+func (r *Router) backfillCachedProfile(id string, backend *Backend, prof *WorkerProfile) {
+	if prof.SpeedVersion < speedProbeVersion {
+		if tps, ttft, err := r.speedProbe(backend); err != nil {
+			log.Printf("speed re-measure failed for %s: %v — keeping the cached %.1f tok/s", id, err, prof.BaselineTPS)
+		} else {
+			log.Printf("worker %s: decode re-measured %.1f -> %.1f tok/s (speed probe v%d)", id, prof.BaselineTPS, tps, speedProbeVersion)
+			prof.BaselineTPS, prof.TTFTMillis, prof.SpeedVersion = tps, ttft, speedProbeVersion
+			if prof.Checks == nil {
+				prof.Checks = map[string]Check{}
+			}
+			prof.Checks["speed"] = Check{OK: true, Message: fmt.Sprintf("%.1f tok/s (re-measured)", tps)}
+			if r.logs != nil {
+				if err := r.logs.SaveWorkerProfile(context.Background(), id, prof); err != nil {
+					log.Printf("persist re-measured decode rate for %s failed: %v", id, err)
+				}
+			}
+			// No registry write here: the caller applies the profile and certifies
+			// from it immediately after, same as the prefill backfill below.
+		}
+	}
+	// Context, re-read unconditionally. It is the one profile field a deployment can
+	// change without changing the cache key, so trusting the cache means advertising a
+	// window the worker no longer has: llm-6000pro-deepseek-284B-q8 kept reporting 256k
+	// for days after being raised to 384k, and the only cure was DELETE /backends/{id},
+	// which throws away the quality benchmark too and parks the worker at a provisional
+	// quality of 3 for ~14 min while it re-runs. Nobody pays that to correct one integer,
+	// so in practice the fleet just stayed wrong.
+	//
+	// Re-measuring is free — one GET on vLLM, two on llama.cpp (/v1/models yields
+	// nothing, then /props), the same cost class as the health check that ran a few
+	// lines up — so there is nothing to trade off and no version gate to add. Note
+	// this runs on every keepalive re-registration, which is exactly what makes a context
+	// change land on restart with no manual step; the prefill probe below is gated
+	// because it is expensive, and this is not.
+	if ctxK, ok := r.queryContextMeasured(backend); ok && ctxK != prof.ContextK {
+		log.Printf("worker %s: context re-read %dk -> %dk on its cached profile", id, prof.ContextK, ctxK)
+		prof.ContextK = ctxK
+		if prof.Checks == nil {
+			prof.Checks = map[string]Check{}
+		}
+		prof.Checks["context"] = Check{OK: true, Message: fmt.Sprintf("%dk (re-read)", ctxK)}
+		if r.logs != nil {
+			if err := r.logs.SaveWorkerProfile(context.Background(), id, prof); err != nil {
+				log.Printf("persist re-read context for %s failed: %v", id, err)
+			}
+		}
+	}
+
+	// The thinking DIALECT postdates every cached profile, so without this clause
+	// the whole fleet would carry the zero value forever — the exact failure this
+	// function exists to prevent. Gated on absence rather than re-measured every
+	// time, like prefill and unlike context: it costs a 1024-token generation, and
+	// which gate an endpoint reads is a property of the endpoint's API rather than
+	// of a deployment knob someone edits.
+	if prof.ThinkingDialect == "" {
+		if thinking, dialect, inconclusive := r.thinkingProbe(backend); inconclusive {
+			log.Printf("thinking dialect backfill for %s was inconclusive — will re-probe next certification", id)
+		} else {
+			log.Printf("worker %s: thinking dialect measured as %q (thinking %v -> %v) on its cached profile",
+				id, dialect, prof.Thinking, thinking)
+			prof.Thinking, prof.ThinkingDialect = thinking, dialect
+			if prof.Checks == nil {
+				prof.Checks = map[string]Check{}
+			}
+			prof.Checks["thinking"] = Check{OK: thinking, Message: mapBool(thinking, "supported via "+dialect+" (re-probed)", "not detected (re-probed)")}
+			if r.logs != nil {
+				if err := r.logs.SaveWorkerProfile(context.Background(), id, prof); err != nil {
+					log.Printf("persist thinking dialect for %s failed: %v", id, err)
+				}
+			}
+		}
+	}
+
+	if prof.PrefillTPS != 0 {
+		return
+	}
+	rate, err := r.prefillProbe(backend)
+	if err != nil {
+		log.Printf("prefill backfill failed for %s: %v — routing will price its TTFT from the flat average", id, err)
+		return
+	}
+	prof.PrefillTPS = rate
+	if prof.Checks == nil {
+		prof.Checks = map[string]Check{}
+	}
+	prof.Checks["prefill"] = Check{OK: true, Message: fmt.Sprintf("%.0f tok/s on a %d-token prompt (backfilled)", rate, prefillProbeTokens)}
+	if r.logs != nil {
+		if err := r.logs.SaveWorkerProfile(context.Background(), id, prof); err != nil {
+			log.Printf("persist backfilled prefill rate for %s failed: %v", id, err)
+		}
+	}
+	log.Printf("worker %s: backfilled prefill rate %.0f tok/s into its cached profile", id, rate)
+}
+
+// prefillProbe measures how fast a worker turns prompt tokens into a first token, by
+// sending a prompt of KNOWN length with a 1-token budget and timing the call.
+//
+// The live EWMA cannot fill this gap on its own. observe() only records a prefill
+// sample from NON-thinking requests — TTFT is not comparable across engines otherwise,
+// because vLLM buffers reasoning into TTFT while llama.cpp streams it — so a worker the
+// router mostly sends thinking traffic to never accumulates one, and prefillSeconds()
+// falls back to a flat TTFT average that ignores prompt length entirely. Measured on
+// llm-naples-deepseek-284B-q4: the router priced its time-to-first-token at 978ms while
+// a 4116-token prompt really took 178s, a 140x underestimate, so it kept sending long
+// prompts to the one worker in the fleet that could not serve them.
+//
+// Thinking is disabled here precisely so the number IS comparable across engines. The
+// single generated token is included in the elapsed time, which slightly understates
+// the rate (~6% on a fast GPU worker, well under 1% on a CPU one) — erring toward
+// pessimism, the safe direction for a latency estimate.
+// prefillProbeSamples is how many times prefillProbe measures before believing a
+// number. One sample is not enough, and the failure is not hypothetical: on
+// 2026-08-08 llm-a750-Granite4.1-8B was probed while a CPU worker on the SAME host
+// (llm-cpu-gemma-26B-silver) was mid-benchmark, and recorded 22 tok/s. Re-measured on
+// an idle host at the identical 1024-token prompt size: 643 tok/s — a 29x
+// underestimate, cached permanently, on the fleet's only 8B GPU worker.
+//
+// Best-of-N rather than mean or median, because the error is ONE-SIDED: contention,
+// scheduling and a cold cache can only ever make a prefill slower than the hardware is
+// capable of. Nothing makes it spuriously fast. The fastest sample is therefore the
+// least-corrupted estimate of what this worker does when it is the one being asked.
+const prefillProbeSamples = 3
+
+// prefillProbe measures prefill rate, taking the best of prefillProbeSamples runs.
+// Returns the last error only if EVERY sample failed.
+func (r *Router) prefillProbe(backend *Backend) (float64, error) {
+	best, lastErr := 0.0, error(nil)
+	for i := 0; i < prefillProbeSamples; i++ {
+		// Distinct salt per sample: identical text would hit the worker's prompt
+		// cache and hand best-of-N a fabricated winner. See prefillFiller.
+		rate, err := r.prefillProbeOnce(backend, uint32(i))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if rate > best {
+			best = rate
+		}
+	}
+	if best <= 0 {
+		if lastErr == nil {
+			lastErr = errors.New("no usable prefill sample")
+		}
+		return 0, lastErr
+	}
+	return best, nil
+}
+
+func (r *Router) prefillProbeOnce(backend *Backend, salt uint32) (float64, error) {
+	payload := map[string]any{
+		"model":                probeModel(backend),
+		"stream":               false,
+		"max_tokens":           1,
+		"temperature":          0,
+		"chat_template_kwargs": map[string]bool{"enable_thinking": false},
+		"messages": []map[string]string{
+			{"role": "system", "content": "You are a concise benchmark assistant. /no_think"},
+			{"role": "user", "content": prefillFiller(prefillProbeTokens, salt) + "\n\nReply with one word: ok"},
+		},
+	}
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequest(http.MethodPost, upstreamChatURL(backend), bytes.NewReader(body))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if backend.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+backend.APIKey)
+	}
+	start := time.Now()
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return 0, fmt.Errorf("prefill probe returned %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	var raw map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return 0, err
+	}
+	elapsed := time.Since(start).Seconds()
+	// Trust the worker's OWN prompt_tokens rather than a word-count estimate:
+	// tokenisers differ enough between model families to bias the rate systematically.
+	promptTokens := 0.0
+	if u, ok := raw["usage"].(map[string]any); ok {
+		promptTokens, _ = u["prompt_tokens"].(float64)
+	}
+	if promptTokens < minPrefillTokens || elapsed <= 0 {
+		return 0, fmt.Errorf("unusable sample: prompt_tokens=%.0f elapsed=%.3fs", promptTokens, elapsed)
+	}
+	return promptTokens / elapsed, nil
+}
+
+// prefillFiller builds roughly n tokens of non-repeating filler (~1.3 tokens per word
+// across common tokenisers). Repetitive text is a bad prefill sample: it compresses an
+// MoE's expert-routing distribution and flatters any prefix cache the worker keeps.
+//
+// `salt` MUST differ between the samples of one probe. llama-server caches prompts by
+// default, so sending identical text twice makes the second call skip prefill entirely
+// and report a fabricated rate — and because prefillProbe takes the BEST of its
+// samples, it would then select that fabrication every time. Measured consequence:
+// llm-a750-Granite4.1-8B profiled at pp=11254 tok/s against a real 643, which would
+// have made the router believe it was the fastest prefill in the fleet by 14x and send
+// it every long prompt. (llama.cpp's own bench.sh carries the same warning about
+// cache_prompt; /v1/chat/completions has no equivalent switch, so vary the text.)
+//
+// Within one sample the sequence is deterministic, so a given salt yields identical
+// text on every worker and the fleet stays comparable.
+func prefillFiller(n int, salt uint32) string {
+	words := []string{"alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta",
+		"theta", "iota", "kappa", "lambda", "mu", "nu", "xi", "omicron", "pi", "rho",
+		"sigma", "tau", "upsilon", "phi", "chi", "psi", "omega"}
+	var sb strings.Builder
+	seed := uint32(2166136261) + salt*2654435761
+	for i := 0; i < int(float64(n)/1.3); i++ {
+		seed = seed*1664525 + 1013904223
+		if i > 0 {
+			sb.WriteByte(' ')
+		}
+		sb.WriteString(words[(seed>>16)%uint32(len(words))])
+	}
+	return sb.String()
+}
+
+func (r *Router) jsonProbe(backend *Backend) error {
+	payload := map[string]any{
+		"model":           probeModel(backend),
+		"stream":          false,
+		"max_tokens":      80,
+		"response_format": map[string]string{"type": "json_object"},
+		"messages": []map[string]string{
+			{"role": "system", "content": "Return only valid JSON. /no_think"},
+			{"role": "user", "content": `Return {"router_ok":true,"score":7} and no other text.`},
+		},
+		"chat_template_kwargs": map[string]bool{"enable_thinking": false},
+	}
+	content, err := r.simpleCompletion(backend, payload)
+	if err != nil {
+		return err
+	}
+	var got struct {
+		RouterOK bool `json:"router_ok"`
+		Score    int  `json:"score"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(content)), &got); err != nil {
+		return fmt.Errorf("invalid json response: %w; content=%q", err, truncate(content, 120))
+	}
+	if !got.RouterOK || got.Score != 7 {
+		return fmt.Errorf("json response had wrong fields: %q", truncate(content, 120))
+	}
+	return nil
+}
+
+func (r *Router) toolProbe(backend *Backend) error {
+	payload := map[string]any{
+		"model":      probeModel(backend),
+		"stream":     false,
+		"max_tokens": 128,
+		"tools": []map[string]any{{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "router_probe_weather",
+				"description": "Probe tool; returns weather for a city.",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"city": map[string]string{"type": "string"},
+					},
+					"required": []string{"city"},
+				},
+			},
+		}},
+		"messages": []map[string]string{
+			{"role": "system", "content": "Use tools when needed. /no_think"},
+			{"role": "user", "content": "Use the weather probe tool for Wellington."},
+		},
+		"chat_template_kwargs": map[string]bool{"enable_thinking": false},
+	}
+	raw, err := r.rawCompletion(backend, payload)
+	if err != nil {
+		return err
+	}
+	choices, _ := raw["choices"].([]any)
+	if len(choices) == 0 {
+		return errors.New("tool probe returned no choices")
+	}
+	choice, _ := choices[0].(map[string]any)
+	msg, _ := choice["message"].(map[string]any)
+	calls, _ := msg["tool_calls"].([]any)
+	for _, item := range calls {
+		call, _ := item.(map[string]any)
+		fn, _ := call["function"].(map[string]any)
+		if fn["name"] != "router_probe_weather" {
+			continue
+		}
+		args := fmt.Sprint(fn["arguments"])
+		if strings.Contains(strings.ToLower(args), "wellington") {
+			return nil
+		}
+		return fmt.Errorf("tool arguments did not include Wellington: %s", truncate(args, 120))
+	}
+	return fmt.Errorf("missing expected tool call; response=%s", truncateJSON(raw, 300))
+}
+
+// embeddingsProbe verifies an embeddings worker returns a vector for a trivial
+// input, and reports how long the round trip took. Used to certify
+// embeddings-only backends, which can't serve the chat-oriented speed/json/tool
+// probes — and the latency is what the classifier's own deadline is derived
+// from (see observeEmbedLatency), because a classifier deadline shorter than the
+// worker it depends on is a feature that switches itself off in silence.
+func (r *Router) embeddingsProbe(backend *Backend) (time.Duration, error) {
+	payload := map[string]any{"model": probeModel(backend), "input": "router embeddings certification probe"}
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequest(http.MethodPost, upstreamPathURL(backend, "/v1/embeddings"), bytes.NewReader(body))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if backend.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+backend.APIKey)
+	}
+	start := time.Now()
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	elapsed := time.Since(start)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return elapsed, fmt.Errorf("embeddings probe returned %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+	}
+	var parsed struct {
+		Data []struct {
+			Embedding []float64 `json:"embedding"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return elapsed, fmt.Errorf("invalid embeddings probe response: %w", err)
+	}
+	if len(parsed.Data) == 0 || len(parsed.Data[0].Embedding) == 0 {
+		return elapsed, errors.New("embeddings probe returned no vector")
+	}
+	return elapsed, nil
+}
+
+// noteEmbedLatency folds a measured embeddings round trip into the classifier's
+// deadline and reports what it settled on. A router with auto-routing off has no
+// classifier and nothing to derive.
+func (r *Router) noteEmbedLatency(measured time.Duration) time.Duration {
+	if r.classifier == nil {
+		return difficultyTimeoutFallback
+	}
+	was := r.classifier.deadline()
+	now := r.classifier.observeEmbedLatency(measured)
+	if now != was {
+		log.Printf("classifier deadline %s -> %s (embeddings round trip measured at %s)",
+			was, now, measured.Round(time.Millisecond))
+	}
+	return now
+}
+
+// isEmbeddingsOnly reports whether a backend serves embeddings but not chat, so
+// it must be certified with an embeddings probe (not the chat probes) and kept
+// out of chat routing.
+func isEmbeddingsOnly(b *Backend) bool {
+	return hasFeature(b, "embeddings") && !hasFeature(b, "chat")
+}
+
+func (r *Router) simpleCompletion(backend *Backend, payload map[string]any) (string, error) {
+	raw, err := r.rawCompletion(backend, payload)
+	if err != nil {
+		return "", err
+	}
+	choices, _ := raw["choices"].([]any)
+	if len(choices) == 0 {
+		return "", errors.New("completion returned no choices")
+	}
+	content, reasoning, _ := completionText(raw)
+	return preferContent(content, reasoning), nil
+}
+
+func (r *Router) rawCompletion(backend *Backend, payload map[string]any) (map[string]any, error) {
+	return r.doCompletion(context.Background(), r.client, backend, payload)
+}
+
+// benchCompletion issues one cold-start benchmark request bounded by ctx (the
+// per-question benchAnswerDeadline). It uses benchClient, which has no client-level
+// timeout, so that deadline alone governs whether an answer arrived in time — the
+// usability bound is a benchmark criterion, independent of the live-proxy
+// BACKEND_TIMEOUT_SECONDS.
+func (r *Router) benchCompletion(ctx context.Context, backend *Backend, payload map[string]any) (map[string]any, error) {
+	return r.doCompletion(ctx, r.benchClient, backend, payload)
+}
+
+// doCompletion POSTs a non-streamed chat completion and returns the decoded body.
+// The error string for a non-2xx response ("completion returned <code>: …") is parsed
+// by vision.go (completionStatusCode/isClientReject) — keep that prefix stable.
+func (r *Router) doCompletion(ctx context.Context, client *http.Client, backend *Backend, payload map[string]any) (map[string]any, error) {
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamChatURL(backend), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if backend.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+backend.APIKey)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("completion returned %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+// modelRecheckInterval is how often the health loop re-fingerprints a ready
+// backend's served model. Identical keepalives no longer trigger
+// re-certification, so this is what catches a model swap behind an unchanged
+// registration (the per-(id,model) profile cache then forces a re-profile).
+const modelRecheckInterval = 10 * time.Minute
+
+// healthCheckConcurrency bounds the per-tick parallel health checks so a large
+// fleet can't spawn an unbounded burst of HTTP GETs at once.
+const healthCheckConcurrency = 16
+
+func (r *Router) healthLoop() {
+	ticker := time.NewTicker(r.cfg.HealthInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		// Fan the per-backend checks out into goroutines: each checkBackend is a
+		// blocking HTTP GET with a 5s timeout, so doing them serially let a few
+		// unreachable backends drag a single tick past the health interval. The
+		// registry methods are all mutex-guarded, so concurrent checks are safe.
+		// Concurrency is bounded by a semaphore in case the fleet is large.
+		backends := r.registry.snapshot()
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, healthCheckConcurrency)
+		for _, backend := range backends {
+			id := backend.ID
+			wg.Add(1)
+			sem <- struct{}{}
+			go func() {
+				defer wg.Done()
+				defer func() { <-sem }()
+				if err := r.checkBackend(id); err == nil {
+					// Re-certify failed backends after their backoff, and rescue
+					// ones stuck in "probing" (see dueForRecertify); the guard in
+					// certifyBackend de-dups overlaps.
+					if r.registry.dueForRecertify(id) {
+						go r.certifyBackend(id)
+					} else if r.registry.modelCheckDue(id, modelRecheckInterval) {
+						go r.recheckModel(id)
+					}
+				}
+			}()
+		}
+		wg.Wait()
+	}
+}
+
+// recheckModel re-certifies a ready backend whose served model no longer
+// matches its profile — e.g. an operator swapped the model without touching
+// the registration env.
+func (r *Router) recheckModel(id string) {
+	b := r.registry.get(id)
+	if b == nil || !b.Certification.Ready || isEmbeddingsOnly(b) {
+		return
+	}
+	model, meta := r.queryModelInfo(b)
+	r.registry.setModelMeta(id, meta)
+	if model != "" && b.Model != "" && model != b.Model {
+		log.Printf("worker %s now serves model %q (profiled as %q) — re-certifying", id, model, b.Model)
+		r.certifyBackend(id)
+		return
+	}
+	// An --alias survives a weights swap, so a stable id proves nothing on its
+	// own — compare the weights themselves. Warn rather than re-certify: a full
+	// re-benchmark costs minutes of GPU, and this is a fingerprint mismatch, not
+	// a measurement.
+	if changed := describeWeightsChange(b.ModelMeta, meta); changed != "" {
+		log.Printf("worker %s still advertises %q but its weights changed (%s) — cached quality may no longer describe it; delete the backend to force a re-profile", id, model, changed)
+	}
+}
+
+// describeWeightsChange reports how a worker's loaded weights differ from what
+// was last recorded, or "" if they match. Only fields the new probe actually
+// read are compared, so a /props blip never reads as a model swap.
+func describeWeightsChange(was, now ModelMeta) string {
+	var diffs []string
+	if now.ModelParams > 0 && was.ModelParams > 0 && now.ModelParams != was.ModelParams {
+		diffs = append(diffs, fmt.Sprintf("params %d→%d", was.ModelParams, now.ModelParams))
+	}
+	if now.ModelQuant != "" && was.ModelQuant != "" && now.ModelQuant != was.ModelQuant {
+		diffs = append(diffs, fmt.Sprintf("quant %q→%q", was.ModelQuant, now.ModelQuant))
+	}
+	if now.ModelPath != "" && was.ModelPath != "" && now.ModelPath != was.ModelPath {
+		diffs = append(diffs, fmt.Sprintf("path %q→%q", was.ModelPath, now.ModelPath))
+	}
+	return strings.Join(diffs, ", ")
+}
+
+// modelCheckDue reports whether a ready backend's periodic model fingerprint
+// is due, and stamps the check time so concurrent ticks don't pile on.
+func (r *Registry) modelCheckDue(id string, interval time.Duration) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	b := r.backends[id]
+	if b == nil || !b.Certification.Ready {
+		return false
+	}
+	if time.Since(b.lastModelCheck) < interval {
+		return false
+	}
+	b.lastModelCheck = time.Now()
+	return true
+}
+
+func (r *Router) checkBackend(id string) error {
+	backend := r.registry.get(id)
+	if backend == nil {
+		return errors.New("backend not found")
+	}
+
+	healthURL := backendRootURL(backend) + backend.HealthPath
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
+	if err != nil {
+		r.registry.setHealth(id, false, err.Error())
+		return err
+	}
+	if backend.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+backend.APIKey)
+	}
+	resp, err := r.client.Do(req)
+	if err != nil {
+		if isExpired(backend) {
+			r.registry.setHealth(id, false, "registration expired")
+			return errors.New("registration expired")
+		}
+		r.registry.setHealth(id, false, err.Error())
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		err := fmt.Errorf("health returned %d", resp.StatusCode)
+		r.registry.setHealth(id, false, err.Error())
+		return err
+	}
+	// Backend is healthy — refresh LastSeen to keep registration alive.
+	// This means TTL only expires for backends that are truly unreachable.
+	r.registry.refreshLastSeen(id)
+	r.registry.setHealth(id, true, "")
+	return nil
+}
+
+func normalizeRegistration(reg *BackendRegistration) error {
+	reg.ID = strings.TrimSpace(reg.ID)
+	if reg.ID == "" {
+		reg.ID = strings.TrimSpace(reg.Model)
+	}
+	if reg.ID == "" {
+		return errors.New("id or model is required")
+	}
+	if _, err := url.ParseRequestURI(reg.URL); err != nil {
+		return fmt.Errorf("valid url is required: %w", err)
+	}
+	if reg.Model == "" {
+		reg.Model = reg.ID
+	}
+	if reg.Quality < 0 || reg.Quality > 100 {
+		return errors.New("quality must be 0..100")
+	}
+	if reg.HealthPath == "" {
+		reg.HealthPath = "/health"
+	}
+	if !strings.HasPrefix(reg.HealthPath, "/") {
+		reg.HealthPath = "/" + reg.HealthPath
+	}
+	if reg.TTLSeconds <= 0 {
+		reg.TTLSeconds = 90
+	}
+	if reg.MaxConcurrency < 0 {
+		reg.MaxConcurrency = 0
+	}
+	reg.Features = normalizeFeatures(reg.Features)
+	return nil
+}
+
+func parseAndValidateChatRequest(body []byte, defaultMaxTokens int) (*ChatRequest, error) {
+	var req ChatRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		return nil, fmt.Errorf("invalid json: %w", err)
+	}
+	if len(req.Messages) == 0 {
+		return nil, errors.New("messages must not be empty")
+	}
+	// Single source of truth for the completion budget: max_completion_tokens
+	// wins over max_tokens (OpenAI's newer name), null/0/absent count as unset.
+	// Routing bookkeeping (context estimation) and the forwarded-body patch must
+	// agree on this — they previously disagreed on max_completion_tokens and on
+	// "max_tokens": null, injecting a conflicting router default alongside the
+	// client's real budget.
+	eff := effectiveMaxTokens(&req)
+	req.ClientSetMaxTokens = eff > 0
+	if eff <= 0 {
+		eff = defaultMaxTokens
+	}
+	req.MaxTokens = eff
+	for i, msg := range req.Messages {
+		switch msg.Role {
+		// "function" is the deprecated pre-tools spelling of a tool result, and
+		// OpenAI still accepts it. Rejecting it was stricter than the standard the
+		// northbound API claims to implement, and inconsistent with the router's
+		// own session tracker, which has always recognised it as continuing a tool
+		// loop (see inToolLoop). It carries `name` rather than `tool_call_id`, so
+		// the tool_call_id check below deliberately does not apply to it.
+		case "system", "developer", "user", "assistant", "tool", "function":
+		default:
+			return nil, fmt.Errorf("messages[%d].role %q is not supported", i, msg.Role)
+		}
+		if msg.Role == "tool" && msg.ToolCallID == "" {
+			return nil, fmt.Errorf("messages[%d] is a tool response without tool_call_id", i)
+		}
+		if len(msg.ToolCalls) > 0 && string(msg.ToolCalls) != "null" {
+			var calls []struct {
+				ID string `json:"id"`
+			}
+			if err := json.Unmarshal(msg.ToolCalls, &calls); err == nil {
+				// Uniqueness is per assistant message, not across the whole
+				// history — OpenAI semantics; clients that synthesize counter
+				// ids (call_0, call_1, reset each turn) are valid.
+				seenToolIDs := map[string]bool{}
+				for _, call := range calls {
+					if call.ID == "" {
+						continue
+					}
+					if seenToolIDs[call.ID] {
+						return nil, fmt.Errorf("messages[%d]: duplicate tool_call id %q", i, call.ID)
+					}
+					seenToolIDs[call.ID] = true
+				}
+			}
+		}
+	}
+	if len(req.Tools) > 0 && string(req.Tools) != "null" && !json.Valid(req.Tools) {
+		return nil, errors.New("tools must be valid json")
+	}
+	return &req, nil
+}
+
+// effectiveMaxTokens returns the completion budget the CLIENT set: the newer
+// max_completion_tokens wins over max_tokens; 0 means the client set neither
+// (absent, null, or explicit 0 all count as unset).
+func effectiveMaxTokens(req *ChatRequest) int {
+	if req.MaxCompletionTokens > 0 {
+		return req.MaxCompletionTokens
+	}
+	if req.MaxTokens > 0 {
+		return req.MaxTokens
+	}
+	return 0
+}
+
+// thinkingKwargKeys are the chat-template gates a client can pin directly, in
+// the precedence the templates themselves use. DeepSeek V4 reads `thinking` and
+// falls back to Qwen's `enable_thinking` only when `thinking` is undefined:
+//
+//	{%- if not thinking is defined -%}
+//	  {%- if enable_thinking is defined -%}{%- set thinking = enable_thinking -%}
+//
+// so a router that looked only at enable_thinking would believe it had control
+// of a request whose `thinking` was already pinned the other way, and would
+// hard-filter on a value the template then ignored. Verified against the live
+// worker: {"thinking":false,"enable_thinking":true} renders thinking OFF.
+var thinkingKwargKeys = []string{"thinking", "enable_thinking"}
+
+// thinkingFromRequest maps an explicit chat-template thinking gate (the
+// low-level escape hatch) to the equivalent requirements.thinking value, so a
+// kwargs choice hard-filters the same way as the standard knob. Absent → ""
+// (auto: no filter).
+func thinkingFromRequest(req *ChatRequest) string {
+	if req.ChatTemplateKwargs == nil {
+		return ""
+	}
+	for _, key := range thinkingKwargKeys {
+		if enabled, ok := req.ChatTemplateKwargs[key].(bool); ok {
+			if enabled {
+				return "on"
+			}
+			return "off"
+		}
+	}
+	return ""
+}
+
+func estimateContextK(messages []Message, maxTokens int) int {
+	chars := 0
+	for _, msg := range messages {
+		chars += estimateContentChars(msg.Content)
+		// tool_calls and tool_call_id also consume tokens
+		if len(msg.ToolCalls) > 0 {
+			chars += len(msg.ToolCalls)
+		}
+	}
+	// chars/3 is more conservative than chars/4 — JSON-heavy payloads
+	// (tool schemas, structured args) tokenize at ~2-3 chars/token, not 4.
+	estimatedTokens := chars/3 + maxTokens
+	return int(math.Ceil(float64(estimatedTokens) / 1024.0))
+}
+
+func estimateContentChars(content any) int {
+	switch v := content.(type) {
+	case string:
+		return len(v)
+	case nil:
+		return 0
+	case []any:
+		total := 0
+		for _, item := range v {
+			total += estimateContentChars(item)
+		}
+		return total
+	case map[string]any:
+		if t, _ := v["type"].(string); t == "image_url" {
+			// Multimodal backends encode images separately; counting a data: URL's
+			// base64 bytes as text context can reject valid vision requests.
+			return 2048
+		}
+		total := 0
+		for _, item := range v {
+			total += estimateContentChars(item)
+		}
+		return total
+	default:
+		b, _ := json.Marshal(v)
+		return len(b)
+	}
+}
+
+func requestNeedsVision(messages []Message) bool {
+	for _, msg := range messages {
+		if contentNeedsVision(msg.Content) {
+			return true
+		}
+	}
+	return false
+}
+
+func contentNeedsVision(content any) bool {
+	switch v := content.(type) {
+	case []any:
+		for _, item := range v {
+			if contentNeedsVision(item) {
+				return true
+			}
+		}
+	case map[string]any:
+		if t, _ := v["type"].(string); t == "image_url" {
+			return true
+		}
+		for _, item := range v {
+			if contentNeedsVision(item) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func filterCandidates(candidates []*Backend, keep func(*Backend) bool) []*Backend {
+	out := make([]*Backend, 0, len(candidates))
+	for _, b := range candidates {
+		if keep(b) {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+// backendScore is the fallback ranking score (used only when auto-tiering is
+// unavailable): quality-weighted, with speed as a secondary pull.
+//
+//	quality*3 + speed*1  (prefer better models)
+func backendScore(b *Backend) int {
+	return b.Quality*3 + speedScore(b)
+}
+
+// rankBackends sorts candidates best-first and returns the slice. The first
+// element is the single best choice; the remaining order lets pickAndAcquire
+// spill to the next-best backend when the best one has no free slot. This is the
+// fallback ranker for when auto-tiering can't run; the auto path uses
+// rankByDifficulty instead.
+func rankBackends(candidates []*Backend, job jobCost) []*Backend {
+	sort.SliceStable(candidates, func(i, j int) bool {
+		a, b := candidates[i], candidates[j]
+		// 1. Strongly prefer backends with free slots over full ones
+		aFull := a.MaxConcurrency > 0 && a.ActiveRequests >= a.MaxConcurrency
+		bFull := b.MaxConcurrency > 0 && b.ActiveRequests >= b.MaxConcurrency
+		if aFull != bFull {
+			return !aFull // prefer the one that's NOT full
+		}
+		// 2. Combined quality+speed score (quality-weighted)
+		sa, sb := backendScore(a), backendScore(b)
+		if sa != sb {
+			return sa > sb
+		}
+		// 2.5 Equal score → prefer the one expected to finish sooner under current
+		//     load (live prefill/decode rates + queue occupancy). Only breaks exact
+		//     score ties, so it never reorders distinct tiers — but it lets the live
+		//     ObservedTPS and active-request count influence routing.
+		if la, lb := expectedLatency(a, job), expectedLatency(b, job); la != lb {
+			return la < lb
+		}
+		// 2.75 Still tied → keep the conversation on the worker that served its
+		//      previous turn (see session.go).
+		if ai, bi := sessionIncumbent(a, job), sessionIncumbent(b, job); ai != bi {
+			return ai
+		}
+		// 3. Context window as tiebreaker
+		if a.ContextK != b.ContextK {
+			return a.ContextK > b.ContextK
+		}
+		return a.ID < b.ID
+	})
+	return candidates
+}
+
+// speedScore returns a stable score derived from the backend's declared
+// baseline_tps (set during registration, not dynamic), scaled to the SAME 0-100
+// range as Quality so the two are commensurable in backendScore.
+//
+// It was bucketed 1-10 back when quality was also 1-10. Quality is now a 0-100
+// benchmark percentage, which left speed contributing ~3% of backendScore — and
+// backendScore is the fallback ranker used when the embeddings worker is down,
+// i.e. exactly when difficulty routing is unavailable and speed matters most.
+func speedScore(b *Backend) int {
+	if b.BaselineTPS <= 0 {
+		return 0
+	}
+	score := int(math.Round(b.BaselineTPS / speedScoreFullTPS * 100))
+	if score > 100 {
+		score = 100
+	}
+	return score
+}
+
+// speedScoreFullTPS is the decode rate that scores a full 100. Set near the
+// fastest worker class in the fleet so slower workers spread out below it.
+var speedScoreFullTPS = 150.0
+
+func hasFeature(b *Backend, feature string) bool {
+	feature = strings.ToLower(feature)
+	for _, f := range b.Features {
+		if f == feature {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeFeatures(features []string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, feature := range features {
+		feature = strings.ToLower(strings.TrimSpace(feature))
+		if feature == "" || seen[feature] {
+			continue
+		}
+		seen[feature] = true
+		out = append(out, feature)
+	}
+	return out
+}
+
+// upsert registers or refreshes a backend. A re-registration with UNCHANGED
+// content (the ~60s keepalive) only refreshes liveness: resetting state on
+// every keepalive used to knock ready workers out of rotation for two worker
+// round-trips per minute and fight the background profiler (stranding fresh
+// workers in "probing" for the whole benchmark). Changed content means a
+// genuinely new deployment: full reset and a new profile generation. The
+// second return value reports whether a full (re)registration happened.
+func (r *Registry) upsert(reg BackendRegistration) (*Backend, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	existing := r.backends[reg.ID]
+	if existing == nil {
+		existing = &Backend{}
+		r.backends[reg.ID] = existing
+	} else if existing.lastReg != nil && registrationsEqual(*existing.lastReg, reg) {
+		existing.LastSeen = now
+		return cloneBackend(existing), false
+	}
+	regCopy := reg
+	existing.lastReg = &regCopy
+	existing.profileGen = nextProfileGen.Add(1)
+	existing.BackendRegistration = reg
+	existing.LastSeen = now
+	existing.Status = "probing"
+	existing.Healthy = false
+	existing.LastError = ""
+	existing.Certification = CertState{
+		Status:    "probing",
+		StartedAt: now,
+		Checks:    map[string]Check{},
+	}
+	// A fresh (re-)registration clears prior failure/backoff bookkeeping so an
+	// operator re-registering a backend gets a prompt certification attempt. The
+	// learned unknown-field set goes with it: changed registration content means a
+	// different deployment, and what the old one refused says nothing about this
+	// one (see stripAndRetry).
+	existing.certFailures = 0
+	existing.nextCertifyAt = time.Time{}
+	existing.proxyFailures = 0
+	existing.RejectedFields = nil
+	// Sync the per-backend slot channel with the registered max_concurrency.
+	// On first registration we lazily create the channel; on re-registration
+	// with a different cap we replace it. Any in-flight requests still hold
+	// a reference to the old channel and release into it harmlessly when
+	// they finish — the orphaned tokens are GC'd with the old channel.
+	if reg.MaxConcurrency > 0 {
+		r.syncSlotsLocked(reg.ID, reg.MaxConcurrency)
+	} else {
+		delete(r.slots, reg.ID)
+		delete(r.slotCap, reg.ID)
+	}
+	return cloneBackend(existing), true
+}
+
+// registrationsEqual compares registration content (JSON form, so slice fields
+// compare by value). Used to recognise keepalives.
+func registrationsEqual(a, b BackendRegistration) bool {
+	aj, errA := json.Marshal(a)
+	bj, errB := json.Marshal(b)
+	return errA == nil && errB == nil && bytes.Equal(aj, bj)
+}
+
+// syncSlotsLocked (re)creates the slot channel when the concurrency cap
+// changes. Callers hold r.mu. In-flight requests keep references to the old
+// channel and release into it harmlessly (see releaseSlot).
+func (r *Registry) syncSlotsLocked(id string, cap int) {
+	if cap <= 0 || r.slotCap[id] == cap {
+		return
+	}
+	ch := make(chan struct{}, cap)
+	for i := 0; i < cap; i++ {
+		ch <- struct{}{}
+	}
+	r.slots[id] = ch
+	r.slotCap[id] = cap
+}
+
+// remove deletes a backend and its slot channel. Returns true if a record
+// was actually removed. Safe to call concurrently with acquire/release: any
+// in-flight requests holding the old slot channel will harmlessly push back
+// into it on completion (the channel just lingers until GC'd).
+func (r *Registry) remove(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.backends[id]; !ok {
+		return false
+	}
+	delete(r.backends, id)
+	delete(r.slots, id)
+	delete(r.slotCap, id)
+	return true
+}
+
+// tryAcquireSlot attempts a non-blocking slot acquisition for the named
+// backend. Returns (slot, true) on success — including the unbounded case,
+// where the slot is nil and releaseSlot is a no-op. Returns (nil, false) when
+// the backend has a declared cap and is currently full. Blocking/spilling
+// across backends is handled by pickAndAcquire.
+func (r *Registry) tryAcquireSlot(id string) (chan struct{}, bool) {
+	r.mu.RLock()
+	ch := r.slots[id]
+	r.mu.RUnlock()
+	if ch == nil {
+		return nil, true
+	}
+	select {
+	case <-ch:
+		return ch, true
+	default:
+		return nil, false
+	}
+}
+
+// releaseSlot restores the slot to the channel it was acquired from. Safe
+// to call with a nil channel (no-op). If the channel has been replaced via
+// re-registration with a smaller cap, the orphan push is silently dropped.
+func (r *Registry) releaseSlot(ch chan struct{}) {
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- struct{}{}:
+	default:
+		// Old channel that's already at capacity — drop the token, it will
+		// be GC'd along with the channel.
+	}
+}
+
+func (r *Registry) snapshot() []*Backend {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]*Backend, 0, len(r.backends))
+	for _, b := range r.backends {
+		out = append(out, cloneBackend(b))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// hasBackendWithFeature reports whether any non-expired backend advertises the
+// given feature (e.g. "embeddings"). Used to surface the embeddings dependency
+// that auto-routing requires.
+func (r *Registry) hasBackendWithFeature(feature string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, b := range r.backends {
+		if !isExpired(b) && hasFeature(b, feature) {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Registry) eligible() []*Backend {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := []*Backend{}
+	for _, b := range r.backends {
+		if b.Healthy && b.Certification.Ready && !isExpired(b) {
+			out = append(out, cloneBackend(b))
+		}
+	}
+	return out
+}
+
+func (r *Registry) get(id string) *Backend {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if b := r.backends[id]; b != nil {
+		return cloneBackend(b)
+	}
+	return nil
+}
+
+func (r *Registry) refreshLastSeen(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if b := r.backends[id]; b != nil {
+		b.LastSeen = time.Now()
+	}
+}
+
+// setModelMeta publishes what a worker's runtime reports about its loaded
+// weights. Fields the probe couldn't read are left at their previous value: a
+// /props that 401s, or a vLLM worker that publishes no parameter count, must
+// not blank metadata an earlier certification did manage to read.
+func (r *Registry) setModelMeta(id string, m ModelMeta) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	b := r.backends[id]
+	if b == nil {
+		return
+	}
+	if m.ModelPath != "" {
+		b.ModelPath = m.ModelPath
+	}
+	if m.ModelParams > 0 {
+		b.ModelParams = m.ModelParams
+	}
+	if m.ModelQuant != "" {
+		b.ModelQuant = m.ModelQuant
+	}
+	if m.ModelSizeBytes > 0 {
+		b.ModelSizeBytes = m.ModelSizeBytes
+	}
+	if m.ModelCtxTrain > 0 {
+		b.ModelCtxTrain = m.ModelCtxTrain
+	}
+	if m.ServedID != "" {
+		b.ServedID = m.ServedID
+	}
+}
+
+func (r *Registry) setHealth(id string, healthy bool, lastError string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if b := r.backends[id]; b != nil {
+		b.Healthy = healthy
+		b.LastError = lastError
+		if healthy {
+			b.LastHealthy = time.Now()
+			if b.Certification.Ready {
+				b.Status = "ready"
+			}
+		} else {
+			b.Status = "unhealthy"
+		}
+	}
+}
+
+func (r *Registry) startCertification(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if b := r.backends[id]; b != nil {
+		b.Status = "probing"
+		b.Certification = CertState{
+			Status:    "probing",
+			StartedAt: time.Now(),
+			Checks:    map[string]Check{},
+		}
+	}
+}
+
+func (r *Registry) finishCertification(id string, ready bool, checks map[string]Check, tps float64, ttft int64, lastError string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if b := r.backends[id]; b != nil {
+		b.Certification = CertState{
+			Status:       mapBool(ready, "ready", "failed"),
+			Ready:        ready,
+			StartedAt:    b.Certification.StartedAt,
+			FinishedAt:   time.Now(),
+			TTFTMillis:   ttft,
+			TokensPerSec: tps,
+			Checks:       checks,
+			LastError:    lastError,
+		}
+		// Only SEED ObservedTPS from the probe when there's no live EWMA yet. A
+		// re-cert (circuit-breaker recovery, model recheck, stuck-probing rescue)
+		// must not throw a runtime-learned throughput back to the one-shot profiled
+		// baseline — the live EWMA is more current. A genuine model change re-profiles
+		// via the cold-start path (a different (id,model) profile), which resets the
+		// backend anyway, so this never pins a stale rate across a real model swap.
+		if b.ObservedTPS == 0 {
+			b.ObservedTPS = tps
+		}
+		b.LastError = lastError
+		if ready {
+			b.Healthy = true
+			b.Status = "ready"
+			b.LastHealthy = time.Now()
+			b.certFailures = 0
+			b.nextCertifyAt = time.Time{}
+			b.proxyFailures = 0
+		} else {
+			b.Healthy = false
+			b.Status = "failed"
+			b.certFailures++
+			// Back off re-certification of a persistently-failing backend so it
+			// isn't re-probed on every health tick (see dueForRecertify).
+			b.nextCertifyAt = time.Now().Add(recertBackoff(b.certFailures))
+		}
+	}
+}
+
+// noteRejectedField records that an endpoint refused a request field it did not
+// recognise, so everything sent to it from now on omits that field. Reports
+// whether this is the first time, which is what gates the log line.
+func (r *Registry) noteRejectedField(id, field string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	b := r.backends[id]
+	if b == nil {
+		return false
+	}
+	for _, f := range b.RejectedFields {
+		if f == field {
+			return false
+		}
+	}
+	b.RejectedFields = append(b.RejectedFields, field)
+	sort.Strings(b.RejectedFields)
+	return true
+}
+
+func (r *Registry) setError(id string, lastError string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if b := r.backends[id]; b != nil {
+		b.LastError = lastError
+	}
+}
+
+// proxyFailureThreshold is the number of consecutive proxy failures (transport
+// errors or 5xx after retries) that trips a backend's circuit breaker.
+const proxyFailureThreshold = 3
+
+// noteProxyResult feeds real request outcomes back into eligibility. A run of
+// consecutive failures trips a circuit breaker: the backend is dropped from
+// rotation and marked for re-certification, so a wedged-but-health-OK backend
+// stops receiving traffic until it proves it can serve again. Any success
+// resets the counter.
+func (r *Registry) noteProxyResult(id string, success bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	b := r.backends[id]
+	if b == nil {
+		return
+	}
+	if success {
+		b.proxyFailures = 0
+		return
+	}
+	b.proxyFailures++
+	if b.proxyFailures < proxyFailureThreshold {
+		return
+	}
+	b.proxyFailures = 0
+	b.Healthy = false
+	b.Status = "unhealthy"
+	b.Certification.Ready = false
+	b.Certification.Status = "failed"
+	b.Certification.LastError = fmt.Sprintf("ejected after %d consecutive proxy failures", proxyFailureThreshold)
+	// Re-certify as soon as the next health probe succeeds (no backoff on the
+	// first attempt after a trip); the health loop drives the recovery.
+	b.nextCertifyAt = time.Time{}
+	b.certFailures = 0
+}
+
+// dueForRecertify reports whether a backend may be re-certified now: a failed
+// backend whose exponential backoff (set in finishCertification) has elapsed,
+// or a backend stuck in "probing" — a certification that started long ago and
+// never finished (e.g. it bailed on the in-flight-profile guard). The guard in
+// certifyBackend de-dups if a profile is genuinely still running.
+func (r *Registry) dueForRecertify(id string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	b := r.backends[id]
+	if b == nil {
+		return false
+	}
+	switch b.Certification.Status {
+	case "failed":
+		return b.nextCertifyAt.IsZero() || !time.Now().Before(b.nextCertifyAt)
+	case "probing":
+		return time.Since(b.Certification.StartedAt) > 2*time.Minute
+	}
+	return false
+}
+
+// recertBackoff grows the gap between re-certification attempts: 30s, 60s,
+// 120s, … capped at 10 minutes.
+func recertBackoff(failures int) time.Duration {
+	const base = 30 * time.Second
+	const ceiling = 10 * time.Minute
+	if failures < 1 {
+		failures = 1
+	}
+	d := base
+	for i := 1; i < failures && d < ceiling; i++ {
+		d *= 2
+	}
+	if d > ceiling {
+		d = ceiling
+	}
+	return d
+}
+
+func (r *Registry) incActive(id string, delta int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if b := r.backends[id]; b != nil {
+		b.ActiveRequests += delta
+		if b.ActiveRequests < 0 {
+			b.ActiveRequests = 0
+		}
+	}
+}
+
+// minObserveTokens is the smallest streamed response we trust as a live
+// throughput sample. Below it the decode window is too short to measure cleanly
+// (a 1–2 token reply is dominated by jitter), so we skip it rather than poison
+// the EWMA.
+const minObserveTokens = 16
+
+// minPrefillTokens is the smallest prompt we trust as a prefill-rate sample.
+// Below it TTFT is dominated by fixed request overhead rather than prefill work,
+// so the derived tok/s says nothing about how the worker handles a real prompt.
+const minPrefillTokens = 256
+
+// decodeSampleRefTokens is the generation length at which a live decode sample
+// earns full EWMA weight; shorter samples are weighted down proportionally.
+// llama.cpp CPU decode degrades as the KV cache grows, so a stream of short
+// replies pushed one CPU worker's ObservedTPS to 51 tok/s when it sustained only
+// 17 tok/s over 1700 tokens — a 3x overestimate on precisely the long generations
+// where placement matters. GPU workers show no such gap, so weighting by length
+// costs nothing there.
+var decodeSampleRefTokens = 512
+
+// observe folds one streamed request's measured first-token latency and decode
+// throughput into the backend's live EWMAs. decodeWindow is the time spent
+// generating *after* the first token (TTFT excluded), so decodeTPS reflects true
+// generation speed rather than end-to-end latency — short or large-prompt
+// requests no longer drag the number down. Only streamed requests can separate
+// the phases; buffered requests don't call this.
+//
+// promptTokens sizes the prefill sample. thinking reports whether the router
+// enabled a thinking phase for this request: TTFT is only comparable across
+// workers when it didn't, because vLLM buffers reasoning (a thinking turn's whole
+// think phase lands inside TTFT — measured 12.45s of a 13.15s turn) while
+// llama.cpp streams it (0.7s on the same job). Folding both into one EWMA made
+// the faster prefill engine look ~30x slower and pushed traffic to CPU workers
+// while the GPU sat idle.
+func (r *Registry) observe(id string, ttft, decodeWindow time.Duration, tokens, promptTokens int, thinking bool) {
+	if tokens < minObserveTokens || decodeWindow <= 0 {
+		return
+	}
+	decodeTPS := float64(tokens) / decodeWindow.Seconds()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	b := r.backends[id]
+	if b == nil {
+		return
+	}
+	// Weight the sample by how much generation it actually observed.
+	alpha := 0.3
+	if decodeSampleRefTokens > 0 {
+		alpha *= math.Min(1, float64(tokens)/float64(decodeSampleRefTokens))
+	}
+	if b.ObservedTPS == 0 {
+		b.ObservedTPS = decodeTPS
+	} else {
+		b.ObservedTPS = b.ObservedTPS*(1-alpha) + decodeTPS*alpha
+	}
+	if thinking || ttft <= 0 {
+		return
+	}
+	ms := float64(ttft.Milliseconds())
+	if b.ObservedTTFTMillis == 0 {
+		b.ObservedTTFTMillis = ms
+	} else {
+		b.ObservedTTFTMillis = b.ObservedTTFTMillis*0.7 + ms*0.3
+	}
+	if promptTokens >= minPrefillTokens {
+		prefillTPS := float64(promptTokens) / ttft.Seconds()
+		if b.ObservedPrefillTPS == 0 {
+			b.ObservedPrefillTPS = prefillTPS
+		} else {
+			b.ObservedPrefillTPS = b.ObservedPrefillTPS*0.7 + prefillTPS*0.3
+		}
+	}
+}
+
+func cloneBackend(b *Backend) *Backend {
+	cp := *b
+	cp.Features = append([]string(nil), b.Features...)
+	cp.RejectedFields = append([]string(nil), b.RejectedFields...)
+	if b.Certification.Checks != nil {
+		cp.Certification.Checks = make(map[string]Check, len(b.Certification.Checks))
+		for k, v := range b.Certification.Checks {
+			cp.Certification.Checks[k] = v
+		}
+	}
+	return &cp
+}
+
+func isExpired(b *Backend) bool {
+	return time.Since(b.LastSeen) > time.Duration(b.TTLSeconds)*time.Second
+}
+
+func openLogStore(path string, maxBody int, persistSecret string) (*LogStore, error) {
+	dir := filepath.Dir(path)
+	// 0o700: the DB holds request bodies and the key file holds the
+	// registration-encryption key — neither should be group/world readable.
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	box, err := newSecretBox(persistSecret, filepath.Join(dir, "persist.key"))
+	if err != nil {
+		return nil, fmt.Errorf("init persistence encryption: %w", err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	if maxBody <= 0 {
+		maxBody = 16384
+	}
+	store := &LogStore{db: db, maxBody: maxBody, box: box}
+	if err := store.init(context.Background()); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return store, nil
+}
+
+// secretBox encrypts small secrets (backend API keys) before they are written
+// to the on-disk registration table, so the SQLite file never contains
+// plaintext credentials. The key comes from ROUTER_PERSIST_SECRET when set,
+// otherwise from an auto-generated 32-byte key file kept beside the database
+// (0600). Sealed values are "enc:v1:<base64(nonce|ciphertext)>"; anything
+// without that prefix is treated as legacy plaintext and returned as-is.
+type secretBox struct {
+	gcm cipher.AEAD
+}
+
+const encPrefix = "enc:v1:"
+
+func newSecretBox(envSecret, keyPath string) (*secretBox, error) {
+	var key []byte
+	if strings.TrimSpace(envSecret) != "" {
+		sum := sha256.Sum256([]byte(envSecret))
+		key = sum[:]
+	} else {
+		k, err := loadOrCreateKeyFile(keyPath)
+		if err != nil {
+			return nil, err
+		}
+		key = k
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	return &secretBox{gcm: gcm}, nil
+}
+
+// loadOrCreateKeyFile reads a 32-byte base64 key from path, generating and
+// persisting one (0600) on first run.
+func loadOrCreateKeyFile(path string) ([]byte, error) {
+	if raw, err := os.ReadFile(path); err == nil {
+		key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(raw)))
+		if err != nil {
+			return nil, fmt.Errorf("decode key file %s: %w", path, err)
+		}
+		if len(key) != 32 {
+			return nil, fmt.Errorf("key file %s must decode to 32 bytes, got %d", path, len(key))
+		}
+		return key, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(path, []byte(base64.StdEncoding.EncodeToString(key)), 0o600); err != nil {
+		return nil, err
+	}
+	return key, nil
+}
+
+// seal encrypts a non-empty secret. Empty input stays empty (no marker).
+func (s *secretBox) seal(plain string) (string, error) {
+	if plain == "" {
+		return "", nil
+	}
+	nonce := make([]byte, s.gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return "", err
+	}
+	ct := s.gcm.Seal(nonce, nonce, []byte(plain), nil)
+	return encPrefix + base64.StdEncoding.EncodeToString(ct), nil
+}
+
+// open reverses seal. Values without the marker are returned unchanged so any
+// pre-existing plaintext rows keep working.
+func (s *secretBox) open(stored string) (string, error) {
+	if !strings.HasPrefix(stored, encPrefix) {
+		return stored, nil
+	}
+	raw, err := base64.StdEncoding.DecodeString(stored[len(encPrefix):])
+	if err != nil {
+		return "", err
+	}
+	if len(raw) < s.gcm.NonceSize() {
+		return "", errors.New("ciphertext too short")
+	}
+	nonce, ct := raw[:s.gcm.NonceSize()], raw[s.gcm.NonceSize():]
+	plain, err := s.gcm.Open(nil, nonce, ct, nil)
+	if err != nil {
+		return "", err
+	}
+	return string(plain), nil
+}
+
+func (s *LogStore) init(ctx context.Context) error {
+	stmts := []string{
+		`PRAGMA journal_mode=WAL`,
+		// The pool is capped at one connection so this process never contends
+		// with itself, but WAL lets other processes open the file concurrently
+		// — backup.sh and any manual sqlite3 session do. Without a busy timeout
+		// those collide as an immediate SQLITE_BUSY, which surfaces as a lost
+		// request log or a failed registration write.
+		`PRAGMA busy_timeout=5000`,
+		`CREATE TABLE IF NOT EXISTS request_logs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			created_at TEXT NOT NULL,
+			backend_id TEXT NOT NULL,
+			backend_model TEXT NOT NULL,
+			route TEXT NOT NULL,
+			observed_tps REAL NOT NULL DEFAULT 0,
+			certified_tps REAL NOT NULL DEFAULT 0,
+			baseline_tps REAL NOT NULL DEFAULT 0,
+			speed_score INTEGER NOT NULL DEFAULT 0,
+			stream INTEGER NOT NULL,
+			status_code INTEGER NOT NULL,
+			duration_ms INTEGER NOT NULL,
+			input TEXT NOT NULL,
+			output TEXT NOT NULL,
+			error TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_request_logs_backend_created ON request_logs (backend_id, created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_request_logs_created ON request_logs (created_at DESC)`,
+		`CREATE TABLE IF NOT EXISTS backend_registrations (
+			id TEXT PRIMARY KEY,
+			updated_at TEXT NOT NULL,
+			registration_json TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS worker_profiles (
+			id TEXT PRIMARY KEY,
+			model TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			profile_json TEXT NOT NULL
+		)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+			return err
+		}
+	}
+	for _, stmt := range []string{
+		`ALTER TABLE request_logs ADD COLUMN observed_tps REAL NOT NULL DEFAULT 0`,
+		`ALTER TABLE request_logs ADD COLUMN certified_tps REAL NOT NULL DEFAULT 0`,
+		`ALTER TABLE request_logs ADD COLUMN baseline_tps REAL NOT NULL DEFAULT 0`,
+		`ALTER TABLE request_logs ADD COLUMN speed_score INTEGER NOT NULL DEFAULT 0`,
+	} {
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *LogStore) Close() error {
+	return s.db.Close()
+}
+
+func (s *LogStore) Insert(ctx context.Context, entry RequestLog) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO request_logs
+		(created_at, backend_id, backend_model, route, observed_tps, certified_tps, baseline_tps, speed_score, stream, status_code, duration_ms, input, output, error)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		entry.CreatedAt.Format(time.RFC3339Nano),
+		entry.BackendID,
+		entry.BackendModel,
+		entry.Route,
+		entry.ObservedTPS,
+		entry.CertifiedTPS,
+		entry.BaselineTPS,
+		entry.SpeedScore,
+		boolInt(entry.Stream),
+		entry.StatusCode,
+		entry.DurationMillis,
+		clipLog(entry.Input, s.maxBody),
+		clipLog(entry.Output, s.maxBody),
+		clipLog(entry.Error, s.maxBody),
+	)
+	return err
+}
+
+// clipLog bounds a stored log field to maxBytes, trimming back to a UTF-8 rune
+// boundary and appending a truncation marker. Keeps the request-log table from
+// growing without limit on large prompts/responses.
+func clipLog(s string, maxBytes int) string {
+	if maxBytes <= 0 || len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + fmt.Sprintf("…[truncated %d bytes]", len(s)-cut)
+}
+
+func (s *LogStore) List(ctx context.Context, backendID string, limit int, offset int) ([]RequestLog, error) {
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if backendID == "" {
+		rows, err = s.db.QueryContext(ctx, `SELECT id, created_at, backend_id, backend_model, route, observed_tps, certified_tps, baseline_tps, speed_score, stream, status_code, duration_ms, input, output, error
+			FROM request_logs ORDER BY created_at DESC LIMIT ? OFFSET ?`, limit, offset)
+	} else {
+		rows, err = s.db.QueryContext(ctx, `SELECT id, created_at, backend_id, backend_model, route, observed_tps, certified_tps, baseline_tps, speed_score, stream, status_code, duration_ms, input, output, error
+			FROM request_logs WHERE backend_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`, backendID, limit, offset)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []RequestLog{}
+	for rows.Next() {
+		var entry RequestLog
+		var created string
+		var stream int
+		if err := rows.Scan(&entry.ID, &created, &entry.BackendID, &entry.BackendModel, &entry.Route, &entry.ObservedTPS, &entry.CertifiedTPS, &entry.BaselineTPS, &entry.SpeedScore, &stream, &entry.StatusCode, &entry.DurationMillis, &entry.Input, &entry.Output, &entry.Error); err != nil {
+			return nil, err
+		}
+		entry.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		entry.Stream = stream != 0
+		out = append(out, entry)
+	}
+	return out, rows.Err()
+}
+
+func (s *LogStore) DeleteOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM request_logs WHERE created_at < ?`, cutoff.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+func (s *LogStore) SaveBackendRegistration(ctx context.Context, reg BackendRegistration) error {
+	// Encrypt the api key so the SQLite file never holds a plaintext credential.
+	sealed, err := s.box.seal(reg.APIKey)
+	if err != nil {
+		return fmt.Errorf("encrypt api key: %w", err)
+	}
+	stored := reg
+	stored.APIKey = sealed
+	data, err := json.Marshal(stored)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO backend_registrations (id, updated_at, registration_json)
+		VALUES (?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at, registration_json = excluded.registration_json`,
+		reg.ID,
+		time.Now().UTC().Format(time.RFC3339Nano),
+		string(data),
+	)
+	return err
+}
+
+// DeleteBackendRegistration removes a backend's persisted row so a deleted
+// backend stays deleted across restarts — otherwise LoadBackendRegistrations
+// resurrects it on the next startup.
+func (s *LogStore) DeleteBackendRegistration(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM backend_registrations WHERE id = ?`, id)
+	return err
+}
+
+func (s *LogStore) LoadBackendRegistrations(ctx context.Context) ([]BackendRegistration, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT registration_json FROM backend_registrations ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []BackendRegistration{}
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		var reg BackendRegistration
+		if err := json.Unmarshal([]byte(raw), &reg); err != nil {
+			return nil, err
+		}
+		if reg.APIKey != "" {
+			plain, err := s.box.open(reg.APIKey)
+			if err != nil {
+				// A key we can't decrypt (e.g. ROUTER_PERSIST_SECRET changed) must
+				// not block startup; drop it and let the worker re-register to
+				// restore it. Log loudly so the cause is visible.
+				log.Printf("decrypt persisted api key for backend %q failed: %v (backend will need re-registration to restore its key)", reg.ID, err)
+				reg.APIKey = ""
+			} else {
+				reg.APIKey = plain
+			}
+		}
+		out = append(out, reg)
+	}
+	return out, rows.Err()
+}
+
+func (r *Router) logRetentionLoop() {
+	r.pruneLogs()
+	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
+	for range ticker.C {
+		r.pruneLogs()
+	}
+}
+
+func (r *Router) pruneLogs() {
+	if r.cfg.LogRetention <= 0 {
+		return
+	}
+	deleted, err := r.logs.DeleteOlderThan(context.Background(), time.Now().Add(-r.cfg.LogRetention))
+	if err != nil {
+		log.Printf("request log retention cleanup failed: %v", err)
+		return
+	}
+	if deleted > 0 {
+		log.Printf("deleted %d expired request logs", deleted)
+	}
+}
+
+// authorizedAsWorker checks the request's Bearer token against the single
+// ROUTER_WORKER_TOKEN. Used for worker self-registration endpoints. Empty
+// configured token disables the check.
+func authorizedAsWorker(req *http.Request, token string) bool {
+	if token == "" {
+		return true
+	}
+	got := req.Header.Get("Authorization")
+	return subtle.ConstantTimeCompare([]byte(got), []byte("Bearer "+token)) == 1
+}
+
+// authorizedAsClient checks the request's Bearer token against the any-of
+// list ROUTER_CLIENT_TOKENS. Used for /v1/*, read-only registry endpoints,
+// and debug endpoints. Empty configured list disables the check.
+func authorizedAsClient(req *http.Request, tokens []string) bool {
+	if len(tokens) == 0 {
+		return true
+	}
+	got := []byte(req.Header.Get("Authorization"))
+	// Check every token without short-circuiting so the comparison work — and
+	// thus the timing — doesn't depend on which token (if any) matched.
+	authorized := false
+	for _, t := range tokens {
+		if subtle.ConstantTimeCompare(got, []byte("Bearer "+t)) == 1 {
+			authorized = true
+		}
+	}
+	return authorized
+}
+
+// maxRequestBytes caps inbound POST bodies. Chat requests with base64 images
+// run to a few MB; nothing legitimate approaches this bound — without it a
+// single multi-GB POST OOMs the router (and with no client tokens configured,
+// auth doesn't gate that).
+const maxRequestBytes = 64 << 20
+
+func readRequestBody(w http.ResponseWriter, req *http.Request) ([]byte, error) {
+	req.Body = http.MaxBytesReader(w, req.Body, maxRequestBytes)
+	return io.ReadAll(req.Body)
+}
+
+func copyHeaders(dst, src http.Header) {
+	for key, values := range src {
+		lower := strings.ToLower(key)
+		if lower == "content-length" || lower == "connection" {
+			continue
+		}
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+}
+
+func upstreamChatURL(backend *Backend) string {
+	return upstreamPathURL(backend, "/v1/chat/completions")
+}
+
+// upstreamPathURL joins a registered backend's base URL to an OpenAI-style
+// API path. If the backend already registered with a `/v1` suffix on its
+// URL, the duplicate `/v1` is collapsed so we end up with one canonical
+// path. `openAIPath` must start with `/v1/`.
+func upstreamPathURL(backend *Backend, openAIPath string) string {
+	base := strings.TrimRight(backend.URL, "/")
+	if strings.HasSuffix(base, "/v1") {
+		return base + strings.TrimPrefix(openAIPath, "/v1")
+	}
+	return base + openAIPath
+}
+
+func backendRootURL(backend *Backend) string {
+	base := strings.TrimRight(backend.URL, "/")
+	return strings.TrimSuffix(base, "/v1")
+}
+
+func publicBackends(backends []*Backend) []*Backend {
+	out := make([]*Backend, 0, len(backends))
+	for _, b := range backends {
+		cp := cloneBackend(b)
+		cp.APIKey = ""
+		if isExpired(cp) {
+			cp.Status = "expired"
+		}
+		out = append(out, cp)
+	}
+	return out
+}
+
+// readSSEStream accumulates a streamed completion's content and reasoning text
+// separately (both dialects' reasoning field names — see extract.go).
+// firstChunk fires on the first non-empty delta of EITHER kind: for a thinking
+// model the reasoning tokens ARE the first generated output, and stamping TTFT
+// only on content would fold the whole reasoning phase into first-token latency.
+// readSSEStream drains a streamed completion. tokens prefers the stream's
+// usage.completion_tokens (sent when the request asked for
+// stream_options.include_usage), falling back to counting non-empty deltas.
+//
+// The fallback is a COUNT only for engines that emit one token per delta.
+// Speculative decoding breaks that: vLLM with MTP packs each accepted
+// multi-token step into ONE delta (measured on Qwen3.8-27B 2026-08-15: 52
+// completion tokens arrived in 25 deltas), so delta-counting under-read the
+// fleet's MTP workers ~2.5x — certified 37 tok/s against a benched 92. That is
+// why the probe now requests include_usage and this prefers it.
+func readSSEStream(body io.Reader, firstChunk func()) (content, reasoning string, tokens int, err error) {
+	var out, think strings.Builder
+	usageTokens := 0
+	scanner := newLargeScanner(body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimSpace(line[6:])
+		if data == "[DONE]" {
+			break
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta sseDelta `json:"delta"`
+			} `json:"choices"`
+			Usage *struct {
+				CompletionTokens int `json:"completion_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+		// Cumulative in both dialects (vLLM final-chunk usage and llama.cpp
+		// per-chunk usage) — the last value seen wins either way.
+		if chunk.Usage != nil && chunk.Usage.CompletionTokens > 0 {
+			usageTokens = chunk.Usage.CompletionTokens
+		}
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+		delta := chunk.Choices[0].Delta
+		rt := delta.reasoningText()
+		if delta.Content != "" || rt != "" {
+			tokens++
+		}
+		if delta.Content != "" {
+			firstChunk()
+			out.WriteString(delta.Content)
+		}
+		if rt != "" {
+			firstChunk()
+			think.WriteString(rt)
+		}
+	}
+	if usageTokens > 0 {
+		tokens = usageTokens
+	}
+	return out.String(), think.String(), tokens, scanner.Err()
+}
+
+func newLargeScanner(r io.Reader) *bufio.Scanner {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	return scanner
+}
+
+func truncate(value string, max int) string {
+	value = strings.TrimSpace(value)
+	if len(value) <= max {
+		return value
+	}
+	return value[:max] + "..."
+}
+
+func truncateJSON(value any, max int) string {
+	data, _ := json.Marshal(value)
+	return truncate(string(data), max)
+}
+
+func mapBool(ok bool, yes string, no string) string {
+	if ok {
+		return yes
+	}
+	return no
+}
+
+// countSSETokens counts actual generated tokens from a captured SSE stream.
+// Each "data: {...}" line with a non-empty content delta represents one token.
+func countSSETokens(data []byte) int {
+	tokens := 0
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		if !bytes.HasPrefix(line, []byte("data: ")) {
+			continue
+		}
+		payload := line[6:]
+		if bytes.Equal(payload, []byte("[DONE]")) {
+			continue
+		}
+		// Count a chunk carrying a non-empty content OR reasoning delta. Reasoning
+		// tokens must count toward throughput: a model that spends most of a turn
+		// emitting a long reasoning block before a short answer would otherwise look
+		// an order of magnitude slower than it is, poisoning latency-aware routing.
+		// vLLM ≥0.23 emits "reasoning" instead of "reasoning_content".
+		if hasNonEmptyDelta(payload, `"content":"`) || hasNonEmptyDelta(payload, `"reasoning_content":"`) || hasNonEmptyDelta(payload, `"reasoning":"`) {
+			tokens++
+		}
+	}
+	return tokens
+}
+
+// hasNonEmptyDelta reports whether payload contains key immediately followed by a
+// non-empty JSON string value (the char after the opening quote isn't the closing
+// quote).
+func hasNonEmptyDelta(payload []byte, key string) bool {
+	idx := bytes.Index(payload, []byte(key))
+	if idx < 0 {
+		return false
+	}
+	after := idx + len(key)
+	return after < len(payload) && payload[after] != '"'
+}
+
+// copyStreaming relays an SSE response to the client (and into capture),
+// returning the timestamp of the first chunk — the worker's first token, ≈ TTFT.
+// A zero time means nothing was ever read.
+func copyStreaming(w http.ResponseWriter, src io.Reader, capture io.Writer, progress func()) (time.Time, error) {
+	buf := make([]byte, 32*1024)
+	flusher, _ := w.(http.Flusher)
+	var firstByte time.Time
+	for {
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			if progress != nil {
+				progress()
+			}
+			if firstByte.IsZero() {
+				firstByte = time.Now()
+			}
+			if capture != nil {
+				if _, captureErr := capture.Write(buf[:n]); captureErr != nil {
+					return firstByte, captureErr
+				}
+			}
+			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+				return firstByte, writeErr
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				return firstByte, nil
+			}
+			return firstByte, readErr
+		}
+	}
+}
+
+// writeJSON is the single northbound response writer. A validationError is
+// rendered into the OpenAI envelope here rather than at its ~20 construction
+// sites, which is what lets those sites stay as short as
+// `validationError{Message: err.Error()}` while the status code still picks the
+// right error `type`.
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	if ve, ok := value.(validationError); ok {
+		value = ve.envelope(status)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(value); err != nil {
+		log.Printf("write json failed: %v", err)
+	}
+}
+
+func methodNotAllowed(w http.ResponseWriter) {
+	writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+}
+
+func logRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		next.ServeHTTP(w, r)
+		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start).Round(time.Millisecond))
+	})
+}
+
+// dashboardTemplate renders the operator dashboard. The markup lives in
+// dashboard.html rather than in a 395-line raw string literal here: as a real
+// .html file it gets syntax highlighting and formatting, and main.go loses a
+// tenth of its length to markup that has nothing to do with routing.
+//
+// NOTE: the Dockerfile must COPY dashboard.html — it previously copied only
+// *.go, so an embed added without that change fails the build.
+//
+//go:embed dashboard.html
+var dashboardHTML string
+
+var dashboardTemplate = template.Must(template.New("dashboard").Parse(dashboardHTML))
+
+func envOr(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func envInt(key string, fallback int) int {
+	if value := os.Getenv(key); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err == nil {
+			return parsed
+		}
+	}
+	return fallback
+}
+
+// envDuration reads an integer-seconds env var and converts to Duration.
+// Falls back to “fallback“ if the var is unset or unparseable.
+func envDuration(key string, fallback time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	return time.Duration(n) * time.Second
+}
+
+func envBoundedInt(value string, fallback int, min int, max int) int {
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	if parsed < min {
+		return min
+	}
+	if parsed > max {
+		return max
+	}
+	return parsed
+}
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}

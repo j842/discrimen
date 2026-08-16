@@ -1,0 +1,395 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LLM Router</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, -apple-system, Segoe UI, sans-serif; }
+    body { margin: 0; background: #0f1115; color: #e9edf3; }
+    header { padding: 18px 24px; border-bottom: 1px solid #2a2f3a; display: flex; justify-content: space-between; align-items: end; gap: 16px; }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    .muted { color: #9aa4b2; font-size: 13px; }
+    main { padding: 18px 24px 32px; }
+    table { width: 100%; border-collapse: collapse; background: #151923; border: 1px solid #2a2f3a; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid #252b36; text-align: left; vertical-align: top; font-size: 14px; }
+    th { color: #aeb8c6; font-weight: 600; background: #111721; position: sticky; top: 0; }
+    tr.ready .status { color: #62d26f; }
+    tr.probing .status { color: #f7c948; }
+    tr.failed .status, tr.unhealthy .status, tr.expired .status { color: #ff6b6b; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    .features { display: flex; gap: 4px; flex-wrap: wrap; }
+    .pill { border: 1px solid #334155; border-radius: 999px; padding: 2px 7px; color: #cbd5e1; font-size: 12px; }
+    button { background: #2563eb; color: white; border: 0; border-radius: 6px; padding: 7px 10px; cursor: pointer; }
+    button.secondary { background: #334155; }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    .try { display: none; padding: 14px; background: #0f141d; border-top: 1px solid #2a2f3a; }
+    .try.open { display: block; }
+    textarea, input, select { width: 100%; box-sizing: border-box; background: #0b0f16; color: #e9edf3; border: 1px solid #303847; border-radius: 6px; padding: 8px; }
+    textarea { min-height: 92px; resize: vertical; }
+    .grid { display: grid; grid-template-columns: 2fr 1fr 120px 130px; gap: 10px; margin: 10px 0; }
+    .output { white-space: pre-wrap; min-height: 72px; background: #080b10; border: 1px solid #303847; padding: 10px; border-radius: 6px; margin-top: 10px; }
+    .panel { margin-top: 18px; background: #151923; border: 1px solid #2a2f3a; }
+    .panel h2 { font-size: 16px; margin: 0; padding: 14px 16px; border-bottom: 1px solid #252b36; }
+    .tabs { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 16px; border-bottom: 1px solid #252b36; }
+    .tabs button.active { background: #1d4ed8; }
+    .logs { padding: 12px 16px 18px; display: grid; gap: 10px; }
+    .logitem { border: 1px solid #303847; border-radius: 6px; background: #0f141d; padding: 10px; }
+    .loghead { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+    details { margin-top: 8px; }
+    summary { cursor: pointer; color: #cbd5e1; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #080b10; border: 1px solid #303847; border-radius: 6px; padding: 10px; max-height: 360px; overflow: auto; }
+    .route-cell { display: grid; gap: 2px; }
+    .route-speed { color: #8dd6ff; font-size: 12px; }
+    .modal-backdrop { position: fixed; inset: 0; z-index: 1000; display: none; align-items: center; justify-content: center; padding: 20px; background: rgba(0,0,0,.64); }
+    .modal-backdrop.open { display: flex; }
+    .modal-card { width: min(960px, 100%); max-height: min(86vh, 900px); overflow: auto; background: #111827; border: 1px solid #303847; border-radius: 10px; box-shadow: 0 24px 80px rgba(0,0,0,.48); }
+    .modal-card .logitem { border: 0; border-radius: 0; }
+    @media (max-width: 900px) { .wide { display: none; } .grid { grid-template-columns: 1fr; } table { font-size: 12px; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>LLM Router</h1>
+      <div class="muted">Generated {{.GeneratedAt}}</div>
+    </div>
+    <div><button class="secondary" onclick="location.reload()">Refresh</button></div>
+  </header>
+  <main>
+    <table>
+      <thead>
+        <tr>
+          <th>Status</th><th>Backend</th><th>Model</th><th>Quality</th><th>Speed</th><th>Context</th><th>Load</th><th class="wide">Capabilities</th><th>Actions</th>
+        </tr>
+      </thead>
+      <tbody id="backends-body">
+        <tr><td colspan="9" class="muted">Loading backends…</td></tr>
+      </tbody>
+    </table>
+    <section class="panel">
+      <h2>Request Logs</h2>
+      <div class="tabs" id="log-tabs">
+        <button class="secondary active" id="tab-all" onclick="logOffset=0;loadLogs('')">All</button>
+      </div>
+      <div id="logs-table-wrap" style="padding:0 16px 4px; overflow-x:auto;">
+        <table id="logs-table" style="display:none; font-size:13px;">
+          <thead><tr><th>Time</th><th>Backend</th><th>Status</th><th>Duration</th><th>Route</th><th>Preview</th></tr></thead>
+          <tbody id="logs-body"></tbody>
+        </table>
+      </div>
+      <div class="logs" id="logs-empty"><div class="muted">Select a tab to load recent requests.</div></div>
+      <div id="logs-detail" style="display:none; padding:0 16px 18px;"></div>
+      <div style="display:flex; gap:8px; padding:8px 16px 18px; align-items:center;">
+        <button class="secondary" id="logs-prev" onclick="logPrev()" disabled>&larr; Newer</button>
+        <span class="muted" id="logs-page"></span>
+        <button class="secondary" id="logs-next" onclick="logNext()">Older &rarr;</button>
+      </div>
+    </section>
+  </main>
+  <div class="modal-backdrop" id="log-modal" onclick="closeLogDetail(event)">
+    <div class="modal-card" id="log-modal-card" onclick="event.stopPropagation()"></div>
+  </div>
+  <script>
+    let activeLogBackend = '';
+    let logOffset = 0;
+    const LOG_LIMIT = 50;
+    let lastLogData = [];
+
+    function token() {
+      let t = sessionStorage.getItem('routerToken') || '';
+      if (!t) {
+        t = prompt('Router token (blank if not configured):') || '';
+        sessionStorage.setItem('routerToken', t);
+      }
+      return t;
+    }
+    function headers() {
+      const h = {'Content-Type':'application/json'};
+      const t = token();
+      if (t) h.Authorization = 'Bearer ' + t;
+      return h;
+    }
+    function toggleTry(id) {
+      document.getElementById('try-' + id).classList.toggle('open');
+    }
+    async function certify(id) {
+      const res = await fetch('/debug/backends/' + encodeURIComponent(id) + '/certify', {method:'POST', headers: headers()});
+      if (!res.ok) alert(await res.text());
+      setTimeout(() => location.reload(), 1200);
+    }
+    async function sendTest(id) {
+      const out = document.getElementById('out-' + id);
+      const meta = document.getElementById('meta-' + id);
+      out.textContent = '';
+      meta.textContent = 'sending...';
+      const started = performance.now();
+      const body = {
+        model: 'default',
+        stream: true,
+        max_tokens: parseInt(document.getElementById('tokens-' + id).value || '256', 10),
+        requirements: {thinking: document.getElementById('thinking-' + id).value},
+        messages: [
+          {role: 'system', content: document.getElementById('system-' + id).value},
+          {role: 'user', content: document.getElementById('prompt-' + id).value}
+        ]
+      };
+      const res = await fetch('/debug/backends/' + encodeURIComponent(id) + '/chat', {method:'POST', headers: headers(), body: JSON.stringify(body)});
+      if (!res.ok || !res.body) {
+        out.textContent = await res.text();
+        meta.textContent = 'failed';
+        return;
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      let chars = 0;
+      for (;;) {
+        const read = await reader.read();
+        if (read.done) break;
+        buf += decoder.decode(read.value, {stream:true});
+        const lines = buf.split('\n');
+        buf = lines.pop();
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const data = line.slice(6).trim();
+          if (data === '[DONE]') continue;
+          try {
+            const chunk = JSON.parse(data);
+            const delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta || {};
+            const text = delta.content || delta.reasoning_content || delta.reasoning || '';
+            if (text) { out.textContent += text; chars += text.length; }
+          } catch (_) {}
+        }
+      }
+      const elapsed = (performance.now() - started) / 1000;
+      meta.textContent = elapsed.toFixed(2) + 's, approx ' + (chars/4/elapsed).toFixed(1) + ' tok/s';
+    }
+    function escapeHtml(value) {
+      return String(value || '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    }
+    function pretty(value) {
+      if (!value) return '';
+      try { return JSON.stringify(JSON.parse(value), null, 2); } catch (_) { return value; }
+    }
+    function timeAgo(iso) {
+      const s = (Date.now() - new Date(iso).getTime()) / 1000;
+      if (s < 60) return Math.floor(s) + 's ago';
+      if (s < 3600) return Math.floor(s/60) + 'm ago';
+      if (s < 86400) return Math.floor(s/3600) + 'h ago';
+      return Math.floor(s/86400) + 'd ago';
+    }
+    function inputPreview(raw) {
+      if (!raw) return '';
+      try {
+        const obj = JSON.parse(raw);
+        const msgs = obj.messages || [];
+        const last = msgs.filter(m => m.role === 'user').pop();
+        const text = last ? last.content : JSON.stringify(obj);
+        return text.length > 120 ? text.slice(0, 120) + '...' : text;
+      } catch (_) { return raw.length > 120 ? raw.slice(0, 120) + '...' : raw; }
+    }
+    function logTPS(row) {
+      return row.observed_tps || row.certified_tps || row.baseline_tps || 0;
+    }
+    function logTPSLabel(row) {
+      const tps = logTPS(row);
+      if (!tps) return '';
+      const source = row.observed_tps ? 'observed' : (row.certified_tps ? 'certified' : 'baseline');
+      const score = row.speed_score ? ' · score ' + row.speed_score : '';
+      return tps.toFixed(1) + ' tok/s ' + source + score;
+    }
+    function routeCell(row) {
+      const speed = logTPSLabel(row);
+      return '<div class="route-cell"><span>' + escapeHtml(row.route) + '</span>' +
+        (speed ? '<span class="route-speed">' + escapeHtml(speed) + '</span>' : '') + '</div>';
+    }
+    function logPrev() { if (logOffset >= LOG_LIMIT) { logOffset -= LOG_LIMIT; loadLogs(activeLogBackend); } }
+    function logNext() { if (lastLogData.length === LOG_LIMIT) { logOffset += LOG_LIMIT; loadLogs(activeLogBackend); } }
+    function showLogDetail(idx) {
+      const row = lastLogData[idx];
+      if (!row) return;
+      const modal = document.getElementById('log-modal');
+      const card = document.getElementById('log-modal-card');
+      const speed = logTPSLabel(row);
+      card.innerHTML = '<article class="logitem">' +
+        '<div class="loghead"><div><code>' + escapeHtml(row.backend_id) + '</code> <span class="muted">' + escapeHtml(row.backend_model) + '</span></div>' +
+        '<div><button class="secondary" onclick="closeLogDetail()">&times; Close</button></div></div>' +
+        '<div class="muted" style="margin-bottom:8px">' + new Date(row.created_at).toLocaleString() + ' · ' + escapeHtml(row.route) + ' · HTTP ' + row.status_code + ' · ' + row.duration_ms + 'ms</div>' +
+        (speed ? '<div class="route-speed" style="margin-bottom:8px">' + escapeHtml(speed) + '</div>' : '') +
+        (row.error ? '<div style="color:#ff6b6b;margin-bottom:8px">' + escapeHtml(row.error) + '</div>' : '') +
+        '<details open><summary>Input</summary><pre>' + escapeHtml(pretty(row.input)) + '</pre></details>' +
+        '<details><summary>Output</summary><pre>' + escapeHtml(pretty(row.output)) + '</pre></details>' +
+        '</article>';
+      modal.classList.add('open');
+    }
+    function closeLogDetail(event) {
+      if (event && event.target && event.target.id !== 'log-modal') return;
+      document.getElementById('log-modal').classList.remove('open');
+    }
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape') closeLogDetail();
+    });
+    async function loadLogs(backendID) {
+      activeLogBackend = backendID || '';
+      document.querySelectorAll('.tabs button').forEach(b => b.classList.remove('active'));
+      const tab = document.getElementById('tab-' + (activeLogBackend || 'all'));
+      if (tab) tab.classList.add('active');
+      const tbody = document.getElementById('logs-body');
+      const tbl = document.getElementById('logs-table');
+      const empty = document.getElementById('logs-empty');
+      const detail = document.getElementById('logs-detail');
+      detail.style.display = 'none';
+      closeLogDetail();
+      tbody.innerHTML = '<tr><td colspan="6" class="muted">loading...</td></tr>';
+      tbl.style.display = 'table';
+      empty.style.display = 'none';
+      const qs = new URLSearchParams({limit: String(LOG_LIMIT), offset: String(logOffset)});
+      if (activeLogBackend) qs.set('backend_id', activeLogBackend);
+      const res = await fetch('/logs?' + qs.toString(), {headers: headers()});
+      if (!res.ok) {
+        tbody.innerHTML = '<tr><td colspan="6" class="muted">' + escapeHtml(await res.text()) + '</td></tr>';
+        return;
+      }
+      const data = await res.json();
+      lastLogData = data.logs || [];
+      document.getElementById('logs-prev').disabled = logOffset === 0;
+      document.getElementById('logs-next').disabled = lastLogData.length < LOG_LIMIT;
+      const page = Math.floor(logOffset / LOG_LIMIT) + 1;
+      document.getElementById('logs-page').textContent = lastLogData.length ? 'Page ' + page : '';
+      if (!lastLogData.length) {
+        tbl.style.display = 'none';
+        empty.style.display = 'block';
+        empty.innerHTML = '<div class="muted">No logs' + (logOffset > 0 ? ' on this page' : '') + '.</div>';
+        return;
+      }
+      tbody.innerHTML = lastLogData.map((row, i) => {
+        const ok = row.status_code >= 200 && row.status_code < 300;
+        return '<tr style="cursor:pointer" onclick="showLogDetail(' + i + ')">' +
+          '<td class="muted">' + timeAgo(row.created_at) + '</td>' +
+          '<td><code>' + escapeHtml(row.backend_id) + '</code></td>' +
+          '<td style="color:' + (ok ? '#62d26f' : '#ff6b6b') + '">' + row.status_code + '</td>' +
+          '<td>' + row.duration_ms + 'ms</td>' +
+          '<td class="muted">' + routeCell(row) + '</td>' +
+          '<td class="muted" style="max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escapeHtml(inputPreview(row.input)) + '</td>' +
+          '</tr>';
+      }).join('');
+    }
+    // ── Backend table + log tabs are rendered CLIENT-SIDE from /backends ──
+    // The unauthenticated server render discloses nothing about the fleet; the
+    // table and per-backend log tabs below are built only after a token-gated
+    // /backends fetch succeeds.
+    let knownBackendIDs = [];
+    function speedScoreOf(b) {
+      // Mirror the server-side speedScore: ceil(baseline_tps/10), clamped to [1,10].
+      const s = Math.ceil((b.baseline_tps || 0) / 10);
+      return Math.min(10, Math.max(1, s));
+    }
+    function tokensPerSecOf(b) {
+      return b.observed_tps || (b.certification && b.certification.tokens_per_sec) || 0;
+    }
+    // el builds an element with attributes and children (strings become text nodes),
+    // so interpolated fleet values are set via textContent/dataset — never spliced
+    // into an HTML/attribute string — and can't inject markup.
+    function el(tag, attrs, children) {
+      const node = document.createElement(tag);
+      if (attrs) for (const k in attrs) {
+        if (k === 'class') node.className = attrs[k];
+        else if (k === 'dataset') for (const d in attrs[k]) node.dataset[d] = attrs[k][d];
+        else node.setAttribute(k, attrs[k]);
+      }
+      (children || []).forEach(c => node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c));
+      return node;
+    }
+    function buildTryPanel(id) {
+      const prompt = el('textarea', {id: 'prompt-' + id, placeholder: 'Send a test message to ' + id}, ['Say hello in one short sentence.']);
+      const system = el('input', {id: 'system-' + id, value: 'You are a concise assistant.', placeholder: 'System prompt'});
+      const thinking = el('select', {id: 'thinking-' + id});
+      [['off','thinking off'],['auto','thinking auto'],['on','thinking on']].forEach(o => thinking.appendChild(el('option', {value: o[0]}, [o[1]])));
+      const tokens = el('input', {id: 'tokens-' + id, type: 'number', value: '256', min: '1', max: '4096'});
+      const sendBtn = el('button', {}, ['Send']);
+      sendBtn.addEventListener('click', () => sendTest(id));
+      const grid = el('div', {class: 'grid'}, [system, thinking, tokens, sendBtn]);
+      const panel = el('div', {class: 'try', id: 'try-' + id}, [
+        prompt, grid,
+        el('div', {class: 'muted', id: 'meta-' + id}),
+        el('div', {class: 'output', id: 'out-' + id}),
+      ]);
+      const td = el('td', {colspan: '9', style: 'padding:0;border-bottom:1px solid #252b36'}, [panel]);
+      return el('tr', {}, [td]);
+    }
+    function renderBackends(list) {
+      const body = document.getElementById('backends-body');
+      // Preserve any existing Try panel rows across the 10s re-render so an open
+      // panel (and its in-flight streamed output) survives a refresh; the row
+      // CELLS are rebuilt with fresh status/load, but the panel DOM is reused.
+      const keptPanels = {};
+      body.querySelectorAll('.try').forEach(p => {
+        const row = p.closest('tr');
+        if (row && p.id.startsWith('try-')) keptPanels[p.id.slice(4)] = row;
+      });
+      body.innerHTML = '';
+      if (!list.length) {
+        body.appendChild(el('tr', {}, [el('td', {colspan: '9', class: 'muted'}, ['No backends registered.'])]));
+      }
+      list.forEach(b => {
+        const tr = el('tr', {class: b.status || ''});
+        const statusTd = el('td', {class: 'status'}, [String(b.status || '')]);
+        if (b.certification && b.certification.last_error) statusTd.appendChild(el('div', {class: 'muted'}, [b.certification.last_error]));
+        tr.appendChild(statusTd);
+        const idTd = el('td', {}, [el('code', {}, [String(b.id || '')])]);
+        idTd.appendChild(el('div', {class: 'muted'}, [String(b.url || '')]));
+        tr.appendChild(idTd);
+        tr.appendChild(el('td', {}, [String(b.model || '')]));
+        tr.appendChild(el('td', {}, [(b.quality != null ? b.quality : 0) + '%']));
+        const speedTd = el('td', {}, [tokensPerSecOf(b).toFixed(1) + ' tok/s']);
+        speedTd.appendChild(el('div', {class: 'muted'}, ['score ' + speedScoreOf(b)]));
+        tr.appendChild(speedTd);
+        tr.appendChild(el('td', {}, [(b.context_k || 0) + 'k']));
+        tr.appendChild(el('td', {}, [(b.active_requests || 0) + ' / ' + (b.max_concurrency || 0)]));
+        const feats = el('div', {class: 'features'});
+        (b.features || []).forEach(f => feats.appendChild(el('span', {class: 'pill'}, [String(f)])));
+        if (b.thinking) feats.appendChild(el('span', {class: 'pill'}, ['thinking']));
+        tr.appendChild(el('td', {class: 'wide'}, [feats]));
+        const tryBtn = el('button', {}, ['Try']);
+        tryBtn.addEventListener('click', () => toggleTry(b.id));
+        const certBtn = el('button', {class: 'secondary'}, ['Certify']);
+        certBtn.addEventListener('click', () => certify(b.id));
+        tr.appendChild(el('td', {}, [tryBtn, certBtn]));
+        body.appendChild(tr);
+        body.appendChild(keptPanels[b.id] || buildTryPanel(b.id));
+      });
+    }
+    // syncLogTabs adds a tab button per backend (the "All" tab is static); it only
+    // appends newly-seen IDs so an in-progress log view isn't disrupted on refresh.
+    function syncLogTabs(list) {
+      const tabs = document.getElementById('log-tabs');
+      list.forEach(b => {
+        if (knownBackendIDs.indexOf(b.id) !== -1) return;
+        knownBackendIDs.push(b.id);
+        const btn = el('button', {class: 'secondary', id: 'tab-' + b.id}, [String(b.id)]);
+        btn.addEventListener('click', () => { logOffset = 0; loadLogs(b.id); });
+        tabs.appendChild(btn);
+      });
+    }
+    async function refreshBackends() {
+      let res;
+      try { res = await fetch('/backends', {headers: headers()}); } catch (_) { return; }
+      if (!res.ok) {
+        const body = document.getElementById('backends-body');
+        body.innerHTML = '';
+        body.appendChild(el('tr', {}, [el('td', {colspan: '9', class: 'muted'}, [await res.text()])]));
+        return;
+      }
+      const data = await res.json();
+      const list = data.backends || [];
+      renderBackends(list);
+      syncLogTabs(list);
+    }
+    // Initial load + auto-refresh every 10s.
+    refreshBackends();
+    setInterval(refreshBackends, 10000);
+    loadLogs('');
+  </script>
+</body>
+</html>

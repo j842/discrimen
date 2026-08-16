@@ -307,6 +307,7 @@ OpenAI server should not have to learn a private vocabulary:
 | `model: "<id from /v1/models>"` | Serve this model. Every endpoint running it stays a candidate, so a named model still load-balances. 404 if nothing serves it |
 | `model: "<group name>"` | Serve from this group's preference list, falling back to automatic routing if no member qualifies |
 | `model: "<endpoint id>"` | Same, narrowed to one endpoint |
+| `model: "expert"` | Ask every model, then have the best one write the final answer. See below |
 | `reasoning_effort` absent | Automatic. The reasoning classifier decides |
 | `reasoning_effort: "none"` | Thinking off |
 | `reasoning_effort: <level>` | Thinking on at that level, hard-filtered to thinking-capable endpoints |
@@ -329,6 +330,43 @@ themselves. The router translates to the endpoint's measured dialect on every
 route. Setting the chat-template gate directly remains supported as a low-level
 escape hatch and wins over everything above, at the cost of switching the
 automatic decision off.
+
+## expert
+
+`"model": "expert"` is a reserved name that routes differently from everything
+else here. Instead of choosing one endpoint, it asks **every model in the fleet
+the same question**, then hands all the answers to the highest-measured-quality
+endpoint and asks it to write the final answer.
+
+```json
+{"model": "expert", "messages": [{"role": "user", "content": "..."}]}
+```
+
+You get back an ordinary chat completion containing that final answer and
+nothing else. No panel, no candidate list, no working: the members' reasoning
+traces are stripped before the synthesiser ever sees them, and stripped again
+from the reply. If you asked for a stream, the synthesis is streamed.
+
+One member per distinct model, not per endpoint, so three endpoints running the
+same model count once. A member that errors, is saturated, or comes back empty
+is simply absent. With one usable answer it is returned directly, because there
+is nothing to gather. With none, 503.
+
+Two things are worth knowing before you point traffic at it.
+
+**It costs what it sounds like.** N generations plus one synthesis, every time.
+Per-key budgets apply and the reported `usage` is the true total across the
+whole panel, so it is metered honestly rather than cheaply.
+
+**Tool calls cannot be merged.** A request carrying `tools`, or one arriving
+mid-tool-loop, silently falls back to normal automatic routing and says so with
+`X-LLM-Expert: fallback=tools`. A synthesiser inventing one tool call out of
+five disagreeing ones would be worse than any single model's answer.
+
+The route reports itself in headers: `X-LLM-Route: expert` and
+`X-LLM-Expert: members=3,skipped=1,synth=<endpoint id>`. It deliberately does
+not look like a router-chosen tier, so the online adapter and the background
+judge learn nothing from it.
 
 ## Endpoints
 

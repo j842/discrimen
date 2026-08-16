@@ -46,20 +46,24 @@ type previewCandidate struct {
 }
 
 type previewResponse struct {
-	Route         string             `json:"route"`
-	WouldServe    string             `json:"would_serve"`
-	TargetQuality int                `json:"target_quality"`
-	Difficulty    *float64           `json:"difficulty,omitempty"`
-	Reasoning     *float64           `json:"reasoning,omitempty"`
-	AdapterBias   float64            `json:"adapter_bias"`
-	Classified    bool               `json:"classified"`
-	Thinking      previewThinking    `json:"thinking"`
-	Job           previewJob         `json:"job"`
-	Session       previewSession     `json:"session"`
-	Group         *previewGroup      `json:"group,omitempty"`
-	Candidates    []previewCandidate `json:"candidates"`
-	Rejected      []rejection        `json:"rejected"`
-	Notes         []string           `json:"notes,omitempty"`
+	Route         string          `json:"route"`
+	WouldServe    string          `json:"would_serve"`
+	TargetQuality int             `json:"target_quality"`
+	Difficulty    *float64        `json:"difficulty,omitempty"`
+	Reasoning     *float64        `json:"reasoning,omitempty"`
+	AdapterBias   float64         `json:"adapter_bias"`
+	Classified    bool            `json:"classified"`
+	Thinking      previewThinking `json:"thinking"`
+	Job           previewJob      `json:"job"`
+	Session       previewSession  `json:"session"`
+	Group         *previewGroup   `json:"group,omitempty"`
+	// Candidates and Rejected are the ADMIN half — the fleet, worker by worker.
+	// Omitted entirely for a client rather than sent empty, because an empty list
+	// would read as "nothing qualified", which is a different answer. See
+	// handleRoutePreview.
+	Candidates []previewCandidate `json:"candidates,omitempty"`
+	Rejected   []rejection        `json:"rejected,omitempty"`
+	Notes      []string           `json:"notes,omitempty"`
 }
 
 // previewGroup is how a named group resolved. A group that silently fell back
@@ -100,14 +104,26 @@ func (r *Router) handleRoutePreview(w http.ResponseWriter, req *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	// CLIENT scope, deliberately. The preview explains one caller's own routing
-	// decision and discloses a superset of /v1/models (worker ids, quality, load)
-	// but no URLs, no credentials and nobody else's traffic — and /v1/models has
-	// to stay client-scoped anyway, so moving this would buy very little.
+	// CLIENT scope, with the fleet detail held back to admin.
+	//
+	// The endpoint exists so a caller can understand what its OWN request would
+	// do, and that answer — the decision, the classification, the tier, the
+	// thinking mode, whether a named group fell back — tells them nothing about
+	// the estate they could not learn from the response headers of the request
+	// itself. The candidate and rejection lists are a different thing entirely:
+	// every worker id, alive or not, with its quality and its load, to anyone
+	// holding any client token. That is the inventory moving GET /backends to
+	// admin scope was meant to stop handing out, and X-LLM-Backend-ID was closed
+	// for the same reason (see refusePin).
 	ident, ok := r.requireClient(w, req)
 	if !ok {
 		return
 	}
+	// Asked through adminAuthenticated rather than off ident, so the browser
+	// session cookie counts as well as an admin bearer key — the same two
+	// credentials requireAdmin accepts, which is what makes this good for
+	// debugging from the dashboard.
+	full := r.adminAuthenticated(req)
 	body, err := readRequestBody(w, req)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "read request: %s", err)
@@ -148,10 +164,12 @@ func (r *Router) handleRoutePreview(w http.ResponseWriter, req *http.Request) {
 		writeUnavailable(w, r.retryAfterUnavailable(), err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, r.renderPreview(chatReq, plan, budget))
+	writeJSON(w, http.StatusOK, r.renderPreview(chatReq, plan, budget, full))
 }
 
-func (r *Router) renderPreview(chatReq *ChatRequest, plan *routePlan, budget time.Duration) previewResponse {
+// renderPreview turns a plan into the preview body. full=false is the client
+// view: the same decision, without the worker-by-worker inventory behind it.
+func (r *Router) renderPreview(chatReq *ChatRequest, plan *routePlan, budget time.Duration, full bool) previewResponse {
 	resp := previewResponse{
 		Route:         plan.route,
 		TargetQuality: plan.target,
@@ -167,10 +185,12 @@ func (r *Router) renderPreview(chatReq *ChatRequest, plan *routePlan, budget tim
 			OutputTokens: plan.job.outputTokens,
 			DeadlineMS:   int(budget.Milliseconds()),
 		},
-		Rejected: plan.rejected,
 	}
-	if resp.Rejected == nil {
-		resp.Rejected = []rejection{}
+	if full {
+		resp.Rejected = plan.rejected
+		if resp.Rejected == nil {
+			resp.Rejected = []rejection{}
+		}
 	}
 	if plan.cl != nil {
 		d, rs := plan.cl.difficulty, plan.cl.reasoning
@@ -182,6 +202,11 @@ func (r *Router) renderPreview(chatReq *ChatRequest, plan *routePlan, budget tim
 				"(no embeddings worker, classifier not ready, or no user turn to classify)")
 	}
 	if plan.group.name != "" {
+		// The group stays in the client view, members included. It is not fleet
+		// inventory: it is the operator's definition of a name the CALLER used, it
+		// lists what the group asks for rather than what is registered (a member
+		// that was never deployed is still listed), and without it "fell back" is a
+		// verdict with nothing behind it.
 		g := previewGroup{Name: plan.group.name, Member: plan.group.member, Fallback: plan.group.fallback}
 		if stored, ok := r.groups.lookup(plan.group.name); ok {
 			g.Members = stored.Members
@@ -202,35 +227,42 @@ func (r *Router) renderPreview(chatReq *ChatRequest, plan *routePlan, budget tim
 		}
 	}
 
-	for _, b := range plan.candidates {
-		prefill := prefillSeconds(b, plan.job.promptTokens)
-		incumbent := sessionIncumbent(b, plan.job)
-		if incumbent {
-			prefill *= 1 - sessionPrefillDiscount
-		}
-		decode := 0.0
-		if tps := liveTPS(b); tps > 0 {
-			decode = float64(plan.job.outputTokens) / tps
-		}
-		resp.Candidates = append(resp.Candidates, previewCandidate{
-			ID:              b.ID,
-			Model:           b.Model,
-			Quality:         b.Quality,
-			AboveBar:        plan.target <= 0 || b.Quality >= plan.target,
-			ExpectedSeconds: round3(expectedLatency(b, plan.job)),
-			PrefillSeconds:  round3(prefill),
-			DecodeSeconds:   round3(decode),
-			ObservedTPS:     round3(b.ObservedTPS),
-			ContextK:        b.ContextK,
-			ActiveRequests:  b.ActiveRequests,
-			MaxConcurrency:  b.MaxConcurrency,
-			Full:            isFull(b),
-			Thinking:        b.Thinking,
-			Incumbent:       incumbent,
-		})
+	// The decision itself, which every caller gets: the worker their request
+	// would land on is the one X-LLM-Backend-ID would name if they sent it.
+	if len(plan.candidates) > 0 {
+		resp.WouldServe = plan.candidates[0].ID
 	}
-	if len(resp.Candidates) > 0 {
-		resp.WouldServe = resp.Candidates[0].ID
+	if full {
+		for _, b := range plan.candidates {
+			prefill := prefillSeconds(b, plan.job.promptTokens)
+			incumbent := sessionIncumbent(b, plan.job)
+			if incumbent {
+				prefill *= 1 - sessionPrefillDiscount
+			}
+			decode := 0.0
+			if tps := liveTPS(b); tps > 0 {
+				decode = float64(plan.job.outputTokens) / tps
+			}
+			resp.Candidates = append(resp.Candidates, previewCandidate{
+				ID:              b.ID,
+				Model:           b.Model,
+				Quality:         b.Quality,
+				AboveBar:        plan.target <= 0 || b.Quality >= plan.target,
+				ExpectedSeconds: round3(expectedLatency(b, plan.job)),
+				PrefillSeconds:  round3(prefill),
+				DecodeSeconds:   round3(decode),
+				ObservedTPS:     round3(b.ObservedTPS),
+				ContextK:        b.ContextK,
+				ActiveRequests:  b.ActiveRequests,
+				MaxConcurrency:  b.MaxConcurrency,
+				Full:            isFull(b),
+				Thinking:        b.Thinking,
+				Incumbent:       incumbent,
+			})
+		}
+	} else {
+		resp.Notes = append(resp.Notes,
+			"per-worker candidate and rejection detail is admin-only; this is the decision for this request")
 	}
 	// The ranked head is only the FIRST choice: acquisition spills past a
 	// saturated front-runner, and a bounded preference may hold the request

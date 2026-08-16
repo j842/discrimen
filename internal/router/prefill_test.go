@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -129,26 +130,81 @@ func TestPrefillProbe(t *testing.T) {
 }
 
 // The filler is what the probe actually prefills, so it has to be long enough to clear
-// minPrefillTokens on a real tokeniser and varied enough not to flatter a prefix cache.
+// minPrefillTokens on a real tokeniser and — the property that actually matters — carry
+// nothing a worker's prompt cache can match. The old closed-vocabulary filler passed a
+// "words don't repeat adjacently" check and was still served 619/623 from cache.
 func TestPrefillFiller(t *testing.T) {
 	s := prefillFiller(prefillProbeTokens, 0)
-	words := len(strings.Fields(s))
-	if words < prefillProbeTokens/2 {
-		t.Errorf("filler has %d words, too short to reach %d tokens", words, prefillProbeTokens)
+	f := strings.Fields(s)
+
+	// Hex words run ~2.4 tokens each, so the word count is lower than a dictionary
+	// filler's for the same token target. Assert on the ESTIMATE, not on raw words.
+	if est := float64(len(f)) * 2.0; est < float64(prefillProbeTokens)*0.8 {
+		t.Errorf("filler has %d words (~%.0f tokens), too short to reach %d", len(f), est, prefillProbeTokens)
 	}
 	if s != prefillFiller(prefillProbeTokens, 0) {
 		t.Error("filler is not deterministic — workers would be measured on different text")
 	}
-	// A run of identical words would compress an MoE's routing and defeat the point.
-	f := strings.Fields(s)
-	same := 0
-	for i := 1; i < len(f); i++ {
-		if f[i] == f[i-1] {
-			same++
+
+	// Every word unique: a repeated word is a span some cache can match, and the point
+	// of the filler is that there is nothing to match.
+	seen := map[string]bool{}
+	dupes := 0
+	for _, w := range f {
+		if seen[w] {
+			dupes++
+		}
+		seen[w] = true
+	}
+	if dupes > len(f)/100 {
+		t.Errorf("%d/%d filler words repeat — a closed vocabulary is what let the cache match the last one", dupes, len(f))
+	}
+
+	// Different salts must share no long span, or sample 2 of a probe re-prefills
+	// sample 1's KV and best-of-N selects the fabrication.
+	a, b := strings.Fields(prefillFiller(prefillProbeTokens, 1)), strings.Fields(prefillFiller(prefillProbeTokens, 2))
+	common := 0
+	for i := 0; i < len(a) && i < len(b) && a[i] == b[i]; i++ {
+		common++
+	}
+	if common > 2 {
+		t.Errorf("salts 1 and 2 share a %d-word prefix — the cache will match it", common)
+	}
+	inA := map[string]bool{}
+	for _, w := range a {
+		inA[w] = true
+	}
+	overlap := 0
+	for _, w := range b {
+		if inA[w] {
+			overlap++
 		}
 	}
-	if same > len(f)/10 {
-		t.Errorf("%d/%d adjacent words repeat — filler is too uniform", same, len(f))
+	if overlap > len(b)/100 {
+		t.Errorf("salts 1 and 2 share %d/%d words — different salts must not reuse a vocabulary", overlap, len(b))
+	}
+}
+
+// A sample the worker served from its cache measures the cache, and because prefillProbe
+// takes the BEST of its samples one cached sample wins outright. Discarding it is the
+// only safe handling: a missing prefill rate degrades to the flat TTFT average, while a
+// fabricated one actively misroutes long prompts to the worker least able to serve them.
+func TestPrefillProbeRejectsCachedSample(t *testing.T) {
+	cases := []struct {
+		name          string
+		prompt, cache float64
+		wantReject    bool
+	}{
+		{"fully cached", 623, 619, true},
+		{"half cached", 1024, 512, true},
+		{"system-prefix only", 1024, 18, false},
+		{"uncached", 1024, 0, false},
+	}
+	for _, c := range cases {
+		got := c.cache > c.prompt*maxPrefillCachedFraction
+		if got != c.wantReject {
+			t.Errorf("%s: cached %.0f of %.0f -> reject=%v, want %v", c.name, c.cache, c.prompt, got, c.wantReject)
+		}
 	}
 }
 
@@ -443,5 +499,53 @@ func TestBackfillCachedProfileThinkingDialect(t *testing.T) {
 	r.backfillCachedProfile("w", b, prof)
 	if probes != before {
 		t.Errorf("re-probed a profile that already carried a dialect: %d extra requests", probes-before)
+	}
+}
+
+// The prefill probe's filler used to be salted with the sample index alone, so
+// every run sent byte-identical text and any worker with a prompt cache answered
+// the second run from cache. Best-of-N then selected that fabricated sample.
+// Measured on a live worker: 2725 tok/s against a real 214.
+//
+// This asserts the property that was missing — two runs never reuse a salt — at
+// the level the bug lived at, the bytes on the wire.
+func TestPrefillProbeSendsFreshTextEveryRun(t *testing.T) {
+	var mu sync.Mutex
+	seen := map[string]int{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		body, _ := io.ReadAll(req.Body)
+		mu.Lock()
+		seen[string(body)]++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		// prompt_tokens has to clear minPrefillTokens or the sample is discarded
+		// before it can be counted.
+		fmt.Fprint(w, `{"choices":[{"message":{"content":"ok"}}],`+
+			`"usage":{"prompt_tokens":1024,"completion_tokens":1,"total_tokens":1025}}`)
+	}))
+	defer srv.Close()
+
+	r := &Router{cfg: &Config{}, registry: newTestRegistry(), client: srv.Client()}
+	b := &Backend{BackendRegistration: BackendRegistration{ID: "w", URL: srv.URL, Model: "m"}}
+
+	const runs = 3
+	for i := 0; i < runs; i++ {
+		if _, err := r.prefillProbe(b); err != nil {
+			t.Fatalf("run %d: %v", i, err)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got := len(seen); got != runs*prefillProbeSamples {
+		for body, n := range seen {
+			if n > 1 {
+				t.Errorf("the same %d-byte prompt was sent %d times — a worker with a "+
+					"prompt cache would serve the repeats from cache and report "+
+					"fabricated prefill", len(body), n)
+			}
+		}
+		t.Fatalf("%d distinct prompts across %d runs of %d samples; want %d",
+			got, runs, prefillProbeSamples, runs*prefillProbeSamples)
 	}
 }

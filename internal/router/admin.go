@@ -149,7 +149,9 @@ func (r *Router) handleAdminProviderByID(w http.ResponseWriter, req *http.Reques
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, publicBackends([]*Backend{existing})[0])
 	case http.MethodPatch, http.MethodPut:
-		r.updateProvider(w, req, id)
+		// The live row goes with the edit, so a persist that fails has something
+		// to put back — see saveProvider.
+		r.updateProvider(w, req, existing)
 	case http.MethodDelete:
 		r.deleteProvider(w, req, id)
 	default:
@@ -194,24 +196,26 @@ func (r *Router) createProvider(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	// Seeding runs AFTER normalisation so it sees the settled provider name.
-	r.saveProvider(w, req, reg, http.StatusCreated, seedPrices(&reg, spec.stated()))
+	r.saveProvider(w, req, reg, nil, http.StatusCreated, seedPrices(&reg, spec.stated()))
 }
 
-func (r *Router) updateProvider(w http.ResponseWriter, req *http.Request, id string) {
+func (r *Router) updateProvider(w http.ResponseWriter, req *http.Request, existing *Backend) {
 	spec, err := decodeProviderSpec(w, req)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json: %s", err)
 		return
 	}
+	id := existing.ID
 	// Patch the operator's own DECLARED registration, not the live row. The live
 	// row carries whatever the profiler measured into the fields the operator left
 	// blank, and folding those back in would silently promote a measurement to a
 	// declaration — after one edit the probe could never refine them again.
-	reg, ok := r.registry.declaredRegistration(id)
+	declared, ok := r.registry.declaredRegistration(id)
 	if !ok {
 		writeJSON(w, http.StatusNotFound, validationError{Message: fmt.Sprintf("provider %q not found", id)})
 		return
 	}
+	reg := declared
 	spec.applyTo(&reg)
 	reg.ID = id // the path owns the identity; renaming is a delete plus a create
 	reg.Source = sourceManual
@@ -226,17 +230,36 @@ func (r *Router) updateProvider(w http.ResponseWriter, req *http.Request, id str
 		})
 		return
 	}
-	r.saveProvider(w, req, reg, http.StatusOK, seedPrices(&reg, spec.stated()))
+	// What the request named is only part of what has been settled. This edit has
+	// no reason to mention a price — the dashboard sends only the fields that
+	// changed, and a zero is absent from the row it filled its form from — so the
+	// fields the last write already settled count as stated too, or an explicit 0
+	// would be re-seeded away on the first unrelated edit. See alreadySeeded.
+	stated := spec.stated().or(alreadySeeded(declared, reg))
+	r.saveProvider(w, req, reg, existing, http.StatusOK, seedPrices(&reg, stated))
 }
 
 // saveProvider commits a manual row: registry, persistence, certification.
-func (r *Router) saveProvider(w http.ResponseWriter, req *http.Request, reg BackendRegistration, status int, seeded []string) {
+//
+// prev is the row as it stood before this write, or nil on a create. It is what
+// a failed persist is rolled back to — see restore for why the two cases cannot
+// share one undo.
+func (r *Router) saveProvider(w http.ResponseWriter, req *http.Request, reg BackendRegistration, prev *Backend, status int, seeded []string) {
 	backend, changed := r.registry.upsert(reg)
 	if err := r.logs.SaveBackendRegistration(req.Context(), reg); err != nil {
 		// Unlike a beacon row, nothing will re-post this one: a failed write here
 		// means the row disappears on the next restart, so it is an error the
 		// operator has to see rather than a log line.
-		r.registry.remove(reg.ID)
+		//
+		// An EDIT undoes differently. Its pre-edit row is still on disk and still
+		// correct, so removing it would take a live provider out of routing and
+		// /v1/models until a restart brought it back — a much larger failure than
+		// the edit that was refused.
+		if prev != nil {
+			r.registry.restore(prev)
+		} else {
+			r.registry.remove(reg.ID)
+		}
 		writeJSON(w, http.StatusInternalServerError, validationError{Message: fmt.Sprintf("persist provider: %s", err)})
 		return
 	}

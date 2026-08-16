@@ -1234,7 +1234,8 @@ func (r *Router) handleDashboard(w http.ResponseWriter, req *http.Request) {
 	// GET / requires no auth, so the server render must disclose NOTHING about the
 	// fleet — no IDs, URLs, models, quality or load. The page is a static shell; the
 	// backend table and per-backend log tabs are populated CLIENT-SIDE from a
-	// token-gated /backends fetch (see renderBackends in dashboardTemplate).
+	// admin-gated /backends fetch (see renderBackends in dashboardTemplate),
+	// authenticated by the session cookie /admin/login sets.
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := dashboardTemplate.Execute(w, map[string]any{
 		"GeneratedAt": time.Now().Format(time.RFC3339),
@@ -1276,6 +1277,10 @@ func (r *Router) handleDebugBackendCertify(w http.ResponseWriter, req *http.Requ
 		writeJSON(w, http.StatusNotFound, validationError{Message: "backend not found"})
 		return
 	}
+	// An operator asking for this is saying they have fixed whatever was wrong, so
+	// a worker whose background profile was abandoned for aborting too often gets
+	// its full allowance back (see profileRetryMaxAttempts).
+	r.registry.clearProfileAborts(id)
 	go r.certifyBackend(id)
 	writeJSON(w, http.StatusAccepted, map[string]any{"status": "probing", "id": id})
 }
@@ -2826,6 +2831,13 @@ func profileRetryBackoff(aborts int) time.Duration {
 // scheduled, or 0 when it has given up on this registration.
 func (r *Router) scheduleProfileRetry(id string, cause error) time.Duration {
 	aborts := r.registry.noteProfileAbort(id)
+	if aborts == 0 {
+		// The row went away mid-profile (deleted, or replaced by a registration
+		// whose own certification is already running). Nothing to retry, and
+		// nothing left to hang the spend on but the log.
+		log.Printf("background profile %s aborted after its registration went away: %v", id, cause)
+		return 0
+	}
 	if aborts >= profileRetryMaxAttempts {
 		log.Printf("background profile %s aborted %d times in a row: %v — GIVING UP. The worker keeps its provisional quality; re-register it or POST /debug/backends/%s/certify once the endpoint is healthy",
 			id, aborts, cause, id)
@@ -2965,11 +2977,13 @@ func (r *Router) certifyBackend(id string) {
 			if err != nil {
 				// Worker likely blipped mid-profile. Keep the provisional profile
 				// (the worker stays routable) and retry on a timer — nothing else
-				// re-triggers a background profile for a ready backend.
-				log.Printf("background profile %s aborted: %v (keeping provisional; retrying in %s)", id, err, profileRetryDelay)
-				time.AfterFunc(profileRetryDelay, func() { r.certifyBackend(id) })
+				// re-triggers a background profile for a ready backend — but on a
+				// counter and a backoff, because a worker that fails this way every
+				// time fails it expensively (see profileRetryMaxAttempts).
+				r.scheduleProfileRetry(id, err)
 				return
 			}
+			r.registry.clearProfileAborts(id)
 			if !r.registry.applyProfileIfGen(id, gen, full) {
 				// The worker re-registered with new content (or was deleted) while
 				// we measured — these numbers describe the old generation. The new
@@ -3040,7 +3054,15 @@ func (r *Router) speedProbe(backend *Backend) (float64, int64, error) {
 		"max_tokens": 64,
 		"messages": []map[string]string{
 			{"role": "system", "content": "You are a concise benchmark assistant. /no_think"},
-			{"role": "user", "content": "Write exactly four short sentences about reliable local LLM routing."},
+			// The trailing tag defeats the worker's prompt cache the same way the
+			// prefill filler's salt does. It matters less here — the prompt is ~15
+			// tokens, so a cache hit saves almost no prefill — but a cached probe
+			// still returns an optimistic TTFT, and TTFT seeds the live estimate.
+			// Kept out of the instruction so it cannot change what is generated:
+			// decode rate is measured from the tokens this reply produces.
+			{"role": "user", "content": fmt.Sprintf(
+				"Write exactly four short sentences about reliable local LLM routing. [run %08x]",
+				nextProbeSalt())},
 		},
 		"chat_template_kwargs": map[string]bool{"enable_thinking": false},
 		// Exact token count in the final chunk — delta-counting under-reads MTP
@@ -3286,14 +3308,47 @@ func (r *Router) backfillCachedProfile(id string, backend *Backend, prof *Worker
 // least-corrupted estimate of what this worker does when it is the one being asked.
 const prefillProbeSamples = 3
 
+// probeSalt hands out a fresh salt for every probe run, so no two runs ever send
+// the same filler to the same worker.
+//
+// The salt used to be the sample index, 0/1/2. That varies the text WITHIN a run,
+// which is what best-of-N needs, and leaves it byte-identical BETWEEN runs — so
+// sample 0 of a re-certification is the same 1024 tokens sample 0 of the first
+// profile left sitting in the worker's cache. Measured on a live worker: 2725
+// tok/s against a real 214, a 13x overestimate, then cached as that worker's
+// prefill rate. Prefill is the primary term in expectedLatency, so that number
+// decides who gets every long prompt, and deadlineFilter believes it too.
+//
+// This is the defence that does not depend on the endpoint being honest. The
+// cached_tokens check in prefillProbeOnce is better when it fires, because it
+// catches a cache hit the salt failed to prevent, but it can only fire on an
+// endpoint that reports prompt_tokens_details.cached_tokens. Plenty do not, and
+// on those a silent cache hit is indistinguishable from fast hardware.
+//
+// Seeded randomly rather than from a counter, because a restart would otherwise
+// replay the same sequence into a cache that outlives the process.
+var probeSalt atomic.Uint32
+
+func init() {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		probeSalt.Store(uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3]))
+	}
+}
+
+// nextProbeSalt reserves prefillProbeSamples consecutive salts, so the samples of
+// one run cannot collide with the samples of the next.
+func nextProbeSalt() uint32 { return probeSalt.Add(prefillProbeSamples) }
+
 // prefillProbe measures prefill rate, taking the best of prefillProbeSamples runs.
 // Returns the last error only if EVERY sample failed.
 func (r *Router) prefillProbe(backend *Backend) (float64, error) {
 	best, lastErr := 0.0, error(nil)
+	base := nextProbeSalt()
 	for i := 0; i < prefillProbeSamples; i++ {
-		// Distinct salt per sample: identical text would hit the worker's prompt
-		// cache and hand best-of-N a fabricated winner. See prefillFiller.
-		rate, err := r.prefillProbeOnce(backend, uint32(i))
+		// Distinct salt per sample AND per run: identical text hits the worker's
+		// prompt cache and hands best-of-N a fabricated winner. See prefillFiller.
+		rate, err := r.prefillProbeOnce(backend, base+uint32(i))
 		if err != nil {
 			lastErr = err
 			continue
@@ -3350,15 +3405,44 @@ func (r *Router) prefillProbeOnce(backend *Backend, salt uint32) (float64, error
 	r.meterProfileUsage(backend.ID, raw) // dials the endpoint itself, so it meters itself
 	// Trust the worker's OWN prompt_tokens rather than a word-count estimate:
 	// tokenisers differ enough between model families to bias the rate systematically.
-	promptTokens := 0.0
+	promptTokens, cachedTokens := 0.0, 0.0
 	if u, ok := raw["usage"].(map[string]any); ok {
 		promptTokens, _ = u["prompt_tokens"].(float64)
+		if d, ok := u["prompt_tokens_details"].(map[string]any); ok {
+			cachedTokens, _ = d["cached_tokens"].(float64)
+		}
 	}
 	if promptTokens < minPrefillTokens || elapsed <= 0 {
 		return 0, fmt.Errorf("unusable sample: prompt_tokens=%.0f elapsed=%.3fs", promptTokens, elapsed)
 	}
+	// A sample the worker served from its prompt cache measures the cache, not the
+	// hardware, and must be DISCARDED rather than merely diluted — prefillProbe takes
+	// the best of its samples, so one cached sample wins outright.
+	//
+	// Varying the text is necessary but NOT sufficient, which is what the earlier fix
+	// assumed. Measured 2026-08-16 against a 284B CPU+GPU worker: two probe prompts
+	// built from different salts still came back with cached_tokens 619 of 623 prompt
+	// tokens and completed in 0.28s, reporting ~2200 tok/s. The same worker on the same
+	// day, given filler the cache could not match, measured 125-143 tok/s. The probe was
+	// capable of returning either number for identical hardware, which is a spread wider
+	// than any real hardware difference in the fleet.
+	//
+	// Reject rather than scale: a partially-cached sample's remaining prefill is not
+	// necessarily proportional to its uncached tokens, so correcting the rate would be a
+	// guess. If every sample is cached the probe reports an error and the caller keeps
+	// its previous estimate, which is the safe direction — a missing prefill rate falls
+	// back to the flat TTFT average, while a fabricated one actively misroutes.
+	if cachedTokens > promptTokens*maxPrefillCachedFraction {
+		return 0, fmt.Errorf("cached sample: %.0f of %.0f prompt tokens served from cache", cachedTokens, promptTokens)
+	}
 	return promptTokens / elapsed, nil
 }
+
+// maxPrefillCachedFraction is how much of a prefill probe's prompt may come from the
+// worker's cache before the sample is discarded. Not zero: llama-server reports a small
+// non-zero cached_tokens for the shared system-message prefix, which is a handful of
+// tokens against a 1024-token prompt and does not meaningfully flatter the rate.
+const maxPrefillCachedFraction = 0.10
 
 // prefillFiller builds roughly n tokens of non-repeating filler (~1.3 tokens per word
 // across common tokenisers). Repetitive text is a bad prefill sample: it compresses an
@@ -3373,20 +3457,36 @@ func (r *Router) prefillProbeOnce(backend *Backend, salt uint32) (float64, error
 // it every long prompt. (llama.cpp's own bench.sh carries the same warning about
 // cache_prompt; /v1/chat/completions has no equivalent switch, so vary the text.)
 //
-// Within one sample the sequence is deterministic, so a given salt yields identical
-// text on every worker and the fleet stays comparable.
+// A given salt yields identical text, but salts are no longer reused: nextProbeSalt
+// hands each run a fresh block, because a salt that repeats across runs is exactly
+// the cache hit this function exists to avoid. The fleet stays comparable anyway —
+// what has to match between workers is the number of prompt tokens, and the rate is
+// computed from the worker's OWN reported prompt_tokens rather than from an assumed
+// count, so a filler that tokenises a little differently costs nothing.
+//
+// A CLOSED VOCABULARY IS NOT ENOUGH, measured 2026-08-16. This function used to draw
+// from 24 Greek letter-names, so a new salt reordered the words but every token had
+// already been seen; llama-server matched almost the whole prompt anyway and reported
+// cached_tokens 619 of 623. Shuffling a small vocabulary defeats an exact-prefix cache
+// and not much else. The filler is therefore built from unique hex words, so no two
+// samples — and no two probes of the same worker, ever — share a matchable span. The
+// cached-token guard in prefillProbeOnce is the backstop for whatever this misses.
 func prefillFiller(n int, salt uint32) string {
-	words := []string{"alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta",
-		"theta", "iota", "kappa", "lambda", "mu", "nu", "xi", "omicron", "pi", "rho",
-		"sigma", "tau", "upsilon", "phi", "chi", "psi", "omega"}
 	var sb strings.Builder
 	seed := uint32(2166136261) + salt*2654435761
-	for i := 0; i < int(float64(n)/1.3); i++ {
+	// ~2.4 tokens per 8-hex-digit word across common BPE tokenisers, against the ~1.3
+	// of a dictionary word: high entropy costs more tokens per character, which is the
+	// point. Sized so the prompt still lands near n tokens.
+	for i := 0; i < int(float64(n)/2.4); i++ {
 		seed = seed*1664525 + 1013904223
 		if i > 0 {
 			sb.WriteByte(' ')
 		}
-		sb.WriteString(words[(seed>>16)%uint32(len(words))])
+		// Two rounds per word so consecutive words don't share a linear-congruential
+		// stride that a tokeniser could turn into a repeating pattern.
+		hi := seed
+		seed = seed*1664525 + 1013904223
+		fmt.Fprintf(&sb, "%04x%04x", hi>>16, seed>>16)
 	}
 	return sb.String()
 }
@@ -4419,6 +4519,46 @@ func (r *Registry) rejectedFields(id string) []string {
 	}
 	b.RejectedFields = live
 	return append([]string(nil), live...)
+}
+
+// noteProfileAbort counts one discarded background profile and returns the
+// running total for this registration.
+func (r *Registry) noteProfileAbort(id string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	b := r.backends[id]
+	if b == nil {
+		return 0
+	}
+	b.profileAborts++
+	return b.profileAborts
+}
+
+// clearProfileAborts forgets the aborted attempts after one finally worked.
+func (r *Registry) clearProfileAborts(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if b := r.backends[id]; b != nil {
+		b.profileAborts = 0
+	}
+}
+
+// setCheck updates ONE entry in a certified backend's check list without
+// disturbing the certification around it. The background profile is the caller
+// that needs it: it finishes long after finishCertification wrote the row, and
+// how that run went (or what it cost when it went nowhere) belongs on
+// /backends/{id} with the rest of the probe results rather than only in the log.
+func (r *Registry) setCheck(id, name string, c Check) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	b := r.backends[id]
+	if b == nil {
+		return
+	}
+	if b.Certification.Checks == nil {
+		b.Certification.Checks = map[string]Check{}
+	}
+	b.Certification.Checks[name] = c
 }
 
 func (r *Registry) setError(id string, lastError string) {

@@ -339,7 +339,7 @@ automatic decision off.
 | POST | `/v1/embeddings` | client | Embeddings |
 | GET | `/v1/models` | client | The model menu, aliases included |
 | GET | `/v1/models/{id}` | client | One model |
-| POST | `/v1/route-preview` | client | What this request *would* do. No generation, no state change |
+| POST | `/v1/route-preview` | client | What this request *would* do. No generation, no state change. An admin caller additionally gets the per-worker estimates and the reason each worker was excluded |
 | POST | `/v1/route-feedback` | client | Report a route outcome; feeds the adapter |
 | GET | `/health` | none | Health and `auto_routing` status |
 | POST | `/backends/register` | worker | Endpoint self-registration. Frozen interface |

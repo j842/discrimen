@@ -528,6 +528,61 @@ func TestIsFreeBackendAndTokenCost(t *testing.T) {
 	}
 }
 
+// TestIsFreeBackendNeedsADeclaredZero: zero prices only mean FREE where a zero
+// is a declaration. On a row an operator entered for someone else's endpoint it
+// is also what "nobody typed a number and the table publishes none" looks like,
+// and reading that as free puts a metered endpoint at the head of the free band,
+// holds requests for it through the free-first grace, hands it to the judge as
+// the free grader and never logs the paid spill.
+//
+// Which of the two a zero is can be read off the row, without storing anything:
+// every manual row is seeded on the way in, so a model the table DOES publish
+// could only be sitting at zero because someone overrode it.
+func TestIsFreeBackendNeedsADeclaredZero(t *testing.T) {
+	if len(prices().exact) == 0 {
+		t.Skip("prices.json is the empty snapshot — nothing is published, so every zero reads as unknown")
+	}
+	// A model the shipped table prices, and one nothing publishes.
+	const published, unpublished = "gpt-4o", "some-orgs-private-finetune-v3"
+	if _, ok := lookupPrice(published, "openai"); !ok {
+		t.Skipf("the embedded snapshot no longer publishes %s", published)
+	}
+	if _, ok := lookupPrice(unpublished, "whoever"); ok {
+		t.Fatalf("%q was meant to be unpublished", unpublished)
+	}
+	row := func(source, provider, model string, in, out float64) *Backend {
+		return &Backend{BackendRegistration: BackendRegistration{
+			ID: "row", URL: "http://row", Source: source, Provider: provider, Model: model,
+			InputPricePerMtok: in, OutputPricePerMtok: out,
+		}}
+	}
+	cases := []struct {
+		name string
+		b    *Backend
+		free bool
+	}{
+		// The fleet. Most of it is local, all of it declares nothing, and none of
+		// it may ever read as unpriced.
+		{"a local manual row", row(sourceManual, providerLocal, published, 0, 0), true},
+		{"a local beacon", row(sourceBeacon, providerLocal, published, 0, 0), true},
+		// /backends/register cannot express a vouched-for price, and every worker
+		// deployed on it posts none — so a beacon's zero stays a declaration
+		// whatever provider it names.
+		{"a beacon that names a provider", row(sourceBeacon, "openai", published, 0, 0), true},
+		{"an unnormalised row", row("", "", published, 0, 0), true},
+		// The operator overrode a price the table publishes: a deliberate zero.
+		{"a declared zero on a priced model", row(sourceManual, "openai", published, 0, 0), true},
+		// Nobody typed a number and nothing could have seeded one.
+		{"an unpriced metered row", row(sourceManual, "whoever", unpublished, 0, 0), false},
+		{"any declared price at all", row(sourceManual, "whoever", unpublished, 0, 15), false},
+	}
+	for _, c := range cases {
+		if got := isFreeBackend(c.b); got != c.free {
+			t.Errorf("%s: isFreeBackend = %v, want %v", c.name, got, c.free)
+		}
+	}
+}
+
 // TestRankByDifficultyPrefersFreeAboveTheBar is PLAN.md's P4 rule as a ranking:
 // among the workers that clear the quality bar the free one leads, even when a
 // paid one would finish sooner. Below the bar cost says nothing — the router has

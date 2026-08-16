@@ -81,6 +81,16 @@ func normalizeProviderFields(reg *BackendRegistration) {
 // isManualRow reports whether a row is operator-owned.
 func isManualRow(b *Backend) bool { return b != nil && b.Source == sourceManual }
 
+// isLocalProvider reports whether a provider name means "runs here, and nobody
+// bills for it". The empty string counts, because that is what
+// normalizeProviderFields settles it to — a caller that has not normalised yet
+// must not get a different answer from one that has, and every path that reaches
+// the price code can be reached before normalisation by a test.
+func isLocalProvider(provider string) bool {
+	p := strings.ToLower(strings.TrimSpace(provider))
+	return p == "" || p == providerLocal
+}
+
 // operatorDeclared is the set of values an OPERATOR entered by hand on this row,
 // or the zero registration when the row is a beacon (which owns nothing).
 //
@@ -130,6 +140,63 @@ func (r *Registry) declaredRegistration(id string) (BackendRegistration, bool) {
 	return reg, true
 }
 
+// alreadySeeded reports the price and context fields a row's STORED declaration
+// has already settled, so an edit that does not mention them does not hand them
+// back to the seeder.
+//
+// It exists because statedness cannot be read off a stored row — an operator's
+// explicit 0 and a field they left blank both persist as 0, and recording the
+// difference would need a field on BackendRegistration. It does not have to be
+// recorded, because seeding is deterministic in (model, provider): every field
+// the table could fill for that pair was filled the first time the row was
+// written. So while the pair is unchanged, a field still at zero is either one
+// the operator declared zero or one the table publishes nothing for, and
+// re-seeding it is a no-op at best and the bug at worst. (The exception is a
+// snapshot refreshed between the two writes, which could now publish a number it
+// did not before. That is a number the operator can still type, and it is not
+// worth being unable to say "free" for.)
+//
+// Point the row at a different model or provider and the pair is new, so nothing
+// has been settled for it and the row goes back to being seedable — which is the
+// one case re-seeding on an edit was ever useful for.
+func alreadySeeded(before, after BackendRegistration) priceStated {
+	if !strings.EqualFold(strings.TrimSpace(before.Model), strings.TrimSpace(after.Model)) {
+		return priceStated{}
+	}
+	if !strings.EqualFold(strings.TrimSpace(before.Provider), strings.TrimSpace(after.Provider)) {
+		return priceStated{}
+	}
+	return priceStated{Input: true, Output: true, Context: true}
+}
+
+// restore puts a row back exactly as it was — measurements, certification and
+// all. It has one caller: an EDIT whose persistence failed, where remove() would
+// be wrong. A create that cannot be written has nothing on disk to come back
+// from, so removing it is the truth; an edit that cannot be written leaves the
+// PRE-EDIT row on disk, so removing it takes a provider out of routing and
+// /v1/models until a restart resurrects it. Same shape as saveGroup.
+//
+// upsert would not do here: it takes a registration, so the row would come back
+// "probing" with every measured value cleared and its certification restarted —
+// a different row from the one the failed edit was supposed to leave untouched.
+func (r *Registry) restore(b *Backend) {
+	if b == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cp := cloneBackend(b)
+	r.backends[cp.ID] = cp
+	// Put the slot channel back on the pre-edit ceiling too, or an edit that
+	// changed max_concurrency would leave the failed value enforced.
+	if cp.MaxConcurrency > 0 {
+		r.syncSlotsLocked(cp.ID, cp.MaxConcurrency)
+	} else {
+		delete(r.slots, cp.ID)
+		delete(r.slotCap, cp.ID)
+	}
+}
+
 // manualRows returns the operator-owned rows, id-sorted, with api keys scrubbed.
 // The admin provider API lists these; beacon rows appear in /backends and are
 // managed by the worker that registered them.
@@ -145,17 +212,66 @@ func (r *Registry) manualRows() []*Backend {
 
 // ── Price ───────────────────────────────────────────────────────────────────
 //
-// Everything cost does to routing is below, and it is deliberately two
+// Everything cost does to routing is below, and it is deliberately three small
 // functions. Price is a declared fact about an endpoint, in the same category
 // as the `uncensored` tag, and NOT a routing knob: there is no cost weight to
 // tune, no price threshold to set and no budget mode. Free versus paid is a
-// binary derived from a declared price of zero, which is what makes the rule
+// binary derived from a DECLARED price of zero, which is what makes the rule
 // need no tuning — every local worker declares zero, so "prefer the free ones"
 // is already right on the fleet this router grew up on.
+//
+// The weight the word "declared" carries is the whole of isPriceUnknown: a row
+// that simply has no price is not the same claim as one that says it is free,
+// and only the second may be treated as free.
 
 // isFreeBackend reports whether an endpoint costs nothing per token.
+//
+// Zero prices only mean FREE where a zero is a DECLARATION, which is the word
+// the paragraph above is careful to use. On the fleet this router grew up on it
+// always is one: a local worker declares zero because nobody bills for the GPU
+// in the next room, and a beacon declares zero because /backends/register is
+// frozen and carries no price at all — so every worker deployed today is free,
+// and stays free, with nothing set.
+//
+// A row an operator entered by hand for SOMEONE ELSE'S endpoint is the case
+// where a zero is not necessarily a declaration. It is also what the row holds
+// when nobody typed a number and the model is absent from the embedded table,
+// and reading THAT as free is backwards in every direction at once: the endpoint
+// sorts to the head of the free band, the free-first grace holds requests for it,
+// the judge picks it as the free grader and grades against it forever, and the
+// paid-spill log line that would have told the operator never fires.
+//
+// The two are distinguishable without storing anything. Every manual row is
+// seeded on the way in and re-checked on every edit (see alreadySeeded), so a
+// model the table DOES publish could only be sitting at zero because someone
+// overrode it — that is a declaration, and it is how a free tier on a metered
+// endpoint stays sayable. A model it publishes nothing for was never seedable,
+// so its zero says nothing, and unknown has to fail towards paid: guessing wrong
+// that way costs a little latency, and guessing wrong the other way costs money.
 func isFreeBackend(b *Backend) bool {
-	return b == nil || (b.InputPricePerMtok <= 0 && b.OutputPricePerMtok <= 0)
+	if b == nil {
+		return true
+	}
+	if b.InputPricePerMtok > 0 || b.OutputPricePerMtok > 0 {
+		return false
+	}
+	return !isPriceUnknown(b)
+}
+
+// isPriceUnknown reports a row that costs something nobody has said what: an
+// operator-entered row on a provider that is not local, still at zero, for a
+// model the embedded table publishes no price for. See isFreeBackend.
+//
+// The table is only consulted for that last group. A local worker and a beacon
+// answer false on the fields already in hand, so the fleet never touches it.
+func isPriceUnknown(b *Backend) bool {
+	if b == nil || !isManualRow(b) || isLocalProvider(b.Provider) {
+		return false
+	}
+	if b.InputPricePerMtok > 0 || b.OutputPricePerMtok > 0 {
+		return false
+	}
+	return !publishesPrice(b.Model, b.Provider)
 }
 
 // tokenCost is what promptTokens in and outputTokens out cost at this row's

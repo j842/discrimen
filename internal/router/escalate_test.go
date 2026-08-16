@@ -228,6 +228,40 @@ func TestEscalationSkipsPinnedRequests(t *testing.T) {
 	}
 }
 
+// An open tool loop is the one place a second opinion cannot be asked for. The
+// better model never emitted the tool call this turn is answering, so it is
+// handed an orphan tool_call_id and usually refuses the request outright — the
+// caller pays for a second generation, on a paid endpoint, and still gets the
+// empty answer. Acquisition already spends sessionLockWait keeping the loop on
+// one worker; escalating would undo that in one hop.
+func TestEscalationSkipsAnOpenToolLoop(t *testing.T) {
+	var cheapHits, goodHits atomic.Int64
+	r, _ := escalationRouter(t, emptyAnswer, realAnswer, &cheapHits, &goodHits)
+
+	// The loop's earlier turns were served by "cheap", which is what makes the
+	// session locked rather than merely sticky.
+	key, _ := sessionKeyFor(convo(sys("agent"), usr("say hello")))
+	r.sessions.remember(key, "cheap")
+
+	rec := runChat(t, r, `{"model":"default","stream":false,"messages":[`+
+		`{"role":"system","content":"agent"},{"role":"user","content":"say hello"},`+
+		`{"role":"assistant","tool_calls":[{"id":"c1","function":{"name":"ls"}}]},`+
+		`{"role":"tool","tool_call_id":"c1","content":"a.txt"}]}`)
+
+	if goodHits.Load() != 0 {
+		t.Fatalf("a mid-tool-loop turn must not be escalated (better worker called %d times)", goodHits.Load())
+	}
+	if cheapHits.Load() != 1 {
+		t.Fatalf("the incumbent should have served exactly once, got %d", cheapHits.Load())
+	}
+	if got := rec.Header().Get("X-LLM-Escalated"); got != "" {
+		t.Fatalf("escalation happened inside a tool loop: %q", got)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("the original answer should still be returned, got %d", rec.Code)
+	}
+}
+
 func runChat(t *testing.T, r *Router, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
@@ -289,8 +323,14 @@ func TestEscalationRespectsADeclaredDeadline(t *testing.T) {
 
 // rejectedField is what decides whether a 400 is safe to retry around, so it is
 // graded directly against the shapes servers actually emit.
+//
+// The request carries a thinking gate and a reasoning level the ROUTER injected
+// (neither is in the client body) plus a temperature and a response_format the
+// CLIENT sent — which is the distinction the whole backstop turns on.
 func TestRejectedField(t *testing.T) {
-	const request = `{"model":"m","messages":[],"chat_template_kwargs":{"enable_thinking":true},"temperature":0.7}`
+	const request = `{"model":"m","messages":[],"chat_template_kwargs":{"enable_thinking":true},` +
+		`"reasoning_effort":"medium","temperature":0.7,"response_format":{"type":"json_schema"}}`
+	const client = `{"model":"m","messages":[],"temperature":0.7,"response_format":{"type":"json_schema"}}`
 	cases := []struct {
 		name   string
 		status int
@@ -316,15 +356,25 @@ func TestRejectedField(t *testing.T) {
 			`{"error":{"message":"Unrecognized request argument supplied: logit_bias"}}`, ""},
 		{"a field that carries the caller's meaning is never dropped", http.StatusBadRequest,
 			`{"error":{"message":"Unknown model: m","param":"model"}}`, ""},
+		// The defect this list was inverted for: the endpoint names a field the
+		// CLIENT sent, and the router has no business removing it however plainly
+		// the rejection is worded. Both spellings of the rejection, because a
+		// machine-readable param bypasses the prose scan entirely.
+		{"a client's response_format is not ours to drop, however the reject is worded", http.StatusBadRequest,
+			`{"error":{"message":"Unrecognized request argument supplied: response_format"}}`, ""},
+		{"…including when the endpoint names it in error.param", http.StatusBadRequest,
+			`{"error":{"message":"Unknown parameter.","param":"response_format","type":"invalid_request_error"}}`, ""},
+		{"…and a client's temperature likewise", http.StatusBadRequest,
+			`{"error":{"message":"Unrecognized request argument supplied: temperature"}}`, ""},
 		{"two candidates is ambiguous, and picking one would be a guess", http.StatusBadRequest,
-			`{"error":{"message":"unknown fields: chat_template_kwargs, temperature"}}`, ""},
+			`{"error":{"message":"unknown fields: chat_template_kwargs, reasoning_effort"}}`, ""},
 		{"a 500 is the endpoint's problem, not the request's", http.StatusInternalServerError,
 			`{"error":{"message":"Unrecognized request argument supplied: chat_template_kwargs"}}`, ""},
 		{"an unparseable error body", http.StatusBadRequest, `<html>unknown chat_template_kwargs</html>`, "chat_template_kwargs"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, ok := rejectedField(tc.status, []byte(tc.body), []byte(request))
+			got, ok := rejectedField(tc.status, []byte(tc.body), []byte(request), []byte(client))
 			if tc.want == "" {
 				if ok {
 					t.Fatalf("retried on %q", got)
@@ -380,16 +430,18 @@ func routerFor(t *testing.T, url string) *Router {
 	}
 }
 
-// TestStripAndRetry: an endpoint that refuses a field the router sent gets the
-// request again without it, once, and the verdict sticks so later requests never
-// pay for it again.
+// TestStripAndRetry: an endpoint that refuses a field the ROUTER injected gets
+// the request again without it, once, and — the retry having worked — the
+// verdict sticks so later requests never pay for it again.
 func TestStripAndRetry(t *testing.T) {
 	var seen []string
 	r := routerFor(t, strictWorker(t, "chat_template_kwargs", &seen))
-	// The client pins the kwargs gate itself (the escape hatch), so the router
-	// forwards it verbatim and the strict endpoint refuses the request.
+	// requirements is a router-only field: it is stripped on the way south, and
+	// what reaches the endpoint in its place is the chat_template_kwargs gate the
+	// router wrote from it. The client asked for no such field, which is what
+	// makes it the router's to withdraw.
 	body := `{"model":"m","messages":[{"role":"user","content":"say hello"}],` +
-		`"chat_template_kwargs":{"enable_thinking":false}}`
+		`"requirements":{"thinking":"off"}}`
 
 	rec := runChat(t, r, body)
 	if rec.Code != http.StatusOK {
@@ -457,7 +509,7 @@ func TestStripAndRetryIsBounded(t *testing.T) {
 	r := routerFor(t, srv.URL)
 
 	rec := runChat(t, r, `{"model":"m","messages":[{"role":"user","content":"hi"}],`+
-		`"chat_template_kwargs":{"enable_thinking":false},"top_k":40}`)
+		`"requirements":{"thinking":"off"},"top_k":40}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want the endpoint's own 400 passed through", rec.Code)
 	}
@@ -472,8 +524,115 @@ func TestStripAndRetrySkipsStreaming(t *testing.T) {
 	var seen []string
 	r := routerFor(t, strictWorker(t, "chat_template_kwargs", &seen))
 	runChat(t, r, `{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}],`+
-		`"chat_template_kwargs":{"enable_thinking":false}}`)
+		`"requirements":{"thinking":"off"}}`)
 	if len(seen) != 1 {
 		t.Fatalf("a streamed request must be forwarded once, got %d", len(seen))
+	}
+}
+
+// ── Defect: the backstop must never negotiate away the CALLER's request ─────
+
+// A field the client sent is not the router's to withdraw. The realistic case is
+// a json_schema response_format on a model that only does json_object: the
+// endpoint says 400, and stripping the field turns a visible rejection into
+// free-form prose returned with a 200 — for this request, and for every later
+// one to that backend, streamed ones included, where none of this code runs.
+func TestStripAndRetryNeverDropsAClientField(t *testing.T) {
+	var seen []string
+	r := routerFor(t, strictWorker(t, "response_format", &seen))
+	body := `{"model":"m","messages":[{"role":"user","content":"say hello"}],` +
+		`"response_format":{"type":"json_schema","json_schema":{"name":"r","schema":{}}}}`
+
+	rec := runChat(t, r, body)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want the endpoint's 400 handed straight to the caller: %s", rec.Code, rec.Body.String())
+	}
+	if len(seen) != 1 {
+		t.Fatalf("the request must be forwarded once and not retried without the field, got %d requests: %v", len(seen), seen)
+	}
+	if !strings.Contains(seen[0], "response_format") {
+		t.Errorf("the client's field never reached the endpoint: %s", seen[0])
+	}
+	if got := r.registry.get("strict").RejectedFields; len(got) != 0 {
+		t.Fatalf("a client's field was blacklisted for every later request: %v", got)
+	}
+	// And the next request still carries it, rather than being quietly answered
+	// as free-form prose.
+	seen = nil
+	runChat(t, r, body)
+	if len(seen) != 1 || !strings.Contains(seen[0], "response_format") {
+		t.Fatalf("a later request lost the client's response_format: %v", seen)
+	}
+}
+
+// The verdict is evidence, not a hypothesis: a retry that is refused just as
+// firmly proves nothing, and recording it anyway strips the field from every
+// later request on the strength of a guess.
+func TestStripAndRetryLearnsOnlyFromASuccessfulRetry(t *testing.T) {
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		body, _ := io.ReadAll(req.Body)
+		seen = append(seen, string(body))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		// The first rejection names the router's injected field; the retry, with
+		// that field gone, is refused for an unrelated reason.
+		if bytes.Contains(body, []byte("chat_template_kwargs")) {
+			_, _ = io.WriteString(w, `{"error":{"message":"Unrecognized request argument supplied: chat_template_kwargs"}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"error":{"message":"this model is not available on your plan"}}`)
+	}))
+	defer srv.Close()
+
+	r := routerFor(t, srv.URL)
+	rec := runChat(t, r, `{"model":"m","messages":[{"role":"user","content":"hi"}],`+
+		`"requirements":{"thinking":"off"}}`)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want a 400", rec.Code)
+	}
+	if len(seen) != 2 {
+		t.Fatalf("want the one bounded retry, got %d requests", len(seen))
+	}
+	if got := r.registry.get("strict").RejectedFields; len(got) != 0 {
+		t.Fatalf("learned %v from a retry that was refused as well", got)
+	}
+}
+
+// A learned verdict is about an endpoint as it was, and endpoints get
+// redeployed. Past the TTL the field goes out again to find out.
+func TestRejectedFieldVerdictIsRetested(t *testing.T) {
+	var seen []string
+	r := routerFor(t, strictWorker(t, "chat_template_kwargs", &seen))
+	body := `{"model":"m","messages":[{"role":"user","content":"hi"}],"requirements":{"thinking":"off"}}`
+
+	if rec := runChat(t, r, body); rec.Code != http.StatusOK {
+		t.Fatalf("first request = %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := r.registry.get("strict").RejectedFields; len(got) != 1 {
+		t.Fatalf("nothing was learned: %v", got)
+	}
+	// Within the TTL the verdict stands: one clean request, no rejection.
+	seen = nil
+	runChat(t, r, body)
+	if len(seen) != 1 {
+		t.Fatalf("a fresh verdict should cost one request, got %d", len(seen))
+	}
+
+	old := rejectedFieldTTL
+	rejectedFieldTTL = time.Nanosecond
+	defer func() { rejectedFieldTTL = old }()
+
+	seen = nil
+	if rec := runChat(t, r, body); rec.Code != http.StatusOK {
+		t.Fatalf("re-tested request = %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(seen) != 2 || !strings.Contains(seen[0], "chat_template_kwargs") {
+		t.Fatalf("an aged-out verdict must be re-tested by sending the field again, got %v", seen)
+	}
+	// Still refused, so it is learned again — with a fresh clock.
+	if got := r.registry.get("strict").RejectedFields; len(got) != 1 || got[0] != "chat_template_kwargs" {
+		t.Fatalf("a re-test that failed should keep the verdict: %v", got)
 	}
 }

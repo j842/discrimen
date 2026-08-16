@@ -402,10 +402,17 @@ func TestAdminProviderLocalRowIsNeverPriced(t *testing.T) {
 		t.Fatalf("a row that names no provider must settle to %q, got %v", providerLocal, row["provider"])
 	}
 	// omitempty: a free row carries no price field at all.
-	for _, field := range []string{"input_price_per_mtok", "output_price_per_mtok", "context_k"} {
+	for _, field := range []string{"input_price_per_mtok", "output_price_per_mtok"} {
 		if v, present := row[field]; present {
 			t.Errorf("a local worker was seeded a %s of %v from a reseller's listing", field, v)
 		}
+	}
+	// A seeded context window is the worse half: it lands in the declared
+	// registration, where applyProfileIfGen reads it as an operator's own value and
+	// stops overwriting it, so a reseller's window would outrank the one the worker
+	// actually serves.
+	if k, _ := row["context_k"].(float64); k != 0 {
+		t.Errorf("a local worker was seeded a context_k of %v from a reseller's listing", k)
 	}
 	if strings.Contains(rec.Body.String(), "seeded_from_price_data") {
 		t.Errorf("seeding ran on a local row: %s", rec.Body.String())
@@ -474,6 +481,17 @@ func TestAdminProviderDeclaredZeroSurvivesAnUnrelatedEdit(t *testing.T) {
 	}
 }
 
+// breakRegistrationPersistence makes SaveBackendRegistration fail and nothing
+// else. Closing the store would be blunter than the failure being modelled — a
+// transient write error — and would also take out the api key lookup the admin
+// gate runs, so the handler would answer 401 before it ever reached the write.
+func breakRegistrationPersistence(t *testing.T, r *Router) {
+	t.Helper()
+	if _, err := r.logs.db.ExecContext(t.Context(), `DROP TABLE backend_registrations`); err != nil {
+		t.Fatalf("drop backend_registrations: %v", err)
+	}
+}
+
 // TestAdminProviderFailedPersistOnEditKeepsTheLiveRow: saveProvider is shared by
 // create and update, and rolling back with remove() is only right for a create.
 // On an edit it deletes a row that is still on disk — so a transient write
@@ -493,11 +511,7 @@ func TestAdminProviderFailedPersistOnEditKeepsTheLiveRow(t *testing.T) {
 		t.Fatal("the row was not registered")
 	}
 
-	// A write that fails, from the only place a SQLite write can fail without a
-	// disk to break: the store is gone.
-	if err := r.logs.Close(); err != nil {
-		t.Fatalf("close log store: %v", err)
-	}
+	breakRegistrationPersistence(t, r)
 	rec = serveAdmin(r, adminReq(http.MethodPatch, "/admin/providers/p", `{"max_concurrency":2}`))
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("failed persist = %d, want 500: %s", rec.Code, rec.Body.String())
@@ -523,9 +537,7 @@ func TestAdminProviderFailedPersistOnEditKeepsTheLiveRow(t *testing.T) {
 // memory that no restart will bring back.
 func TestAdminProviderFailedPersistOnCreateRemovesTheRow(t *testing.T) {
 	r := adminRouter(t)
-	if err := r.logs.Close(); err != nil {
-		t.Fatalf("close log store: %v", err)
-	}
+	breakRegistrationPersistence(t, r)
 	rec := serveAdmin(r, adminReq(http.MethodPost, "/admin/providers",
 		`{"id":"p","url":"https://api.example.com/v1","model":"m","provider":"whoever","input_price_per_mtok":1}`))
 	if rec.Code != http.StatusInternalServerError {

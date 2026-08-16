@@ -234,6 +234,17 @@ type priceStated struct {
 	Context bool
 }
 
+// or widens a statement with another. An EDIT names only the fields the caller
+// chose to send, which is a subset of what the row has already settled — see
+// alreadySeeded, which supplies the rest.
+func (s priceStated) or(other priceStated) priceStated {
+	return priceStated{
+		Input:   s.Input || other.Input,
+		Output:  s.Output || other.Output,
+		Context: s.Context || other.Context,
+	}
+}
+
 // seedPrices fills the blanks on a registration from the embedded snapshot and
 // reports which fields it touched, so the admin API can say what it did rather
 // than silently inventing numbers on an operator's row.
@@ -246,6 +257,27 @@ func seedPrices(reg *BackendRegistration, stated priceStated) []string {
 }
 
 func seedPricesWith(t *priceTable, reg *BackendRegistration, stated priceStated) []string {
+	// A local row is not in this table and must never be seeded from any part of
+	// it. The snapshot is keyed by model NAME, and open weights are listed under
+	// every reseller that hosts them, so the basename index resolves a worker
+	// serving gpt-oss-120b to azure_ai's listing of the same weights — likewise
+	// deepseek-r1, qwen3-30b-a3b, gemma-3-27b-it. A price seeded from there is
+	// money nobody owes: it drops the worker out of the free-first band, changes
+	// the judge's free/paid split and starts consuming its paid allowance, all of
+	// which contradicts the flat statement above that a local worker costs
+	// nothing.
+	//
+	// The context window goes with it, for the same reason and one worse. A seeded
+	// value is stored in the registration, which is where applyProfileIfGen reads
+	// an operator's declarations from — so on a manual row it OUTRANKS the
+	// measurement, and a reseller's 128k would permanently override the 8k the
+	// llama.cpp in the next room actually serves. Over-declared context routes
+	// long prompts to a worker that truncates them, which is worse than not
+	// knowing: queryContextMeasured reads the real number off the endpoint on
+	// every certification as soon as the field is left blank.
+	if isLocalProvider(reg.Provider) {
+		return nil
+	}
 	entry, ok := t.lookup(reg.Model, reg.Provider)
 	if !ok {
 		return nil
@@ -294,6 +326,13 @@ type publishedPrice struct {
 func priceReference(rows []*Backend) map[string]publishedPrice {
 	out := map[string]publishedPrice{}
 	for _, b := range rows {
+		// Local rows are omitted for the reason seedPricesWith skips them: the
+		// table describes what a reseller charges for weights of that name, which
+		// is not a fact about the GPU in the next room. Reporting it here would
+		// have the page attribute a provenance that seeding can no longer have.
+		if isLocalProvider(b.Provider) {
+			continue
+		}
 		entry, ok := lookupPrice(b.Model, b.Provider)
 		if !ok {
 			continue
@@ -310,6 +349,17 @@ func priceReference(rows []*Backend) map[string]publishedPrice {
 		out[b.ID] = ref
 	}
 	return out
+}
+
+// publishesPrice reports whether the embedded table carries a per-token price
+// for this model, which is the question "would seeding have filled this in?".
+//
+// isFreeBackend asks it to tell an operator's deliberate zero from a price
+// nobody ever entered — see the reasoning there. `prices fetch` drops every row
+// with no per-token price, so a hit here always means a positive number.
+func publishesPrice(model, provider string) bool {
+	entry, ok := lookupPrice(model, provider)
+	return ok && (entry.InputCostPerToken > 0 || entry.OutputCostPerToken > 0)
 }
 
 // priceSourceInfo names where the snapshot came from and when it was taken, so a

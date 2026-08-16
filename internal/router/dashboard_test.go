@@ -48,7 +48,7 @@ func TestDockerfileCopiesEmbeddedAssets(t *testing.T) {
 }
 
 // GET / is unauthenticated by design — the page is a static shell and the fleet
-// table is populated client-side from a token-gated /backends fetch. That
+// table is populated client-side from an admin-gated /backends fetch. That
 // invariant lives in a comment above handleDashboard and is enforced by nothing:
 // adding "Backends": registry.snapshot() to the template data to "save a
 // round-trip" would publish every worker's id, URL and model to anyone who

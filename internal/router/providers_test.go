@@ -907,3 +907,56 @@ func TestSlugifyAndProviderRowID(t *testing.T) {
 		t.Errorf("slugify = %q", got)
 	}
 }
+
+// TestPlateauVerdictIsRetried: one noisy throughput sample must not cache a
+// concurrent worker at serial dispatch. This is the mirror image of the
+// failed-level retry ladder (and of TestDeclaredConcurrencyOutranksRamp's 429
+// case): here the worker serves n=2 perfectly well, but its FIRST n=2 sample
+// comes back slow — a speculative decoder's acceptance swing, a graph capture,
+// scheduler jitter — and under the old single-sample knee test that one reading
+// was a permanent verdict (measured live on an MTP engine, 2026-08-18: a
+// 2-lane worker cached at capacity 1). The ramp must re-sample a plateau and
+// keep the level's best reading.
+func TestPlateauVerdictIsRetried(t *testing.T) {
+	withCapacityProbeRetryDelay(t, time.Millisecond)
+	var served int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		// Request 1 is the n=1 baseline (fast). Requests 2-3 are the first n=2
+		// sample: slow enough that the level's aggregate lands under the
+		// 1.15x knee. Requests 4+ (the re-sample) run at full speed.
+		i := atomic.AddInt64(&served, 1)
+		if i == 2 || i == 3 {
+			time.Sleep(300 * time.Millisecond)
+		} else {
+			time.Sleep(20 * time.Millisecond)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"the ocean is wide and deep"}}]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	reg := newTestRegistry()
+	reg.upsert(manualReg(t, BackendRegistration{
+		ID: "noisy", URL: srv.URL, Model: "m", TTLSeconds: 3600,
+	}))
+	r := &Router{
+		// Cap the ramp at 2 so the test settles the level under dispute and
+		// nothing above it.
+		cfg:      &Config{CapacityProbeMax: 2},
+		registry: reg,
+		client:   &http.Client{Timeout: 5 * time.Second},
+	}
+
+	ramp, ok := r.capacityProbe(reg.get("noisy"))
+	if !ok {
+		t.Fatal("capacity probe reported the worker unreachable")
+	}
+	if ramp != 2 {
+		t.Fatalf("capacity = %d, want 2 — a single slow n=2 sample became a permanent serial-dispatch verdict", ramp)
+	}
+	// The slow first sample must actually have been drawn, or the re-sample
+	// path was never exercised: 1 (n=1) + 2 (slow n=2) + 2 (re-sample) = 5.
+	if n := atomic.LoadInt64(&served); n < 5 {
+		t.Fatalf("only %d requests served — the plateau was never provoked or never re-sampled", n)
+	}
+}

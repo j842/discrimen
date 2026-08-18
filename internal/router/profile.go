@@ -560,8 +560,25 @@ func (r *Router) capacityProbe(b *Backend) (capacity int, ok bool) {
 			log.Printf("capacity probe: %s failed n=%d after %d attempts; capacity=%d", b.ID, n, capacityProbeAttempts, best)
 			break // repeatable errors at a higher level → that's the capacity ceiling
 		}
+		// Retry a PLATEAU verdict before believing it, for exactly the reason a
+		// failed level is retried above: one noisy sample otherwise becomes a
+		// permanent verdict. The knee compares two short throughput samples, and
+		// on a speculative-decoding worker the acceptance rate alone swings the
+		// per-sample rate by 2-3x (measured 35-100% on near-identical requests
+		// on an MTP engine, 2026-08-18: its n=2 sample missed the 1.15x knee once
+		// and a 2-lane worker was cached at serial dispatch). Capacity is a
+		// capability claim — "CAN it run n concurrently" — so the level keeps its
+		// best sample: noise can fake a plateau, it cannot fake genuine scaling.
+		for attempt := 1; n > 1 && agg < prev*1.15 && attempt < capacityProbeAttempts; attempt++ {
+			time.Sleep(capacityProbeRetryDelay)
+			log.Printf("capacity probe: n=%d for %s plateaued (%.0f vs %.0f needed) — re-sampling (attempt %d/%d)",
+				n, b.ID, agg, prev*1.15, attempt+1, capacityProbeAttempts)
+			if again, ok := r.measureConcurrent(b, n); ok && again > agg {
+				agg = again
+			}
+		}
 		if n > 1 && agg < prev*1.15 {
-			break // throughput plateaued → saturation knee
+			break // plateau held across every re-sample → saturation knee
 		}
 		best, prev = n, agg
 	}
@@ -603,10 +620,18 @@ func (r *Router) resolveCapacity(b *Backend, ramp int) int {
 // measureConcurrent fires n identical short completions at once and returns the
 // aggregate throughput (approx tokens/sec). ok is false if any request failed.
 func (r *Router) measureConcurrent(b *Backend, n int) (float64, bool) {
+	// The sample window has to be long enough to average out per-request noise:
+	// at 64 tokens a fast worker finishes in ~0.3-0.4s and a speculative
+	// decoder's acceptance-rate swing dominates the reading (see the plateau
+	// retry in capacityProbe). Ten sentences under a 256-token cap runs the
+	// window ~4x longer for a few thousand extra tokens per profile — noise in
+	// the aggregate, next to the benchmark's ~99% share of the bill. The prompt
+	// asks for the length; raising max_tokens alone would change nothing, the
+	// model stops where the prompt stops it.
 	payload := map[string]any{
-		"model": probeModel(b), "stream": false, "max_tokens": 64,
+		"model": probeModel(b), "stream": false, "max_tokens": 256,
 		"chat_template_kwargs": map[string]bool{"enable_thinking": false},
-		"messages":             []map[string]string{{"role": "user", "content": "Write two sentences about the ocean. /no_think"}},
+		"messages":             []map[string]string{{"role": "user", "content": "Write ten sentences about the ocean. /no_think"}},
 	}
 	type res struct {
 		toks int

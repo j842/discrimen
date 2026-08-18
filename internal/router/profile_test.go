@@ -25,7 +25,7 @@ func abortingWorker(t *testing.T, promptTokens, completionTokens int) *httptest.
 			return
 		}
 		body, _ := io.ReadAll(req.Body)
-		if bytes.Contains(body, []byte("two sentences about the ocean")) {
+		if bytes.Contains(body, []byte("sentences about the ocean")) {
 			http.Error(w, `{"error":{"message":"rate limited"}}`, http.StatusTooManyRequests)
 			return
 		}

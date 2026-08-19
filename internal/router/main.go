@@ -1146,6 +1146,7 @@ func (r *Router) modelCatalogue() []map[string]any {
 	byModel := map[string]map[string]any{}
 	order := []string{}
 	fleetFeatures := []string{"chat"}
+	fleetCtx := 0                        // largest measured window in the fleet
 	aliasModels := map[string][]string{} // alias → distinct models claiming it
 	servable := []*Backend{}             // what a group's members can resolve to
 	for _, b := range r.registry.snapshot() {
@@ -1154,15 +1155,22 @@ func (r *Router) modelCatalogue() []map[string]any {
 		}
 		servable = append(servable, b)
 		fleetFeatures = append(fleetFeatures, b.Features...)
+		if b.ContextK*1024 > fleetCtx {
+			fleetCtx = b.ContextK * 1024
+		}
 		entry, seen := byModel[b.Model]
 		if !seen {
-			byModel[b.Model] = map[string]any{
+			entry = map[string]any{
 				"id":       b.Model,
 				"object":   "model",
 				"owned_by": b.ID,
 				"features": append([]string(nil), b.Features...),
 				"workers":  1,
 			}
+			if b.ContextK > 0 {
+				entry["context_length"] = b.ContextK * 1024
+			}
+			byModel[b.Model] = entry
 			order = append(order, b.Model)
 			if a := backendAlias(b); a != "" {
 				aliasModels[a] = append(aliasModels[a], b.Model)
@@ -1173,6 +1181,13 @@ func (r *Router) modelCatalogue() []map[string]any {
 		// A feature is only claimable for the pooled id if every worker behind it
 		// has it — the router may send the request to any of them.
 		entry["features"] = intersectFeatures(entry["features"].([]string), b.Features)
+		// Same intersection logic for the window: the pooled id may land on any
+		// worker, so advertise the smallest measured one. A worker that didn't
+		// report stays out of the min — its requests are context-filtered at
+		// route time anyway (see hard filter), so the claim stays honest.
+		if cur, ok := entry["context_length"].(int); b.ContextK > 0 && (!ok || b.ContextK*1024 < cur) {
+			entry["context_length"] = b.ContextK * 1024
+		}
 	}
 	// The menu id is the human spelling when it is unambiguous: the alias
 	// replaces the raw model id ("gemma4", not a quant-encrusted .gguf path),
@@ -1201,6 +1216,14 @@ func (r *Router) modelCatalogue() []map[string]any {
 		"owned_by": routerOwner,
 		"features": fleet,
 	}, expertEntry(fleet)}
+	// default and expert advertise the fleet MAX, matching their union-of-features
+	// stance: both routes context-filter workers per request, so a long prompt
+	// really can be served as long as any worker holds it (expert just seats a
+	// smaller panel).
+	if fleetCtx > 0 {
+		models[0]["context_length"] = fleetCtx
+		models[1]["context_length"] = fleetCtx
+	}
 	for _, name := range order {
 		// A worker that registered a model called "expert" does not get the name:
 		// the ensemble resolves ahead of it, so the menu has to say where the name

@@ -255,6 +255,7 @@ func groupEntries(groups []Group, servable []*Backend, fleetFeatures []string) [
 	out := make([]map[string]any, 0, len(groups))
 	for _, g := range groups {
 		features, found := fleetFeatures, false
+		ctxK := 0 // smallest measured window across members, like the feature intersection
 		for _, member := range g.Members {
 			for _, b := range servable {
 				if !backendServesModel(b, member) {
@@ -265,16 +266,23 @@ func groupEntries(groups []Group, servable []*Backend, fleetFeatures []string) [
 				} else {
 					features = intersectFeatures(features, b.Features)
 				}
+				if b.ContextK > 0 && (ctxK == 0 || b.ContextK < ctxK) {
+					ctxK = b.ContextK
+				}
 			}
 		}
-		out = append(out, map[string]any{
+		entry := map[string]any{
 			"id":       g.Name,
 			"object":   "model",
 			"owned_by": routerOwner,
 			"group":    true,
 			"members":  append([]string(nil), g.Members...),
 			"features": features,
-		})
+		}
+		if ctxK > 0 {
+			entry["context_length"] = ctxK * 1024
+		}
+		out = append(out, entry)
 	}
 	return out
 }

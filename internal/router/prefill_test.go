@@ -290,8 +290,9 @@ func TestBackfillCachedProfilePrefill(t *testing.T) {
 		t.Fatalf("expected exactly one probe (%d samples), got %d requests", prefillProbeSamples, calls)
 	}
 
-	// Already measured: must NOT re-probe. This runs on every registration keepalive,
-	// so a probe here would be a recurring cost on the whole fleet forever.
+	// Already measured: must NOT re-probe. This runs on every certification — a
+	// changed registration, a recovering backend, a model swap — so a probe here
+	// would be a recurring cost on the whole fleet forever.
 	already := &WorkerProfile{Model: "m", BenchVersion: benchmarkVersion, SpeedVersion: speedProbeVersion,
 		PrefillTPS: 77, ThinkingDialect: thinkingDialectNone}
 	r.backfillCachedProfile("w", b, already)
@@ -433,8 +434,9 @@ func TestBackfillCachedProfileRereadsContext(t *testing.T) {
 		t.Error("context was re-read but no check surfaced it in /backends")
 	}
 
-	// Unchanged context must not churn the profile. This runs on every keepalive, so a
-	// write here would be a persist on every worker every ~60s, forever.
+	// Unchanged context must not churn the profile. Every certification runs this,
+	// and so does reconcileContext's own re-read on the health loop, so a write here
+	// would be a persist on every worker forever.
 	same := base(512)
 	same.Checks = nil
 	r.backfillCachedProfile("w", b, same)
@@ -494,8 +496,8 @@ func TestBackfillCachedProfileThinkingDialect(t *testing.T) {
 	}
 	before := probes
 
-	// Already measured: silent. This runs on every registration keepalive, so a
-	// probe here is a 1024-token generation on the whole fleet every ~60s.
+	// Already measured: silent. This runs on every certification, so a probe here is
+	// a 1024-token generation every time any worker in the fleet re-certifies.
 	r.backfillCachedProfile("w", b, prof)
 	if probes != before {
 		t.Errorf("re-probed a profile that already carried a dialect: %d extra requests", probes-before)

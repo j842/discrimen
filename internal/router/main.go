@@ -3277,10 +3277,15 @@ func (r *Router) backfillCachedProfile(id string, backend *Backend, prof *Worker
 	//
 	// Re-measuring is free — one GET on vLLM, two on llama.cpp (/v1/models yields
 	// nothing, then /props), the same cost class as the health check that ran a few
-	// lines up — so there is nothing to trade off and no version gate to add. Note
-	// this runs on every keepalive re-registration, which is exactly what makes a context
-	// change land on restart with no manual step; the prefill probe below is gated
-	// because it is expensive, and this is not.
+	// lines up — so there is nothing to trade off and no version gate to add; the
+	// prefill probe below is gated because it is expensive, and this is not.
+	//
+	// This clause alone is NOT enough to make a context change land on restart, and
+	// an earlier version of this comment claimed it was. It runs on the certification
+	// path, and a restarted worker re-registers a byte-identical payload, which
+	// handleRegisterBackend treats as a keepalive and does not certify. reconcileContext
+	// covers that case from the health loop; this one still matters for every path that
+	// DOES certify (a changed registration, a recovering backend, a model swap).
 	if ctxK, ok := r.queryContextMeasured(backend); ok && ctxK != prof.ContextK {
 		log.Printf("worker %s: context re-read %dk -> %dk on its cached profile", id, prof.ContextK, ctxK)
 		prof.ContextK = ctxK
@@ -3830,6 +3835,79 @@ func (r *Router) recheckModel(id string) {
 	if changed := describeWeightsChange(b.ModelMeta, meta); changed != "" {
 		log.Printf("worker %s still advertises %q but its weights changed (%s) — cached quality may no longer describe it; delete the backend to force a re-profile", id, model, changed)
 	}
+	// Same class of drift, cheaper cure: a CTX_SIZE edit moves the context window
+	// without moving the model, so neither check above fires. See reconcileContext.
+	r.reconcileContext(id, b)
+}
+
+// reconcileContext re-reads a ready worker's context window and lands a change
+// without re-certifying it.
+//
+// backfillCachedProfile already re-reads context, but only on the CERTIFICATION
+// path, and its own comment overstated when that path runs. A keepalive does not
+// certify: handleRegisterBackend deliberately skips a ready backend whose
+// registration is unchanged, because certifying parks it in "probing" for two
+// round trips every ~60s. A worker restarted with a new CTX_SIZE re-registers a
+// byte-identical payload — same id, url, api_key — so nothing is "changed",
+// nothing certifies, and the re-read never runs.
+//
+// Measured: llm-arcb60-Gemma-4-26B-A4B went from 32k to 128k per slot and the
+// router kept hard-filtering it at 32k across the restart. The only cure was
+// DELETE /backends/{id}, which is exactly the manual step (and the discarded
+// quality benchmark) the backfill was written to remove.
+//
+// So the re-read also runs here, on the health loop's periodic metadata check,
+// which is already paying for a round trip and already runs on ready backends
+// that nothing else will re-certify. Cost is one GET on vLLM, two on llama.cpp;
+// no benchmark, no capacity ramp, and the worker never leaves rotation.
+func (r *Router) reconcileContext(id string, b *Backend) {
+	ctxK, ok := r.queryContextMeasured(b)
+	if !ok {
+		return // could not measure — leave the standing value alone, never guess
+	}
+	was, changed := r.registry.setMeasuredContext(id, ctxK)
+	if !changed {
+		return
+	}
+	log.Printf("worker %s: context re-read %dk -> %dk (deployment change; no re-profile needed)", id, was, ctxK)
+	// Persist it too, or a router restart certifies from the cached profile and
+	// resurrects the window the worker no longer has.
+	if r.logs == nil {
+		return
+	}
+	prof, found := r.logs.LoadWorkerProfile(context.Background(), id, b.Model)
+	if !found || prof.ContextK == ctxK {
+		return
+	}
+	prof.ContextK = ctxK
+	if prof.Checks == nil {
+		prof.Checks = map[string]Check{}
+	}
+	prof.Checks["context"] = Check{OK: true, Message: fmt.Sprintf("%dk (re-read)", ctxK)}
+	if err := r.logs.SaveWorkerProfile(context.Background(), id, prof); err != nil {
+		log.Printf("persist re-read context for %s failed: %v", id, err)
+	}
+}
+
+// setMeasuredContext writes a re-measured context window onto a live row and
+// reports the previous value and whether it moved.
+//
+// A MANUAL row's declared context is left alone, the same invariant
+// applyProfileIfGen enforces for every other measured field: a probe fills in
+// what an operator left blank and never overwrites what they entered.
+func (r *Registry) setMeasuredContext(id string, ctxK int) (int, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	b := r.backends[id]
+	if b == nil || ctxK <= 0 || b.ContextK == ctxK {
+		return 0, false
+	}
+	if operatorDeclared(b).ContextK != 0 {
+		return b.ContextK, false
+	}
+	was := b.ContextK
+	b.ContextK = ctxK
+	return was, true
 }
 
 // describeWeightsChange reports how a worker's loaded weights differ from what

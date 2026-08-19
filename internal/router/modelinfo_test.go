@@ -1,6 +1,7 @@
 package router
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -269,5 +270,107 @@ func TestModelMetaComesFromTheSelectedEntry(t *testing.T) {
 	r := &Router{client: &http.Client{}}
 	if _, meta := r.queryModelInfo(b); meta.ModelParams != 284334567511 || meta.ModelQuant != "MXFP4 MoE" {
 		t.Errorf("metadata came from the wrong entry: %+v", meta)
+	}
+}
+
+// A worker restarted with a new CTX_SIZE re-registers a BYTE-IDENTICAL payload —
+// same id, url, api_key — so upsert reports no change and handleRegisterBackend
+// skips certification to keep a ready worker in rotation. backfillCachedProfile's
+// context re-read only runs on the certification path, so it never fires, and the
+// router goes on hard-filtering against a window the worker no longer has:
+// llm-arcb60-Gemma-4-26B-A4B was raised from 32k to 128k per slot and stayed
+// advertised at 32k until it was force-deleted, which throws away the quality
+// benchmark to correct one integer.
+func TestReconcileContextLandsAcrossARestart(t *testing.T) {
+	fail := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if fail {
+			http.Error(w, "{}", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch req.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"data":[]}`)) // llama.cpp: no max_model_len, falls through to /props
+		case "/props":
+			_, _ = w.Write([]byte(`{"n_ctx":131072}`))
+		default:
+			http.Error(w, "{}", http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	reg := newTestRegistry()
+	r := &Router{registry: reg, client: &http.Client{}, logs: newTestLogStore(t)}
+	payload := BackendRegistration{ID: "w", URL: srv.URL, Model: "m", ContextK: 32}
+	reg.upsert(payload)
+
+	// The precondition. If a restart's re-registration ever counts as changed, it
+	// certifies, the backfill covers it, and this whole path is redundant.
+	if _, changed := reg.upsert(payload); changed {
+		t.Fatal("an identical re-registration reported a change — re-read handleRegisterBackend before trusting this test")
+	}
+	reg.backends["w"].Certification.Ready = true
+
+	// What the router would certify from if it restarted: quality measured, context stale.
+	if err := r.logs.SaveWorkerProfile(context.Background(), "w", &WorkerProfile{
+		Model: "m", ContextK: 32, Quality: 63, BenchVersion: benchmarkVersion}); err != nil {
+		t.Fatalf("seed profile: %v", err)
+	}
+
+	r.recheckModel("w")
+
+	if got := reg.get("w").ContextK; got != 128 {
+		t.Fatalf("live context = %dk, want 128k — the restart's CTX_SIZE change did not land", got)
+	}
+	prof, ok := r.logs.LoadWorkerProfile(context.Background(), "w", "m")
+	if !ok {
+		t.Fatal("cached profile vanished")
+	}
+	if prof.ContextK != 128 {
+		t.Errorf("cached profile = %dk, want 128k — a router restart would resurrect the stale window", prof.ContextK)
+	}
+	// The point of doing this outside certification: it costs one metadata read,
+	// not a re-benchmark.
+	if prof.Quality != 63 || prof.BenchVersion != benchmarkVersion {
+		t.Errorf("the context re-read discarded the quality benchmark: q=%d bench=%d", prof.Quality, prof.BenchVersion)
+	}
+
+	// A worker that cannot answer must leave the standing value alone. A blip is
+	// not a deployment change, and guessing from the registry is how a good value
+	// gets silently downgraded.
+	fail = true
+	r.recheckModel("w")
+	if got := reg.get("w").ContextK; got != 128 {
+		t.Errorf("a failed probe moved the context to %dk", got)
+	}
+}
+
+// The manual-row invariant: a probe fills in what an operator left blank and never
+// overwrites what they entered. Context is measured for beacons precisely because
+// nobody declared one; a hand-entered reseller row is the operator's number.
+func TestReconcileContextLeavesAManualRowAlone(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch req.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"data":[]}`))
+		case "/props":
+			_, _ = w.Write([]byte(`{"n_ctx":131072}`))
+		default:
+			http.Error(w, "{}", http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	reg := newTestRegistry()
+	r := &Router{registry: reg, client: &http.Client{}}
+	reg.upsert(BackendRegistration{ID: "w", URL: srv.URL, Model: "m", ContextK: 32, Source: sourceManual})
+	reg.backends["w"].Certification.Ready = true
+
+	r.recheckModel("w")
+
+	if got := reg.get("w").ContextK; got != 32 {
+		t.Errorf("a measured context overwrote an operator's declared %dk with %dk", 32, got)
 	}
 }

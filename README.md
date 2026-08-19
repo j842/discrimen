@@ -124,6 +124,13 @@ The result is cached per `(endpoint id, model)` in SQLite, so a restart is
 **instant**: same id, same model, profile reloaded, no re-measurement. Only a
 brand-new endpoint or a changed model pays the cost again.
 
+The context window is the exception, because it is a deployment choice rather
+than a property of the model: raise `--ctx-size` (or vLLM's `--max-model-len`),
+restart, and the cache key does not move, so the profile would keep advertising
+the old window. Discrimen re-reads it — one metadata GET, no benchmark — on
+every certification and again on the health loop's periodic check, so a change
+lands within ten minutes of the restart with nothing to do by hand.
+
 On a paid endpoint, that cost is money. The benchmark is 130 questions: 122 of
 them graded thinking-on against a 16384-token ceiling, and 8 graded thinking-off
 against a 1024-token one. A reasoning answer on this set runs roughly 2000 to

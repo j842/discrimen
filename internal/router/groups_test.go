@@ -255,6 +255,54 @@ func TestGroupsAppearInTheModelMenu(t *testing.T) {
 	}
 }
 
+// TestMenuAdvertisesContextLength: harnesses size their compression window from
+// the menu, and without a published context_length they fall back to family
+// guesses (Hermes: any "qwen" → 131072). Pooled ids claim the smallest measured
+// window (the router may land on any member), default/expert claim the fleet
+// max (they context-filter per request), and a worker that never reported stays
+// out of both the min and the row.
+func TestMenuAdvertisesContextLength(t *testing.T) {
+	reg := newTestRegistry()
+	for _, w := range []struct {
+		id, model string
+		ctxK      int
+	}{
+		{"w-small", "qwen3", 32},
+		{"w-big", "qwen3", 256},
+		{"w-silent", "gemma4", 0},
+	} {
+		reg.upsert(BackendRegistration{
+			ID: w.id, URL: "http://x", Model: w.model, Quality: 50,
+			TTLSeconds: 3600, Features: []string{"chat"}, ContextK: w.ctxK,
+		})
+		reg.finishCertification(w.id, true, map[string]Check{}, 50, 10, "")
+	}
+	r := &Router{
+		cfg:      &Config{DefaultMaxTokens: 4096, HealthInterval: 15 * time.Second},
+		registry: reg, logs: newTestLogStore(t),
+	}
+	putGroup(t, r, "coding", "qwen3", "gemma4")
+
+	rows := map[string]map[string]any{}
+	for _, m := range r.modelCatalogue() {
+		rows[m["id"].(string)] = m
+	}
+	if got := rows["qwen3"]["context_length"]; got != 32*1024 {
+		t.Errorf("pooled qwen3 context_length = %v, want the smallest member (32768)", got)
+	}
+	if _, ok := rows["gemma4"]["context_length"]; ok {
+		t.Errorf("gemma4 published a context it never reported: %v", rows["gemma4"])
+	}
+	for _, id := range []string{"default", "expert"} {
+		if got := rows[id]["context_length"]; got != 256*1024 {
+			t.Errorf("%s context_length = %v, want the fleet max (262144)", id, got)
+		}
+	}
+	if got := rows["coding"]["context_length"]; got != 32*1024 {
+		t.Errorf("group context_length = %v, want the min over reporting members (32768)", got)
+	}
+}
+
 // TestGroupReplacesAShadowedMenuRow: routing sends the name to the group, so the
 // menu has to agree rather than advertising the worker that lost it.
 func TestGroupReplacesAShadowedMenuRow(t *testing.T) {

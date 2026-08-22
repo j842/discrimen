@@ -163,6 +163,84 @@ func TestDashboardDistinguishesUnmeasuredProfileCostFromFree(t *testing.T) {
 	}
 }
 
+// A log row's bodies are rendered as a conversation rather than as raw JSON,
+// and the pieces that has to cover are the ones a fleet actually produces:
+// both reply shapes (a buffered completion and a captured event stream), the
+// separation of reasoning from the answer, tool calls, and the router's own
+// truncation markers.
+func TestDashboardRendersLogBodiesAsATranscript(t *testing.T) {
+	body := renderDashboard(t)
+	for _, needle := range []string{
+		"function renderChatRequest", "function renderCompletion", "function sseAnswer",
+		"tx-system", "tx-user", "tx-assistant", "tx-tool", "tx-think",
+		"reasoning_content", // the other dialect's spelling, or thinking renders as nothing
+	} {
+		if !strings.Contains(body, needle) {
+			t.Errorf("the log transcript renderer is missing %q", needle)
+		}
+	}
+	// The raw bytes stay reachable. This renderer makes judgements about what
+	// matters and the stored body is the thing of record, so a formatting bug
+	// must never be the reason an operator cannot see what was actually sent.
+	if !strings.Contains(body, "function pane(") || !strings.Contains(body, "'Formatted'") {
+		t.Error("the log detail has no raw/formatted toggle; a body the renderer cannot parse would be unreachable")
+	}
+}
+
+// The log viewer strips the router's own truncation markers out of a body
+// before parsing it and shows them as a notice instead. That makes the marker
+// text a contract between Go and a regex in a browser, which no compiler checks
+// and no reader would think to look for: change the wording on the Go side and
+// the page silently starts feeding "…[capture truncated: 8291 bytes omitted]…"
+// to JSON.parse, which fails, and every streamed reply falls back to raw.
+func TestDashboardTruncationPatternMatchesWhatTheRouterWrites(t *testing.T) {
+	// Lifted from the page verbatim, so the two cannot drift apart unnoticed.
+	const pattern = `…\[(capture )?truncated[^\]]*\]…?`
+	if !strings.Contains(renderDashboard(t), pattern) {
+		t.Fatalf("the log viewer's truncation pattern is no longer %q — update this test with the new one", pattern)
+	}
+	re := regexp.MustCompile(pattern)
+
+	// Marker one: the insert-time clip in clipLog.
+	if got := clipLog(strings.Repeat("x", 200), 32); !re.MatchString(got) {
+		t.Errorf("clipLog writes %q, which the log viewer will not recognise", got)
+	}
+	// Marker two: the head-and-tail join in boundedCapture.
+	cap := newBoundedCapture(4096)
+	if _, err := cap.Write(bytes.Repeat([]byte("y"), 64<<10)); err != nil {
+		t.Fatalf("boundedCapture write: %v", err)
+	}
+	if got := string(cap.Bytes()); !re.MatchString(got) {
+		t.Errorf("boundedCapture writes a marker the log viewer will not recognise: %q", truncate(got, 120))
+	}
+}
+
+// Prompts and model output are the most attacker-influenced strings this page
+// shows: they arrive from any client key, are stored verbatim, and are rendered
+// to an admin. They must reach the DOM as text nodes, never spliced into an
+// HTML string — one forgotten escape there is script in an admin session.
+func TestDashboardBuildsLogBodiesAsTextNodes(t *testing.T) {
+	body := renderDashboard(t)
+	start := strings.Index(body, "function showLogDetail")
+	if start < 0 {
+		t.Fatal("showLogDetail is gone; this guard no longer guards anything")
+	}
+	end := strings.Index(body[start:], "\n    function closeLogDetail")
+	if end < 0 {
+		t.Fatal("cannot find the end of showLogDetail")
+	}
+	// innerHTML = '' is a clear, which is fine. Assigning anything else there
+	// would be building markup out of a stored prompt.
+	for _, line := range strings.Split(body[start:start+end], "\n") {
+		if !strings.Contains(line, "innerHTML") {
+			continue
+		}
+		if !strings.Contains(line, "innerHTML = ''") {
+			t.Errorf("showLogDetail assigns markup rather than text: %s", strings.TrimSpace(line))
+		}
+	}
+}
+
 // The bearer-token prompt is gone: admin is a password session, the cookie is
 // HttpOnly, and a page that also kept a copy of an admin key in sessionStorage
 // would be handing a live credential to anything that ever ran script on this

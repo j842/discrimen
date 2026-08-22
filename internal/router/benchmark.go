@@ -77,7 +77,36 @@ import (
 // v35: tier 12 (programming / coding-agent fitness) added, and the weighted score grew a
 // THIRD bucket for it. Also: the numeric grader now keeps the sign (benchNumberRe), which
 // silently mis-graded any negative answer in both directions — see the var block.
-const benchmarkVersion = 35
+// v36: the tier-10 lift question is revised — it was under-specified, and it was costing
+// the fleet far more than the one point it was worth. Nothing in it stated that the express
+// lift beats a man running up 30 flights, and "H) it depends on the lift's speed" was then
+// offered as an option, so H was defensible as written. Three of the four benchmarked
+// workers spent their ENTIRE budget on that single item rather than answering it: a
+// Qwen3.8-27B burned all 16384 thinking tokens without emitting one content token (the
+// trunc=1 in its breakdown), and a 7.9B and a 26B both hit the frontier deadline on it as
+// speed-fails. Reading the 27B's trace — which the tier's own CAVEAT asks for before
+// blaming the model — shows it never simulating the scenario at all: it oscillates between
+// C, D, H and I doing puzzle-author psychology on the option list ("If rigorous eval: I
+// (40%) — If puzzle author casual: H (30%) or D (25%)"). Raising the ceiling is not the fix
+// either; the same worker given 32k concludes in 12k tokens and answers I.
+//
+// The fix is that the item now leaves NO quantity unstated, which is what separates the
+// tier's clean items from this one. Measured on the 27B, pinning one side was not enough:
+// with the lift alone pinned ("reaches the roof terrace in under a minute") it stopped
+// truncating but still spent 6907 thinking tokens and answered I, because Dan's climb was
+// still a judgement call it refused to make. With both sides pinned (Dan's stairs "a little
+// over five minutes") it answers C in 399 thinking tokens, and all four benchmarked workers
+// now pass it in seconds. H is also replaced by an age decoy in the style of the Rosa
+// question, keeping ten options and keeping a wrong answer available to a model that does
+// fall for the red herring.
+//
+// KNOWN TRADE-OFF: with 4/4 workers passing it, this item no longer spreads the fleet — it
+// is now a guard like the ice-cube question rather than a discriminator. That is still worth
+// more than it was, because an item that eats three workers' whole budgets measures
+// endurance rather than reasoning, which this tier is explicitly built not to do. If tier 10
+// needs its twelfth discriminating item back, the replacement should be written compact and
+// fully specified from the start, and its spread measured across the fleet before it lands.
+const benchmarkVersion = 36
 
 // benchmarkQ is one graded question in the cold-start quality benchmark. The
 // question set lives in benchmark_data.go.

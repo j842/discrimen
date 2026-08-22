@@ -24,7 +24,7 @@ read code rather than solve a puzzle.
 
 ## Versioning
 
-`benchmarkVersion` (in `internal/router/benchmark.go`) is currently **35**. It is
+`benchmarkVersion` (in `internal/router/benchmark.go`) is currently **36**. It is
 part of the profile cache key: a stored profile is reused only if its
 `BenchVersion` matches the running binary's. Changing a question, adding a tier,
 or altering how answers are graded means bumping that constant, which invalidates
@@ -60,6 +60,7 @@ which is the only kind of change that belongs in this list.
 | v33 | Tier 11 added, and the frontier tiers (at or above `benchFrontierTier`) given the longer 6-minute deadline. |
 | v34 | Quality became a weighted two-bucket score instead of a flat percentage. |
 | v35 | Tier 12 added and the weighted score grew a third bucket for it. The numeric grader now keeps the sign (`benchNumberRe`). |
+| v36 | Question 89 (tier 10, the lift) revised. It never stated that the lift beats a man running up 30 flights while offering "it depends on the lift's speed" as an option, so that option was defensible and three of four workers spent their whole budget on the one item instead of answering it. Both journey times are now stated, and the escape hatch is replaced by an age decoy. |
 
 v33 and v34 both landed **without** bumping the constant, which is exactly the
 failure the constant exists to prevent. Profiles measured under the flat
@@ -934,6 +935,18 @@ model misses one, read its reasoning before assuming the model is wrong — the
 question may be, and that is a real failure mode here in a way it never was for
 arithmetic.*
 
+*Question 89 is the worked example of that, and of how strict "forced by an
+explicit clause" has to be. It used to leave the lift's speed unstated while
+offering "it depends on the lift's speed" as an option, so that option was
+defensible; three of the four benchmarked workers then spent their entire budget
+on it rather than answering, one truncating at 16384 thinking tokens and two
+blowing the frontier deadline. Pinning only the lift was not enough either — the
+27B stopped truncating but still answered "it cannot be determined" after 6907
+thinking tokens, because the stairs were still a judgement call. An item here is
+forced only when no quantity is left to judgement, which is what the clean items
+do: both beanbags are on the ground, and the candles' burn time and lighting
+times are all given.*
+
 **86.**
 ```
 Every minute for five minutes, Ravi drops two sugar cubes into a mug of freshly boiled tea and stirs it thoroughly each time. At the end of the five minutes, how many whole, undissolved sugar cubes are in the mug?
@@ -984,7 +997,7 @@ Answer with just the letter.
 
 **89.**
 ```
-Three colleagues leave the ground floor of a 30-storey office tower at the same moment, all heading for the roof terrace. Priya takes the express lift, which travels non-stop. Dan takes the stairs, running two at a time. Marcus rides the same express lift as Priya, carrying a full tray of coffees, and is 94 years old. Who reaches the roof terrace last?
+Three colleagues leave the ground floor of a 30-storey office tower at the same moment, all heading for the roof terrace. Priya takes the express lift, which travels non-stop and reaches the roof terrace in under a minute. Dan takes the stairs, running two at a time, which takes him a little over five minutes. Marcus rides the same express lift as Priya, carrying a full tray of coffees, and is 94 years old. Who reaches the roof terrace last?
 A) Priya
 B) Marcus
 C) Dan
@@ -992,7 +1005,7 @@ D) Priya and Marcus, together
 E) Dan and Marcus, together
 F) all three arrive together
 G) Priya and Dan, together
-H) it depends on the lift's speed
+H) Marcus, because of his age
 I) it cannot be determined
 J) nobody reaches the roof terrace
 Answer with just the letter.
@@ -1131,7 +1144,7 @@ Answer with just the letter.
 | 86 | **E** | mcq | Sugar dissolves in freshly boiled tea, and every addition is stirred thoroughly. The 2 × 5 = 10 is the decoy. |
 | 87 | **F** | mcq | Both beanbags were thrown fifteen minutes ago and both landed. The throw heights are irrelevant. |
 | 88 | **D** | mcq | Both attendants tell the truth and a sign already states which way the exit is, so no question is needed. The setup is the classic two-guards riddle with its difficulty removed. |
-| 89 | **C** | mcq | Thirty storeys of stairs lose to an express lift. Marcus's age and the coffee tray are distractions; he is in the lift. |
+| 89 | **C** | mcq | Five minutes of stairs lose to a lift that reaches the roof in under a minute. Marcus's age and the coffee tray are distractions; he is in the lift, so he arrives when Priya does. Revised in v36: with either journey time left unstated the question was arguable, and it was eating whole reasoning budgets. It is now a guard rather than a discriminator — every worker passes it. |
 | 90 | **G** | mcq | Each set burns out after about twenty minutes, and the last set was lit an hour before the end. None is still alight. |
 | 91 | **A** | mcq | Wei is the only one who has not been drinking. Speed and strength are the decoys. |
 | 92 | **E** | mcq | The bridge holds all three, it is floodlit, and they can walk side by side, so the time is the slowest walker's. The famous torch-relay answer of 8 does not apply. |

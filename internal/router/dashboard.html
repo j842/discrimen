@@ -48,6 +48,28 @@
     pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #080b10; border: 1px solid #303847; border-radius: 6px; padding: 10px; max-height: 360px; overflow: auto; }
     .route-cell { display: grid; gap: 2px; }
     .route-speed { color: #8dd6ff; font-size: 12px; }
+    /* Transcript view for a stored request. The role colours are the whole
+       point: a long tool loop is unreadable as one wall of JSON, and the first
+       thing anyone reads it for is "who said what". */
+    .tx { display: grid; gap: 8px; }
+    .tx-head { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-bottom: 2px; }
+    .tx-msg { border: 1px solid #262d3a; border-left: 3px solid #3f4a5f; border-radius: 6px; background: #0b0f16; padding: 8px 10px; }
+    .tx-role { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: #9aa4b2; margin-bottom: 4px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+    .tx-body { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; max-height: 340px; overflow: auto; }
+    .tx-system { border-left-color: #f7c948; } .tx-system .tx-role { color: #f7c948; }
+    .tx-user { border-left-color: #8dd6ff; } .tx-user .tx-role { color: #8dd6ff; }
+    .tx-assistant { border-left-color: #62d26f; } .tx-assistant .tx-role { color: #62d26f; }
+    .tx-tool { border-left-color: #c4a7f7; } .tx-tool .tx-role { color: #c4a7f7; }
+    .tx-think { border-left-color: #4b5566; background: #0a0d13; } .tx-think .tx-role { color: #7f8b9c; }
+    .tx-think .tx-body { color: #9aa4b2; font-style: italic; }
+    .tx-error { border-left-color: #ff6b6b; } .tx-error .tx-role { color: #ff6b6b; }
+    .tx-call { border: 1px dashed #3f4a5f; border-radius: 6px; padding: 6px 8px; margin-top: 6px; background: #0a0d13; }
+    .tx-call code { color: #c4a7f7; }
+    .tx-note { color: #f7c948; font-size: 12px; border: 1px solid #6b5b12; border-radius: 6px; padding: 6px 8px; background: #14120a; }
+    .tx-empty { color: #9aa4b2; font-size: 13px; font-style: italic; }
+    .pane-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin: 14px 0 6px; }
+    .pane-head h3 { font-size: 13px; margin: 0; color: #cbd5e1; text-transform: uppercase; letter-spacing: .06em; }
+    .pane-head button { padding: 3px 8px; font-size: 12px; }
     .modal-backdrop { position: fixed; inset: 0; z-index: 1000; display: none; align-items: center; justify-content: center; padding: 20px; background: rgba(0,0,0,.64); }
     .modal-backdrop.open { display: flex; }
     .modal-card { width: min(960px, 100%); max-height: min(86vh, 900px); overflow: auto; background: #111827; border: 1px solid #303847; border-radius: 10px; box-shadow: 0 24px 80px rgba(0,0,0,.48); }
@@ -1480,21 +1502,274 @@
       if (row.key_id === 'env') return 'environment token';
       return 'key ' + row.key_id;
     }
+    // ── Transcript rendering ────────────────────────────────────────────────
+    //
+    // A stored request is a chat body and a completion, and read as raw JSON it
+    // is close to useless: the thing anyone opens a log row to find out is who
+    // said what, and that is buried under generation settings, escaped newlines
+    // and — on a tool loop — a dozen near-identical envelopes.
+    //
+    // Everything below builds DOM NODES rather than HTML strings. That is not
+    // stylistic. Prompts and model output are the most attacker-influenced text
+    // on this page: they arrive from whoever holds a client key, they are stored
+    // verbatim, and they are rendered here to an admin. textContent cannot be
+    // escaped wrongly, where one forgotten escapeHtml in a string concatenation
+    // is script running in an authenticated admin session.
+    //
+    // Best-effort throughout. Anything that does not parse falls back to the raw
+    // text with a note saying so, because a log viewer that hides a body it
+    // could not understand is worse than one that never tried.
+
+    // The two markers the router leaves when a body did not fit. Worth calling
+    // out rather than letting them read as part of the prompt — and they are
+    // also why every parse here has to tolerate a body that stops mid-token.
+    const TRUNC = /…\[(capture )?truncated[^\]]*\]…?/g;
+    function truncationNote(raw) {
+      const found = String(raw || '').match(TRUNC);
+      return found ? found.join(' ') : '';
+    }
+
+    // txMsg is one coloured block: a role, an optional right-hand annotation,
+    // and a body.
+    function txMsg(role, note, body, extra) {
+      const cls = ['tx-msg', 'tx-' + role].join(' ');
+      const head = el('div', {class: 'tx-role'}, [role]);
+      if (note) head.appendChild(el('span', {class: 'muted'}, [note]));
+      const node = el('div', {class: cls}, [head]);
+      const extras = extra || [];
+      if (body !== '' && body != null) node.appendChild(el('div', {class: 'tx-body'}, [String(body)]));
+      // "(empty)" is a finding when a model returned nothing — it is what an
+      // inadequate reply looks like — but not when the turn's whole content is
+      // the tool calls rendered below it.
+      else if (!extras.length) node.appendChild(el('div', {class: 'tx-empty'}, ['(empty)']));
+      extras.forEach(x => node.appendChild(x));
+      return node;
+    }
+    function chip(text, title) {
+      const attrs = {class: 'pill'};
+      if (title) attrs.title = title;
+      return el('span', attrs, [text]);
+    }
+    // messageText flattens a content field. A string is itself; the multimodal
+    // array form keeps its text parts and names the rest, because an image is
+    // usually a megabyte of base64 that the body cap has already cut in half —
+    // rendering it would be a wall of noise, and fetching it would have this
+    // page load an attacker-supplied URL in an admin session.
+    function messageText(content) {
+      if (content == null) return '';
+      if (typeof content === 'string') return content;
+      if (!Array.isArray(content)) return JSON.stringify(content, null, 2);
+      return content.map(part => {
+        if (typeof part === 'string') return part;
+        if (!part || typeof part !== 'object') return String(part);
+        if (part.type === 'text' || typeof part.text === 'string') return part.text || '';
+        const url = (part.image_url && part.image_url.url) || part.url || '';
+        const kind = part.type || 'part';
+        if (!url) return '[' + kind + ']';
+        // A data: URL is named by its media type rather than its payload; an
+        // ordinary URL is short enough to show whole.
+        const comma = url.indexOf(',');
+        const label = url.slice(0, 5) === 'data:' && comma > 0 ? url.slice(0, comma + 1) : url;
+        return '[' + kind + ': ' + label + ' — ' + url.length + ' chars]';
+      }).join('\n');
+    }
+    function toolCallNode(call) {
+      const fn = (call && call.function) || {};
+      const node = el('div', {class: 'tx-call'}, [
+        el('div', {}, [el('code', {}, [(fn.name || call.name || 'tool') + '(…)'])]),
+      ]);
+      let args = fn.arguments != null ? fn.arguments : call.arguments;
+      if (typeof args === 'string') { try { args = JSON.parse(args); } catch (_) { /* leave it */ } }
+      if (args != null && typeof args !== 'string') args = JSON.stringify(args, null, 2);
+      node.appendChild(el('div', {class: 'tx-body'}, [String(args == null ? '' : args)]));
+      return node;
+    }
+
+    // renderChatRequest turns a forwarded chat body into a conversation.
+    function renderChatRequest(raw) {
+      const wrap = el('div', {class: 'tx'});
+      const note = truncationNote(raw);
+      let body;
+      try { body = JSON.parse(String(raw).replace(TRUNC, '')); } catch (_) { return null; }
+      if (!body || typeof body !== 'object') return null;
+      // The generation settings as chips, so the conversation below is only the
+      // conversation. Only fields that were actually sent.
+      const head = el('div', {class: 'tx-head'});
+      const settings = [
+        ['model', body.model], ['stream', body.stream], ['max_tokens', body.max_tokens],
+        ['max_completion_tokens', body.max_completion_tokens], ['temperature', body.temperature],
+        ['top_p', body.top_p], ['reasoning_effort', body.reasoning_effort], ['seed', body.seed],
+      ];
+      settings.forEach(([k, v]) => { if (v !== undefined && v !== null) head.appendChild(chip(k + '=' + v)); });
+      if (body.chat_template_kwargs) head.appendChild(chip('chat_template_kwargs=' + JSON.stringify(body.chat_template_kwargs)));
+      if (body.response_format) head.appendChild(chip('response_format=' + (body.response_format.type || 'set')));
+      if (Array.isArray(body.tools) && body.tools.length) {
+        head.appendChild(chip(body.tools.length + ' tool' + (body.tools.length === 1 ? '' : 's'),
+          body.tools.map(t => (t.function && t.function.name) || '?').join(', ')));
+      }
+      if (head.childNodes.length) wrap.appendChild(head);
+      if (note) wrap.appendChild(el('div', {class: 'tx-note'}, [note]));
+      const msgs = Array.isArray(body.messages) ? body.messages : [];
+      if (!msgs.length) {
+        // /v1/completions has a prompt rather than messages, and an embeddings
+        // body has neither — show whichever it turns out to be.
+        const alt = body.prompt != null ? body.prompt : body.input;
+        if (alt == null) return null;
+        wrap.appendChild(txMsg('user', 'prompt', messageText(alt)));
+        return wrap;
+      }
+      msgs.forEach(m => {
+        const role = ['system', 'user', 'assistant', 'tool'].indexOf(m.role) >= 0 ? m.role : 'system';
+        const calls = Array.isArray(m.tool_calls) ? m.tool_calls.map(toolCallNode) : [];
+        wrap.appendChild(txMsg(role, m.name || m.tool_call_id || '', messageText(m.content), calls));
+      });
+      return wrap;
+    }
+
+    // sseAnswer reassembles a captured event-stream into the answer it carried.
+    // The capture keeps the head and the tail and drops the middle, so frames
+    // are read individually and a broken one is skipped rather than failing the
+    // whole parse — a partial answer is still the most useful thing on screen.
+    function sseAnswer(raw) {
+      const out = {content: '', reasoning: '', calls: [], finish: '', usage: null, frames: 0};
+      String(raw).split('\n').forEach(line => {
+        if (line.slice(0, 5) !== 'data:') return;
+        const payload = line.slice(5).trim();
+        if (!payload || payload === '[DONE]') return;
+        let frame;
+        try { frame = JSON.parse(payload); } catch (_) { return; }
+        out.frames++;
+        if (frame.usage) out.usage = frame.usage;
+        if (frame.error) out.error = frame.error.message || JSON.stringify(frame.error);
+        const choice = (frame.choices || [])[0];
+        if (!choice) return;
+        if (choice.finish_reason) out.finish = choice.finish_reason;
+        const d = choice.delta || {};
+        if (typeof d.content === 'string') out.content += d.content;
+        const think = d.reasoning_content != null ? d.reasoning_content : d.reasoning;
+        if (typeof think === 'string') out.reasoning += think;
+        (d.tool_calls || []).forEach(tc => {
+          const i = tc.index || 0;
+          out.calls[i] = out.calls[i] || {function: {name: '', arguments: ''}};
+          if (tc.function && tc.function.name) out.calls[i].function.name = tc.function.name;
+          if (tc.function && tc.function.arguments) out.calls[i].function.arguments += tc.function.arguments;
+        });
+      });
+      return out;
+    }
+
+    // renderCompletion handles both reply shapes: a buffered JSON completion and
+    // a captured SSE stream.
+    function renderCompletion(raw) {
+      const text = String(raw || '');
+      if (!text.trim()) return null;
+      const note = truncationNote(text);
+      let answer = null;
+      const stripped = text.replace(TRUNC, '');
+      if (text.indexOf('data:') >= 0) {
+        const sse = sseAnswer(stripped);
+        if (sse.frames) answer = sse;
+      }
+      if (!answer) {
+        let body;
+        try { body = JSON.parse(stripped); } catch (_) { return null; }
+        if (!body || typeof body !== 'object') return null;
+        const choice = (body.choices || [])[0] || {};
+        const msg = choice.message || {};
+        answer = {
+          content: messageText(msg.content),
+          reasoning: msg.reasoning_content != null ? msg.reasoning_content : (msg.reasoning || ''),
+          calls: msg.tool_calls || [],
+          finish: choice.finish_reason || '',
+          usage: body.usage || null,
+          error: body.error ? (body.error.message || JSON.stringify(body.error)) : '',
+        };
+      }
+      const wrap = el('div', {class: 'tx'});
+      if (note) wrap.appendChild(el('div', {class: 'tx-note'}, [note]));
+      if (answer.error) wrap.appendChild(txMsg('error', '', answer.error));
+      // Reasoning first and dimmed: it comes first on the wire, it is usually
+      // the bulk of the bytes, and it is not the answer.
+      if (answer.reasoning) wrap.appendChild(txMsg('think', 'reasoning', answer.reasoning));
+      const calls = (answer.calls || []).filter(Boolean).map(toolCallNode);
+      // An error envelope carries no answer at all, and an empty assistant block
+      // beneath the error would read as a model that returned nothing — a
+      // different fault from one that was never asked.
+      if (answer.content || calls.length) {
+        wrap.appendChild(txMsg('assistant', calls.length && !answer.content ? 'tool call only' : '', answer.content, calls));
+      } else if (!answer.error) {
+        wrap.appendChild(txMsg('assistant', '', ''));
+      }
+      const foot = el('div', {class: 'tx-head'});
+      if (answer.finish) {
+        foot.appendChild(chip('finish=' + answer.finish, answer.finish === 'length'
+          ? 'The answer hit the token ceiling — it stops mid-thought rather than ending.' : ''));
+      }
+      const u = answer.usage;
+      if (u) foot.appendChild(chip('tokens ' + (u.prompt_tokens || 0) + ' in / ' + (u.completion_tokens || 0) + ' out'));
+      if (foot.childNodes.length) wrap.appendChild(foot);
+      return wrap;
+    }
+
+    // pane is one titled section with a formatted view and a raw view behind a
+    // toggle. The raw text is always reachable: this renderer makes judgements
+    // about what matters, and the stored bytes are the thing of record.
+    function pane(title, formatted, rawText, openRaw) {
+      const section = el('div', {});
+      const head = el('div', {class: 'pane-head'}, [el('h3', {}, [title])]);
+      const bodyWrap = el('div', {});
+      const rawNode = el('pre', {}, [pretty(rawText)]);
+      let showingRaw = !formatted || openRaw;
+      const toggle = btn('', () => {
+        showingRaw = !showingRaw;
+        render();
+      });
+      function render() {
+        bodyWrap.innerHTML = '';
+        bodyWrap.appendChild(showingRaw ? rawNode : formatted);
+        toggle.textContent = showingRaw ? 'Formatted' : 'Raw';
+        toggle.disabled = !formatted;
+      }
+      if (formatted) head.appendChild(toggle);
+      section.appendChild(head);
+      section.appendChild(bodyWrap);
+      render();
+      return section;
+    }
+
     function showLogDetail(idx) {
       const row = lastLogData[idx];
       if (!row) return;
       const modal = document.getElementById('log-modal');
       const card = document.getElementById('log-modal-card');
       const speed = logTPSLabel(row);
-      card.innerHTML = '<article class="logitem">' +
-        '<div class="loghead"><div><code>' + escapeHtml(row.backend_id) + '</code> <span class="muted">' + escapeHtml(row.backend_model) + '</span></div>' +
-        '<div><button class="secondary" onclick="closeLogDetail()">&times; Close</button></div></div>' +
-        '<div class="muted" style="margin-bottom:8px">' + new Date(row.created_at).toLocaleString() + ' · ' + escapeHtml(row.route) + ' · HTTP ' + row.status_code + ' · ' + row.duration_ms + 'ms · ' + escapeHtml(callerLabel(row)) + '</div>' +
-        (speed ? '<div class="route-speed" style="margin-bottom:8px">' + escapeHtml(speed) + '</div>' : '') +
-        (row.error ? '<div style="color:#ff6b6b;margin-bottom:8px">' + escapeHtml(row.error) + '</div>' : '') +
-        '<details open><summary>Input</summary><pre>' + escapeHtml(pretty(row.input)) + '</pre></details>' +
-        '<details><summary>Output</summary><pre>' + escapeHtml(pretty(row.output)) + '</pre></details>' +
-        '</article>';
+
+      const item = el('article', {class: 'logitem'});
+      const closeBtn = btn('× Close', () => closeLogDetail());
+      item.appendChild(el('div', {class: 'loghead'}, [
+        el('div', {}, [el('code', {}, [String(row.backend_id || '')]), el('span', {class: 'muted'}, [' ' + (row.backend_model || '')])]),
+        el('div', {}, [closeBtn]),
+      ]));
+      item.appendChild(el('div', {class: 'muted'}, [
+        new Date(row.created_at).toLocaleString() + ' · ' + row.route + ' · HTTP ' + row.status_code +
+        ' · ' + row.duration_ms + 'ms · ' + callerLabel(row),
+      ]));
+      if (speed) item.appendChild(el('div', {class: 'route-speed'}, [speed]));
+      if (row.error) item.appendChild(el('div', {class: 'bad', style: 'margin-top:6px'}, [row.error]));
+
+      // A relay caller's bodies are dropped before the row is written, so an
+      // empty pair here is a policy rather than a failure — say which, or this
+      // reads as a router that lost the request.
+      if (!row.input && !row.output) {
+        item.appendChild(el('div', {class: 'tx-note', style: 'margin-top:12px'}, [
+          'No request or response body was stored for this row. Relay callers are logged without their content — the routing and cost fields above are the whole record.',
+        ]));
+      } else {
+        item.appendChild(pane('Request', renderChatRequest(row.input), row.input));
+        item.appendChild(pane('Response', renderCompletion(row.output), row.output));
+      }
+      card.innerHTML = '';
+      card.appendChild(item);
       modal.classList.add('open');
     }
     function closeLogDetail(event) {

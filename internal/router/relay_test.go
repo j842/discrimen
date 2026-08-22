@@ -705,4 +705,3 @@ func TestRelayLatencyIncludesTheLink(t *testing.T) {
 			expectedLatency(far, job), expectedLatency(near, job))
 	}
 }
-

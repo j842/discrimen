@@ -48,6 +48,13 @@ const (
 	// construction, whatever its payload claims.
 	sourceBeacon = "beacon"
 	sourceManual = "manual"
+	// sourceRelay is a row DERIVED from another discrimen's fleet (see relay.go).
+	// It owns none of its values — every one is imported from upstream on each
+	// refresh — which is why it is neither of the two above: a beacon's values are
+	// a seed the measurement replaces, a manual row's are the operator's to keep,
+	// and a relay row's are somebody else's measurement, replaced wholesale each
+	// time it is re-read.
+	sourceRelay = "relay"
 )
 
 // normalizeProviderFields settles the P2 fields on a registration. Called from
@@ -62,12 +69,20 @@ func normalizeProviderFields(reg *BackendRegistration) {
 	if reg.Provider == "" {
 		reg.Provider = providerLocal
 	}
-	// Only the exact spelling counts as manual. A typo must not silently grant a
-	// row operator ownership of its own values.
-	if strings.ToLower(strings.TrimSpace(reg.Source)) == sourceManual {
+	// Only the exact spellings count. A typo must not silently grant a row
+	// operator ownership of its own values, nor mark it as somebody else's fleet;
+	// anything unrecognised falls back to beacon, which owns nothing and is what
+	// every registration predating these fields is.
+	switch strings.ToLower(strings.TrimSpace(reg.Source)) {
+	case sourceManual:
 		reg.Source = sourceManual
-	} else {
+	case sourceRelay:
+		reg.Source = sourceRelay
+	default:
 		reg.Source = sourceBeacon
+	}
+	if reg.Source != sourceRelay {
+		reg.Relay = ""
 	}
 	// A negative price is not a discount.
 	if reg.InputPricePerMtok < 0 {
@@ -80,6 +95,14 @@ func normalizeProviderFields(reg *BackendRegistration) {
 
 // isManualRow reports whether a row is operator-owned.
 func isManualRow(b *Backend) bool { return b != nil && b.Source == sourceManual }
+
+// isRelayRow reports whether a row was derived from another router's fleet.
+//
+// The distinction matters wherever this router would otherwise treat the row's
+// URL as an endpoint: it is a router, so it must not be probed, benchmarked or
+// asked what weights it loaded, and the thinking gate spoken to it is the
+// client-facing one rather than any endpoint's dialect. See relay.go.
+func isRelayRow(b *Backend) bool { return b != nil && b.Source == sourceRelay }
 
 // isLocalProvider reports whether a provider name means "runs here, and nobody
 // bills for it". The empty string counts, because that is what

@@ -292,6 +292,69 @@ group over both restores the readable name.
 Extend the existing single-file dashboard, which has no build step, with tabs
 for the fleet, providers, keys, groups and logs, behind the admin password.
 
+### P7. Relay
+
+Two fleets, run by the same operator in different places, where one may route
+to part of the other. The obvious construction — register the far workers
+directly, or point a provider row at the far router's port — is wrong in three
+ways, and P7 is the three fixes.
+
+**Slot accounting has to stay in one place.** Two routers dispatching to the
+same GPUs each keep their own view of how busy those GPUs are, and both are
+wrong by the size of the other's queue. So a relayed request goes to the other
+ROUTER, which acquires the slot, queues and spills for both fleets at once.
+The downstream always names the model on the way out, so the upstream is a
+slot broker rather than a second classifier deciding a tier the downstream had
+already decided.
+
+**A measurement should cross rather than be repeated.** The quality benchmark
+is 130 questions and several hundred thousand output tokens of the upstream's
+GPU time, and it has already been run against exactly these workers. Running
+it again from the downstream would spend the same GPUs to learn the same
+answer. "Measure, don't trust" survives intact — they ARE measured, and
+`bench_version` on the wire is the statement that the two measurements are the
+same measurement. A mismatch is not papered over: capacity, context and
+capabilities still cross, because those are facts about the deployment rather
+than the question set, and the quality is held at the provisional tier an
+unproven worker gets. Re-measuring locally is not an option a relay has, which
+is why the version is reported on `/health` rather than quietly worked around.
+
+The one value that cannot cross is the thinking dialect. It describes how to
+spell the gate to the endpoint that finally serves the request, and a relay's
+immediate peer is a router — which speaks the client-facing OpenAI spelling
+and translates onward. So it is `reasoning_effort` by construction.
+
+**Content and accounting are different things.** A relay key marks its caller,
+and a marked caller's request and response bodies never reach the log store.
+The row does: which endpoint served, what it cost, how long it took, which key
+spent it. An operator who could not see those could not answer "what is my
+fleet doing" about the traffic they did not send, and a per-key budget that
+stopped counting would not be a budget. Relayed outcomes are also kept out of
+the online adapter and the judge, on the same reasoning that already excludes
+a named-model route: both learn about a tier THIS router chose, and a relayed
+prompt was classified downstream against a fleet this router cannot see — so
+feeding it here would count one signal twice and move bins that describe
+somebody else's hardware.
+
+Relay is a flag on a client key rather than a fourth role: the roles map onto
+the three surfaces, and a relay calls the OpenAI one. The per-key model
+allow-list, which already exists, is what limits a relay to part of a fleet —
+and it holds through `allowsBackend`, so it constrains the auto route too, not
+just what the caller may name.
+
+Cycles are refused by construction. Each router generates and persists its own
+id, every relayed request carries the chain of ids it has passed through, and
+a router that finds itself in the chain answers 508. Generated rather than
+configured: an environment variable two deployments copy from each other is
+precisely how a cycle becomes undetectable.
+
+The link is priced, not ignored. The round trip measured on the fleet poll is
+folded into the imported first-token latency, so a remote fleet is not ranked
+against local workers as though it were in the next rack. The prefill RATE is
+deliberately not imported at all — a rate has nowhere to put a constant
+offset, and the downstream measures its own within a few requests, link
+included.
+
 ## Findings from the code review
 
 Line numbers refer to the pre-extraction `llm-router` tree.
@@ -315,7 +378,7 @@ a provider with no health route.
 
 ## Known costs
 
-Two things this plan accepts rather than solves.
+Three things this plan accepts rather than solves.
 
 The benchmark is published in full, questions and answer key both. That
 exposes the grading set to anything that scrapes GitHub, which over time means
@@ -335,3 +398,19 @@ restarts reuse the cache, but a benchmark version bump re-runs it across the
 whole fleet including the paid endpoints. Profiling stays aggressive by
 choice. The UI should show what a run cost once it has finished, so the number
 is at least visible.
+
+A relay is trusted, and cannot be anything else. The downstream adopts the
+upstream's quality, capacity and capabilities as measured, so an upstream that
+claims a quality it has not earned is believed — there is no cheap way to
+verify it that is not simply running the benchmark again, which is the cost the
+import exists to avoid. That is the right trade between two halves of one fleet
+under one operator and the wrong one anywhere else, and the mitigation is to say
+so rather than to build a verification nobody would want to pay for: a relay is
+a router you run, and a stranger's endpoint belongs in `/admin/providers`, which
+measures what it is told.
+
+It also couples the two deployments' benchmark versions. Bump one side and the
+imported quality stops being adoptable until the other follows, which is a
+version skew nothing else in this design has. The alternative — a version-free
+quality — would be worse, because it is exactly the number that must not be
+comparable by accident.

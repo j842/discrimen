@@ -670,7 +670,28 @@ func deadlineFilter(candidates []*Backend, job jobCost, budget time.Duration) ([
 
 // isFull reports whether a capped backend is at its concurrency limit.
 func isFull(b *Backend) bool {
-	return b.MaxConcurrency > 0 && b.ActiveRequests >= b.MaxConcurrency
+	return b.MaxConcurrency > 0 && occupancy(b) >= b.MaxConcurrency
+}
+
+// occupancy is how many requests are in flight against a backend's real
+// hardware, which is not always what this router dispatched.
+//
+// For a local worker the two are the same and this is ActiveRequests. For a
+// RELAY row the upstream router is dispatching to those GPUs as well — that is
+// the point of a relay, one queue for both fleets — so its own count is the
+// fleet truth, refreshed on each poll (see setRelayLoad).
+//
+// The two are combined with max rather than sum, and the difference matters:
+// this router's in-flight requests are occupying upstream slots, so they are
+// ALREADY inside the number the upstream reported, and adding them would count
+// each one twice. Max instead takes the upstream's figure as the floor and lets
+// a burst dispatched since the last poll — which the upstream has not told us
+// about yet — raise it.
+func occupancy(b *Backend) int {
+	if b.RemoteActive > b.ActiveRequests {
+		return b.RemoteActive
+	}
+	return b.ActiveRequests
 }
 
 // liveTPS prefers the live EWMA throughput, falling back to the certified then
@@ -713,7 +734,7 @@ func expectedLatency(b *Backend, job jobCost) float64 {
 		slots = 1
 	}
 	wait := 0.0
-	if over := float64(b.ActiveRequests + 1 - slots); over > 0 {
+	if over := float64(occupancy(b) + 1 - slots); over > 0 {
 		wait = math.Ceil(over / float64(slots))
 	}
 	// One request's service time is first-token latency plus decode; queueing past
@@ -729,6 +750,13 @@ func expectedLatency(b *Backend, job jobCost) float64 {
 // average. The raw EWMA is also not comparable across workers, because each one's
 // average reflects whatever prompt sizes it happens to receive. Falls back to the
 // TTFT EWMA (previous behaviour) until a prefill rate has been measured.
+//
+// A relay row needs no special case here, and deliberately gets none. Both terms
+// it reads are measured by THIS router from its own streamed requests (see
+// Registry.observe), so the WAN hop to an upstream is already inside them — and
+// until the first sample lands, the fallback reads a certified TTFT that the
+// relay import seeded with the round trip for exactly that reason. Adding the
+// round trip again here would charge a remote fleet for its link twice.
 func prefillSeconds(b *Backend, promptTokens int) float64 {
 	if rate := b.ObservedPrefillTPS; rate > 0 && promptTokens > 0 {
 		return float64(promptTokens) / rate

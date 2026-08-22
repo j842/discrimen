@@ -286,7 +286,7 @@ func (r *Router) serveExpert(w http.ResponseWriter, req *http.Request, ident *id
 		logEntry.DurationMillis = time.Since(start).Milliseconds()
 		// Async, exactly as on the proxy path: a synchronous SQLite write against a
 		// pool capped at one connection would extend every request by it.
-		charged, caller, entry := tally.charged, ident, logEntry
+		charged, caller, entry := tally.charged, ident, redactForRelay(logEntry, ident)
 		go func() {
 			r.recordKeyUse(caller, charged)
 			if r.logs != nil {
@@ -724,6 +724,7 @@ func (r *Router) streamSynthesis(w http.ResponseWriter, req *http.Request, plan 
 	}
 	proxyReq.Header.Set("Content-Type", "application/json")
 	setBackendCredential(proxyReq, synth)
+	r.stampRelayChain(proxyReq, req, synth)
 
 	idle := time.Duration(0)
 	if r.cfg != nil {

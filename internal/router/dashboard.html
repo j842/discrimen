@@ -116,6 +116,7 @@
         <button class="secondary" id="mtab-providers">Providers</button>
         <button class="secondary" id="mtab-keys">Keys</button>
         <button class="secondary" id="mtab-groups">Groups</button>
+        <button class="secondary" id="mtab-relays">Relays</button>
         <button class="secondary" id="mtab-logs">Logs</button>
       </nav>
 
@@ -195,6 +196,13 @@
                 <label for="k-budget">Token budget</label>
                 <input id="k-budget" type="number" min="0" placeholder="blank ⇒ unlimited">
               </div>
+              <div class="field">
+                <label for="k-relay">Relay key</label>
+                <label class="rowline" style="font-weight:400">
+                  <input id="k-relay" type="checkbox">
+                  <span class="muted">held by another discrimen, not a client</span>
+                </label>
+              </div>
             </div>
             <div class="rowline">
               <button id="btn-issue-key">Issue</button>
@@ -205,6 +213,12 @@
               The allow-list is matched against whatever the client names — a model id, an alias, a worker id
               or a group name — so a key restricted to a group needs the group's name, not its members'.
               The budget is a lifetime ceiling on tokens.
+            </div>
+            <div class="hint">
+              A <strong>relay key</strong> is for another discrimen routing through this one. It opens
+              <code>GET /relay/fleet</code>, and it drops the prompts and answers from the request log —
+              the row stays, so what was served and what it cost still count. Client role only, and pair it
+              with an allow-list: that is what limits the other router to part of this fleet.
             </div>
           </div>
         </section>
@@ -261,6 +275,59 @@
         </table>
       </section>
 
+      <section class="view" id="view-relays">
+        <div class="rowline" style="margin-bottom:12px">
+          <button id="btn-new-relay">Add a relay</button>
+          <span class="muted" id="relay-self"></span>
+        </div>
+        <div class="banner" id="relay-note"></div>
+        <section class="panel" id="relay-form-panel" hidden>
+          <h2>Add a relay</h2>
+          <div class="panel-body stack">
+            <div class="formgrid">
+              <div class="field">
+                <label for="r-name">Name</label>
+                <input id="r-name" placeholder="work">
+              </div>
+              <div class="field">
+                <label for="r-url">Base URL</label>
+                <input id="r-url" placeholder="http://other-router:8585">
+              </div>
+              <div class="field">
+                <label for="r-key">Relay key</label>
+                <input id="r-key" type="password" placeholder="sk-… issued on the other router">
+              </div>
+            </div>
+            <div class="rowline">
+              <button id="btn-create-relay">Add</button>
+              <button class="secondary" id="btn-cancel-relay">Cancel</button>
+            </div>
+            <div class="banner" id="relay-form-note"></div>
+            <div class="hint">
+              A relay is another discrimen whose fleet this one may route to. It expands into one backend per
+              model the other router publishes to this key, and their measured quality, capacity, context and
+              capabilities are imported rather than benchmarked again here. The name prefixes those backend
+              ids, so keep it short.
+            </div>
+            <div class="hint">
+              Point it at a router you run. The values it reports are adopted as measured, which is the right
+              trade between two halves of one fleet and the wrong one for a stranger's endpoint — for those
+              use Providers, which measures what it is told.
+            </div>
+          </div>
+        </section>
+        <table style="margin-top:12px">
+          <thead>
+            <tr>
+              <th>Relay</th><th>URL</th><th>State</th><th>Models</th><th>Round trip</th><th>Last fetch</th><th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="relays-body">
+            <tr><td colspan="7" class="muted">Loading relays…</td></tr>
+          </tbody>
+        </table>
+      </section>
+
       <section class="view" id="view-logs">
         <section class="panel">
           <h2>Request Logs</h2>
@@ -310,7 +377,7 @@
     // revoked server-side by /admin/logout, and expires on its own.
     let signedIn = false;
     let activeTab = 'fleet';
-    const TABS = ['fleet', 'providers', 'keys', 'groups', 'logs'];
+    const TABS = ['fleet', 'providers', 'keys', 'groups', 'relays', 'logs'];
 
     // Any key the previous version of this page left behind. Removed rather than
     // migrated: it is a live admin credential in a store this page no longer has
@@ -420,6 +487,7 @@
       else if (name === 'providers') loadProviders();
       else if (name === 'keys') loadKeys();
       else if (name === 'groups') loadGroups();
+      else if (name === 'relays') loadRelays();
       else if (name === 'logs') loadLogs(activeLogBackend);
     }
 
@@ -1037,7 +1105,18 @@
         const tr = el('tr', {});
         tr.appendChild(td([el('code', {}, [String(k.prefix || '')]), el('span', {class: 'muted'}, ['…'])]));
         tr.appendChild(td([String(k.name || '')]));
-        tr.appendChild(td([el('span', {class: 'pill'}, [String(k.role || '')])]));
+        // The relay flag rides on the role cell: it changes what the credential
+        // is for, and an operator reading this page for "who can call this
+        // router" has to be able to see that one caller's prompts are not being
+        // recorded.
+        const role = [el('span', {class: 'pill'}, [String(k.role || '')])];
+        if (k.relay) {
+          role.push(el('span', {
+            class: 'pill',
+            title: 'Another discrimen routing through this one. Reads /relay/fleet; its prompts and answers are not stored, and its outcomes do not teach the tier adapter.',
+          }, ['relay']));
+        }
+        tr.appendChild(td([el('div', {class: 'features'}, role)]));
         tr.appendChild(td([k.enabled
           ? el('span', {class: 'ok'}, ['enabled'])
           : el('span', {class: 'muted', title: 'Disabled keys are refused, but stay here so the key id on old log rows still resolves.'}, ['disabled'])]));
@@ -1082,6 +1161,7 @@
         }
         body.token_budget = n;
       }
+      if (document.getElementById('k-relay').checked) body.relay = true;
       setBanner('key-form-note', 'Issuing…');
       const res = await request('/admin/keys', {method: 'POST', body: body});
       if (!res.ok) {
@@ -1091,6 +1171,7 @@
       document.getElementById('k-name').value = '';
       document.getElementById('k-models').value = '';
       document.getElementById('k-budget').value = '';
+      document.getElementById('k-relay').checked = false;
       document.getElementById('key-form-panel').hidden = true;
       showSecret(res.data);
       loadKeys();
@@ -1277,6 +1358,91 @@
       loadGroups('Created ' + name + '.');
     }
 
+    // ── Relays ──────────────────────────────────────────────────────────────
+    async function loadRelays(note, kind) {
+      if (note !== undefined) setBanner('relay-note', note, kind || 'ok');
+      const res = await request('/admin/relays');
+      if (!res.ok) {
+        emptyRow('relays-body', 7, res.error);
+        return;
+      }
+      const data = res.data || {};
+      // This router's own id is what an upstream needs in order to recognise a
+      // cycle, and the only place it is shown.
+      document.getElementById('relay-self').textContent =
+        'this router is ' + (data.router_id || '?') + ' · benchmark v' + (data.bench_version || '?');
+      const relays = data.relays || [];
+      if (!relays.length) {
+        emptyRow('relays-body', 7, 'No relays. A relay lets this router send traffic to another discrimen’s fleet, importing what that router already measured.');
+        return;
+      }
+      const body = document.getElementById('relays-body');
+      body.innerHTML = '';
+      relays.forEach(rel => {
+        const tr = el('tr', {});
+        tr.appendChild(td([el('code', {}, [rel.name])]));
+        tr.appendChild(td([el('span', {class: 'muted'}, [rel.url])]));
+        tr.appendChild(td([relayState(rel, data.bench_version)]));
+        tr.appendChild(td([String(rel.models || 0)]));
+        tr.appendChild(td([rel.rtt_ms ? Math.round(rel.rtt_ms) + ' ms' : '—']));
+        tr.appendChild(td([rel.last_fetch ? timeAgo(rel.last_fetch) : 'never']));
+        const actions = el('div', {class: 'actions'});
+        actions.appendChild(btn(rel.enabled ? 'Disable' : 'Enable', () => toggleRelay(rel)));
+        actions.appendChild(btn('Delete', () => deleteRelay(rel), 'danger'));
+        tr.appendChild(td([actions]));
+        body.appendChild(tr);
+      });
+    }
+    // relayState folds the three things that can be wrong with a relay into one
+    // cell: switched off, unreachable, or reachable but benchmarking with a
+    // different question set — which is the one fault that leaves everything
+    // apparently working while the tiers stop meaning the same thing.
+    function relayState(rel, localBench) {
+      if (!rel.enabled) return el('span', {class: 'muted'}, ['disabled']);
+      if (rel.last_error) return el('span', {class: 'bad', title: rel.last_error}, ['unreachable']);
+      if (rel.bench_version && localBench && rel.bench_version !== localBench) {
+        return el('span', {
+          class: 'warn',
+          title: 'Its benchmark is v' + rel.bench_version + ' and this router runs v' + localBench +
+                 '. Capacity and capabilities still cross; quality is held at the provisional tier until the two match.',
+        }, ['benchmark v' + rel.bench_version]);
+      }
+      if (!rel.last_fetch) return el('span', {class: 'muted'}, ['not yet fetched']);
+      return el('span', {class: 'ok'}, ['connected']);
+    }
+    async function toggleRelay(rel) {
+      const res = await request('/admin/relays/' + encodeURIComponent(rel.name),
+        {method: 'PATCH', body: {enabled: !rel.enabled}});
+      loadRelays(res.ok ? (rel.enabled ? 'Disabled ' : 'Enabled ') + rel.name + '.' : res.error, res.ok ? 'ok' : 'bad');
+    }
+    async function deleteRelay(rel) {
+      if (!confirm('Delete relay ' + rel.name + '? Its models stop being routable from here immediately.')) return;
+      const res = await request('/admin/relays/' + encodeURIComponent(rel.name), {method: 'DELETE'});
+      loadRelays(res.ok ? 'Removed ' + rel.name + '.' : res.error, res.ok ? 'ok' : 'bad');
+    }
+    async function createRelay() {
+      const name = document.getElementById('r-name').value.trim();
+      const url = document.getElementById('r-url').value.trim();
+      const key = document.getElementById('r-key').value;
+      if (!name || !url) {
+        setBanner('relay-form-note', 'A relay needs a name and the other router’s base URL.', 'bad');
+        return;
+      }
+      setBanner('relay-form-note', 'Adding…');
+      const body = {name: name, url: url};
+      if (key) body.api_key = key;
+      const res = await request('/admin/relays', {method: 'POST', body: body});
+      if (!res.ok) {
+        setBanner('relay-form-note', res.error, 'bad');
+        return;
+      }
+      document.getElementById('r-name').value = '';
+      document.getElementById('r-url').value = '';
+      document.getElementById('r-key').value = '';
+      document.getElementById('relay-form-panel').hidden = true;
+      loadRelays('Added ' + name + '. Its models appear in the fleet once the first fetch lands.');
+    }
+
     // ── Logs ────────────────────────────────────────────────────────────────
     let activeLogBackend = '';
     let logOffset = 0;
@@ -1409,6 +1575,12 @@
     });
     on('btn-create-group', 'click', createGroup);
     on('btn-cancel-group', 'click', () => { document.getElementById('group-form-panel').hidden = true; });
+    on('btn-new-relay', 'click', () => {
+      document.getElementById('relay-form-panel').hidden = false;
+      setBanner('relay-form-note', '');
+    });
+    on('btn-create-relay', 'click', createRelay);
+    on('btn-cancel-relay', 'click', () => { document.getElementById('relay-form-panel').hidden = true; });
     document.addEventListener('keydown', event => {
       if (event.key !== 'Escape') return;
       closeLogDetail();

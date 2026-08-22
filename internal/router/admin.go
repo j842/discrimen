@@ -135,14 +135,19 @@ func (r *Router) handleAdminProviderByID(w http.ResponseWriter, req *http.Reques
 		writeJSON(w, http.StatusNotFound, validationError{Message: fmt.Sprintf("provider %q not found", id)})
 		return
 	}
-	// Beacon rows are reachable here by id, and must not be editable here: their
-	// values belong to the worker that registers them, and the next keepalive
-	// would overwrite whatever an operator typed. Say so rather than accept an
-	// edit that silently evaporates in 60 seconds.
+	// Beacon and relay rows are reachable here by id, and must not be editable
+	// here. Neither one's values are the operator's: a beacon's belong to the
+	// worker that posts them and the next keepalive would overwrite whatever was
+	// typed, and a relay's belong to the upstream router and the next fleet
+	// refresh would do the same. Say so rather than accept an edit that silently
+	// evaporates within the minute.
 	if !isManualRow(existing) {
-		writeJSON(w, http.StatusConflict, validationError{
-			Message: fmt.Sprintf("backend %q registered itself (source=%s); it is managed by its own beacon, not here", id, existing.Source),
-		})
+		message := fmt.Sprintf("backend %q registered itself (source=%s); it is managed by its own beacon, not here", id, existing.Source)
+		if isRelayRow(existing) {
+			message = fmt.Sprintf("backend %q is derived from relay %q; edit the relay at /admin/relays/%s, or change it on the upstream router",
+				id, existing.Relay, existing.Relay)
+		}
+		writeJSON(w, http.StatusConflict, validationError{Message: message})
 		return
 	}
 	switch req.Method {
@@ -610,6 +615,7 @@ type keySpec struct {
 	Enabled     *bool     `json:"enabled"`
 	Models      *[]string `json:"models"`
 	TokenBudget *int64    `json:"token_budget"`
+	Relay       *bool     `json:"relay"`
 }
 
 func (r *Router) handleAdminKeys(w http.ResponseWriter, req *http.Request) {
@@ -682,9 +688,11 @@ func (r *Router) createKey(w http.ResponseWriter, req *http.Request) {
 		name   string
 		models []string
 		budget int64
+		relay  bool
 	)
 	assign(&name, spec.Name)
 	assign(&budget, spec.TokenBudget)
+	assign(&relay, spec.Relay)
 	if spec.Models != nil {
 		models = *spec.Models
 	}
@@ -692,11 +700,16 @@ func (r *Router) createKey(w http.ResponseWriter, req *http.Request) {
 		writeJSON(w, http.StatusBadRequest, validationError{Message: "token_budget must not be negative", Param: "token_budget"})
 		return
 	}
+	if err := validateRelayFlag(relay, role); err != nil {
+		writeJSON(w, http.StatusBadRequest, *err)
+		return
+	}
 	plain, key, err := newAPIKey(name, role, models, budget)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, validationError{Message: err.Error()})
 		return
 	}
+	key.Relay = relay
 	stored, err := r.logs.CreateAPIKey(req.Context(), plain, key)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, validationError{Message: err.Error()})
@@ -748,11 +761,16 @@ func (r *Router) updateKey(w http.ResponseWriter, req *http.Request, id int64) {
 	assign(&current.Name, spec.Name)
 	assign(&current.Enabled, spec.Enabled)
 	assign(&current.TokenBudget, spec.TokenBudget)
+	assign(&current.Relay, spec.Relay)
 	if spec.Models != nil {
 		current.Models = normalizeModelList(*spec.Models)
 	}
 	if current.TokenBudget < 0 {
 		writeJSON(w, http.StatusBadRequest, validationError{Message: "token_budget must not be negative", Param: "token_budget"})
+		return
+	}
+	if err := validateRelayFlag(current.Relay, current.Role); err != nil {
+		writeJSON(w, http.StatusBadRequest, *err)
 		return
 	}
 	if err := r.logs.UpdateAPIKey(req.Context(), id, *current); err != nil {

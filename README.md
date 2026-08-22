@@ -397,6 +397,8 @@ judge learn nothing from it.
 | any | `/admin/providers[/{id}]` | admin | CRUD over manually-entered endpoints |
 | any | `/admin/keys[/{id}]` | admin | Issue, list, disable and delete API keys |
 | any | `/admin/groups[/{id}]` | admin | CRUD over named groups |
+| any | `/admin/relays[/{name}]` | admin | CRUD over upstream routers this one relays to |
+| GET | `/relay/fleet` | relay | What a downstream router may see of this fleet: one entry per model it is allowed, with the measured profile and live occupancy |
 | POST | `/admin/login`, `/admin/logout` | password | Session cookie |
 | GET | `/` | none | Dashboard shell. Discloses nothing; the fleet table is fetched client-side with the admin session cookie |
 
@@ -421,6 +423,12 @@ the OpenAI surface, `/backends`, `/logs`, `/admin/*` and worker registration.
 There is no authority a client has that an admin does not, so the OpenAI surface
 accepts an admin key rather than making an operator hold a second credential to
 test what they just configured.
+
+**Relay** is not a fourth role. It is a flag on a client key, and the only thing
+it opens is `GET /relay/fleet` — everything else it does is subtractive (see
+[Relay](#relay)). A client key without it is refused there, because the fleet's
+measured capacity and live occupancy is most of what moving `/backends` behind
+the admin gate was meant to protect.
 
 `/workers` and `/workers/register` are accepted as aliases of the `/backends`
 spellings. Both are frozen: a worker deployed against an older version must keep
@@ -478,6 +486,83 @@ Groups also fix a display wrinkle. Two endpoints running different builds of the
 same family have different raw model ids that reduce to the same alias, which
 the menu then suppresses as ambiguous even though routing still pools them
 correctly. A group over both restores the readable name.
+
+## Relay
+
+A relay is a second discrimen, somewhere else, whose fleet this one may route
+to. Add it once and it expands into one backend per model the other router
+publishes to you; they appear in `/v1/models` and rank against your local
+workers like anything else.
+
+**On the upstream** — issue a client key with the relay flag, and an allow-list
+saying which models it may reach:
+
+```bash
+curl -X POST http://upstream:8585/admin/keys \
+  -H "Authorization: Bearer $ADMIN_KEY" -H 'Content-Type: application/json' \
+  -d '{"name":"home","role":"client","relay":true,"models":["model-a","model-b"]}'
+```
+
+**On the downstream** — point a relay at it with that key:
+
+```bash
+curl -X POST http://localhost:8585/admin/relays \
+  -H "Authorization: Bearer $ADMIN_KEY" -H 'Content-Type: application/json' \
+  -d '{"name":"work","url":"http://upstream:8585","api_key":"sk-…"}'
+```
+
+That is the whole configuration. Both ends also have a tab on the dashboard.
+
+The allow-list is what limits a relay to part of a fleet, and it holds through
+`allowsBackend`, so it constrains the automatic route as well as what the
+downstream may name. Write it in whichever spelling you prefer — a model id, an
+endpoint id or an alias: `/relay/fleet` publishes each model back under the name
+this key was actually issued for, so everything the downstream discovers is
+something it is allowed to say.
+
+It is not the same thing as pointing a provider row at the other router's port,
+and the difference is three things.
+
+**The upstream keeps the slots.** A relayed request is dispatched to the other
+router, which acquires the worker slot, queues, ranks and spills exactly as it
+does for its own traffic. Register the same workers directly on two routers and
+each keeps its own idea of how busy those GPUs are, and both are wrong by the
+size of the other's queue.
+
+**The profile crosses instead of being re-measured.** Quality, capacity,
+context, capabilities and the thinking dialect were already measured upstream by
+the same graded benchmark this binary carries — 130 questions and several
+hundred thousand output tokens of somebody's GPU time. `bench_version` on the
+wire is what says the two measurements are the same measurement; when it does
+not match, capacity and capabilities still cross and the quality is held at the
+provisional tier an unproven worker gets, rather than adopting a score from
+another scale. `/health` reports the mismatch under `relays`.
+
+**Relayed traffic leaves no prompts upstream.** A relay key marks its caller,
+and a marked caller's request and response bodies are dropped before the log row
+is written. The row itself stays — which endpoint served, what it cost, how long
+it took, which key spent it — because that is capacity accounting rather than
+content, and a per-key budget that stopped counting would be a budget nobody
+could enforce. Relayed outcomes also do not teach the tier adapter or the
+background judge: the downstream classified that prompt against its own fleet
+and is already learning from the same outcome.
+
+**Trust.** A relay is a router you run. The downstream adopts the upstream's
+measurements sight unseen, so an upstream that claims quality 100 is believed.
+That is the right trade between two halves of one fleet and the wrong one for a
+stranger's endpoint — for those there is `/admin/providers`, which measures what
+it is told.
+
+**Cycles.** Every relayed request carries `X-LLM-Relay`, a chain of router ids.
+A router that finds its own id in the chain answers 508, and so does one past
+`relayMaxHops`. Each router's id is generated on first run and persisted; there
+is nothing to configure and nothing two deployments can copy from each other.
+
+**What it costs.** Two hops of network, and the downstream prices them: the
+round trip to the upstream is folded into the imported first-token latency, so a
+remote fleet is not compared against local workers as though it were in the next
+rack. The downstream always names the model on the way out, so the upstream is a
+slot broker rather than a second classifier.
 
 ## Measuring the router
 
@@ -547,6 +632,7 @@ standard library.
 | `benchmark.go`, `benchmark_data.go` | the tiered quality benchmark |
 | `session.go` | conversation identity, tool-loop detection, affinity tracker |
 | `escalate.go` | buffered dispatch, inline escalation, strip-and-retry |
+| `relay.go` | routing through another discrimen: the relay key, `/relay/fleet`, the loop guard, and the fleet import |
 | `adapter.go` | online tier adapter |
 | `judge.go` | background LLM-as-judge |
 | `preview.go` | `/v1/route-preview` |

@@ -122,6 +122,11 @@ type BackendRegistration struct {
 	// a local beacon at zero cost, which is what every deployed worker sends.
 	Provider string `json:"provider,omitempty"`
 	Source   string `json:"source,omitempty"`
+	// Relay names which configured relay a source=="relay" row was derived from
+	// (see relay.go). Empty on every other kind of row, and cleared by
+	// normalizeProviderFields on anything that is not a relay row — a beacon that
+	// claimed to belong to a relay would be pruned by the next refresh.
+	Relay string `json:"relay,omitempty"`
 	// Price per MILLION tokens, in whatever currency the operator is billed in.
 	// Zero means free, which is the truth for every local worker and therefore
 	// the right default (see PLAN.md, P4).
@@ -145,6 +150,19 @@ type Backend struct {
 	ObservedTTFTMillis float64   `json:"observed_ttft_ms,omitempty"`     // live EWMA of first-token latency (prefill + queue), ms
 	ObservedPrefillTPS float64   `json:"observed_prefill_tps,omitempty"` // live EWMA of PREFILL throughput (prompt tokens / TTFT), tok/s
 	ThinkingDialect    string    `json:"thinking_dialect,omitempty"`     // measured spelling of the thinking gate (see WorkerProfile.ThinkingDialect)
+	// RemoteActive is how many requests the UPSTREAM says are in flight against a
+	// relay row's model, refreshed on every relay poll. It exists because
+	// ActiveRequests counts only what this router dispatched, and the point of a
+	// relay is that the other router is dispatching to the same GPUs — pricing a
+	// remote fleet by our own share of its queue would prefer it precisely when
+	// it is busiest. See relayOccupancy.
+	RemoteActive int `json:"remote_active,omitempty"`
+	// RelayRTTMillis is the smoothed round trip to the upstream router. It is
+	// folded into the certified TTFT at import (see relayProfile) so a WAN hop is
+	// priced from the very first request rather than only once this router has
+	// measured its own latency; the copy here is what puts the number in front of
+	// an operator on /backends. Zero on every non-relay row.
+	RelayRTTMillis float64 `json:"relay_rtt_ms,omitempty"`
 	// RejectedFields are request fields this endpoint has refused as
 	// unrecognised; they are omitted from everything sent to it until the verdict
 	// ages out (see stripAndRetry and rejectedFieldTTL). Learned at runtime and
@@ -520,6 +538,7 @@ func Main() {
 		log.Printf("inline escalation enabled (empty non-streamed answers are re-dispatched to a better worker)")
 	}
 	router.loadGroups(context.Background())
+	router.loadRelays(context.Background())
 	if saved, err := logs.LoadBackendRegistrations(context.Background()); err != nil {
 		log.Printf("load persisted backend registrations failed: %v", err)
 	} else {
@@ -538,6 +557,10 @@ func Main() {
 
 	go router.healthLoop()
 	go router.logRetentionLoop()
+	// Relay rows are DERIVED, never persisted: the refresh below is what creates
+	// them, and it runs its first pass immediately rather than on the first tick
+	// so a restart does not leave the relayed half of the fleet missing.
+	go router.relayRefreshLoop()
 
 	server := &http.Server{
 		Addr:              ":" + cfg.Port,
@@ -578,6 +601,17 @@ type Router struct {
 	// groups holds the named preference lists a client can select through the
 	// model field (see groups.go). A value for the same reason as adminAuth.
 	groups groupStore
+	// relays holds the upstream routers this one may route through, and the last
+	// fleet each reported (see relay.go). A value for the same reason as groups.
+	relays relayStore
+	// relayRefresh serialises the reconcile pass, which the ticker and both admin
+	// write paths can all start. See refreshRelays.
+	relayRefresh sync.Mutex
+	// selfID is this router's own identity, generated once and persisted, used to
+	// recognise a relay chain that has already been here. Lazily resolved, so a
+	// Router built by hand in a test needs no setup.
+	selfID     atomic.Value
+	selfIDOnce sync.Once
 	// Whether a client / worker credential is REQUIRED, cached from the keys
 	// table so the check is not a database read per request. Refreshed at startup
 	// and after every write to that table (see refreshAuthRequired).
@@ -762,6 +796,11 @@ func (r *Router) routes() *http.ServeMux {
 	mux.HandleFunc("/admin/keys/", r.handleAdminKeyByID)
 	mux.HandleFunc("/admin/groups", r.handleAdminGroups)
 	mux.HandleFunc("/admin/groups/", r.handleAdminGroupByName)
+	mux.HandleFunc("/admin/relays", r.handleAdminRelays)
+	mux.HandleFunc("/admin/relays/", r.handleAdminRelayByName)
+	// What a downstream router may see of this fleet. Client scope plus the relay
+	// flag — see handleRelayFleet for why an ordinary client key is not enough.
+	mux.HandleFunc("/relay/fleet", r.handleRelayFleet)
 	// The password session. /admin/login and /admin/session are the only two
 	// unauthenticated routes under /admin, and neither discloses anything: login
 	// answers the same 401 for "wrong password" and "no password is set", and
@@ -804,6 +843,13 @@ func (r *Router) handleHealth(w http.ResponseWriter, req *http.Request) {
 		// cannot predict and needs to be able to read. It stays at
 		// difficultyTimeoutFallback until that worker has been certified once.
 		resp["classifier_deadline"] = r.classifier.deadline().String()
+	}
+	// The relayed half of the fleet, when there is one. A benchmark-version
+	// mismatch in particular is the one relay fault that leaves everything
+	// apparently working, so it belongs somewhere a monitor reads (see
+	// relayHealthLine).
+	if line := r.relayHealthLine(); line != nil {
+		resp["relays"] = line
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -1007,10 +1053,19 @@ func (r *Router) handleRegisterBackend(w http.ResponseWriter, req *http.Request)
 	// Nor may it take over a row an operator entered by hand. The id collision is
 	// almost certainly a mistake, and silently converting the operator's row into
 	// a beacon would discard exactly the declared values manual rows exist to
-	// protect.
-	if existing := r.registry.get(reg.ID); isManualRow(existing) {
+	// protect. A relay's derived row is refused for the mirror-image reason: it
+	// would be taken over here and pruned again by the next relay refresh, so the
+	// two would fight over the id every fifteen seconds.
+	switch existing := r.registry.get(reg.ID); {
+	case isManualRow(existing):
 		writeJSON(w, http.StatusConflict, validationError{
 			Message: fmt.Sprintf("backend %q is an operator-managed provider row; register under a different id", reg.ID),
+			Param:   "id",
+		})
+		return
+	case isRelayRow(existing):
+		writeJSON(w, http.StatusConflict, validationError{
+			Message: fmt.Sprintf("backend %q is derived from relay %q; register under a different id", reg.ID, existing.Relay),
 			Param:   "id",
 		})
 		return
@@ -1359,6 +1414,11 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request)
 	if !ok {
 		return
 	}
+	// Before the body is even read: a request that has already passed through
+	// this router will not find a worker by going round again (see relay.go).
+	if r.refuseRelayLoop(w, req) {
+		return
+	}
 
 	body, err := readRequestBody(w, req)
 	if err != nil {
@@ -1513,6 +1573,9 @@ func (r *Router) handleCompletions(w http.ResponseWriter, req *http.Request) {
 	if !ok {
 		return
 	}
+	if r.refuseRelayLoop(w, req) {
+		return
+	}
 	body, err := readRequestBody(w, req)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "read request: %s", err)
@@ -1557,6 +1620,9 @@ func (r *Router) handleEmbeddings(w http.ResponseWriter, req *http.Request) {
 	}
 	ident, ok := r.requireClient(w, req)
 	if !ok {
+		return
+	}
+	if r.refuseRelayLoop(w, req) {
 		return
 	}
 	body, err := readRequestBody(w, req)
@@ -1737,7 +1803,7 @@ func (r *Router) proxyPassthrough(w http.ResponseWriter, req *http.Request, iden
 
 	backend, slot, slotErr := r.pickAndAcquire(req.Context(), candidates)
 	if slotErr != nil {
-		r.logSlotUnavailable(candidates[0], route, false, nil, start, slotErr)
+		r.logSlotUnavailable(ident, candidates[0], route, false, nil, start, slotErr)
 		writeUnavailable(w, r.retryAfterSaturated(), fmt.Sprintf("no backend slot available: %s", slotErr))
 		return
 	}
@@ -1782,7 +1848,7 @@ func (r *Router) proxyPassthrough(w http.ResponseWriter, req *http.Request, iden
 		// synchronous SQLite write here — against a pool capped at one connection —
 		// extends the busy window of a max_concurrency=1 worker after every request.
 		// recordKeyUse was that write; the log insert next to it always knew better.
-		caller, entry := ident, logEntry
+		caller, entry := ident, redactForRelay(logEntry, ident)
 		go func() {
 			r.recordKeyUse(caller, charged)
 			if err := r.logs.Insert(context.Background(), entry); err != nil {
@@ -1803,6 +1869,7 @@ func (r *Router) proxyPassthrough(w http.ResponseWriter, req *http.Request, iden
 	}
 	proxyReq.Header.Set("Content-Type", "application/json")
 	setBackendCredential(proxyReq, backend)
+	r.stampRelayChain(proxyReq, req, backend)
 
 	resp, err := r.client.Do(proxyReq)
 	if err != nil {
@@ -1864,8 +1931,12 @@ func (r *Router) proxyPassthrough(w http.ResponseWriter, req *http.Request, iden
 // logSlotUnavailable records the 503 we return when no candidate backend had a
 // free slot before the deadline. Attributed to the primary (best-ranked)
 // candidate for context.
-func (r *Router) logSlotUnavailable(primary *Backend, route string, stream bool, input []byte, start time.Time, cause error) {
-	entry := RequestLog{
+//
+// It takes the caller for the same reason the success path does: a relayed
+// request's prompt must not reach the log store on the failure path either, and
+// a redaction that only covered the requests that worked would be no redaction.
+func (r *Router) logSlotUnavailable(ident *identity, primary *Backend, route string, stream bool, input []byte, start time.Time, cause error) {
+	entry := redactForRelay(RequestLog{
 		CreatedAt:      start.UTC(),
 		BackendID:      primary.ID,
 		BackendModel:   primary.Model,
@@ -1875,7 +1946,8 @@ func (r *Router) logSlotUnavailable(primary *Backend, route string, stream bool,
 		StatusCode:     http.StatusServiceUnavailable,
 		Error:          cause.Error(),
 		DurationMillis: time.Since(start).Milliseconds(),
-	}
+		KeyID:          ident.logKeyID(),
+	}, ident)
 	if err := r.logs.Insert(context.Background(), entry); err != nil {
 		log.Printf("request log insert failed backend=%s: %v", primary.ID, err)
 	}
@@ -2161,7 +2233,7 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 	}
 	backend, slot, missedPref, slotErr := r.pickAndAcquirePreferred(req.Context(), candidates, pref)
 	if slotErr != nil {
-		r.logSlotUnavailable(candidates[0], route, chatReq.Stream, body, start, slotErr)
+		r.logSlotUnavailable(ident, candidates[0], route, chatReq.Stream, body, start, slotErr)
 		writeUnavailable(w, r.retryAfterSaturated(), fmt.Sprintf("no backend slot available: %s", slotErr))
 		return
 	}
@@ -2273,7 +2345,7 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 				charged += estimateGenTokens(capture.total)
 			}
 		}
-		entry := logEntry
+		entry := redactForRelay(logEntry, ident)
 		served := backend
 		didEscalate := escalated
 		caller := ident
@@ -2285,7 +2357,9 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 			// nothing about answer quality — feeding it as "inadequate" ratcheted
 			// bins toward expensive workers on exactly the slow-prefill prompts
 			// clients abort most.
-			if r.adapter != nil && entry.Error == "" && entry.StatusCode >= 200 && entry.StatusCode < 300 {
+			// A relayed request was classified by the router that sent it, which is
+			// already learning from this same outcome — see learnFromRelay.
+			if r.adapter != nil && learnFromRelay(caller) && entry.Error == "" && entry.StatusCode >= 200 && entry.StatusCode < 300 {
 				if score, ok := parseRouteScore(route); ok {
 					// Streamed inadequacy comes from the full-stream stats; the capture
 					// may have truncated the middle away.
@@ -2382,6 +2456,7 @@ func (r *Router) dispatchStreaming(w http.ResponseWriter, req *http.Request, bac
 	}
 	proxyReq.Header.Set("Content-Type", "application/json")
 	setBackendCredential(proxyReq, backend)
+	r.stampRelayChain(proxyReq, req, backend)
 
 	idle := r.cfg.BackendIdleTimeout
 	var watchdog *time.Timer
@@ -2989,6 +3064,22 @@ func (r *Router) certifyBackend(id string) {
 		return
 	}
 	checks["health"] = Check{OK: true}
+
+	// A relay row's URL is another router, not an endpoint. Nothing below applies
+	// to it: there are no weights to fingerprint, no capabilities to probe (the
+	// upstream probed them), and no benchmark to run (the upstream ran it, and
+	// running it again would spend the upstream's GPUs to learn its own answer).
+	// The relay refresh is this row's certification — see applyRelayEntry — so
+	// there is nothing to do here but leave the imported values alone.
+	//
+	// This is reachable at all because healthLoop re-certifies a row that has gone
+	// unhealthy, which for a relay means the WAN link or the upstream was down. It
+	// comes back when the link does, and the next refresh re-certifies it.
+	if isRelayRow(backend) {
+		checks["relay"] = Check{OK: true, Message: fmt.Sprintf("derived from relay %q; profile imported, not measured", backend.Relay)}
+		r.registry.finishCertification(id, true, checks, backend.BaselineTPS, backend.Certification.TTFTMillis, "")
+		return
+	}
 
 	// Embeddings-only workers don't serve chat, so the chat-oriented speed/json/
 	// tool probes don't apply. Certify them with an embeddings probe instead.
@@ -3771,6 +3862,9 @@ func (r *Router) doCompletion(ctx context.Context, client *http.Client, backend 
 	if backend.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+backend.APIKey)
 	}
+	// A router-originated call (an expert member, a judge grading) starts its own
+	// chain: there is no inbound request behind it, so this router is hop one.
+	r.stampRelayChain(req, nil, backend)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -3839,9 +3933,14 @@ func (r *Router) healthLoop() {
 // recheckModel re-certifies a ready backend whose served model no longer
 // matches its profile — e.g. an operator swapped the model without touching
 // the registration env.
+//
+// A relay row is exempt. Its URL answers /v1/models with the upstream's whole
+// menu, so the fingerprint would compare this row's one model against a list
+// and re-certify it on every check; the drift this guards against is instead
+// caught upstream, and reaches here through the next fleet refresh.
 func (r *Router) recheckModel(id string) {
 	b := r.registry.get(id)
-	if b == nil || !b.Certification.Ready || isEmbeddingsOnly(b) {
+	if b == nil || !b.Certification.Ready || isEmbeddingsOnly(b) || isRelayRow(b) {
 		return
 	}
 	model, meta := r.queryModelInfo(b)
@@ -4580,6 +4679,32 @@ func (r *Registry) startCertification(id string) {
 	}
 }
 
+// setRelayLoad publishes what an upstream router reported about one of its
+// models: how many requests it currently has in flight, how many it can hold,
+// and how far away it is. Called on every relay refresh (see relay.go).
+//
+// The capacity also syncs the local slot channel, so this router's own dispatch
+// is bounded by the real upstream pool rather than by the last measurement that
+// happened to land. A zero capacity is ignored rather than treated as "no
+// limit": an upstream that reported nothing has told us nothing.
+func (r *Registry) setRelayLoad(id string, active, capacity int, rttMillis float64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	b := r.backends[id]
+	if b == nil {
+		return
+	}
+	if active < 0 {
+		active = 0
+	}
+	b.RemoteActive = active
+	b.RelayRTTMillis = rttMillis
+	if capacity > 0 {
+		b.MaxConcurrency = capacity
+		r.syncSlotsLocked(id, capacity)
+	}
+}
+
 func (r *Registry) finishCertification(id string, ready bool, checks map[string]Check, tps float64, ttft int64, lastError string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -5121,6 +5246,18 @@ func (s *LogStore) init(ctx context.Context) error {
 			value TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		)`,
+		// Upstream routers this one may relay through (see relay.go). The name is
+		// stored already lowercased (see relayKey), so the primary key is the
+		// lookup key. api_key is sealed with the same box that protects a backend's
+		// credential; the backends this relay expands into are DERIVED and are not
+		// persisted anywhere — the refresh loop rebuilds them from this row.
+		`CREATE TABLE IF NOT EXISTS router_relays (
+			name TEXT PRIMARY KEY,
+			url TEXT NOT NULL,
+			api_key TEXT NOT NULL DEFAULT '',
+			enabled INTEGER NOT NULL DEFAULT 1,
+			updated_at TEXT NOT NULL
+		)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
@@ -5139,6 +5276,10 @@ func (s *LogStore) init(ctx context.Context) error {
 		// default, which reads as "the router required no credential" — true of
 		// every request made under the old client-token-or-nothing scheme.
 		`ALTER TABLE request_logs ADD COLUMN key_id TEXT NOT NULL DEFAULT ''`,
+		// Whether a key belongs to a downstream router rather than a client
+		// (see relay.go). Every key issued before relays existed is not one, and
+		// 0 is what the default gives them.
+		`ALTER TABLE api_keys ADD COLUMN relay INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return err

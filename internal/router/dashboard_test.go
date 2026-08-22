@@ -94,15 +94,16 @@ func TestUnauthenticatedDashboardDisclosesNoFleetDetail(t *testing.T) {
 func TestDashboardShellCarriesEveryAdminView(t *testing.T) {
 	body := renderDashboard(t)
 	for _, anchor := range []string{
-		// The tab bar and its five panels.
+		// The tab bar and its six panels.
 		`id="mtab-fleet"`, `id="view-fleet"`,
 		`id="mtab-providers"`, `id="view-providers"`,
 		`id="mtab-keys"`, `id="view-keys"`,
 		`id="mtab-groups"`, `id="view-groups"`,
+		`id="mtab-relays"`, `id="view-relays"`,
 		`id="mtab-logs"`, `id="view-logs"`,
 		// The tables each view fills client-side.
 		`id="backends-body"`, `id="providers-body"`, `id="keys-body"`,
-		`id="groups-body"`, `id="logs-body"`,
+		`id="groups-body"`, `id="relays-body"`, `id="logs-body"`,
 		// The password session: a login form, a visible way out, and a way to
 		// change the password without a redeploy.
 		`id="login-form"`, `id="login-password"`, `id="btn-logout"`, `id="btn-password"`,
@@ -141,7 +142,7 @@ func TestDashboardCallsOnlyRoutesTheMuxServes(t *testing.T) {
 	// And the reverse direction: a tab whose endpoint was dropped from the page.
 	for _, want := range []string{
 		"/admin/session", "/admin/login", "/admin/logout", "/admin/password",
-		"/admin/providers", "/admin/keys", "/admin/groups",
+		"/admin/providers", "/admin/keys", "/admin/groups", "/admin/relays",
 		"/backends", "/logs",
 	} {
 		if !seen[want] && !seen[want+"/"] {

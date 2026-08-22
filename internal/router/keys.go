@@ -78,6 +78,12 @@ type apiKey struct {
 	// TokenBudget is a lifetime ceiling on TokensUsed. 0 means unlimited.
 	TokenBudget int64 `json:"token_budget,omitempty"`
 	TokensUsed  int64 `json:"tokens_used"`
+	// Relay marks a key held by another discrimen rather than by a client (see
+	// relay.go). It grants one thing — GET /relay/fleet — and removes two:
+	// request bodies are dropped before the log row is written, and outcomes do
+	// not teach the tier adapter or the judge. It is only meaningful on a client
+	// key; a worker key never reaches the OpenAI surface at all.
+	Relay bool `json:"relay,omitempty"`
 }
 
 // identity is who made a request. Nil means no recognised credential was
@@ -96,6 +102,10 @@ type identity struct {
 	Models      []string
 	TokenBudget int64
 	TokensUsed  int64
+	// Relay is the apiKey.Relay flag of the credential presented, false for an
+	// environment token and for an unauthenticated caller. Nothing infers it: a
+	// router relaying through this one holds a key that was issued for it.
+	Relay bool
 }
 
 // logKeyID is what gets stamped on a request log row. A decimal row id for a
@@ -220,10 +230,11 @@ func validRole(role string) bool {
 
 func (s *LogStore) CreateAPIKey(ctx context.Context, plain string, key apiKey) (apiKey, error) {
 	res, err := s.db.ExecContext(ctx, `INSERT INTO api_keys
-		(key_hash, prefix, name, role, enabled, created_at, last_used_at, models, token_budget, tokens_used)
-		VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, 0)`,
+		(key_hash, prefix, name, role, enabled, created_at, last_used_at, models, token_budget, tokens_used, relay)
+		VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, 0, ?)`,
 		sha256Hex(plain), key.Prefix, key.Name, key.Role, boolInt(key.Enabled),
-		key.CreatedAt.Format(time.RFC3339Nano), strings.Join(key.Models, ","), key.TokenBudget)
+		key.CreatedAt.Format(time.RFC3339Nano), strings.Join(key.Models, ","), key.TokenBudget,
+		boolInt(key.Relay))
 	if err != nil {
 		return apiKey{}, err
 	}
@@ -251,16 +262,18 @@ func (s *LogStore) LookupAPIKey(ctx context.Context, plain string) (apiKey, bool
 		created  string
 		lastUsed string
 		models   string
+		relay    int
 	)
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, key_hash, prefix, name, role, enabled, created_at, last_used_at, models, token_budget, tokens_used
+		`SELECT id, key_hash, prefix, name, role, enabled, created_at, last_used_at, models, token_budget, tokens_used, relay
 		 FROM api_keys WHERE key_hash = ?`, want).
 		Scan(&key.ID, &gotHash, &key.Prefix, &key.Name, &key.Role, &enabled,
-			&created, &lastUsed, &models, &key.TokenBudget, &key.TokensUsed)
+			&created, &lastUsed, &models, &key.TokenBudget, &key.TokensUsed, &relay)
 	if err != nil || !constantTimeEqual(gotHash, want) || enabled == 0 {
 		return apiKey{}, false
 	}
 	key.Enabled = true
+	key.Relay = relay != 0
 	key.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 	key.LastUsedAt, _ = time.Parse(time.RFC3339Nano, lastUsed)
 	key.Models = splitModelList(models)
@@ -269,7 +282,7 @@ func (s *LogStore) LookupAPIKey(ctx context.Context, plain string) (apiKey, bool
 
 func (s *LogStore) ListAPIKeys(ctx context.Context) ([]apiKey, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, prefix, name, role, enabled, created_at, last_used_at, models, token_budget, tokens_used
+		`SELECT id, prefix, name, role, enabled, created_at, last_used_at, models, token_budget, tokens_used, relay
 		 FROM api_keys ORDER BY id`)
 	if err != nil {
 		return nil, err
@@ -279,14 +292,15 @@ func (s *LogStore) ListAPIKeys(ctx context.Context) ([]apiKey, error) {
 	for rows.Next() {
 		var (
 			key                       apiKey
-			enabled                   int
+			enabled, relay            int
 			created, lastUsed, models string
 		)
 		if err := rows.Scan(&key.ID, &key.Prefix, &key.Name, &key.Role, &enabled,
-			&created, &lastUsed, &models, &key.TokenBudget, &key.TokensUsed); err != nil {
+			&created, &lastUsed, &models, &key.TokenBudget, &key.TokensUsed, &relay); err != nil {
 			return nil, err
 		}
 		key.Enabled = enabled != 0
+		key.Relay = relay != 0
 		key.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 		key.LastUsedAt, _ = time.Parse(time.RFC3339Nano, lastUsed)
 		key.Models = splitModelList(models)
@@ -296,13 +310,21 @@ func (s *LogStore) ListAPIKeys(ctx context.Context) ([]apiKey, error) {
 }
 
 // UpdateAPIKey changes the mutable half of a key: whether it is enabled, its
-// name, its allow-list and its budget. The hash and the role are immutable —
-// re-roling a key in place would silently change what an already-issued
-// credential can reach.
+// name, its allow-list, its budget and its relay flag. The hash and the role are
+// immutable — re-roling a key in place would silently change what an
+// already-issued credential can reach.
+//
+// The relay flag is mutable, unlike the role, because flipping it grants no
+// authority the key did not have: it opens one read-only fleet endpoint and
+// otherwise only REMOVES things — the prompts stored about the caller, and the
+// caller's influence on the adapter. An operator who has just pointed a second
+// router at an existing key should not have to reissue it to stop logging its
+// prompts.
 func (s *LogStore) UpdateAPIKey(ctx context.Context, id int64, key apiKey) error {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE api_keys SET name = ?, enabled = ?, models = ?, token_budget = ? WHERE id = ?`,
-		key.Name, boolInt(key.Enabled), strings.Join(key.Models, ","), key.TokenBudget, id)
+		`UPDATE api_keys SET name = ?, enabled = ?, models = ?, token_budget = ?, relay = ? WHERE id = ?`,
+		key.Name, boolInt(key.Enabled), strings.Join(key.Models, ","), key.TokenBudget,
+		boolInt(key.Relay), id)
 	if err != nil {
 		return err
 	}
@@ -502,6 +524,7 @@ func (r *Router) identify(req *http.Request) *identity {
 	return &identity{
 		Role: key.Role, KeyID: key.ID, Name: key.Name,
 		Models: key.Models, TokenBudget: key.TokenBudget, TokensUsed: key.TokensUsed,
+		Relay: key.Relay,
 	}
 }
 

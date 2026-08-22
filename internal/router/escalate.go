@@ -249,6 +249,7 @@ func (r *Router) requestBuffered(req *http.Request, backend *Backend, body []byt
 		// (setBackendCredential) rather than relying on that Del to neutralise a
 		// second copy of it is the point.
 		setBackendCredential(proxyReq, backend)
+		r.stampRelayChain(proxyReq, req, backend)
 
 		resp, err := r.client.Do(proxyReq)
 		if err != nil {

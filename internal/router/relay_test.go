@@ -353,12 +353,17 @@ func TestRelayProfileImport(t *testing.T) {
 		BaselineTPS: 90, PrefillTPS: 4000, TTFTMillis: 300,
 		MaxConcurrency: 6, ActiveRequests: 2, Endpoints: 2,
 	}
-	prof := relayProfile(entry, 90)
-	if prof.TTFTMillis != 390 {
-		t.Errorf("ttft = %d, want the upstream's 300 plus the 90ms link", prof.TTFTMillis)
+	prof := relayProfile(entry)
+	// Both latency terms describe the far ENDPOINT, link excluded — prefillSeconds
+	// is the one place the link is added. Importing the prefill rate is what stops
+	// a remote model being priced at a flat first-token latency however long the
+	// prompt is, which is the shape that makes it look unbeatable on exactly the
+	// long-context prompts it is worst at.
+	if prof.TTFTMillis != 300 {
+		t.Errorf("ttft = %d, want the upstream's own 300 with no link folded in", prof.TTFTMillis)
 	}
-	if prof.PrefillTPS != 0 {
-		t.Errorf("prefill rate = %v, want it left unset — a rate cannot carry a link's latency", prof.PrefillTPS)
+	if prof.PrefillTPS != 4000 {
+		t.Errorf("prefill rate = %v, want the upstream's measured 4000", prof.PrefillTPS)
 	}
 	if prof.ThinkingDialect != thinkingDialectEffort {
 		t.Errorf("dialect = %q, want %q: the peer is a router, which speaks the client-facing spelling",
@@ -375,7 +380,8 @@ func TestRelayRefreshRegistersAndPrunes(t *testing.T) {
 	models := []relayModelEntry{{
 		Model: "qwen3.8-uncensored", Quality: 82, BenchVersion: benchmarkVersion,
 		ContextK: 116, Features: []string{"chat", "tools", "vision"}, Thinking: true,
-		BaselineTPS: 108, TTFTMillis: 250, MaxConcurrency: 4, ActiveRequests: 1, Endpoints: 1,
+		BaselineTPS: 108, PrefillTPS: 2816, TTFTMillis: 250,
+		MaxConcurrency: 4, ActiveRequests: 1, Endpoints: 1,
 	}}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.URL.Path != "/relay/fleet" {
@@ -421,6 +427,18 @@ func TestRelayRefreshRegistersAndPrunes(t *testing.T) {
 	}
 	if b.RemoteActive != 1 {
 		t.Fatalf("remote occupancy = %d, want the upstream's 1", b.RemoteActive)
+	}
+	// Over a real HTTP round trip, so a wrong or duplicated json tag on the wire
+	// shape is caught here rather than by a fleet that silently prices every
+	// remote model at a flat first-token latency. This is the field `ask -l`
+	// renders as pp=, and the one the long-prompt estimate is built from.
+	if b.ObservedPrefillTPS != 2816 {
+		t.Fatalf("prefill rate = %v, want the upstream's measured 2816 — without it a long prompt is priced flat",
+			b.ObservedPrefillTPS)
+	}
+	if b.Certification.TTFTMillis != 250 {
+		t.Fatalf("certified ttft = %d, want the endpoint's own 250 with the link kept separate",
+			b.Certification.TTFTMillis)
 	}
 	if b.URL != upstream.URL {
 		t.Fatalf("url = %q, want the upstream router %q", b.URL, upstream.URL)
@@ -687,21 +705,56 @@ func TestOccupancyPrefersUpstreamCount(t *testing.T) {
 func TestRelayLatencyIncludesTheLink(t *testing.T) {
 	entry := relayModelEntry{
 		Model: "m", Quality: 80, BenchVersion: benchmarkVersion, ContextK: 128,
-		Features: []string{"chat"}, BaselineTPS: 100, TTFTMillis: 250,
+		Features: []string{"chat"}, BaselineTPS: 100, PrefillTPS: 4000, TTFTMillis: 250,
 		MaxConcurrency: 4, Endpoints: 1,
 	}
 	build := func(id string, rtt float64) *Backend {
 		reg := newTestRegistry()
 		reg.upsert(BackendRegistration{ID: id, URL: "http://" + id, Model: "m"})
-		prof := relayProfile(entry, rtt)
-		reg.applyProfileIfGen(id, 0, prof)
-		reg.finishCertification(id, true, map[string]Check{}, entry.BaselineTPS, prof.TTFTMillis, "")
+		reg.applyProfileIfGen(id, 0, relayProfile(entry))
+		reg.setRelayLoad(id, 0, entry.MaxConcurrency, rtt)
+		reg.finishCertification(id, true, map[string]Check{}, entry.BaselineTPS, entry.TTFTMillis, "")
 		return reg.get(id)
 	}
 	near, far := build("local", 0), build("relayed", 90)
 	job := jobCost{promptTokens: 1000, outputTokens: 500}
-	if expectedLatency(far, job) <= expectedLatency(near, job) {
-		t.Fatalf("a relayed worker was priced as though it were in the next rack: far=%v near=%v",
-			expectedLatency(far, job), expectedLatency(near, job))
+	if got, want := expectedLatency(far, job)-expectedLatency(near, job), 0.09; got < want*0.9 || got > want*1.1 {
+		t.Fatalf("the link cost %.4fs in the estimate, want ~%.2fs (far=%v near=%v)",
+			got, want, expectedLatency(far, job), expectedLatency(near, job))
 	}
+}
+
+// The prefill rate has to SCALE with the prompt, which is the whole reason it is
+// imported rather than left to the flat TTFT fallback. Without it a remote model
+// costs the same for a 200-token prompt and a 100k one, and wins every
+// long-context comparison against a local worker it is nowhere near as fast as.
+func TestRelayPrefillScalesWithThePrompt(t *testing.T) {
+	reg := newTestRegistry()
+	reg.upsert(BackendRegistration{ID: "far", URL: "http://far", Model: "m"})
+	reg.applyProfileIfGen(id0(t, reg, "far"), 0, relayProfile(relayModelEntry{
+		Model: "m", Quality: 80, BenchVersion: benchmarkVersion, ContextK: 256,
+		BaselineTPS: 100, PrefillTPS: 2800, TTFTMillis: 300, MaxConcurrency: 4, Endpoints: 1,
+	}))
+	reg.setRelayLoad("far", 0, 4, 137)
+	b := reg.get("far")
+
+	short := prefillSeconds(b, 200)
+	long := prefillSeconds(b, 100_000)
+	if long <= short*10 {
+		t.Fatalf("prefill does not scale with the prompt: 200 tokens %.3fs vs 100k tokens %.3fs", short, long)
+	}
+	// 100k at 2800 tok/s is ~35.7s, plus the 0.137s link.
+	if want := 100_000/2800.0 + 0.137; long < want*0.99 || long > want*1.01 {
+		t.Fatalf("100k prompt priced at %.3fs, want ~%.3fs", long, want)
+	}
+}
+
+// id0 returns the id it was given, after asserting the row exists — a readable
+// way to keep the upsert and the profile application on one line each.
+func id0(t *testing.T, reg *Registry, id string) string {
+	t.Helper()
+	if reg.get(id) == nil {
+		t.Fatalf("no backend %q", id)
+	}
+	return id
 }

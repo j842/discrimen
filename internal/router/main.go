@@ -5007,6 +5007,20 @@ func (r *Registry) observe(id string, ttft, decodeWindow time.Duration, tokens, 
 	if thinking || ttft <= 0 {
 		return
 	}
+	// On a relay row the measured first-token latency contains the hop to the
+	// other ROUTER as well as the endpoint's own prefill, and everything that
+	// reads these two fields expects the endpoint's figure alone — the imported
+	// profile carries it that way, and prefillSeconds adds the link back once.
+	// Leaving the link in would make a locally-measured sample mean something
+	// different from an imported one, and then charge for the link twice.
+	//
+	// A sample that is somehow shorter than the link itself measures nothing but
+	// clock noise, so it is dropped rather than clamped.
+	if wire := time.Duration(b.RelayRTTMillis) * time.Millisecond; wire > 0 {
+		if ttft -= wire; ttft <= 0 {
+			return
+		}
+	}
 	ms := float64(ttft.Milliseconds())
 	if b.ObservedTTFTMillis == 0 {
 		b.ObservedTTFTMillis = ms

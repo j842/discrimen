@@ -830,7 +830,7 @@ func (r *Router) applyRelayEntry(rel Relay, id string, entry relayModelEntry, fl
 	// already chosen a model for. It is the name the upstream published, so it is
 	// a name the upstream accepts, which is the whole contract of relayFleetFor.
 	r.registry.setModelMeta(id, ModelMeta{ServedID: entry.Model})
-	prof := relayProfile(entry, r.relayRTT(rel.Name))
+	prof := relayProfile(entry)
 	mismatch := fleetBench != benchmarkVersion
 	if mismatch {
 		// A quality measured against a different question set is not a quality on
@@ -861,7 +861,7 @@ func (r *Router) applyRelayEntry(rel Relay, id string, entry relayModelEntry, fl
 		}
 		r.registry.finishCertification(id, true, map[string]Check{
 			"relay": {OK: true, Message: message},
-		}, entry.BaselineTPS, prof.TTFTMillis, "")
+		}, entry.BaselineTPS, entry.TTFTMillis, "")
 	}
 }
 
@@ -869,16 +869,24 @@ func (r *Router) applyRelayEntry(rel Relay, id string, entry relayModelEntry, fl
 // local probe would have produced, so the import lands through exactly the path
 // a measurement does.
 //
-// TTFT carries the round trip; the PREFILL RATE is deliberately not imported at
-// all. The two look like the same fact and are not. A first-token latency is a
-// duration, so a link's latency adds to it and the sum is what a caller here
-// will see. A prefill rate is tokens per second measured between the upstream
-// and its own worker on their own LAN — there is nowhere in a rate to put a
-// constant offset, so importing it would price a remote fleet as though it were
-// in the next rack, on the one term that dominates a long prompt. Leaving it
-// empty makes prefillSeconds fall back to the seeded TTFT until this router has
-// measured its own rate from its own streamed requests (Registry.observe), which
-// includes the link by construction.
+// Every latency term here is the ENDPOINT's, measured on the upstream's own
+// LAN, with the link between the two routers excluded. The link is added back
+// once, at the point of use, by prefillSeconds — and Registry.observe strips it
+// back out of this router's own samples, so the field means the same thing
+// whichever of the two filled it in.
+//
+// It is worth saying why, because the obvious alternative was tried and is
+// wrong. Folding the round trip into the imported TTFT works only while the
+// prefill RATE is empty, because prefillSeconds reads the rate in preference to
+// the TTFT and never looks at it again — and a rate has nowhere to put a
+// constant offset. Leaving the rate empty to force the TTFT path costs far more
+// than the link is worth: without a rate, a remote model is priced at a FLAT
+// first-token latency no matter how long the prompt is, which on a fleet whose
+// local workers prefill at thousands of tokens a second makes the far one look
+// unbeatable on exactly the long-context prompts it is worst at. And nothing
+// fixes it later — observe() only samples non-thinking turns, so a reasoning
+// worker never measures a rate here at all (see applyProfileIfGen, which seeds
+// a local worker's rate from the probe for that same reason).
 //
 // The thinking dialect is the one value that is NOT imported, and cannot be. It
 // describes how to spell the thinking gate to the endpoint that finally serves
@@ -888,7 +896,7 @@ func (r *Router) applyRelayEntry(rel Relay, id string, entry relayModelEntry, fl
 // would have this router write a chat-template gate that the upstream, per its
 // own escape-hatch rule, would forward verbatim to an endpoint that may not
 // speak it.
-func relayProfile(entry relayModelEntry, rttMillis float64) *WorkerProfile {
+func relayProfile(entry relayModelEntry) *WorkerProfile {
 	return &WorkerProfile{
 		Model:           entry.Model,
 		Quality:         entry.Quality,
@@ -896,7 +904,8 @@ func relayProfile(entry relayModelEntry, rttMillis float64) *WorkerProfile {
 		ContextK:        entry.ContextK,
 		MaxConcurrency:  entry.MaxConcurrency,
 		BaselineTPS:     entry.BaselineTPS,
-		TTFTMillis:      entry.TTFTMillis + int64(rttMillis),
+		PrefillTPS:      entry.PrefillTPS,
+		TTFTMillis:      entry.TTFTMillis,
 		Features:        append([]string(nil), entry.Features...),
 		Thinking:        entry.Thinking,
 		ThinkingDialect: thinkingDialectEffort,

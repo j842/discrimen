@@ -558,11 +558,13 @@ A router that finds its own id in the chain answers 508, and so does one past
 `relayMaxHops`. Each router's id is generated on first run and persisted; there
 is nothing to configure and nothing two deployments can copy from each other.
 
-**What it costs.** Two hops of network, and the downstream prices them: the
-round trip to the upstream is folded into the imported first-token latency, so a
-remote fleet is not compared against local workers as though it were in the next
-rack. The downstream always names the model on the way out, so the upstream is a
-slot broker rather than a second classifier.
+**What it costs.** Two hops of network, and the downstream prices them. Every
+latency figure it imports — first-token latency, prefill rate — describes the far
+endpoint on the upstream's own LAN, and the round trip between the two routers is
+added once, where the estimate is built. So a remote fleet is neither compared
+against local workers as though it were in the next rack, nor charged for its
+link twice. The downstream always names the model on the way out, so the upstream
+is a slot broker rather than a second classifier.
 
 ## Measuring the router
 

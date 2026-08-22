@@ -751,17 +751,20 @@ func expectedLatency(b *Backend, job jobCost) float64 {
 // average reflects whatever prompt sizes it happens to receive. Falls back to the
 // TTFT EWMA (previous behaviour) until a prefill rate has been measured.
 //
-// A relay row needs no special case here, and deliberately gets none. Both terms
-// it reads are measured by THIS router from its own streamed requests (see
-// Registry.observe), so the WAN hop to an upstream is already inside them — and
-// until the first sample lands, the fallback reads a certified TTFT that the
-// relay import seeded with the round trip for exactly that reason. Adding the
-// round trip again here would charge a remote fleet for its link twice.
+// A relay row adds its round trip on top, and this is the only place it is
+// added. Every latency term on such a row describes the far ENDPOINT with the
+// link between the two routers excluded — imported that way (relayProfile) and
+// stripped back out of this router's own samples (Registry.observe) — precisely
+// so that the link can be one term here rather than something folded into a
+// rate, which cannot carry it, or into a TTFT that the rate then shadows.
+// Zero on every other row, which is the truth for a worker this router reaches
+// directly.
 func prefillSeconds(b *Backend, promptTokens int) float64 {
+	wire := b.RelayRTTMillis / 1000
 	if rate := b.ObservedPrefillTPS; rate > 0 && promptTokens > 0 {
-		return float64(promptTokens) / rate
+		return float64(promptTokens)/rate + wire
 	}
-	return liveTTFT(b)
+	return liveTTFT(b) + wire
 }
 
 // liveTTFT returns the backend's first-token latency in seconds — the live EWMA

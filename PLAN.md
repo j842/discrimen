@@ -348,12 +348,21 @@ a router that finds itself in the chain answers 508. Generated rather than
 configured: an environment variable two deployments copy from each other is
 precisely how a cycle becomes undetectable.
 
-The link is priced, not ignored. The round trip measured on the fleet poll is
-folded into the imported first-token latency, so a remote fleet is not ranked
-against local workers as though it were in the next rack. The prefill RATE is
-deliberately not imported at all — a rate has nowhere to put a constant
-offset, and the downstream measures its own within a few requests, link
-included.
+The link is priced, not ignored, and it is priced in exactly one place. Every
+latency term on a relayed row describes the far ENDPOINT with the link
+excluded: imported that way, and stripped back out of the downstream's own
+live samples. The round trip measured on the fleet poll is then added once,
+where the estimate is built.
+
+The obvious alternative — fold the round trip into the imported TTFT and skip
+the prefill rate, on the grounds that a rate has nowhere to put a constant
+offset — is wrong, and wrong in the expensive direction. Without a rate a
+remote model is priced at a FLAT first-token latency however long the prompt
+is, so against local workers that prefill at thousands of tokens a second it
+wins every long-context comparison it should lose. Nor does it correct itself:
+the live sampler only measures non-thinking turns, so a reasoning worker never
+earns a rate that way — which is why a local worker's rate is seeded from its
+probe for the same reason.
 
 ## Findings from the code review
 

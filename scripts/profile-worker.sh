@@ -236,9 +236,16 @@ KEEPALIVE_PID=$!
 event "•" "registered ${TARGET_URL} as '${WORKER_ID}' — profiling starts now"
 
 # ── 4. Watch the checks land ────────────────────────────────────────────────
+# Completion signal: the registry's `profiling` flag is true while the
+# background quality+capacity run is in flight and cleared when it finishes —
+# on BOTH the persisted and the not-persisted (inconclusive-probe) paths. The
+# checks.profile message is NOT a completion signal on a cold profile: it
+# stays "provisional — …" after a successful fresh run ("cached: …" only ever
+# appears on a warm restart, which a scratch router never has).
 declare -A SEEN
 BACKEND=""
 DONE=false
+SAW_PROFILING=false
 while :; do
     NOW=$(date +%s); ELAPSED=$((NOW - START_TS))
     if [ "${ELAPSED}" -ge "${TIMEOUT}" ]; then
@@ -263,15 +270,27 @@ while :; do
         STATUS="$(jq -r '.status // "?"' <<<"${BACKEND}")"
         PROFILING="$(jq -r '.profiling // false' <<<"${BACKEND}")"
         PROFMSG="$(jq -r '((.certification.checks // {}) + (.checks // {})).profile.message // ""' <<<"${BACKEND}")"
-        PROFOK="$(jq -r '((.certification.checks // {}) + (.checks // {})).profile.ok // false' <<<"${BACKEND}")"
         SUMMARY="$(jq -r '"status=\(.status // "?") q=\(.quality // "?") \(.baseline_tps // 0 | floor) tok/s ctx=\(.context_k // "?")k"' <<<"${BACKEND}")"
-        spin_draw "[${ELAPSED}s] ${SUMMARY} — $([ "${PROFILING}" = "true" ] && echo "benchmark running" || echo "waiting")"
+        spin_draw "[${ELAPSED}s] ${SUMMARY} — $([ "${PROFILING}" = "true" ] && echo "quality+capacity benchmark running" || echo "waiting")"
 
-        if [ "${PROFILING}" != "true" ] && [ "${PROFOK}" = "true" ] \
-           && [ -n "${PROFMSG}" ] && [[ "${PROFMSG}" != provisional* ]]; then
+        if [ "${PROFILING}" = "true" ]; then
+            $SAW_PROFILING || event "•" "background quality+capacity profile started"
+            SAW_PROFILING=true
+        elif $SAW_PROFILING; then
             DONE=true
             spin_clear
-            event "★" "profile complete: ${PROFMSG}"
+            event "★" "profile complete: ${SUMMARY#status=* }"
+            break
+        elif curl -sf -o /dev/null -b "${COOKIES}" "${ROUTER}/backends/${WORKER_ID}/benchmark" 2>/dev/null; then
+            # Fallback: a persisted run exists but we never caught the in-flight
+            # flag (profile finished inside one poll interval).
+            DONE=true
+            spin_clear
+            event "★" "profile complete (persisted): ${SUMMARY}"
+            break
+        fi
+        if [[ "${PROFMSG}" == abandoned* ]]; then
+            event "✗" "profiler gave up: ${PROFMSG}"
             break
         fi
         if [ "${STATUS}" = "failed" ] || [ "${STATUS}" = "unhealthy" ]; then
@@ -310,10 +329,10 @@ mkdir -p "$(dirname "${OUT}")"
             "quality:          \(.quality // "?")/10\(if .quality_detail then "  (" + .quality_detail + ")" else "" end)",
             "thinking:         \(.thinking // false)\(if .thinking_dialect then "  (dialect: " + .thinking_dialect + ")" else "" end)",
             "context:          \(.context_k // "?")k",
-            "baseline decode:  \(.baseline_tps // "?") tok/s",
-            "observed decode:  \(.observed_tps // "n/a") tok/s",
-            "observed prefill: \(.observed_prefill_tps // "n/a") tok/s",
-            "observed TTFT:    \(.observed_ttft_ms // "n/a") ms",
+            "baseline decode:  \(if .baseline_tps then (.baseline_tps * 10 | round / 10 | tostring) else "?" end) tok/s",
+            "observed decode:  \(if .observed_tps then (.observed_tps * 10 | round / 10 | tostring) else "n/a" end) tok/s",
+            "observed prefill: \(if .observed_prefill_tps then (.observed_prefill_tps * 10 | round / 10 | tostring) else "n/a" end) tok/s",
+            "observed TTFT:    \(if .observed_ttft_ms then (.observed_ttft_ms | round | tostring) else "n/a" end) ms",
             "max concurrency:  \(.max_concurrency // "?")",
             "features:         \((.features // []) | join(", "))",
             "",

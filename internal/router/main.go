@@ -175,10 +175,14 @@ type Backend struct {
 	// by. Zero means not measured (pre-two-score profile, or provisional);
 	// selection then falls back to Quality via qualityFor. See
 	// WorkerProfile.QualityNoThink for the full story.
-	QualityNoThink int       `json:"quality_nothink,omitempty"`
-	Failed         []string  `json:"failed_benchmarks,omitempty"` // benchmark questions the worker missed
-	LastError      string    `json:"last_error,omitempty"`
-	Certification  CertState `json:"certification"`
+	QualityNoThink int `json:"quality_nothink,omitempty"`
+	// QualityNoThinkDetail is the per-tier breakdown behind QualityNoThink, the
+	// no-think counterpart of QualityDetail — what `ask -ls` renders as the
+	// second bench line.
+	QualityNoThinkDetail string    `json:"quality_nothink_detail,omitempty"`
+	Failed               []string  `json:"failed_benchmarks,omitempty"` // benchmark questions the worker missed
+	LastError            string    `json:"last_error,omitempty"`
+	Certification        CertState `json:"certification"`
 
 	// Scheduling/eviction bookkeeping. In-memory only — unexported so it is
 	// never serialized into the API or dashboard payloads.
@@ -919,6 +923,7 @@ func (r *Router) serveBenchmark(w http.ResponseWriter, req *http.Request, id str
 		"model":           prof.Model,
 		"quality":         prof.Quality,
 		"quality_nothink": prof.QualityNoThink,
+		"thinking":        prof.Thinking,
 		"bench_version":   prof.BenchVersion,
 		"measured_at":     prof.MeasuredAt,
 		"profile_ms":      prof.ProfileMillis,

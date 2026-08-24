@@ -1004,6 +1004,7 @@ func (r *Registry) applyProfileIfGen(id string, gen int64, p *WorkerProfile) boo
 	// measured, so the profile is always authoritative. Zero (old profile, or a
 	// failed no-think pass) means qualityFor falls back to Quality.
 	b.QualityNoThink = p.QualityNoThink
+	b.QualityNoThinkDetail = p.QualityNoThinkDetail
 	b.Failed = append([]string(nil), p.Failed...)
 	// Measured capacity becomes the slot cap — the bound that makes requests
 	// queue at the router and spill across the fleet instead of piling onto a

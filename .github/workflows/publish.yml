@@ -11,29 +11,115 @@ permissions:
   contents: read
   packages: write
 
+# Each architecture builds on its NATIVE runner — ubuntu-24.04-arm is free for
+# public repos — and a merge job stitches the per-arch digests into one
+# multi-arch manifest. Nothing runs under qemu emulation anywhere: the old
+# single-runner shape emulated the whole arm64 leg, which spent ~20 minutes
+# compiling modernc.org/sqlite before the Dockerfile learned to cross-compile,
+# and still emulated the embeddings pip install after. The per-arch legs run in
+# parallel, so wall time is the slower leg plus a seconds-long merge.
+#
+# The build legs push by DIGEST only, no tags: a half-published state is a pair
+# of untagged blobs nobody can pull by name, and the tags only ever appear on
+# the assembled manifest in the merge job — so `latest` moves atomically.
 jobs:
-  publish:
-    runs-on: ubuntu-latest
+  build:
+    runs-on: ${{ matrix.runner }}
     strategy:
-      # A matrix rather than two near-identical jobs: the images differ only in
-      # name and build context, so duplicating the steps would just be two places
-      # to forget to update.
+      fail-fast: false
+      # One leg per (image, arch): the images differ only in name and build
+      # context, the legs only in runner — the matrix is the single place to
+      # update either list.
       matrix:
         include:
           - image: discrimen
             context: .
             dockerfile: Dockerfile
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - image: discrimen
+            context: .
+            dockerfile: Dockerfile
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
           - image: discrimen-embeddings
             context: ./embeddings
             dockerfile: embeddings/Dockerfile
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - image: discrimen-embeddings
+            context: ./embeddings
+            dockerfile: embeddings/Dockerfile
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
 
     steps:
       - uses: actions/checkout@v7
 
-      # arm64 is emulated on an amd64 runner. Without qemu registered, buildx has
-      # no way to execute the arm64 leg and the multi-arch manifest cannot be
-      # produced at all.
-      - uses: docker/setup-qemu-action@v4
+      # "linux/arm64" is not a legal artifact name; everything downstream keys
+      # on the flattened form.
+      - name: flatten platform for the artifact name
+        run: echo "PLATFORM_PAIR=${{ matrix.platform }}" | tr '/' '-' >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Labels only here — the tags are computed and applied in the merge job,
+      # on the assembled manifest.
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/j842/${{ matrix.image }}
+
+      - name: build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=ghcr.io/j842/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
+          # Scoped per (image, arch) so the four legs do not evict each other's
+          # cache. mode=max keeps the intermediate stages, which is what makes a
+          # rebuild after a source-only change cheap.
+          cache-from: type=gha,scope=${{ matrix.image }}-${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ env.PLATFORM_PAIR }}
+
+      # The digest travels to the merge job as an empty file NAMED by the
+      # digest — the filename is the data.
+      - name: export digest
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.image }}-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    runs-on: ubuntu-latest
+    needs: build
+    strategy:
+      matrix:
+        include:
+          - image: discrimen
+          - image: discrimen-embeddings
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-${{ matrix.image }}-*
+          merge-multiple: true
 
       - uses: docker/setup-buildx-action@v4
 
@@ -57,17 +143,12 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha
 
-      - name: build and push
-        uses: docker/build-push-action@v7
-        with:
-          context: ${{ matrix.context }}
-          file: ${{ matrix.dockerfile }}
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          # Scoped per image so the two matrix legs do not evict each other's
-          # cache. mode=max keeps the intermediate stages, which is what makes a
-          # rebuild after a source-only change cheap.
-          cache-from: type=gha,scope=${{ matrix.image }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+      - name: create and push the multi-arch manifest
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf 'ghcr.io/j842/${{ matrix.image }}@sha256:%s ' *)
+
+      - name: inspect
+        run: docker buildx imagetools inspect ghcr.io/j842/${{ matrix.image }}:${{ steps.meta.outputs.version }}

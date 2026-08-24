@@ -640,6 +640,17 @@ func (r *Router) runNoThinkQualityBenchmark(b *Backend, concurrency int, mixed [
 	return score2, true, strings.TrimSpace(bd.String())
 }
 
+// needsNoThinkBackfill reports whether a cached profile is missing its no-think
+// quality score AND carries enough stored state to backfill it without a full
+// re-benchmark: the mixed run's per-question results, aligned with the CURRENT
+// question set (the caller has already gated on BenchVersion, so a length match
+// means the same questions). A non-thinking worker needs nothing — its mixed
+// score already is its no-think score, and qualityFor's fallback covers the
+// window until its profile is rewritten anyway.
+func needsNoThinkBackfill(p *WorkerProfile) bool {
+	return p.Thinking && p.QualityNoThink == 0 && len(p.BenchResults) == len(benchmarkQuestions)
+}
+
 // benchWeightedScore turns the per-tier tallies into the 0-100 quality score, split
 // across the three weighted buckets described in the const block. Extracted from
 // runQualityBenchmark so the arithmetic can be tested directly: a second copy written

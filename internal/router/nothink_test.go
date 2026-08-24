@@ -210,3 +210,22 @@ func TestNoThinkBenchmarkMergesEasyTiers(t *testing.T) {
 		t.Fatalf("no-think score=%d, want 50 (easy carried over, hard failed)", nt)
 	}
 }
+
+func TestNeedsNoThinkBackfill(t *testing.T) {
+	aligned := make([]BenchResult, len(benchmarkQuestions))
+	cases := []struct {
+		name string
+		p    WorkerProfile
+		want bool
+	}{
+		{"thinking worker with stored results", WorkerProfile{Thinking: true, BenchResults: aligned}, true},
+		{"already has the score", WorkerProfile{Thinking: true, QualityNoThink: 40, BenchResults: aligned}, false},
+		{"non-thinking worker needs nothing", WorkerProfile{BenchResults: aligned}, false},
+		{"no stored results to merge from", WorkerProfile{Thinking: true}, false},
+	}
+	for _, c := range cases {
+		if got := needsNoThinkBackfill(&c.p); got != c.want {
+			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
+		}
+	}
+}

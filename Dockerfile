@@ -2,7 +2,17 @@
 # makes an alpine runtime viable at all: the single direct dependency,
 # modernc.org/sqlite, is pure Go, so there is no libsqlite3 to link and no musl
 # vs glibc question to answer.
-FROM golang:1.24-alpine AS builder
+#
+# --platform=$BUILDPLATFORM pins the builder to the machine actually running
+# the build, and GOOS/GOARCH below cross-compile for the target. Without this,
+# a multi-arch build ran the whole Go compile under qemu for the arm64 leg —
+# and modernc.org/sqlite (a transpiled C codebase, slow to compile even
+# natively) made that the entire publish wall time, paid again on every source
+# change. CGO_ENABLED=0 is what makes the cross-compile a pure flag flip; only
+# the runtime stage's one-line apk below still runs emulated, and that is
+# seconds.
+FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS builder
+ARG TARGETOS TARGETARCH
 
 WORKDIR /build
 
@@ -21,7 +31,7 @@ COPY internal/ ./internal/
 # -s -w strip the symbol table and DWARF. Nothing reads a Go stack trace off a
 # published binary, and the router is deployed as an image far more often than
 # it is debugged in one.
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o discrimen .
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags="-s -w" -o discrimen .
 
 FROM alpine:3.21
 

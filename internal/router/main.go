@@ -3154,6 +3154,52 @@ func (r *Router) certifyBackend(id string) {
 			checks["profile"] = Check{OK: true, Message: fmt.Sprintf("cached: q=%d%%, %.0f tok/s, ctx %dk, conc %d (profiled in %s)", prof.Quality, prof.BaselineTPS, prof.ContextK, prof.MaxConcurrency, fmtProfileDuration(prof.ProfileMillis))}
 			r.registry.finishCertification(id, true, checks, prof.BaselineTPS, prof.TTFTMillis, "")
 			log.Printf("worker %s certified from cached profile (model=%s)", id, model)
+			// A profile cached before the two-score benchmark lacks the no-think
+			// quality. Backfill it in the BACKGROUND from the stored per-question
+			// results — only the hard tiers re-run, thinking-off — so the worker
+			// keeps serving on its certified values throughout. This is the
+			// deliberate alternative to bumping benchmarkVersion, which would
+			// re-run the FULL suite on every worker in the fleet and park each at
+			// provisional quality to learn one new number. Too long in the guard
+			// for the certification path (minutes, not the seconds the other
+			// backfills cost), hence the ownership handoff, same as cold start.
+			if needsNoThinkBackfill(prof) {
+				owned = false // guard ownership moves to the background backfill
+				go func() {
+					defer r.recertifyIfRegenerated(id, gen)
+					defer r.profiling.Delete(id)
+					conc := prof.MaxConcurrency
+					if conc > 4 {
+						conc = 4 // same live-traffic headroom rule as the cold-start benchmark
+					}
+					if conc < 1 {
+						conc = 1
+					}
+					score, ok, breakdown := r.runNoThinkQualityBenchmark(backend, conc, prof.BenchResults)
+					if !ok {
+						// Worker likely blipped mid-run. Keep the single-score profile —
+						// qualityFor falls back to the mixed score, the pre-two-score
+						// behaviour — and the next certification (router restart, changed
+						// registration, recovery) retries.
+						log.Printf("no-think quality backfill for %s failed — keeping the single-score profile until the next certification", id)
+						return
+					}
+					prof.QualityNoThink = score
+					prof.QualityNoThinkDetail = breakdown
+					if prof.Checks == nil {
+						prof.Checks = map[string]Check{}
+					}
+					prof.Checks["quality_nothink"] = Check{OK: true, Message: fmt.Sprintf("%d%% %s (backfilled)", score, breakdown)}
+					if !r.registry.applyProfileIfGen(id, gen, prof) {
+						log.Printf("no-think backfill %s finished for a stale registration generation — discarded", id)
+						return
+					}
+					if err := r.logs.SaveWorkerProfile(context.Background(), id, prof); err != nil {
+						log.Printf("persist no-think backfill for %s failed: %v", id, err)
+					}
+					log.Printf("worker %s: backfilled no-think quality q=%d beside thinking-mode q=%d", id, score, prof.Quality)
+				}()
+			}
 			return
 		}
 		// Cold start. Quick profile (capabilities + speed + context) makes the

@@ -226,7 +226,7 @@ func TestSessionStickinessLosesToAMuchFasterWorker(t *testing.T) {
 		ObservedTPS:         120, ObservedPrefillTPS: 6000,
 	}
 	job := jobCost{promptTokens: 4000, outputTokens: 1500}.withIncumbent("cpu")
-	got := rankByDifficulty([]*Backend{slowIncumbent, fastRival}, 50, job)
+	got := rankByDifficulty([]*Backend{slowIncumbent, fastRival}, 50, job, false)
 	if got[0].ID != "gpu" {
 		t.Fatalf("affinity must not pin a conversation to a far slower worker: got %s (cpu=%.1fs gpu=%.1fs)",
 			got[0].ID, expectedLatency(slowIncumbent, job), expectedLatency(fastRival, job))
@@ -238,7 +238,7 @@ func TestSessionStickinessLosesToAMuchFasterWorker(t *testing.T) {
 		ObservedTPS:         120, ObservedPrefillTPS: 6000,
 	}
 	stickyJob := jobCost{promptTokens: 4000, outputTokens: 1500}.withIncumbent("gpu2")
-	if got := rankByDifficulty([]*Backend{fastRival, twin}, 50, stickyJob); got[0].ID != "gpu2" {
+	if got := rankByDifficulty([]*Backend{fastRival, twin}, 50, stickyJob, false); got[0].ID != "gpu2" {
 		t.Fatalf("between equals the incumbent should win, got %s", got[0].ID)
 	}
 }

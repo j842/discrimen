@@ -216,7 +216,7 @@ func betterCandidates(candidates []*Backend, from *Backend, job jobCost) []*Back
 	// The incumbent discount is meaningless here — we are deliberately leaving the
 	// worker that holds the prefix — so rank on the undiscounted job.
 	job.incumbent = ""
-	return rankByDifficulty(out, 0, job)
+	return rankByDifficulty(out, 0, job, false)
 }
 
 // requestBuffered runs one buffered exchange against a worker, including the

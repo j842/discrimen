@@ -456,11 +456,11 @@ func (c *difficultyClassifier) targetQuality(req *ChatRequest) (int, float64, bo
 // targetForFleet maps a difficulty score to a target quality. With an explicit
 // bands override configured it uses that; otherwise it derives the target from
 // the candidate fleet's own quality range — zero-config and self-adapting.
-func (c *difficultyClassifier) targetForFleet(candidates []*Backend, score float64) int {
+func (c *difficultyClassifier) targetForFleet(candidates []*Backend, score float64, thinkOff bool) int {
 	if len(c.bands) > 0 {
 		return c.bandQuality(score)
 	}
-	return autoTargetQuality(candidates, score)
+	return autoTargetQuality(candidates, score, thinkOff)
 }
 
 // benchmarkQualityScale is the ceiling of runQualityBenchmark's score: quality
@@ -481,14 +481,18 @@ const benchmarkQualityScale = 100
 // (26.4s on the CPU worker) — the speed ranking never saw more than one
 // candidate. Anchoring the bar absolutely keeps every worker above it in the
 // race, and rankByDifficulty's expected-completion ordering does the rest.
-func autoTargetQuality(candidates []*Backend, score float64) int {
+func autoTargetQuality(candidates []*Backend, score float64, thinkOff bool) int {
 	if len(candidates) == 0 {
 		return 0
 	}
-	qmax := candidates[0].Quality
+	// The clamp reads the score for the mode the request will be SERVED in: a
+	// no-think request clamps against the best no-think quality, so the bar a
+	// thinking-mode score set can't strand it above every worker's real
+	// no-think ability.
+	qmax := qualityFor(candidates[0], thinkOff)
 	for _, b := range candidates {
-		if b.Quality > qmax {
-			qmax = b.Quality
+		if q := qualityFor(b, thinkOff); q > qmax {
+			qmax = q
 		}
 	}
 	target := int(math.Round(clamp01(score) * benchmarkQualityScale))
@@ -588,22 +592,26 @@ func (c *difficultyClassifier) bandQuality(score float64) int {
 // completion time under current load. Backends below the bar trail (closest
 // first) as graceful fallback. The returned slice feeds pickAndAcquire, which
 // still spills past any momentarily-saturated front-runner.
-func rankByDifficulty(candidates []*Backend, target int, job jobCost) []*Backend {
+func rankByDifficulty(candidates []*Backend, target int, job jobCost, thinkOff bool) []*Backend {
 	sort.SliceStable(candidates, func(i, j int) bool {
 		a, b := candidates[i], candidates[j]
+		// Quality is read for the mode this request will be SERVED in — see
+		// qualityFor. A reasoning MoE ranks by its no-think score on a no-think
+		// request, not the thinking-mode score it benchmarked.
+		aq, bq := qualityFor(a, thinkOff), qualityFor(b, thinkOff)
 		// 1. Prefer a backend with a free slot (matches rankBackends; spilling is
 		//    still handled downstream by pickAndAcquire).
 		if af, bf := isFull(a), isFull(b); af != bf {
 			return !af
 		}
 		// 2. Prefer backends that clear the quality bar.
-		am, bm := a.Quality >= target, b.Quality >= target
+		am, bm := aq >= target, bq >= target
 		if am != bm {
 			return am
 		}
 		// 3. Among those below the bar, the highest quality (closest) first.
-		if !am && a.Quality != b.Quality {
-			return a.Quality > b.Quality
+		if !am && aq != bq {
+			return aq > bq
 		}
 		// 3.5 Among those that CLEAR the bar, prefer the free ones (PLAN.md, P4).
 		//     Deliberately scoped to the above-bar group: below the bar the router
@@ -1008,6 +1016,17 @@ type thinkingResolution struct {
 	effort    string // chat_template_kwargs.reasoning_effort to write beside it ("" ⇒ write none)
 	hardThink bool   // hard-require a thinking-capable worker (explicit "on"; may 503)
 	softThink bool   // prefer a thinking-capable worker if any survive (auto reasoning)
+	// noThink records that this request WILL be served with thinking disabled —
+	// explicit "off", reasoning_effort "none", a kwargs escape hatch pinning it
+	// off, or a direct verdict from the auto classifier. Selection then compares
+	// quality targets against each worker's no-think benchmark score instead of
+	// the mixed-mode one (see qualityFor): a reasoning MoE can be a different,
+	// far worse model with thinking suppressed, and routing it hard no-think
+	// requests on its thinking-mode score is how a q=84 worker came to write
+	// deterministic garbage SQL (2026-08-24). False when the mode is unknown
+	// (no classifier and nothing explicit), where the mixed score is the best
+	// available estimate — the pre-two-score behaviour.
+	noThink bool
 	// dialect is the spelling the CHOSEN worker was measured to honour (a
 	// thinkingDialect* constant). Empty ⇒ unknown, use chat_template_kwargs, the
 	// dialect the fleet has always spoken. Stamped after selection rather than
@@ -1077,7 +1096,7 @@ func normalizeEffort(v string) string {
 func (r *Router) resolveThinking(chatReq *ChatRequest, route string, cl *classification) thinkingResolution {
 	if eff := normalizeEffort(chatReq.ReasoningEffort); eff != "" {
 		if eff == "none" {
-			return thinkingResolution{patch: true, enable: false}
+			return thinkingResolution{patch: true, enable: false, noThink: true}
 		}
 		return thinkingResolution{patch: true, enable: true, effort: eff, hardThink: true}
 	}
@@ -1089,11 +1108,12 @@ func (r *Router) resolveThinking(chatReq *ChatRequest, route string, cl *classif
 	case "on":
 		return thinkingResolution{patch: true, enable: true, hardThink: true}
 	case "off":
-		return thinkingResolution{patch: true, enable: false}
+		return thinkingResolution{patch: true, enable: false, noThink: true}
 	}
 	// No explicit requirements.thinking — the kwargs escape hatch is next.
 	if clientSetKwargThinking(chatReq) {
-		return thinkingResolution{hardThink: normalizeThinking(thinkingFromRequest(chatReq)) == "on"}
+		kwarg := normalizeThinking(thinkingFromRequest(chatReq))
+		return thinkingResolution{hardThink: kwarg == "on", noThink: kwarg == "off"}
 	}
 	// Auto reasoning. Only on normal routes, with auto-thinking enabled and a
 	// usable classification (nil on pinned/debug, or when the classifier was
@@ -1107,7 +1127,7 @@ func (r *Router) resolveThinking(chatReq *ChatRequest, route string, cl *classif
 	if r.classifier.wantThinking(cl.reasoning) {
 		return thinkingResolution{patch: true, enable: true, softThink: true}
 	}
-	return thinkingResolution{patch: true, enable: false}
+	return thinkingResolution{patch: true, enable: false, noThink: true}
 }
 
 // clientSetKwargThinking reports whether the client pinned a thinking gate at

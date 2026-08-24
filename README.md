@@ -140,6 +140,21 @@ running to its ceiling, is 2.0M, but a model doing that is being scored as
 truncated on most of the set anyway. See [docs/benchmark.md](docs/benchmark.md)
 for the whole question set and its answer key.
 
+An endpoint that can think is scored **twice**: the headline quality grades the
+hard tiers thinking-on (the mode discrimen serves them in when it decides), and
+a second pass re-asks those same hard tiers with thinking disabled, merging in
+the easy-tier answers that already ran thinking-off. The result is a separate
+`quality_nothink` score, because a reasoning MoE with its thinking suppressed
+can be a different, far worse model than the one the headline score describes —
+measured on this fleet, a 35B A3B at quality 84 thinking-on wrote deterministic
+garbage SQL thinking-off. A request that will be served without thinking (an
+explicit `requirements.thinking: "off"`, `reasoning_effort: "none"`, a pinned
+`enable_thinking: false`, or a direct verdict from the auto classifier) is
+filtered, ranked and floor-checked against the no-think score; every other
+request uses the headline score. Profiles cached before the second score
+existed fall back to the headline number — the pre-two-score behaviour — until
+their endpoint re-profiles.
+
 ## How a request is routed
 
 For each `POST /v1/chat/completions`:

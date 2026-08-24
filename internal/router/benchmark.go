@@ -285,6 +285,104 @@ const (
 	benchCodingWeight  = 20
 )
 
+// benchOutcome is the graded result of one benchmark question against one worker.
+type benchOutcome struct {
+	tier  int
+	pass  bool
+	errd  bool
+	slow  bool
+	trunc bool
+	loose bool
+	got   string
+}
+
+// benchOne asks the worker one benchmark question in the given thinking mode and
+// grades the answer. Extracted from runQualityBenchmark's loop so the no-think
+// scoring pass (runNoThinkQualityBenchmark) asks questions EXACTLY the way the
+// main benchmark does — a second copy of the request/grading logic would drift.
+func (r *Router) benchOne(b *Backend, q benchmarkQ, think bool) benchOutcome {
+	res := benchOutcome{tier: q.Tier}
+	maxTokens := benchMaxTokens
+	prompt := q.Prompt
+	// Only NUMERIC grading is fooled by a verbose reasoned reply (an intermediate or a
+	// trailing restatement gets read as the answer), so make the worker answer with
+	// just the number — unless the prompt already says so. mcq (letter) and contains
+	// (substring) grade fine through a long reply, so they need no extra instruction.
+	if q.Match == "numeric" && !strings.Contains(q.Prompt, "number only") && !strings.Contains(q.Prompt, "only the output") {
+		prompt += " Give the number only."
+	}
+	if think {
+		maxTokens = benchThinkMaxTokens
+	} else {
+		prompt += " /no_think" // belt-and-suspenders with the kwarg (matches chatProbe)
+	}
+	// Greedy decoding (temperature 0): a graded benchmark must be
+	// deterministic, so the same (model, question) returns the same answer on
+	// every run and two identical models on different hosts score identically.
+	// With default-temperature sampling the quality score wobbles ±1–2 between
+	// re-profiles purely from the random draw — exactly the noise that made a
+	// model's two instances disagree. vLLM and llama.cpp both treat
+	// temperature 0 as argmax. (Heterogeneous hardware can still differ on a
+	// rare near-tie in the logits, but the sampling noise — the dominant
+	// source — is gone.)
+	payload := map[string]any{
+		"model":                probeModel(b),
+		"stream":               false,
+		"max_tokens":           maxTokens,
+		"temperature":          0,
+		"chat_template_kwargs": map[string]bool{"enable_thinking": think},
+		"messages":             []map[string]string{{"role": "user", "content": prompt}},
+	}
+	// Two failure modes are graded differently. A request that exceeds the
+	// per-question usability deadline (benchAnswerDeadline) is a SPEED fail —
+	// too slow to be usable is a quality fail for this question, not a transport
+	// hiccup, so it is recorded immediately and NOT retried (a retry would just
+	// burn another deadline for the same verdict). Any other failure is treated
+	// as transient (a dropped request under concurrent profiling load) and
+	// retried with backoff to let the congestion clear; only one that still fails
+	// every attempt is recorded as errored (worker likely down).
+	var raw map[string]any
+	var err error
+	var slow bool
+	deadline := benchAnswerDeadline
+	if q.Tier >= benchFrontierTier {
+		deadline = benchAnswerDeadlineFrontier // v33: frontier tiers measure capability, not patience
+	}
+	for attempt := 1; attempt <= benchMaxAttempts; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), deadline)
+		raw, err = r.benchCompletion(ctx, b, payload)
+		cancel()
+		if err == nil {
+			break
+		}
+		if isTimeout(err) {
+			slow = true
+			break // too slow → a usability fail for this question, never retried
+		}
+		if attempt < benchMaxAttempts {
+			time.Sleep(benchRetryBackoff * time.Duration(attempt))
+		}
+	}
+	switch {
+	case slow:
+		res.slow = true // answered too slowly to be usable — counts as a wrong answer, not an outage
+		res.got = "(too slow)"
+	case err != nil:
+		res.errd = true // every attempt failed (≠ a wrong answer) — worker likely down
+		res.got = "(no response)"
+	default:
+		content, finish := completionContent(raw)
+		res.trunc = finish == "length"
+		res.got = answerTail(content)
+		if checkAnswer(q, content) {
+			res.pass = true
+		} else if checkAnswerLoose(q, content) {
+			res.loose = true // right answer, ignored the requested format — half credit
+		}
+	}
+	return res
+}
+
 // runQualityBenchmark grades the worker against benchmarkQuestions and scores it as the
 // PERCENTAGE of questions answered correctly (0–100): every question counts the same
 // regardless of tier, so a model holds a high score only by staying correct through the
@@ -311,16 +409,13 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 	}
 	// Grade questions concurrently (bounded by the worker's measured capacity) so a
 	// thinking-on benchmark finishes in minutes rather than ~20.
-	type result struct {
-		tier  int
-		pass  bool
-		errd  bool
-		slow  bool
-		trunc bool
-		loose bool
-		got   string
-	}
-	results := make([]result, len(benchmarkQuestions))
+	//
+	// Grade in the mode the router serves this difficulty in WHEN IT CHOOSES: hard
+	// tiers thinking-on (with the reasoning headroom), easy tiers thinking-off with
+	// a tight cap (see the const block and benchmark_data.go). This mixed-mode
+	// score is what router-decided traffic experiences; a request whose client
+	// forces thinking OFF is scored separately — see runNoThinkQualityBenchmark.
+	results := make([]benchOutcome, len(benchmarkQuestions))
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	for i := range benchmarkQuestions {
@@ -330,90 +425,7 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 			defer wg.Done()
 			defer func() { <-sem }()
 			q := benchmarkQuestions[i]
-			res := result{tier: q.Tier}
-			// Grade in the mode the router serves this difficulty in: hard tiers
-			// thinking-on (with the reasoning headroom), easy tiers thinking-off with a
-			// tight cap (see the const block and benchmark_data.go).
-			think := q.Tier >= benchHardTier
-			maxTokens := benchMaxTokens
-			prompt := q.Prompt
-			// Only NUMERIC grading is fooled by a verbose reasoned reply (an intermediate or a
-			// trailing restatement gets read as the answer), so make the worker answer with
-			// just the number — unless the prompt already says so. mcq (letter) and contains
-			// (substring) grade fine through a long reply, so they need no extra instruction.
-			if q.Match == "numeric" && !strings.Contains(q.Prompt, "number only") && !strings.Contains(q.Prompt, "only the output") {
-				prompt += " Give the number only."
-			}
-			if think {
-				maxTokens = benchThinkMaxTokens
-			} else {
-				prompt += " /no_think" // belt-and-suspenders with the kwarg (matches chatProbe)
-			}
-			// Greedy decoding (temperature 0): a graded benchmark must be
-			// deterministic, so the same (model, question) returns the same answer on
-			// every run and two identical models on different hosts score identically.
-			// With default-temperature sampling the quality score wobbles ±1–2 between
-			// re-profiles purely from the random draw — exactly the noise that made a
-			// model's two instances disagree. vLLM and llama.cpp both treat
-			// temperature 0 as argmax. (Heterogeneous hardware can still differ on a
-			// rare near-tie in the logits, but the sampling noise — the dominant
-			// source — is gone.)
-			payload := map[string]any{
-				"model":                probeModel(b),
-				"stream":               false,
-				"max_tokens":           maxTokens,
-				"temperature":          0,
-				"chat_template_kwargs": map[string]bool{"enable_thinking": think},
-				"messages":             []map[string]string{{"role": "user", "content": prompt}},
-			}
-			// Two failure modes are graded differently. A request that exceeds the
-			// per-question usability deadline (benchAnswerDeadline) is a SPEED fail —
-			// too slow to be usable is a quality fail for this question, not a transport
-			// hiccup, so it is recorded immediately and NOT retried (a retry would just
-			// burn another deadline for the same verdict). Any other failure is treated
-			// as transient (a dropped request under concurrent profiling load) and
-			// retried with backoff to let the congestion clear; only one that still fails
-			// every attempt is recorded as errored (worker likely down).
-			var raw map[string]any
-			var err error
-			var slow bool
-			deadline := benchAnswerDeadline
-			if q.Tier >= benchFrontierTier {
-				deadline = benchAnswerDeadlineFrontier // v33: frontier tiers measure capability, not patience
-			}
-			for attempt := 1; attempt <= benchMaxAttempts; attempt++ {
-				ctx, cancel := context.WithTimeout(context.Background(), deadline)
-				raw, err = r.benchCompletion(ctx, b, payload)
-				cancel()
-				if err == nil {
-					break
-				}
-				if isTimeout(err) {
-					slow = true
-					break // too slow → a usability fail for this question, never retried
-				}
-				if attempt < benchMaxAttempts {
-					time.Sleep(benchRetryBackoff * time.Duration(attempt))
-				}
-			}
-			switch {
-			case slow:
-				res.slow = true // answered too slowly to be usable — counts as a wrong answer, not an outage
-				res.got = "(too slow)"
-			case err != nil:
-				res.errd = true // every attempt failed (≠ a wrong answer) — worker likely down
-				res.got = "(no response)"
-			default:
-				content, finish := completionContent(raw)
-				res.trunc = finish == "length"
-				res.got = answerTail(content)
-				if checkAnswer(q, content) {
-					res.pass = true
-				} else if checkAnswerLoose(q, content) {
-					res.loose = true // right answer, ignored the requested format — half credit
-				}
-			}
-			results[i] = res
+			results[i] = r.benchOne(b, q, q.Tier >= benchHardTier)
 		}(i)
 	}
 	wg.Wait()
@@ -517,6 +529,115 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 	breakdown = strings.TrimSpace(bd.String())
 	log.Printf("benchmark %s: q=%d%% (errored=%d, slow=%d, conc=%d) %s", b.ID, score, errored, slowFailed, concurrency, breakdown)
 	return score, true, breakdown, failed, details
+}
+
+// runNoThinkQualityBenchmark scores the worker as it answers with thinking
+// DISABLED — the mode a client's requirements.thinking="off" (or
+// reasoning_effort:"none", or a direct-verdict auto classification) serves in.
+//
+// The headline mixed-mode score grades hard tiers thinking-on, so it describes a
+// worker the no-think client never talks to: measured 2026-08-24, a 35B MoE that
+// benchmarked q>=84 in its thinking mode wrote deterministic garbage SQL with
+// thinking suppressed, and the router kept handing it hard no-think requests
+// against the thinking-mode score. Two scores end that: selection compares the
+// target against the score for the mode the request will actually be served in
+// (see qualityFor).
+//
+// Cost control: the easy tiers (below benchHardTier) were ALREADY graded
+// thinking-off in the mixed run, so only the hard tiers are re-asked; their
+// outcomes are merged with the mixed run's easy-tier results and scored with the
+// same weighted arithmetic. `mixed` is the detail list runQualityBenchmark
+// returned, aligned index-for-index with benchmarkQuestions.
+func (r *Router) runNoThinkQualityBenchmark(b *Backend, concurrency int, mixed []BenchResult) (score int, ok bool, breakdown string) {
+	if len(benchmarkQuestions) == 0 || len(mixed) != len(benchmarkQuestions) {
+		return 0, false, ""
+	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	var hardIdx []int
+	for i, q := range benchmarkQuestions {
+		if q.Tier >= benchHardTier {
+			hardIdx = append(hardIdx, i)
+		}
+	}
+	rerun := make([]benchOutcome, len(hardIdx))
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	for j, i := range hardIdx {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(j, i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			rerun[j] = r.benchOne(b, benchmarkQuestions[i], false)
+		}(j, i)
+	}
+	wg.Wait()
+
+	maxTier := 1
+	for _, q := range benchmarkQuestions {
+		if q.Tier > maxTier {
+			maxTier = q.Tier
+		}
+	}
+	pass := make([]int, maxTier+1)
+	loose := make([]int, maxTier+1)
+	count := make([]int, maxTier+1)
+	errored, slowFailed, truncated := 0, 0, 0
+	outcomes := make([]benchOutcome, len(benchmarkQuestions))
+	for i, m := range mixed {
+		// Easy tiers ran thinking-off in the mixed pass; carry them over verbatim.
+		outcomes[i] = benchOutcome{tier: m.Tier, pass: m.Pass, loose: m.Loose,
+			errd: m.Errored, slow: m.Slow, trunc: m.Truncated}
+	}
+	for j, i := range hardIdx {
+		outcomes[i] = rerun[j]
+	}
+	for _, res := range outcomes {
+		count[res.tier]++
+		switch {
+		case res.errd:
+			errored++
+		case res.slow:
+			slowFailed++
+		case res.pass:
+			pass[res.tier]++
+		case res.loose:
+			loose[res.tier]++
+		}
+		if res.trunc {
+			truncated++
+		}
+	}
+	// Same give-up rule as the mixed run, judged over the questions this pass
+	// actually asked: a worker that went unreachable mid-run is unmeasurable,
+	// not bad.
+	if errored*2 > len(hardIdx) {
+		return 0, false, ""
+	}
+	ok2, score2 := benchWeightedScore(pass, loose, count, maxTier)
+	if !ok2 {
+		return 0, false, ""
+	}
+	var bd strings.Builder
+	for t := 1; t <= maxTier; t++ {
+		if count[t] > 0 {
+			fmt.Fprintf(&bd, "t%d=%d/%d ", t, pass[t], count[t])
+		}
+	}
+	if truncated > 0 {
+		fmt.Fprintf(&bd, "trunc=%d ", truncated)
+	}
+	if slowFailed > 0 {
+		fmt.Fprintf(&bd, "slow=%d ", slowFailed)
+	}
+	if errored > 0 {
+		fmt.Fprintf(&bd, "err=%d ", errored)
+	}
+	log.Printf("benchmark %s (no-think): q=%d%% (errored=%d, slow=%d, conc=%d) %s",
+		b.ID, score2, errored, slowFailed, concurrency, strings.TrimSpace(bd.String()))
+	return score2, true, strings.TrimSpace(bd.String())
 }
 
 // benchWeightedScore turns the per-tier tallies into the 0-100 quality score, split

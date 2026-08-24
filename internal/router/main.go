@@ -168,8 +168,14 @@ type Backend struct {
 	// ages out (see stripAndRetry and rejectedFieldTTL). Learned at runtime and
 	// deliberately not persisted, so a provider that starts accepting a field is
 	// forgiven on the next restart as well.
-	RejectedFields []string  `json:"rejected_fields,omitempty"`
-	QualityDetail  string    `json:"quality_detail,omitempty"`    // benchmark per-tier + truncation breakdown
+	RejectedFields []string `json:"rejected_fields,omitempty"`
+	QualityDetail  string   `json:"quality_detail,omitempty"` // benchmark per-tier + truncation breakdown
+	// QualityNoThink is the benchmark scored with thinking DISABLED on every
+	// question — what a requirements.thinking="off" client is actually served
+	// by. Zero means not measured (pre-two-score profile, or provisional);
+	// selection then falls back to Quality via qualityFor. See
+	// WorkerProfile.QualityNoThink for the full story.
+	QualityNoThink int       `json:"quality_nothink,omitempty"`
 	Failed         []string  `json:"failed_benchmarks,omitempty"` // benchmark questions the worker missed
 	LastError      string    `json:"last_error,omitempty"`
 	Certification  CertState `json:"certification"`
@@ -909,13 +915,14 @@ func (r *Router) serveBenchmark(w http.ResponseWriter, req *http.Request, id str
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id":            id,
-		"model":         prof.Model,
-		"quality":       prof.Quality,
-		"bench_version": prof.BenchVersion,
-		"measured_at":   prof.MeasuredAt,
-		"profile_ms":    prof.ProfileMillis,
-		"profiled_in":   fmtProfileDuration(prof.ProfileMillis),
+		"id":              id,
+		"model":           prof.Model,
+		"quality":         prof.Quality,
+		"quality_nothink": prof.QualityNoThink,
+		"bench_version":   prof.BenchVersion,
+		"measured_at":     prof.MeasuredAt,
+		"profile_ms":      prof.ProfileMillis,
+		"profiled_in":     fmtProfileDuration(prof.ProfileMillis),
 		// What the run cost. Omitted entirely for a profile measured before the
 		// accounting existed, so a UI renders nothing rather than a confident zero
 		// (see WorkerProfile.ProfilePromptTokens).
@@ -1687,7 +1694,7 @@ func (r *Router) selectBackendsByFeature(feature string) ([]*Backend, error) {
 	}
 	// Feature lookups (/v1/embeddings) carry no chat request to size, so rank on
 	// the nominal job — unchanged from before jobCost existed.
-	return rankBackends(filtered, nominalJob()), nil
+	return rankBackends(filtered, nominalJob(), false), nil
 }
 
 // The two passthrough routes, named so the budgeting fallback can tell them
@@ -2055,6 +2062,19 @@ type acquirePreference struct {
 	why string
 }
 
+// qualityFor is the quality score to judge b by for a request served in the
+// given thinking mode. A no-think request reads the no-think benchmark score —
+// the model that client actually talks to — falling back to the mixed-mode
+// Quality when no no-think score was measured (an old cached profile, a
+// provisional worker, a failed no-think pass), which is exactly the
+// pre-two-score behaviour.
+func qualityFor(b *Backend, thinkOff bool) int {
+	if thinkOff && b.QualityNoThink > 0 {
+		return b.QualityNoThink
+	}
+	return b.Quality
+}
+
 // qualityFloorPreference is the bounded first choice for an ordinary request:
 // the workers at or above the classified tier and, among those, the FREE ones.
 //
@@ -2078,8 +2098,8 @@ type acquirePreference struct {
 // unclassified request, or the fallback ranker) makes the tier test vacuous and
 // leaves free-first on its own, which is what "prefer the free ones" means when
 // there is no bar to clear.
-func qualityFloorPreference(candidates []*Backend, target int) acquirePreference {
-	aboveBar := func(b *Backend) bool { return target <= 0 || b.Quality >= target }
+func qualityFloorPreference(candidates []*Backend, target int, thinkOff bool) acquirePreference {
+	aboveBar := func(b *Backend) bool { return target <= 0 || qualityFor(b, thinkOff) >= target }
 	tiers := []struct {
 		why  string
 		keep func(*Backend) bool
@@ -2112,8 +2132,8 @@ func sessionLockPreference(incumbent string) acquirePreference {
 
 // pickAndAcquireWithFloor is pickAndAcquire under the quality-floor preference.
 // Retained as the named entry point for the floor policy (and its tests).
-func (r *Router) pickAndAcquireWithFloor(ctx context.Context, candidates []*Backend, target int) (*Backend, chan struct{}, bool, error) {
-	return r.pickAndAcquirePreferred(ctx, candidates, qualityFloorPreference(candidates, target))
+func (r *Router) pickAndAcquireWithFloor(ctx context.Context, candidates []*Backend, target int, thinkOff bool) (*Backend, chan struct{}, bool, error) {
+	return r.pickAndAcquirePreferred(ctx, candidates, qualityFloorPreference(candidates, target, thinkOff))
 }
 
 // pickAndAcquirePreferred is pickAndAcquire plus a bounded first-choice set.
@@ -2227,7 +2247,7 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 	// is open the session lock wins instead — handing a tool result to a model that
 	// never emitted the matching tool call breaks the loop outright, which is worse
 	// than serving that turn a tier low.
-	pref := qualityFloorPreference(candidates, target)
+	pref := qualityFloorPreference(candidates, target, tr.noThink)
 	if plan.session.locked() {
 		pref = sessionLockPreference(plan.session.incumbent)
 	}
@@ -2272,10 +2292,10 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 				log.Printf("cost: %s served on PAID backend=%s (in %g / out %g per Mtok) after %s grace — no free worker above the bar freed a slot",
 					route, backend.ID, backend.InputPricePerMtok, backend.OutputPricePerMtok, qualityFloorWait)
 			}
-			if target > 0 && backend.Quality < target {
+			if target > 0 && qualityFor(backend, tr.noThink) < target {
 				w.Header().Set("X-LLM-Quality-Floor", "downgraded")
 				log.Printf("quality floor: %s served below target q>=%d on backend=%s (q=%d) after %s grace — no above-bar slot freed",
-					route, target, backend.ID, backend.Quality, qualityFloorWait)
+					route, target, backend.ID, qualityFor(backend, tr.noThink), qualityFloorWait)
 			}
 		}
 	}
@@ -2827,7 +2847,7 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 	// embeddings worker) or the request carries no messages (a bare /v1/completions
 	// call), fall through to the quality-ranked fallback below.
 	if cl != nil && r.cfg.AutoDifficulty {
-		target := r.classifier.targetForFleet(filtered, r.adapter.adjust(cl.difficulty))
+		target := r.classifier.targetForFleet(filtered, r.adapter.adjust(cl.difficulty), tr.noThink)
 		// target is surfaced as the quality floor so the acquire step prefers to
 		// wait BRIEFLY for an above-target worker before spilling below it (fix #2);
 		// routing too cheap is the quality-risky direction.
@@ -2837,7 +2857,7 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 		// tier adapter and the background judge learn from tiers the ROUTER chose
 		// and not from ones a harness chose for it.
 		return &routePlan{
-			candidates: rankByDifficulty(filtered, target, job),
+			candidates: rankByDifficulty(filtered, target, job, tr.noThink),
 			route:      fmt.Sprintf("%s:d=%.2f,q>=%d", routeKind(wantModel), cl.difficulty, target),
 			cl:         cl,
 			target:     target,
@@ -2855,7 +2875,7 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 	// candidate, so the request is always served. target=0 ⇒ no quality floor
 	// (everyone is above-bar), so the acquire step behaves exactly as before.
 	return &routePlan{
-		candidates: rankBackends(filtered, job),
+		candidates: rankBackends(filtered, job, tr.noThink),
 		route:      routeKind(wantModel),
 		cl:         cl,
 		job:        job,
@@ -4334,8 +4354,8 @@ func filterCandidates(candidates []*Backend, keep func(*Backend) bool) []*Backen
 // unavailable): quality-weighted, with speed as a secondary pull.
 //
 //	quality*3 + speed*1  (prefer better models)
-func backendScore(b *Backend) int {
-	return b.Quality*3 + speedScore(b)
+func backendScore(b *Backend, thinkOff bool) int {
+	return qualityFor(b, thinkOff)*3 + speedScore(b)
 }
 
 // rankBackends sorts candidates best-first and returns the slice. The first
@@ -4343,7 +4363,7 @@ func backendScore(b *Backend) int {
 // spill to the next-best backend when the best one has no free slot. This is the
 // fallback ranker for when auto-tiering can't run; the auto path uses
 // rankByDifficulty instead.
-func rankBackends(candidates []*Backend, job jobCost) []*Backend {
+func rankBackends(candidates []*Backend, job jobCost, thinkOff bool) []*Backend {
 	sort.SliceStable(candidates, func(i, j int) bool {
 		a, b := candidates[i], candidates[j]
 		// 1. Strongly prefer backends with free slots over full ones
@@ -4353,7 +4373,7 @@ func rankBackends(candidates []*Backend, job jobCost) []*Backend {
 			return !aFull // prefer the one that's NOT full
 		}
 		// 2. Combined quality+speed score (quality-weighted)
-		sa, sb := backendScore(a), backendScore(b)
+		sa, sb := backendScore(a, thinkOff), backendScore(b, thinkOff)
 		if sa != sb {
 			return sa > sb
 		}

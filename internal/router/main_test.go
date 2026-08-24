@@ -136,7 +136,7 @@ func TestQualityFloorAboveBarFreesWithinGrace(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 		reg.releaseSlot(bigSlot)
 	}()
-	got, slot, downgraded, err := r.pickAndAcquireWithFloor(context.Background(), cands, 7)
+	got, slot, downgraded, err := r.pickAndAcquireWithFloor(context.Background(), cands, 7, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -164,7 +164,7 @@ func TestQualityFloorDowngradesPastGrace(t *testing.T) {
 		t.Fatal("could not saturate big")
 	}
 	start := time.Now()
-	got, slot, downgraded, err := r.pickAndAcquireWithFloor(context.Background(), cands, 7)
+	got, slot, downgraded, err := r.pickAndAcquireWithFloor(context.Background(), cands, 7, false)
 	if err != nil {
 		t.Fatalf("downgrade path must still serve, got err=%v", err)
 	}
@@ -192,7 +192,7 @@ func TestQualityFloorNoAboveBarImmediate(t *testing.T) {
 	cands := []*Backend{mid, tiny}
 
 	start := time.Now()
-	got, slot, downgraded, err := r.pickAndAcquireWithFloor(context.Background(), cands, 9)
+	got, slot, downgraded, err := r.pickAndAcquireWithFloor(context.Background(), cands, 9, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -220,7 +220,7 @@ func TestQualityFloorTargetZeroUnchanged(t *testing.T) {
 	cands := []*Backend{a, b}
 
 	// Best free slot, no floor: takes the first candidate immediately.
-	got, slot, downgraded, err := r.pickAndAcquireWithFloor(context.Background(), cands, 0)
+	got, slot, downgraded, err := r.pickAndAcquireWithFloor(context.Background(), cands, 0, false)
 	if err != nil || got.ID != "a" || downgraded {
 		t.Fatalf("target=0 both free: got=%v downgraded=%v err=%v, want a", got, downgraded, err)
 	}
@@ -231,7 +231,7 @@ func TestQualityFloorTargetZeroUnchanged(t *testing.T) {
 		t.Fatal("could not saturate a")
 	}
 	start := time.Now()
-	got, slot, downgraded, err = r.pickAndAcquireWithFloor(context.Background(), cands, 0)
+	got, slot, downgraded, err = r.pickAndAcquireWithFloor(context.Background(), cands, 0, false)
 	if err != nil || got.ID != "b" || downgraded {
 		t.Fatalf("target=0 spill: got=%v downgraded=%v err=%v, want b", got, downgraded, err)
 	}
@@ -592,8 +592,8 @@ func TestSpeedScoreCommensurableWithQuality(t *testing.T) {
 	// much faster one — the fallback ranker stays quality-weighted.
 	better := &Backend{BackendRegistration: BackendRegistration{Quality: 100, BaselineTPS: 30}}
 	quicker := &Backend{BackendRegistration: BackendRegistration{Quality: 60, BaselineTPS: 150}}
-	if backendScore(better) <= backendScore(quicker) {
-		t.Fatalf("quality should still dominate: %d vs %d", backendScore(better), backendScore(quicker))
+	if backendScore(better, false) <= backendScore(quicker, false) {
+		t.Fatalf("quality should still dominate: %d vs %d", backendScore(better, false), backendScore(quicker, false))
 	}
 	// Uncapped/unknown speed must not be scored as if it were fast.
 	if speedScore(&Backend{}) != 0 {

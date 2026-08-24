@@ -188,7 +188,7 @@ func expertEntry(fleetFeatures []string) map[string]any {
 // asked here rather than re-invented. target 0: an ensemble has no quality bar
 // to clear, since it is asking everyone.
 func expertMembers(candidates []*Backend, job jobCost) []*Backend {
-	ranked := rankByDifficulty(append([]*Backend(nil), candidates...), 0, job)
+	ranked := rankByDifficulty(append([]*Backend(nil), candidates...), 0, job, false)
 	seen := map[string]bool{}
 	members := make([]*Backend, 0, len(ranked))
 	for _, b := range ranked {
@@ -228,7 +228,7 @@ func pickSynthesiser(candidates []*Backend, neededContext int, job jobCost) *Bac
 		}
 	}
 	tied := filterCandidates(fits, func(b *Backend) bool { return b.Quality == best })
-	return rankByDifficulty(tied, 0, job)[0]
+	return rankByDifficulty(tied, 0, job, false)[0]
 }
 
 // ── Dispatch ────────────────────────────────────────────────────────────────

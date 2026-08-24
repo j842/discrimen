@@ -591,23 +591,23 @@ func TestIsFreeBackendNeedsADeclaredZero(t *testing.T) {
 func TestRankByDifficultyPrefersFreeAboveTheBar(t *testing.T) {
 	free := mkBackend("free", 8, 30, 4, 0)
 	paidFast := pricedBackend("paid-fast", 9, 200, 4, 0, 3, 15)
-	if got := rankByDifficulty([]*Backend{paidFast, free}, 7, nominalJob()); got[0].ID != "free" {
+	if got := rankByDifficulty([]*Backend{paidFast, free}, 7, nominalJob(), false); got[0].ID != "free" {
 		t.Errorf("both clear q>=7: want the free worker first, got %s", got[0].ID)
 	}
 	// Only the paid worker clears the bar → it leads. Cost never buys worse.
-	if got := rankByDifficulty([]*Backend{free, paidFast}, 9, nominalJob()); got[0].ID != "paid-fast" {
+	if got := rankByDifficulty([]*Backend{free, paidFast}, 9, nominalJob(), false); got[0].ID != "paid-fast" {
 		t.Errorf("only paid clears q>=9: want paid-fast, got %s", got[0].ID)
 	}
 	// Below the bar, closest quality still wins.
 	freeWeak := mkBackend("free-weak", 3, 200, 4, 0)
 	paidMid := pricedBackend("paid-mid", 6, 30, 4, 0, 3, 15)
-	if got := rankByDifficulty([]*Backend{freeWeak, paidMid}, 9, nominalJob()); got[0].ID != "paid-mid" {
+	if got := rankByDifficulty([]*Backend{freeWeak, paidMid}, 9, nominalJob(), false); got[0].ID != "paid-mid" {
 		t.Errorf("both below q>=9: want the closest (paid-mid), got %s", got[0].ID)
 	}
 	// A saturated free worker still loses the head of the list: holding the
 	// request for it is the acquire step's job, not the ranker's.
 	fullFree := mkBackend("free", 8, 30, 1, 1)
-	if got := rankByDifficulty([]*Backend{fullFree, paidFast}, 7, nominalJob()); got[0].ID != "paid-fast" {
+	if got := rankByDifficulty([]*Backend{fullFree, paidFast}, 7, nominalJob(), false); got[0].ID != "paid-fast" {
 		t.Errorf("free worker full: want paid-fast at the head, got %s", got[0].ID)
 	}
 }
@@ -620,11 +620,11 @@ func TestRankBackendsCostIsOnlyATieBreak(t *testing.T) {
 	// rule the final a.ID < b.ID tiebreak would put the paid one first.
 	free := mkBackend("zzz-free", 7, 50, 4, 0)
 	paid := pricedBackend("aaa-paid", 7, 50, 4, 0, 3, 15)
-	if got := rankBackends([]*Backend{paid, free}, nominalJob()); got[0].ID != "zzz-free" {
+	if got := rankBackends([]*Backend{paid, free}, nominalJob(), false); got[0].ID != "zzz-free" {
 		t.Errorf("equal score: want the free worker first, got %s", got[0].ID)
 	}
 	better := pricedBackend("aaa-paid-better", 10, 50, 4, 0, 3, 15)
-	if got := rankBackends([]*Backend{free, better}, nominalJob()); got[0].ID != "aaa-paid-better" {
+	if got := rankBackends([]*Backend{free, better}, nominalJob(), false); got[0].ID != "aaa-paid-better" {
 		t.Errorf("a clearly better paid worker must still lead, got %s", got[0].ID)
 	}
 }
@@ -651,7 +651,7 @@ func TestQualityFloorPreferenceTiers(t *testing.T) {
 		{"nothing clears the bar", []*Backend{free3}, 9, ""},
 	}
 	for _, c := range cases {
-		pref := qualityFloorPreference(c.candidates, c.target)
+		pref := qualityFloorPreference(c.candidates, c.target, false)
 		if pref.why != c.why {
 			t.Errorf("%s: preference = %q, want %q", c.name, pref.why, c.why)
 		}
@@ -671,7 +671,7 @@ func TestFreeFirstServesFreeWhileItHasASlot(t *testing.T) {
 	r := &Router{registry: reg}
 
 	start := time.Now()
-	got, slot, missed, err := r.pickAndAcquireWithFloor(context.Background(), []*Backend{paid, free}, 7)
+	got, slot, missed, err := r.pickAndAcquireWithFloor(context.Background(), []*Backend{paid, free}, 7, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -700,7 +700,7 @@ func TestFreeFirstSpillsToPaidOnlyPastTheGrace(t *testing.T) {
 		t.Fatal("could not saturate the free worker")
 	}
 	start := time.Now()
-	got, slot, missed, err := r.pickAndAcquireWithFloor(context.Background(), []*Backend{paid, free}, 7)
+	got, slot, missed, err := r.pickAndAcquireWithFloor(context.Background(), []*Backend{paid, free}, 7, false)
 	if err != nil {
 		t.Fatalf("the spill must still serve, got err=%v", err)
 	}
@@ -733,7 +733,7 @@ func TestFreeFirstTakesTheFreeSlotThatFreesWithinTheGrace(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 		reg.releaseSlot(held)
 	}()
-	got, slot, missed, err := r.pickAndAcquireWithFloor(context.Background(), []*Backend{paid, free}, 7)
+	got, slot, missed, err := r.pickAndAcquireWithFloor(context.Background(), []*Backend{paid, free}, 7, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

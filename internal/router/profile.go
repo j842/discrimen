@@ -19,12 +19,23 @@ import (
 // persisted per (id, model) and reused on warm restarts — see the /llm skill and
 // the README.
 type WorkerProfile struct {
-	Model          string  `json:"model"`
-	Quality        int     `json:"quality"`
-	ContextK       int     `json:"context_k"`
-	MaxConcurrency int     `json:"max_concurrency"`
-	BaselineTPS    float64 `json:"baseline_tps"`
-	TTFTMillis     int64   `json:"ttft_millis"`
+	Model   string `json:"model"`
+	Quality int    `json:"quality"`
+	// QualityNoThink is the same weighted benchmark scored with thinking
+	// DISABLED on every question — the model a requirements.thinking="off"
+	// client actually talks to. The headline Quality grades hard tiers
+	// thinking-on, and the two can diverge sharply on MoE reasoners (measured
+	// 2026-08-24: a 35B A3B at q=84 thinking wrote deterministic garbage SQL
+	// no-think). Zero means NOT MEASURED (a profile cached before this field
+	// existed, or a worker that cannot think — where the mixed score already IS
+	// the no-think score); selection falls back to Quality then, which is
+	// exactly the pre-two-score behaviour. See qualityFor.
+	QualityNoThink       int     `json:"quality_nothink,omitempty"`
+	QualityNoThinkDetail string  `json:"quality_nothink_detail,omitempty"`
+	ContextK             int     `json:"context_k"`
+	MaxConcurrency       int     `json:"max_concurrency"`
+	BaselineTPS          float64 `json:"baseline_tps"`
+	TTFTMillis           int64   `json:"ttft_millis"`
 	// PrefillTPS is prompt tokens per second, measured on a prompt of known length.
 	// Unlike TTFTMillis it scales with the request, which is what routing needs: the
 	// spread across the fleet is far wider for prefill than for decode (0.67s vs 37.2s
@@ -364,6 +375,25 @@ func (r *Router) profileBackend(b *Backend, model string) (*WorkerProfile, error
 		qMsg += " " + qBreakdown // per-tier + truncation breakdown, visible via /backends/{id}
 	}
 	p.Checks["quality"] = Check{OK: true, Message: qMsg}
+	// Second score: the worker with thinking disabled, for requests a client
+	// forces no-think (see WorkerProfile.QualityNoThink). Only thinking-capable
+	// workers diverge — for the rest the mixed run already asked every question
+	// no-think, so the score is the same number and costs nothing to reuse.
+	if p.Thinking {
+		ntScore, ntOK, ntBreakdown := r.runNoThinkQualityBenchmark(b, benchConc, qResults)
+		if ntOK {
+			p.QualityNoThink = ntScore
+			p.QualityNoThinkDetail = ntBreakdown
+			p.Checks["quality_nothink"] = Check{OK: true,
+				Message: fmt.Sprintf("%d%% %s", ntScore, ntBreakdown)}
+		}
+		// A failed no-think pass leaves the field zero → selection falls back to
+		// the mixed score, the pre-two-score behaviour; not worth aborting a
+		// profile the main benchmark already earned.
+	} else {
+		p.QualityNoThink = quality
+		p.QualityNoThinkDetail = qBreakdown
+	}
 	p.MeasuredAt = time.Now()
 	p.ProfileMillis = time.Since(start).Milliseconds()
 	// What the run cost, recorded on the profile it produced so it survives the
@@ -970,6 +1000,10 @@ func (r *Registry) applyProfileIfGen(id string, gen int64, p *WorkerProfile) boo
 	b.Thinking = p.Thinking
 	b.ThinkingDialect = p.ThinkingDialect
 	b.QualityDetail = p.QualityDetail
+	// No operator-declared analog exists for the no-think score: it is purely
+	// measured, so the profile is always authoritative. Zero (old profile, or a
+	// failed no-think pass) means qualityFor falls back to Quality.
+	b.QualityNoThink = p.QualityNoThink
 	b.Failed = append([]string(nil), p.Failed...)
 	// Measured capacity becomes the slot cap — the bound that makes requests
 	// queue at the router and spill across the fleet instead of piling onto a

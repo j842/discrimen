@@ -424,20 +424,20 @@ func TestRankByDifficulty(t *testing.T) {
 
 	// Easy: every backend clears q>=2, so the one that FINISHES SOONEST wins —
 	// the fastest (big), not the cheapest. (Completion-time ranking.)
-	if got := rankByDifficulty([]*Backend{tiny, mid, gem, big}, 2, nominalJob()); got[0].ID != "big" {
+	if got := rankByDifficulty([]*Backend{tiny, mid, gem, big}, 2, nominalJob(), false); got[0].ID != "big" {
 		t.Fatalf("easy idle: want fastest sufficient (big), got %s", got[0].ID)
 	}
 	// Hard: only big clears q>=9.
-	if got := rankByDifficulty([]*Backend{tiny, mid, gem, big}, 9, nominalJob()); got[0].ID != "big" {
+	if got := rankByDifficulty([]*Backend{tiny, mid, gem, big}, 9, nominalJob(), false); got[0].ID != "big" {
 		t.Fatalf("hard: want big, got %s", got[0].ID)
 	}
 	// Among equal-quality (q7) candidates the faster one wins.
-	if got := rankByDifficulty([]*Backend{gem, mid}, 7, nominalJob()); got[0].ID != "mid" {
+	if got := rankByDifficulty([]*Backend{gem, mid}, 7, nominalJob(), false); got[0].ID != "mid" {
 		t.Fatalf("q7 tie: want faster (mid), got %s", got[0].ID)
 	}
 	// Spill: when the fast big is full, the fastest backend with a free slot wins.
 	fullBig := mkBackend("big", 10, 140, 6, 6) // active==cap → full
-	if got := rankByDifficulty([]*Backend{fullBig, mid, tiny}, 2, nominalJob()); got[0].ID != "tiny" {
+	if got := rankByDifficulty([]*Backend{fullBig, mid, tiny}, 2, nominalJob(), false); got[0].ID != "tiny" {
 		t.Fatalf("big full: want fastest free slot (tiny), got %s", got[0].ID)
 	}
 }
@@ -571,16 +571,16 @@ func TestAutoReasoningGatesSelection(t *testing.T) {
 func TestAutoTargetQuality(t *testing.T) {
 	// Realistic measured qualities (benchmark percentages), not tiers.
 	fleet := []*Backend{mkBackend("a", 40, 0, 0, 0), mkBackend("b", 71, 0, 0, 0), mkBackend("c", 82, 0, 0, 0)}
-	if q := autoTargetQuality(fleet, 0.0); q != 0 {
+	if q := autoTargetQuality(fleet, 0.0, false); q != 0 {
 		t.Fatalf("score 0 → %d, want 0 (no bar)", q)
 	}
-	if q := autoTargetQuality(fleet, 0.65); q != 65 {
+	if q := autoTargetQuality(fleet, 0.65, false); q != 65 {
 		t.Fatalf("score .65 → %d, want 65 (absolute scale)", q)
 	}
-	if q := autoTargetQuality(fleet, 1.0); q != 82 {
+	if q := autoTargetQuality(fleet, 1.0, false); q != 82 {
 		t.Fatalf("score 1 → %d, want 82 (clamped to best available)", q)
 	}
-	if q := autoTargetQuality([]*Backend{mkBackend("x", 50, 0, 0, 0)}, 0.9); q != 50 {
+	if q := autoTargetQuality([]*Backend{mkBackend("x", 50, 0, 0, 0)}, 0.9, false); q != 50 {
 		t.Fatalf("single worker → %d, want 50 (clamped)", q)
 	}
 
@@ -590,7 +590,7 @@ func TestAutoTargetQuality(t *testing.T) {
 	// Under the old fleet-range mapping this went from 67 to 74 the moment
 	// the 93 registered, silently excluding the 82.
 	withGenius := append(append([]*Backend{}, fleet...), mkBackend("genius", 93, 0, 0, 0))
-	if before, after := autoTargetQuality(fleet, 0.65), autoTargetQuality(withGenius, 0.65); before != after {
+	if before, after := autoTargetQuality(fleet, 0.65, false), autoTargetQuality(withGenius, 0.65, false); before != after {
 		t.Fatalf("adding a high-quality worker moved the bar: %d → %d", before, after)
 	}
 }
@@ -1053,7 +1053,7 @@ func TestThinkingJobPrefersGPU(t *testing.T) {
 
 	// The failing request: ~4k tokens of system prompt + tool schemas, thinking on.
 	job := jobCost{promptTokens: 4000, outputTokens: latencyEstThinkTokens}
-	got := rankByDifficulty([]*Backend{cpu, gpu}, 87, job)
+	got := rankByDifficulty([]*Backend{cpu, gpu}, 87, job, false)
 	if got[0].ID != "llm-6000pro" {
 		t.Fatalf("thinking agent turn should go to the GPU, got %s (gpu=%.1fs cpu=%.1fs)",
 			got[0].ID, expectedLatency(gpu, job), expectedLatency(cpu, job))

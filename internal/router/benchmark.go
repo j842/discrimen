@@ -106,7 +106,16 @@ import (
 // endurance rather than reasoning, which this tier is explicitly built not to do. If tier 10
 // needs its twelfth discriminating item back, the replacement should be written compact and
 // fully specified from the start, and its spread measured across the fleet before it lands.
-const benchmarkVersion = 36
+// v37: loose half-credit grading. A reply that fails strict extraction but visibly
+// ASSERTS the expected answer — emphasised ("**114**"), as its final stated equation
+// ("… = 42"), an emphasised option pick ("**B) backward…**"), or the expected option's
+// own text — scores HALF a point, tallied separately as "loose". Motivated by
+// Ornith-1.5-35B-A3B (2026-08-24): 8 of its 12 misses were semantically correct answers
+// that ignored "Give the number only" / "Answer with just the letter", so its q=89
+// measured formatting, not knowledge. Strict grading is unchanged — nobody's full
+// credit moved — loose only ADDS credit, and the tally keeps the formatting cost
+// visible per worker.
+const benchmarkVersion = 37
 
 // benchmarkQ is one graded question in the cold-start quality benchmark. The
 // question set lives in benchmark_data.go.
@@ -128,7 +137,8 @@ type BenchResult struct {
 	Pass      bool   `json:"pass"`
 	Truncated bool   `json:"truncated,omitempty"`
 	Errored   bool   `json:"errored,omitempty"`
-	Slow      bool   `json:"slow,omitempty"` // exceeded benchAnswerDeadline — too slow to be usable, scored a fail (not a transport error)
+	Slow      bool   `json:"slow,omitempty"`  // exceeded benchAnswerDeadline — too slow to be usable, scored a fail (not a transport error)
+	Loose     bool   `json:"loose,omitempty"` // failed strict extraction but asserts the expected answer — half credit (see checkAnswerLoose)
 }
 
 var (
@@ -193,6 +203,17 @@ var (
 	// benchNumListRe matches a line-leading list marker ("1. ", "2) "); two or more
 	// mean the answer is a numbered list, whose lead number is a marker, not the answer.
 	benchNumListRe = regexp.MustCompile(`(?m)^\s*[0-9]{1,2}[.)]\s`)
+
+	// v37 loose grading (checkAnswerLoose). benchEmphasisRe captures a markdown
+	// bold/italic span — a model that ignores "give the number only" still marks its
+	// answer up ("**114**", "**Step 6 is wrong.**", "**B) backward…**"), so an
+	// emphasised span is where an answer is ASSERTED, unlike arbitrary prose. Spans are
+	// single-line and short; backticks are code, not emphasis, and are not read.
+	benchEmphasisRe = regexp.MustCompile(`\*{1,2}([^*\n]{1,120}?)\*{1,2}`)
+	// benchLastEqRe reads a stated equation result ("… = 42", "… ≡ 77 (mod 100)"); the
+	// LAST one in the reply is the model's final claim, mirroring the last-number rule.
+	// Only the value directly after =/≡ counts, so "1 + 2 + 12" operands never match.
+	benchLastEqRe = regexp.MustCompile(`[=≡]\s*\(?(-?[0-9]+(?:\.[0-9]+)?)`)
 )
 
 // Each question is graded in the MODE THE ROUTER WOULD SERVE IT IN: the easy tiers
@@ -296,6 +317,7 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 		errd  bool
 		slow  bool
 		trunc bool
+		loose bool
 		got   string
 	}
 	results := make([]result, len(benchmarkQuestions))
@@ -387,6 +409,8 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 				res.got = answerTail(content)
 				if checkAnswer(q, content) {
 					res.pass = true
+				} else if checkAnswerLoose(q, content) {
+					res.loose = true // right answer, ignored the requested format — half credit
 				}
 			}
 			results[i] = res
@@ -401,8 +425,9 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 		}
 	}
 	pass := make([]int, maxTier+1)
+	loose := make([]int, maxTier+1)
 	count := make([]int, maxTier+1)
-	errored, slowFailed, truncated := 0, 0, 0
+	errored, slowFailed, truncated, looseTotal := 0, 0, 0, 0
 	for i, res := range results {
 		q := benchmarkQuestions[i]
 		count[res.tier]++
@@ -413,6 +438,9 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 			slowFailed++ // too slow to be usable — a normal failure (stays in the denominator), not an outage
 		case res.pass:
 			pass[res.tier]++
+		case res.loose:
+			loose[res.tier]++ // semantically right, wrong format — half credit
+			looseTotal++
 		}
 		// A length-truncated answer is a normal failure (it stays in the denominator
 		// and, unless it still parsed to the right result, didn't pass), matching the
@@ -424,6 +452,7 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 		details = append(details, BenchResult{
 			Tier: q.Tier, Prompt: q.Prompt, Expect: q.Expect,
 			Got: res.got, Pass: res.pass, Truncated: res.trunc, Errored: res.errd, Slow: res.slow,
+			Loose: res.loose,
 		})
 		if !res.pass {
 			reason := " (wrong)"
@@ -433,6 +462,8 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 				reason = " (too slow)"
 			} else if res.trunc {
 				reason = " (truncated)"
+			} else if res.loose {
+				reason = " (loose: right answer, ignored format — half credit)"
 			}
 			failed = append(failed, fmt.Sprintf("t%d %s%s", res.tier, benchSnippet(q.Prompt), reason))
 		}
@@ -457,18 +488,22 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 	// (too slow), and a request that still errors after every retry all yielded no usable
 	// answer and count as a failure, the same as a wrong answer — matching what the runtime
 	// adapter penalizes.
-	ok2, score2 := benchWeightedScore(pass, count, maxTier)
+	ok2, score2 := benchWeightedScore(pass, loose, count, maxTier)
 	if !ok2 {
 		return 0, false, "", nil, nil
 	}
 	score = score2
 	// Per-tier breakdown (+ any truncations) so the spread is visible and a
 	// truncation problem shows up explicitly rather than as fake low quality.
+	// Per-tier counts are STRICT passes; the loose tally is global, like trunc.
 	var bd strings.Builder
 	for t := 1; t <= maxTier; t++ {
 		if count[t] > 0 {
 			fmt.Fprintf(&bd, "t%d=%d/%d ", t, pass[t], count[t])
 		}
+	}
+	if looseTotal > 0 {
+		fmt.Fprintf(&bd, "loose=%d ", looseTotal)
 	}
 	if truncated > 0 {
 		fmt.Fprintf(&bd, "trunc=%d ", truncated)
@@ -499,8 +534,16 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 //
 // Reports false when the set has no questions at all, which the caller treats as an
 // unmeasurable worker rather than as a zero.
-func benchWeightedScore(pass, count []int, maxTier int) (bool, int) {
-	buckets := []struct{ weight, pass, count int }{
+//
+// v37: a loose pass (right answer, ignored the requested format — checkAnswerLoose)
+// contributes HALF a point to its bucket, so knowledge is credited but a compliant
+// worker still outranks a verbose one on the same answers.
+func benchWeightedScore(pass, loose, count []int, maxTier int) (bool, int) {
+	buckets := []struct {
+		weight int
+		pass   float64
+		count  int
+	}{
 		{weight: benchBaseWeight},
 		{weight: benchInsightWeight},
 		{weight: benchCodingWeight},
@@ -513,7 +556,10 @@ func benchWeightedScore(pass, count []int, maxTier int) (bool, int) {
 		case t >= benchInsightTier:
 			i = 1
 		}
-		buckets[i].pass += pass[t]
+		buckets[i].pass += float64(pass[t])
+		if loose != nil && t < len(loose) {
+			buckets[i].pass += 0.5 * float64(loose[t])
+		}
 		buckets[i].count += count[t]
 	}
 	liveWeight := 0
@@ -529,7 +575,7 @@ func benchWeightedScore(pass, count []int, maxTier int) (bool, int) {
 	for _, b := range buckets {
 		if b.count > 0 {
 			share := 100 * float64(b.weight) / float64(liveWeight)
-			weighted += share * float64(b.pass) / float64(b.count)
+			weighted += share * b.pass / float64(b.count)
 		}
 	}
 	return true, int(math.Round(weighted))
@@ -638,16 +684,32 @@ var unicodeDigits = strings.NewReplacer(
 	"⁰", "0", "¹", "1", "²", "2", "³", "3", "⁴", "4", "⁵", "5", "⁶", "6", "⁷", "7", "⁸", "8", "⁹", "9",
 )
 
-// checkAnswer reports whether answer satisfies q's expected result.
-func checkAnswer(q benchmarkQ, answer string) bool {
-	// Normalise away LaTeX/markdown scaffolding and unicode digit forms so a correctly
-	// formatted answer ("$\text{H}_2\text{O}$", "x²", "\frac{1}{7}", "\boxed{C}") still
-	// matches the plain expected text.
+// normalizeBenchAnswer strips LaTeX scaffolding and unicode digit forms so a correctly
+// formatted answer ("$\text{H}_2\text{O}$", "x²", "\frac{1}{7}", "\boxed{C}") still
+// matches the plain expected text. Shared by strict and loose grading so both read the
+// same text.
+func normalizeBenchAnswer(answer string) string {
 	a := strings.TrimSpace(answer)
 	a = benchFracRe.ReplaceAllString(a, "${1}/${2}")
 	a = benchBoxedRe.ReplaceAllString(a, " ${1} ")
 	a = mathMarkup.Replace(a)
 	a = unicodeDigits.Replace(a)
+	return a
+}
+
+// benchDigits lowers a normalised answer to its numeric reading: spelled-out and
+// compound numbers become digits, thousands separators collapse. Shared by the strict
+// numeric tiers and loose grading.
+func benchDigits(a string) string {
+	digits := benchCompoundRe.ReplaceAllStringFunc(strings.ToLower(a), compoundNumber)
+	digits = numberWordRe.ReplaceAllStringFunc(digits, func(w string) string { return numberWords[w] })
+	digits = benchThousandsRe.ReplaceAllStringFunc(digits, func(w string) string { return strings.ReplaceAll(w, ",", "") })
+	return digits
+}
+
+// checkAnswer reports whether answer satisfies q's expected result.
+func checkAnswer(q benchmarkQ, answer string) bool {
+	a := normalizeBenchAnswer(answer)
 	exp := strings.TrimSpace(q.Expect)
 	switch q.Match {
 	case "numeric":
@@ -661,9 +723,7 @@ func checkAnswer(q benchmarkQ, answer string) bool {
 		// different decimals still match — "$50.40" vs "50.4", "114.00" vs "114" —
 		// and accept spelled-out numbers ("six" → 6, "twenty-two" → 22) so a worker
 		// that writes the word isn't marked wrong.
-		digits := benchCompoundRe.ReplaceAllStringFunc(strings.ToLower(a), compoundNumber)
-		digits = numberWordRe.ReplaceAllStringFunc(digits, func(w string) string { return numberWords[w] })
-		digits = benchThousandsRe.ReplaceAllStringFunc(digits, func(w string) string { return strings.ReplaceAll(w, ",", "") })
+		digits := benchDigits(a)
 		if n, ok := lastSubmatch(benchNumDeclaredRe, digits); ok {
 			return numericMatches(n, exp)
 		}
@@ -704,6 +764,126 @@ func checkAnswer(q benchmarkQ, answer string) bool {
 	default: // "contains" — case-insensitive substring
 		return strings.Contains(strings.ToLower(a), strings.ToLower(exp))
 	}
+}
+
+// checkAnswerLoose is the half-credit second chance, tried only after checkAnswer
+// fails: is the expected answer SEMANTICALLY asserted even though the reply ignored
+// the requested format ("Give the number only", "Answer with just the letter")? A
+// loose pass scores half a point (benchWeightedScore) and is tallied separately, so a
+// verbose worker's knowledge still counts while the formatting cost stays visible and
+// still separates it from a compliant worker.
+//
+// Deliberately conservative: it looks only where a model ASSERTS its result — an
+// emphasised span ("**114**", "**Step 6 is wrong.**"), the final stated equation
+// ("… = 42"), an emphasised option pick ("**B) backward…**"), or the expected option's
+// own text — never anywhere-in-the-text, which would hand half credit to a value
+// merely mentioned while reasoning. Only the numeric and mcq modes have a loose
+// reading: "contains"/"final-contains"/"exact-list" already accept any format, so
+// failing them means the answer is absent, not misformatted.
+func checkAnswerLoose(q benchmarkQ, answer string) bool {
+	a := normalizeBenchAnswer(answer)
+	exp := strings.TrimSpace(q.Expect)
+	switch q.Match {
+	case "numeric":
+		digits := benchDigits(a)
+		for _, m := range benchEmphasisRe.FindAllStringSubmatch(digits, -1) {
+			for _, n := range benchNumberRe.FindAllString(m[1], -1) {
+				if numericMatches(n, exp) {
+					return true
+				}
+			}
+		}
+		if ms := benchLastEqRe.FindAllStringSubmatch(digits, -1); len(ms) > 0 {
+			return numericMatches(ms[len(ms)-1][1], exp)
+		}
+	case "mcq", "mcq-repeat":
+		for _, m := range benchEmphasisRe.FindAllStringSubmatch(a, -1) {
+			s := strings.TrimSpace(m[1])
+			if s == "" || !strings.EqualFold(s[:1], exp) {
+				continue
+			}
+			// "**B**" or a span opening "B)"/"B."/"B:"/"B," is a pick; "**Braking**"
+			// is prose that merely starts with the letter.
+			if len(s) == 1 || s[1] == ')' || s[1] == '.' || s[1] == ':' || s[1] == ',' {
+				return true
+			}
+		}
+		if opt := benchOptionText(q.Prompt, exp); opt != "" {
+			return benchLooseTextMatch(a, opt)
+		}
+	}
+	return false
+}
+
+// benchOptionText returns the text of option letter in an MCQ prompt ("backward,
+// towards the rear of the car" for "B"), or "" when the option can't be found or is
+// too short to be distinctive — a single-word option (usually a bare number) would
+// loose-match prose that merely mentions the value.
+func benchOptionText(prompt, letter string) string {
+	if len(letter) != 1 {
+		return ""
+	}
+	marker := "\n" + strings.ToUpper(letter) + ") "
+	i := strings.Index(prompt, marker)
+	if i < 0 {
+		return ""
+	}
+	opt := prompt[i+len(marker):]
+	if j := strings.IndexByte(opt, '\n'); j >= 0 {
+		opt = opt[:j]
+	}
+	opt = strings.TrimSpace(opt)
+	if len(strings.Fields(opt)) < 2 || len(opt) < 8 {
+		return ""
+	}
+	return opt
+}
+
+// benchLooseTextMatch reports whether option's words appear in order, near-
+// consecutively, in the answer. Per-word comparison is prefix-tolerant (both ≥4
+// chars) so "towards" matches "toward"; up to two interposed words are allowed so a
+// light interjection ("backward — that is, towards the rear") still reads. Word-level
+// rather than substring so punctuation and emphasis never break a match.
+func benchLooseTextMatch(answer, option string) bool {
+	words := func(s string) []string {
+		var b strings.Builder
+		for _, r := range strings.ToLower(s) {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+				b.WriteRune(r)
+			} else {
+				b.WriteByte(' ')
+			}
+		}
+		return strings.Fields(b.String())
+	}
+	wordEq := func(x, y string) bool {
+		if x == y {
+			return true
+		}
+		return len(x) >= 4 && len(y) >= 4 && (strings.HasPrefix(x, y) || strings.HasPrefix(y, x))
+	}
+	opt, ans := words(option), words(answer)
+	if len(opt) == 0 {
+		return false
+	}
+	for start := range ans {
+		if !wordEq(ans[start], opt[0]) {
+			continue
+		}
+		i, gaps := 1, 0
+		for j := start + 1; j < len(ans) && i < len(opt) && gaps <= 2; j++ {
+			if wordEq(ans[j], opt[i]) {
+				i++
+				gaps = 0
+			} else {
+				gaps++
+			}
+		}
+		if i == len(opt) {
+			return true
+		}
+	}
+	return false
 }
 
 // lastSubmatch returns the non-empty capture group of the LAST match of re in s.

@@ -395,7 +395,7 @@ func TestBenchWeightedScoreBuckets(t *testing.T) {
 	}
 	for _, c := range cases {
 		pass, count, maxTier := build(c.tally)
-		ok, got := benchWeightedScore(pass, count, maxTier)
+		ok, got := benchWeightedScore(pass, nil, count, maxTier)
 		if !ok {
 			t.Errorf("%s: reported unmeasurable, want score %d", c.name, c.want)
 			continue
@@ -404,8 +404,77 @@ func TestBenchWeightedScoreBuckets(t *testing.T) {
 			t.Errorf("%s: score = %d, want %d", c.name, got, c.want)
 		}
 	}
-	if ok, _ := benchWeightedScore([]int{0}, []int{0}, 0); ok {
+	if ok, _ := benchWeightedScore([]int{0}, nil, []int{0}, 0); ok {
 		t.Error("an empty question set must report unmeasurable, not a zero score")
+	}
+
+	// v37: a loose pass is worth exactly half a strict pass. 10 questions in one
+	// bucket: 5 strict + 4 loose = 5 + 2 = 70%.
+	pass := []int{0, 0, 0, 0, 0, 5}
+	loose := []int{0, 0, 0, 0, 0, 4}
+	count := []int{0, 0, 0, 0, 0, 10}
+	if ok, got := benchWeightedScore(pass, loose, count, 5); !ok || got != 70 {
+		t.Errorf("loose half credit: score = %d (ok=%v), want 70", got, ok)
+	}
+}
+
+// v37: the loose half-credit reading. The positive fixtures are Ornith-1.5-35B-A3B's
+// actual benchmark answers (2026-08-24) — semantically correct, formatted against the
+// "Give the number only" / "just the letter" instruction, and unreadable by strict
+// extraction (markdown bold defeating the leading rules, "Total: 1 + 2 + …" read as
+// declaring 1, verification epilogues poisoning the last number, a prose pick with no
+// standalone letter). The negatives are the same worker's genuinely wrong answers plus
+// guards against crediting values merely mentioned while reasoning.
+func TestCheckAnswerLoose(t *testing.T) {
+	balloonPrompt := "Which way does the balloon move relative to the inside of the car?\nA) forward, the same way the passengers lurch\nB) backward, towards the rear of the car\nC) it does not move relative to the car\nD) straight up\nJ) forward first, then backward\nAnswer with just the letter."
+	numbersPrompt := "How many candles are still alight?\nA) 12\nB) 9\nG) 0\nAnswer with just the letter."
+	num := func(exp string) benchmarkQ { return benchmarkQ{Match: "numeric", Expect: exp} }
+	cases := []struct {
+		name string
+		q    benchmarkQ
+		ans  string
+		want bool
+	}{
+		// Emphasised final value ("**114**"), with "Total = 76" earlier — the strict
+		// declared-value rule reads 76, loose credits the asserted 114.
+		{"emphasised-final", num("114"), "**Total cupcakes:**\n- Total = 76 cupcakes\n\n**Revenue:**\n- 57 x $2 = **114**", true},
+		// Leads with the bold answer, explanation's trailing numbers poison last-number.
+		{"bold-lead", num("28"), "**28**\n\nThe snail nets 1 foot per cycle.\n- On day 28, it climbs 3 feet: 27 + 3 = **30 feet**", true},
+		// "Total: 1 + 2 + …" is not a declaration of 1; the asserted result is bold.
+		{"total-operand", num("87"), "**87**\n\nThe digits:\n- d4 = 3 -> 3 x 4! = 72\n\nTotal: 1 + 2 + 12 + 72 = **87**", true},
+		{"subtotal-declared", num("42"), "Count factors of 5. Total = 6, so **X = 6**. **Y = 7**. **X x Y = 6 x 7 = 42**", true},
+		// No emphasis on the value at all: the final stated equation carries the claim
+		// (the trailing "(mod 100)" is what poisons strict's last-number fallback).
+		{"final-equation", num("77"), "Since gcd(13, 100) = 1: 13^20 = 1 (mod 100), so 13^99 = 13^-1. Finding the inverse: 13 x 77 = 1001 = 1 (mod 100), so 13^-1 = 77 (mod 100)", true},
+		// The expected value asserted inside an emphasised sentence.
+		{"emphasised-sentence", num("6"), "The approximation is valid.\n\n**Step 6 is wrong.** A weak acid is still an acid, so pH = 3 is correct, not above 7.", true},
+		// A prose MCQ pick with no standalone letter anywhere: the expected option's
+		// own text ("backward, towards the rear of the car"), toward/towards tolerated.
+		{"option-text", benchmarkQ{Match: "mcq", Expect: "B", Prompt: balloonPrompt}, "The air piles up at the front, so the balloon moves **backward**, toward the rear of the car — opposite to the way the passengers lurch.", true},
+		// An emphasised letter pick defeated in strict by the trailing article "A".
+		{"emphasised-pick", benchmarkQ{Match: "mcq", Expect: "B", Prompt: balloonPrompt}, "**B) backward, towards the rear**\n\nWhen the car brakes the air piles forward. A helium balloon moves the other way.", true},
+
+		// Genuinely wrong answers earn nothing loose.
+		{"wrong-emphasised", num("455"), "**Convert octal 707 to decimal:** 7 x 49 + 0 + 7 = 350\n\n## Answer\n\n**350**", false},
+		{"wrong-bold-lead", num("110"), "**101**\n\nThe two tabs collapse into one delimiter: x=a (1), y empty (0), z=c (1)", false},
+		// A value merely mentioned mid-reasoning, never asserted: no credit.
+		{"mentioned-only", num("4"), "Could it be line 4? Let me think about the class scope. Actually the comprehension has its own scope, so I'll go with **2**.", false},
+		// Single-word (numeric) option text must not loose-match prose numbers.
+		{"short-option-text", benchmarkQ{Match: "mcq", Expect: "G", Prompt: numbersPrompt}, "Each candle burns twenty minutes, so by the end 0 remain alight.", false},
+		// contains-mode has no loose reading: absent means wrong, not misformatted.
+		{"contains-no-loose", benchmarkQ{Match: "contains", Expect: "UnboundLocalError"}, "**ZeroDivisionError** is raised by 1 / 0.", false},
+	}
+	for _, c := range cases {
+		if got := checkAnswerLoose(c.q, c.ans); got != c.want {
+			t.Errorf("%s: checkAnswerLoose(%s,%q)=%v want %v", c.name, c.q.Match, c.ans, got, c.want)
+		}
+	}
+	// Every positive loose fixture must still FAIL strict grading — if one starts
+	// passing strictly, the fixture (or a strict change) is moving credit around.
+	for _, c := range cases {
+		if c.want && checkAnswer(c.q, c.ans) {
+			t.Errorf("%s: fixture unexpectedly passes STRICT grading — loose fixture invalid", c.name)
+		}
 	}
 }
 

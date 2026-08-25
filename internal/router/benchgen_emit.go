@@ -45,13 +45,45 @@ var benchTierTargets = []struct {
 	Tier    int
 	Target  int
 	MinRate float64 // inclusive
-	MaxRate float64 // exclusive; p==1 is already dropped as non-discriminating
+	MaxRate float64 // exclusive; p==1 is handled by the reserve bands instead
+	Reserve int     // reserveNone | reserveFloor | reserveCeiling
 }{
+	{Tier: 2, Target: 12, Reserve: reserveFloor},
 	{Tier: 4, Target: 25, MinRate: 0.75, MaxRate: 1.00},
-	{Tier: 5, Target: 7, MinRate: 0.50, MaxRate: 0.75},
-	{Tier: 7, Target: 5, MinRate: 0.25, MaxRate: 0.50},
-	{Tier: 8, Target: 13, MinRate: 0.00, MaxRate: 0.25},
+	{Tier: 5, Target: 60, MinRate: 0.50, MaxRate: 0.75},
+	{Tier: 7, Target: 70, MinRate: 0.25, MaxRate: 0.50},
+	{Tier: 8, Target: 70, MinRate: 0.00, MaxRate: 0.25},
+	{Tier: 12, Target: 40, Reserve: reserveCeiling},
 }
+
+// reserveFloor / reserveCeiling mark the two HEADROOM bands, which exist for a
+// fleet this calibration has not met.
+//
+// The ordinary bands drop p==1 and p==0 because a question every worker answers
+// the same way carries no information ABOUT THIS FLEET. That is true and it is
+// also why the bank needs replacing every time the fleet moves — the saturation
+// treadmill this file was written to get off. A question today's best model
+// fails is precisely the question that will rank tomorrow's, and one today's
+// worst passes is what will rank a smaller/faster worker when one is deployed.
+//
+// So a bounded number of each is kept. They cost profiling budget and tell us
+// nothing now; they are what lets a new worker be placed correctly WITHOUT a
+// re-fetch, a re-calibration and a benchmarkVersion bump that re-profiles the
+// whole fleet.
+//
+// Selection cannot rank by discrimination — D is 0 for a constant item by
+// definition — so it stratifies round-robin across source tasks and breaks ties
+// by id, which keeps the choice deterministic and stops one task's quirks
+// filling the whole band.
+//
+// NOTE the ceiling band deflates every current score, and that is the point: a
+// fleet scoring 99/100 has no room to represent a better model. Headroom has to
+// come from somewhere.
+const (
+	reserveNone = iota
+	reserveFloor
+	reserveCeiling
+)
 
 // benchRanked is one backend's calibration outcome, ordered by the score it got
 // on this pool.
@@ -129,7 +161,7 @@ func benchEmit() error {
 	half := len(fleet) / 2
 	top, bottom := fleet[:half], fleet[len(fleet)-half:]
 
-	var scored []scoredQuestion
+	var scored, floor, ceiling []scoredQuestion
 	var noData, tooEasy, tooHard, backwards int
 	for _, q := range pool.Questions {
 		graded, passes := 0, 0
@@ -151,9 +183,11 @@ func benchEmit() error {
 		switch p {
 		case 1:
 			tooEasy++
+			floor = append(floor, scoredQuestion{q: q, p: p})
 			continue
 		case 0:
 			tooHard++
+			ceiling = append(ceiling, scoredQuestion{q: q, p: p})
 			continue
 		}
 		d := benchHalfRate(top, q.ID) - benchHalfRate(bottom, q.ID)
@@ -168,6 +202,24 @@ func benchEmit() error {
 
 	var selected []scoredQuestion
 	for _, band := range benchTierTargets {
+		if band.Reserve != reserveNone {
+			src := floor
+			if band.Reserve == reserveCeiling {
+				src = ceiling
+			}
+			pick := benchStratifyByTask(src, band.Target)
+			for i := range pick {
+				pick[i].tier = band.Tier
+			}
+			if len(pick) < band.Target {
+				fmt.Fprintf(os.Stderr, "  WARNING tier %d (headroom): only %d available, wanted %d\n",
+					band.Tier, len(pick), band.Target)
+			}
+			fmt.Fprintf(os.Stderr, "  tier %2d: %2d selected of %2d available (target %d, headroom)\n",
+				band.Tier, len(pick), len(src), band.Target)
+			selected = append(selected, pick...)
+			continue
+		}
 		var pick []scoredQuestion
 		for _, s := range scored {
 			if s.p >= band.MinRate && s.p < band.MaxRate {
@@ -287,6 +339,7 @@ func benchBandFor(tier int) struct {
 	Target  int
 	MinRate float64
 	MaxRate float64
+	Reserve int
 } {
 	for _, b := range benchTierTargets {
 		if b.Tier == tier {
@@ -336,6 +389,42 @@ func benchRanks(xs []float64) []float64 {
 			out[s[k].i] = avg
 		}
 		i = j + 1
+	}
+	return out
+}
+
+// benchStratifyByTask takes up to n questions, dealt round-robin across their
+// source tasks so one task's quirks cannot fill a headroom band on its own.
+// Deterministic: tasks in name order, questions by id within each.
+func benchStratifyByTask(src []scoredQuestion, n int) []scoredQuestion {
+	if n <= 0 || len(src) == 0 {
+		return nil
+	}
+	byTask := map[string][]scoredQuestion{}
+	for _, s := range src {
+		byTask[s.q.Task] = append(byTask[s.q.Task], s)
+	}
+	tasks := make([]string, 0, len(byTask))
+	for k := range byTask {
+		tasks = append(tasks, k)
+		sort.Slice(byTask[k], func(i, j int) bool { return byTask[k][i].q.ID < byTask[k][j].q.ID })
+	}
+	sort.Strings(tasks)
+	out := make([]scoredQuestion, 0, n)
+	for round := 0; len(out) < n; round++ {
+		progressed := false
+		for _, task := range tasks {
+			if round < len(byTask[task]) {
+				out = append(out, byTask[task][round])
+				progressed = true
+				if len(out) == n {
+					return out
+				}
+			}
+		}
+		if !progressed {
+			break
+		}
 	}
 	return out
 }

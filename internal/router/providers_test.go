@@ -636,6 +636,8 @@ func TestQualityFloorPreferenceTiers(t *testing.T) {
 	free3 := mkBackend("free3", 3, 50, 2, 0)
 	paid9 := pricedBackend("paid9", 9, 50, 2, 0, 3, 15)
 	paid2 := pricedBackend("paid2", 2, 50, 2, 0, 3, 15)
+	relayed9 := mkBackend("relayed9", 9, 50, 2, 0)
+	relayed9.Source = sourceRelay
 	cases := []struct {
 		name       string
 		candidates []*Backend
@@ -649,6 +651,16 @@ func TestQualityFloorPreferenceTiers(t *testing.T) {
 		{"everything is free and above the bar", []*Backend{free8, free3}, 3, ""},
 		{"everything is free, no bar", []*Backend{free8, free3}, 0, ""},
 		{"nothing clears the bar", []*Backend{free3}, 9, ""},
+		// Local before relayed, among workers that cost nothing and clear the
+		// bar: a relayed row's occupancy is up to a refresh interval stale and
+		// blind to the upstream's own clients, so its predicted completion time
+		// is systematically optimistic.
+		{"local and relayed both clear the bar", []*Backend{free8, relayed9}, 7, "local-free"},
+		// ...but never at the cost of the answer: when only the remote worker
+		// clears the bar, the local one is not a candidate at all.
+		{"only the relayed worker clears the bar", []*Backend{free3, relayed9}, 7, "free-first"},
+		// ...and a paid local does not get preferred over a free remote.
+		{"local costs money, relayed does not", []*Backend{paid9, relayed9}, 7, "free-first"},
 	}
 	for _, c := range cases {
 		pref := qualityFloorPreference(c.candidates, c.target, false)

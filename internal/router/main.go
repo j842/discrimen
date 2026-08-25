@@ -2109,7 +2109,30 @@ func qualityFloorPreference(candidates []*Backend, target int, thinkOff bool) ac
 		why  string
 		keep func(*Backend) bool
 	}{
+		// Costs nothing AND is ours, before costs nothing somewhere else. The
+		// local half of that is not about the link being slow: prefillSeconds
+		// already prices the round trip, and it is milliseconds against a
+		// generation measured in seconds, so it decides nothing on its own.
+		//
+		// It is about the two OCCUPANCY numbers not being equally trustworthy.
+		// A local queue depth is exact and live. A relayed row's is a snapshot
+		// up to one refresh interval old (15s), and blind to the upstream's own
+		// clients competing for those same slots. So the completion time
+		// predicted for a remote worker is systematically optimistic, and
+		// ranking on it alone over-picks remote. Preferring local here corrects
+		// a biased estimator; it is not an operator's thumb on the scale.
+		//
+		// Ordered AFTER free-first: cost outranks locality, so a paid local
+		// worker never gets preferred over a free remote one. That leaves this
+		// tier deciding only between workers that all cost nothing, which is
+		// the comparison it is actually about. It is reached whenever free-first
+		// fails to narrow, i.e. when every candidate is already free.
+		// It stays inside aboveBar, so it can never answer a hard question with
+		// a weak local worker, and it falls through the moment no local clears
+		// the bar or every local is loaded, at which point a remote worker is
+		// the right answer rather than a fallback.
 		{"free-first", func(b *Backend) bool { return aboveBar(b) && isFreeBackend(b) }},
+		{"local-free", func(b *Backend) bool { return aboveBar(b) && isFreeBackend(b) && !isRelayRow(b) }},
 		{"quality-floor", aboveBar},
 	}
 	for _, tier := range tiers {

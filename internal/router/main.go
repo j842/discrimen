@@ -2062,7 +2062,13 @@ func (r *Router) scanForSlot(candidates []*Backend) (*Backend, chan struct{}, bo
 // A zero preference (nil keep) means no preference at all.
 type acquirePreference struct {
 	keep func(*Backend) bool
-	wait time.Duration
+	// weaker are progressively WIDER fallback sets, most-preferred first, tried
+	// the instant nothing in `keep` has a slot free. Without them a busy first
+	// choice fell straight through to the whole ranked list — so a loaded local
+	// worker could spill BELOW the quality bar while an idle remote worker above
+	// it sat unused. The cascade is what makes the ladder a ladder.
+	weaker []func(*Backend) bool
+	wait   time.Duration
 	// why labels the preference for logging; it is also what tells the caller
 	// which "missed" story to tell.
 	why string
@@ -2125,42 +2131,44 @@ func qualityFor(b *Backend, thinkOff bool) int {
 // there is no bar to clear.
 func qualityFloorPreference(candidates []*Backend, target int, thinkOff bool) acquirePreference {
 	aboveBar := func(b *Backend) bool { return target <= 0 || qualityFor(b, thinkOff) >= target }
-	tiers := []struct {
+	free := func(b *Backend) bool { return aboveBar(b) && isFreeBackend(b) }
+	ladder := []struct {
 		why  string
 		keep func(*Backend) bool
 	}{
-		// Costs nothing AND is ours, before costs nothing somewhere else. The
-		// local half of that is not about the link being slow: prefillSeconds
-		// already prices the round trip, and it is milliseconds against a
-		// generation measured in seconds, so it decides nothing on its own.
-		//
-		// It is about the two OCCUPANCY numbers not being equally trustworthy.
-		// A local queue depth is exact and live. A relayed row's is a snapshot
-		// up to one refresh interval old (15s), and blind to the upstream's own
-		// clients competing for those same slots. So the completion time
-		// predicted for a remote worker is systematically optimistic, and
-		// ranking on it alone over-picks remote. Preferring local here corrects
-		// a biased estimator; it is not an operator's thumb on the scale.
-		//
-		// Ordered AFTER free-first: cost outranks locality, so a paid local
-		// worker never gets preferred over a free remote one. That leaves this
-		// tier deciding only between workers that all cost nothing, which is
-		// the comparison it is actually about. It is reached whenever free-first
-		// fails to narrow, i.e. when every candidate is already free.
-		// It stays inside aboveBar, so it can never answer a hard question with
-		// a weak local worker, and it falls through the moment no local clears
-		// the bar or every local is loaded, at which point a remote worker is
-		// the right answer rather than a fallback.
-		{"free-first", func(b *Backend) bool { return aboveBar(b) && isFreeBackend(b) }},
-		{"local-free", func(b *Backend) bool { return aboveBar(b) && isFreeBackend(b) && !isRelayRow(b) }},
+		// Costs nothing, is ours, clears the bar. Preferring local is not about
+		// the link being slow — prefillSeconds already prices the round trip and
+		// it is milliseconds against a generation measured in seconds. It is that
+		// the two OCCUPANCY numbers are not equally trustworthy: a local queue
+		// depth is exact and live, while a relayed row's is a snapshot up to one
+		// refresh interval old (15s) and blind to the upstream's own clients
+		// competing for those same slots. Remote completion times are therefore
+		// systematically optimistic, and ranking on them alone over-picks remote.
+		// This corrects a biased estimator, not an operator's preference.
+		{"local-free", func(b *Backend) bool { return free(b) && !isRelayRow(b) }},
+		// Costs nothing, anywhere. Reached when every local worker above the bar
+		// is loaded — an idle remote worker beats waiting on a busy local one.
+		{"free-first", free},
+		// Clears the bar at any price. Reached when the only above-bar workers
+		// left are metered.
 		{"quality-floor", aboveBar},
 	}
-	for _, tier := range tiers {
-		if n := len(filterCandidates(candidates, tier.keep)); n > 0 && n < len(candidates) {
-			return acquirePreference{keep: tier.keep, wait: qualityFloorWait, why: tier.why}
+	// Keep the rungs that actually decide something: an empty set selects
+	// nothing, and one equal to the whole candidate list is not a preference.
+	tiers := ladder[:0:0]
+	for _, rung := range ladder {
+		if n := len(filterCandidates(candidates, rung.keep)); n > 0 && n < len(candidates) {
+			tiers = append(tiers, rung)
 		}
 	}
-	return acquirePreference{}
+	if len(tiers) == 0 {
+		return acquirePreference{}
+	}
+	pref := acquirePreference{keep: tiers[0].keep, wait: qualityFloorWait, why: tiers[0].why}
+	for _, rung := range tiers[1:] {
+		pref.weaker = append(pref.weaker, rung.keep)
+	}
+	return pref
 }
 
 // sessionLockPreference prefers the worker that served the previous turn. It
@@ -2208,8 +2216,20 @@ func (r *Router) pickAndAcquirePreferred(ctx context.Context, candidates []*Back
 		b, slot, err := r.pickAndAcquire(ctx, candidates)
 		return b, slot, false, err
 	}
-	// Fast path: a preferred worker has a slot free right now.
-	if b, slot, ok := r.scanForSlot(preferred); ok {
+	// Fast path: walk the ladder — the first rung with a slot free right now
+	// wins, so a busy top choice steps down one rung rather than off the end.
+	cascade := func() (*Backend, chan struct{}, bool) {
+		if b, slot, ok := r.scanForSlot(preferred); ok {
+			return b, slot, true
+		}
+		for _, keep := range pref.weaker {
+			if b, slot, ok := r.scanForSlot(filterCandidates(candidates, keep)); ok {
+				return b, slot, true
+			}
+		}
+		return nil, nil, false
+	}
+	if b, slot, ok := cascade(); ok {
 		return b, slot, false, nil
 	}
 	// Every preferred worker is momentarily full. Wait a BOUNDED grace for one to
@@ -2227,14 +2247,14 @@ func (r *Router) pickAndAcquirePreferred(ctx context.Context, candidates []*Back
 			// Grace elapsed: fall back to the full ranked list (normal spill, up to
 			// slotMaxWait). Re-check the preferred set one last time first so a slot
 			// that frees exactly at the deadline is still honoured.
-			if b, slot, ok := r.scanForSlot(preferred); ok {
+			if b, slot, ok := cascade(); ok {
 				return b, slot, false, nil
 			}
 			b, slot, err := r.pickAndAcquire(ctx, candidates)
 			return b, slot, err == nil, err
 		case <-poll.C:
 		}
-		if b, slot, ok := r.scanForSlot(preferred); ok {
+		if b, slot, ok := cascade(); ok {
 			return b, slot, false, nil
 		}
 	}

@@ -629,6 +629,48 @@ func TestRankBackendsCostIsOnlyATieBreak(t *testing.T) {
 	}
 }
 
+// TestQualityFloorCascadesRatherThanFallingOffTheEnd is the point of the ladder.
+// The top rung (free, local, above bar) exists but is FULL. Acquisition must
+// step down to the next rung — a free remote worker above the bar — instead of
+// spilling to the whole ranked list, which would serve BELOW the quality bar
+// while an idle above-bar worker sat unused.
+func TestQualityFloorCascadesRatherThanFallingOffTheEnd(t *testing.T) {
+	r := adminRouter(t)
+	// local9 is the preferred rung and has no free slot; relayed8 is a rung
+	// down; weak2 is below the bar and must not be chosen.
+	local9 := mkBackend("local9", 9, 50, 1, 1)
+	relayed8 := mkBackend("relayed8", 8, 50, 1, 0)
+	relayed8.Source = sourceRelay
+	weak2 := mkBackend("weak2", 2, 500, 4, 0)
+	for _, b := range []*Backend{local9, relayed8, weak2} {
+		r.registry.backends[b.ID] = b
+		// Through syncSlotsLocked: the slot channel is a token POOL and has to
+		// start full, not empty.
+		r.registry.syncSlotsLocked(b.ID, b.MaxConcurrency)
+	}
+	// Fill the top rung so only the lower rungs have capacity.
+	if _, ok := r.registry.tryAcquireSlot("local9"); !ok {
+		t.Fatal("could not occupy local9")
+	}
+
+	candidates := []*Backend{local9, relayed8, weak2}
+	pref := qualityFloorPreference(candidates, 7, false)
+	if pref.why != "local-free" {
+		t.Fatalf("top rung = %q, want local-free", pref.why)
+	}
+	if len(pref.weaker) == 0 {
+		t.Fatal("no fallback rungs — a busy top choice would spill off the end")
+	}
+	got, slot, _, err := r.pickAndAcquirePreferred(t.Context(), candidates, pref)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	defer r.registry.releaseSlot(slot)
+	if got.ID != "relayed8" {
+		t.Errorf("served %q, want relayed8 — the rung below a full local worker, not a spill below the bar", got.ID)
+	}
+}
+
 // TestQualityFloorPreferenceTiers pins which bounded preference applies, since
 // that single choice is where free-first and the quality floor are reconciled.
 func TestQualityFloorPreferenceTiers(t *testing.T) {
@@ -644,8 +686,8 @@ func TestQualityFloorPreferenceTiers(t *testing.T) {
 		target     int
 		why        string
 	}{
-		{"free and paid both clear the bar", []*Backend{free8, paid9}, 7, "free-first"},
-		{"no classification, so no bar to clear", []*Backend{free8, paid9}, 0, "free-first"},
+		{"free and paid both clear the bar", []*Backend{free8, paid9}, 7, "local-free"},
+		{"no classification, so no bar to clear", []*Backend{free8, paid9}, 0, "local-free"},
 		{"every above-bar worker is paid", []*Backend{free3, paid9}, 7, "quality-floor"},
 		{"no free worker at all", []*Backend{paid2, paid9}, 7, "quality-floor"},
 		{"everything is free and above the bar", []*Backend{free8, free3}, 3, ""},

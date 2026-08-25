@@ -324,6 +324,14 @@ func (r *Router) renderPreview(chatReq *ChatRequest, plan *routePlan, budget tim
 		resp.Notes = append(resp.Notes, fmt.Sprintf(
 			"tool loop open — acquisition waits up to %s for incumbent %q before spilling (the session lock outranks the quality floor)",
 			sessionLockWait, plan.session.incumbent))
+	case pref.why == "local-free":
+		bar := ""
+		if plan.target > 0 {
+			bar = fmt.Sprintf(" at q>=%d", plan.target)
+		}
+		resp.Notes = append(resp.Notes, fmt.Sprintf(
+			"acquisition prefers a free LOCAL worker%s, stepping down to a free remote one and then to a paid endpoint as each is found busy (up to %s)",
+			bar, qualityFloorWait))
 	case pref.why == "free-first":
 		bar := ""
 		if plan.target > 0 {

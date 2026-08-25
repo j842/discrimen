@@ -41,7 +41,7 @@ package router
 //	the loop guard, and the log redaction.
 //
 //	southbound (the relaying side) — the relay config rows, the refresh loop
-//	that expands one relay into one backend per upstream model, and the profile
+//	that expands one relay into one backend per upstream worker, and the profile
 //	import that certifies them without a probe.
 
 import (
@@ -196,33 +196,36 @@ func (r *Router) stampRelayChain(out *http.Request, in *http.Request, backend *B
 
 // ── Northbound: what a relay may see ────────────────────────────────────────
 
-// relayModelEntry is one servable model as the upstream describes it. One entry
-// per MODEL, not per endpoint: the downstream names a model and the upstream
-// decides which of its endpoints answers, which is the whole reason the slots
-// stay upstream.
+// relayModelEntry is ONE UPSTREAM WORKER as the upstream describes it — not one
+// per model. Every worker crosses separately, carrying its own measured numbers,
+// so the downstream ranks remote workers against local ones as peers and picks
+// the best of the whole union.
 //
-// Where several endpoints serve one model the values are combined, and the
-// direction depends on what the number is FOR:
+// This replaced a per-MODEL summary that merged endpoints together (quality and
+// context minimised, speed averaged, slots summed). The merge was lossy in the
+// one direction that mattered: workers differ — different quantisations, cards
+// and context windows — and a single blended row hid exactly the differences the
+// ranker exists to exploit. It also forced a rule per field about which
+// direction to combine in, all of which is now simply deleted.
 //
-//	quality and context_k take the MINIMUM, because they feed the downstream's
-//	hard filters and a request may land on any member. Promising the best
-//	member's context window would route a prompt the worst member cannot hold.
-//
-//	features take the INTERSECTION, for the same reason.
-//
-//	thinking is the UNION, which looks like the opposite and is not: thinking is
-//	hard-filtered again upstream, within the model, so claiming it here only
-//	means "ask us and we will find one" — while claiming it false would make the
-//	downstream refuse to ask at all.
-//
-//	the speed numbers are AVERAGED, because they feed a latency estimate rather
-//	than a filter, and the expectation over the members is what a request that
-//	may land on any of them will actually see.
-//
-//	max_concurrency and active_requests are SUMMED: they describe the pool.
+// ADDRESSING. ID is the upstream's own worker id, and it is what makes this
+// work without any new protocol: the downstream stores it as the row's ServedID,
+// patchForwardedBody stamps it into the outbound "model" field, and upstream
+// backendServesModel already resolves a worker id as a model name. So naming the
+// worker IS the routing — no pin header, no second mechanism. Model stays the
+// real model name, for display only.
 type relayModelEntry struct {
-	Model          string   `json:"model"`
+	ID    string `json:"id"`
+	Model string `json:"model"`
+	// Quality is the thinking-mode benchmark score; QualityNoThink is the same
+	// benchmark with thinking forced off. Both cross, because selection reads
+	// whichever matches the mode it is about to serve (see qualityFor). Sending
+	// only Quality left every imported row at QualityNoThink=0, which made a
+	// no-think request fall back to the THINKING score and over-rate the whole
+	// relayed fleet on exactly the requests the two-score benchmark exists to
+	// separate. Zero means "not measured upstream", not "scored zero".
 	Quality        int      `json:"quality"`
+	QualityNoThink int      `json:"quality_nothink,omitempty"`
 	BenchVersion   int      `json:"bench_version"`
 	ContextK       int      `json:"context_k"`
 	Features       []string `json:"features"`
@@ -233,7 +236,6 @@ type relayModelEntry struct {
 	TTFTMillis     int64    `json:"ttft_ms,omitempty"`
 	MaxConcurrency int      `json:"max_concurrency"`
 	ActiveRequests int      `json:"active_requests"`
-	Endpoints      int      `json:"endpoints"`
 }
 
 // relayFleetResponse is the whole of GET /relay/fleet.
@@ -290,102 +292,32 @@ func (r *Router) handleRelayFleet(w http.ResponseWriter, req *http.Request) {
 // response has to be one the downstream can send back and have accepted, by a
 // key that gates discovery and traffic through two different tests.
 func relayFleetFor(ident *identity, backends []*Backend) []relayModelEntry {
-	type agg struct {
-		entry    relayModelEntry
-		tpsSum   float64
-		obsSum   float64
-		prefSum  float64
-		ttftSum  int64
-		ttftSeen int
-	}
-	byModel := map[string]*agg{}
+	out := make([]relayModelEntry, 0, len(backends))
 	for _, b := range backends {
 		if isEmbeddingsOnly(b) || !ident.allowsBackend(b) {
 			continue
 		}
-		name := relayModelName(ident, b)
-		if name == "" {
-			continue
-		}
-		a := byModel[name]
-		if a == nil {
-			a = &agg{entry: relayModelEntry{
-				Model:        name,
-				Quality:      b.Quality,
-				BenchVersion: benchmarkVersion,
-				ContextK:     b.ContextK,
-				Features:     append([]string(nil), b.Features...),
-			}}
-			byModel[name] = a
-		} else {
-			if b.Quality < a.entry.Quality {
-				a.entry.Quality = b.Quality
-			}
-			if b.ContextK > 0 && (a.entry.ContextK == 0 || b.ContextK < a.entry.ContextK) {
-				a.entry.ContextK = b.ContextK
-			}
-			a.entry.Features = intersectFeatures(a.entry.Features, b.Features)
-		}
-		a.entry.Thinking = a.entry.Thinking || b.Thinking
-		a.entry.MaxConcurrency += effectiveSlots(b)
-		a.entry.ActiveRequests += b.ActiveRequests
-		a.entry.Endpoints++
-		a.tpsSum += b.BaselineTPS
-		a.obsSum += liveTPS(b)
-		a.prefSum += b.ObservedPrefillTPS
-		if b.Certification.TTFTMillis > 0 {
-			a.ttftSum += b.Certification.TTFTMillis
-			a.ttftSeen++
-		}
+		out = append(out, relayModelEntry{
+			ID:             b.ID,
+			Model:          b.Model,
+			Quality:        b.Quality,
+			QualityNoThink: b.QualityNoThink,
+			BenchVersion:   benchmarkVersion,
+			ContextK:       b.ContextK,
+			Features:       append([]string(nil), b.Features...),
+			Thinking:       b.Thinking,
+			BaselineTPS:    b.BaselineTPS,
+			ObservedTPS:    liveTPS(b),
+			PrefillTPS:     b.ObservedPrefillTPS,
+			TTFTMillis:     b.Certification.TTFTMillis,
+			MaxConcurrency: effectiveSlots(b),
+			ActiveRequests: b.ActiveRequests,
+		})
 	}
-	out := make([]relayModelEntry, 0, len(byModel))
-	for _, a := range byModel {
-		n := float64(a.entry.Endpoints)
-		a.entry.BaselineTPS = a.tpsSum / n
-		a.entry.ObservedTPS = a.obsSum / n
-		a.entry.PrefillTPS = a.prefSum / n
-		if a.ttftSeen > 0 {
-			a.entry.TTFTMillis = a.ttftSum / int64(a.ttftSeen)
-		}
-		out = append(out, a.entry)
-	}
-	// Model-sorted so a downstream diffing two fetches sees content changes and
+	// Id-sorted so a downstream diffing two fetches sees content changes and
 	// not Go's randomised map order.
-	sort.Slice(out, func(i, j int) bool { return out[i].Model < out[j].Model })
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
-}
-
-// relayModelName is the spelling this credential should use for a backend, and
-// the one /relay/fleet publishes for it.
-//
-// It has to be a name that survives BOTH gates, which are not the same gate.
-// Discovery runs through allowsBackend, which asks what a worker answers to and
-// therefore accepts the model id, the endpoint id or the alias. The traffic path
-// runs through allowsModel, which compares the spelling the client sent to the
-// allow-list LITERALLY — because a name is a name, and an allow-list entry that
-// matched things it does not say would not be an allow-list.
-//
-// So publishing b.Model unconditionally is wrong whenever the operator wrote the
-// allow-list in any other accepted spelling: the downstream would discover a
-// model, ask for it by the name it was given, and be refused by the key that had
-// just advertised it. Preferring an entry from the key's OWN list closes that by
-// construction — everything published is something the caller may literally say.
-// A key with no allow-list is refused nothing, so it gets b.Model, which
-// backendServesModel accepts unconditionally.
-//
-// An entry that is an alias covering two different builds pools them into one
-// row here, and that is right rather than a collision: pooling is exactly what
-// the upstream will do when asked for that name, and the aggregation above is
-// conservative in every direction that matters.
-func relayModelName(ident *identity, b *Backend) string {
-	if ident != nil {
-		for _, allowed := range ident.Models {
-			if backendServesModel(b, allowed) {
-				return allowed
-			}
-		}
-	}
-	return b.Model
 }
 
 // effectiveSlots is what one endpoint contributes to a pool's concurrency. An
@@ -744,10 +676,18 @@ func (r *Router) refreshRelay(rel Relay) []string {
 	}
 	ids := make([]string, 0, len(fleet.Models))
 	for _, entry := range fleet.Models {
-		if entry.Model == "" {
+		// An upstream that predates the per-worker fleet sends no id, only a
+		// pooled model name. Fall back to it rather than skipping the entry:
+		// the alternative is that upgrading this side first takes the whole
+		// relayed fleet dark until the other side catches up. The name still
+		// addresses the pool, which is exactly the old behaviour.
+		if entry.ID == "" {
+			entry.ID = entry.Model
+		}
+		if entry.ID == "" {
 			continue
 		}
-		id := relayBackendID(rel.Name, entry.Model)
+		id := relayBackendID(rel.Name, entry.ID)
 		ids = append(ids, id)
 		r.applyRelayEntry(rel, id, entry, fleet.BenchVersion)
 	}
@@ -820,8 +760,8 @@ func (r *Router) applyRelayEntry(rel Relay, id string, entry relayModelEntry, fl
 	}
 	backend, created := r.registry.upsert(reg)
 	if created {
-		log.Printf("relay %s: registered %s (q=%d%%, ctx %dk, %d endpoint(s) upstream)",
-			rel.Name, id, entry.Quality, entry.ContextK, entry.Endpoints)
+		log.Printf("relay %s: registered %s (model %s, q=%d%%, ctx %dk)",
+			rel.Name, id, entry.Model, entry.Quality, entry.ContextK)
 	}
 	// The model spelling to put in a forwarded body. Ordinarily this is read off
 	// the endpoint's own /v1/models by queryModelInfo, which a relay row never
@@ -829,7 +769,7 @@ func (r *Router) applyRelayEntry(rel Relay, id string, entry relayModelEntry, fl
 	// in place and the upstream would auto-route a request this router had
 	// already chosen a model for. It is the name the upstream published, so it is
 	// a name the upstream accepts, which is the whole contract of relayFleetFor.
-	r.registry.setModelMeta(id, ModelMeta{ServedID: entry.Model})
+	r.registry.setModelMeta(id, ModelMeta{ServedID: entry.ID})
 	prof := relayProfile(entry)
 	mismatch := fleetBench != benchmarkVersion
 	if mismatch {
@@ -842,6 +782,10 @@ func (r *Router) applyRelayEntry(rel Relay, id string, entry relayModelEntry, fl
 		// running: routable, and only for easy traffic, until the two routers are
 		// on the same build.
 		prof.Quality = provisionalQuality
+		// The no-think score is graded against the same question set, so it is
+		// exactly as incomparable — drop it rather than let a number from
+		// another scale reach qualityFor.
+		prof.QualityNoThink = 0
 		prof.BenchVersion = 0
 	}
 	r.registry.applyProfileIfGen(id, 0, prof)
@@ -850,8 +794,8 @@ func (r *Router) applyRelayEntry(rel Relay, id string, entry relayModelEntry, fl
 	// counter, so calling it every refresh would disable the circuit breaker that
 	// takes a misbehaving upstream out of rotation.
 	if backend != nil && !backend.Certification.Ready {
-		message := fmt.Sprintf("imported from relay %q: q=%d%%, %d endpoint(s), benchmark v%d",
-			rel.Name, entry.Quality, entry.Endpoints, fleetBench)
+		message := fmt.Sprintf("imported from relay %q: worker %s, q=%d%%, benchmark v%d",
+			rel.Name, entry.ID, entry.Quality, fleetBench)
 		if mismatch {
 			message = fmt.Sprintf(
 				"imported from relay %q, but it benchmarks with v%d and this router with v%d — capacity and capabilities adopted, quality held at the provisional %d%% until the two match",
@@ -900,6 +844,7 @@ func relayProfile(entry relayModelEntry) *WorkerProfile {
 	return &WorkerProfile{
 		Model:           entry.Model,
 		Quality:         entry.Quality,
+		QualityNoThink:  entry.QualityNoThink,
 		BenchVersion:    entry.BenchVersion,
 		ContextK:        entry.ContextK,
 		MaxConcurrency:  entry.MaxConcurrency,

@@ -9,6 +9,67 @@ import (
 	"testing"
 )
 
+// TestRelayCarriesNoThinkQuality covers the score that used to be dropped on the
+// floor. Sending only Quality left every imported row at QualityNoThink=0, so
+// qualityFor fell back to the THINKING score for no-think requests and over-rated
+// the whole relayed fleet — `ask -ls` showed it as "q=? qt=84".
+func TestRelayCarriesNoThinkQuality(t *testing.T) {
+	reg := newTestRegistry()
+	relayReady(t, reg, "a", "m", 84, 128, 4, "chat")
+	relayReady(t, reg, "b", "m", 70, 128, 2, "chat")
+	// Through the registry map: eligible() hands out snapshots, so mutating the
+	// pointer upsert returned would not be seen.
+	reg.backends["a"].QualityNoThink = 40
+	reg.backends["b"].QualityNoThink = 55
+
+	got := relayFleetFor(&identity{Role: roleClient, Relay: true}, reg.eligible())
+	by := map[string]relayModelEntry{}
+	for _, e := range got {
+		by[e.ID] = e
+	}
+	// Each worker carries its OWN no-think score — no merging.
+	if by["a"].QualityNoThink != 40 || by["b"].QualityNoThink != 55 {
+		t.Errorf("quality_nothink = %d/%d, want 40/55 per worker",
+			by["a"].QualityNoThink, by["b"].QualityNoThink)
+	}
+
+	// And it has to survive the trip into a WorkerProfile, or selection never
+	// sees it however well the wire carries it.
+	if prof := relayProfile(by["a"]); prof.QualityNoThink != 40 {
+		t.Errorf("profile quality_nothink = %d, want 40", prof.QualityNoThink)
+	}
+
+	// A worker nobody scored no-think reports 0, which qualityFor reads as
+	// "not measured" and falls back to Quality for.
+	reg.backends["b"].QualityNoThink = 0
+	got = relayFleetFor(&identity{Role: roleClient, Relay: true}, reg.eligible())
+	for _, e := range got {
+		if e.ID == "b" && e.QualityNoThink != 0 {
+			t.Errorf("unmeasured worker published quality_nothink = %d, want 0", e.QualityNoThink)
+		}
+	}
+}
+
+// An upstream that predates the per-worker fleet sends entries with a model and
+// no id. Upgrading the downstream first must not take the relayed fleet dark.
+func TestRelayToleratesUpstreamWithoutWorkerIDs(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		writeJSON(w, http.StatusOK, relayFleetResponse{
+			RouterID: "r-old", BenchVersion: benchmarkVersion,
+			// No ID — the shape an older upstream emits.
+			Models: []relayModelEntry{{Model: "m", Quality: 70, BenchVersion: benchmarkVersion, MaxConcurrency: 2}},
+		})
+	}))
+	defer upstream.Close()
+
+	r := adminRouter(t)
+	r.relays.put(Relay{Name: "up", URL: upstream.URL, Enabled: true})
+	r.refreshRelays()
+	if got := len(r.relayRowIDs("up")); got != 1 {
+		t.Fatalf("registered %d rows, want 1 — an id-less upstream must still relay", got)
+	}
+}
+
 // relayReady builds a registry row in the state a certified backend is in, so
 // the fleet endpoint and the ranker see something eligible.
 func relayReady(t *testing.T, reg *Registry, id, model string, quality, ctxK, conc int, features ...string) *Backend {
@@ -83,79 +144,114 @@ func TestRelayFleetRespectsAllowList(t *testing.T) {
 	}
 }
 
-// Discovery and traffic are gated by two different tests — allowsBackend, which
-// accepts any spelling a worker answers to, and allowsModel, which compares the
-// client's word to the allow-list literally. Publish a name outside the list and
-// the downstream is refused by the key that just advertised it.
-func TestRelayFleetPublishesASayableName(t *testing.T) {
-	reg := newTestRegistry()
-	relayReady(t, reg, "w-endpoint-id", "Qwen3.8-27B-Uncensored-NInfer", 80, 128, 4, "chat")
+// Discovery and traffic are gated by two different tests, and they have to
+// agree. Discovery runs through allowsBackend (what a worker answers to); the
+// traffic path runs through allowsModel, which matches the allow-list
+// LITERALLY. Publishing the worker id would once have been discovered and then
+// refused — which is why the fleet used to publish the allow-list's own
+// spelling instead. Now the id IS the address, so mayNameWorker closes the gap:
+// a key that may be SERVED BY a worker may also NAME it.
+func TestRelayPublishedIDSurvivesTheTrafficGate(t *testing.T) {
+	r := adminRouter(t)
+	relayReady(t, r.registry, "w-endpoint-id", "Qwen3.8-27B-Uncensored-NInfer", 80, 128, 4, "chat")
 
-	// Every spelling backendServesModel accepts has to round-trip: whichever one
-	// the operator wrote is what comes back.
+	// Whichever spelling the operator allow-listed, the published id must be
+	// usable by that same key.
 	for _, spelling := range []string{
 		"Qwen3.8-27B-Uncensored-NInfer", // the model id
 		"w-endpoint-id",                 // the endpoint id
 		"qwen3.8uncensoredninfer",       // the published alias
 	} {
 		ident := &identity{Role: roleClient, Relay: true, Models: []string{spelling}}
-		got := relayFleetFor(ident, reg.eligible())
+		got := relayFleetFor(ident, r.registry.eligible())
 		if len(got) != 1 {
 			t.Fatalf("allow-list %q: got %d entries, want 1", spelling, len(got))
 		}
-		if got[0].Model != spelling {
-			t.Errorf("allow-list %q published as %q — the downstream would ask for a name this key refuses",
-				spelling, got[0].Model)
+		if got[0].ID != "w-endpoint-id" {
+			t.Errorf("allow-list %q published id %q, want the worker id", spelling, got[0].ID)
 		}
-		// And prove the refusal is real: the published name must pass the gate the
-		// traffic path applies.
-		if !ident.allowsModel(got[0].Model) {
-			t.Errorf("published %q, which allowsModel refuses", got[0].Model)
+		// The gap that used to bite: the downstream will send this id as the
+		// model, and the same key has to accept it.
+		if !ident.allowsModel(got[0].ID) && !r.mayNameWorker(ident, got[0].ID) {
+			t.Errorf("allow-list %q: published id %q is refused by the traffic gate", spelling, got[0].ID)
 		}
 	}
 
-	// No allow-list refuses nothing, so the raw model id is the right answer.
-	got := relayFleetFor(&identity{Role: roleClient, Relay: true}, reg.eligible())
-	if len(got) != 1 || got[0].Model != "Qwen3.8-27B-Uncensored-NInfer" {
-		t.Fatalf("unrestricted key: got %+v, want the raw model id", got)
+	// A key restricted to something else still cannot name it — mayNameWorker
+	// widens the spelling, not the permission.
+	other := &identity{Role: roleClient, Relay: true, Models: []string{"some-other-model"}}
+	if r.mayNameWorker(other, "w-endpoint-id") {
+		t.Error("a key with no claim on this worker was allowed to name it")
 	}
 }
 
-// Several endpoints serving one model become one entry, and each field combines
-// in the direction its USE requires — see relayModelEntry.
-func TestRelayFleetAggregatesEndpoints(t *testing.T) {
+// Two endpoints serving the SAME model stay two entries, each carrying its own
+// measured numbers. This is the point of the per-worker fleet: the downstream
+// ranks them against its local workers individually, and a blended row would
+// hide exactly the differences the ranker exists to exploit.
+func TestRelayFleetPublishesEachWorkerSeparately(t *testing.T) {
 	reg := newTestRegistry()
 	relayReady(t, reg, "a", "m", 80, 128, 4, "chat", "tools", "vision")
 	relayReady(t, reg, "b", "m", 60, 32, 2, "chat", "tools")
-	reg.backends["a"].Thinking = true // b cannot think; the union still can
+	reg.backends["a"].Thinking = true
 	reg.incActive("a", 1)
 	reg.incActive("b", 2)
 
 	got := relayFleetFor(&identity{Role: roleClient, Relay: true}, reg.eligible())
+	if len(got) != 2 {
+		t.Fatalf("want one entry per worker, got %d: %+v", len(got), got)
+	}
+	by := map[string]relayModelEntry{}
+	for _, e := range got {
+		by[e.ID] = e
+	}
+	a, b := by["a"], by["b"]
+	if a.ID == "" || b.ID == "" {
+		t.Fatalf("entries are not keyed by worker id: %+v", got)
+	}
+	// Both name the same model — the model is display, the id is the address.
+	if a.Model != "m" || b.Model != "m" {
+		t.Errorf("models = %q/%q, want both \"m\"", a.Model, b.Model)
+	}
+	// Nothing is merged: each worker reports itself.
+	if a.Quality != 80 || b.Quality != 60 {
+		t.Errorf("quality = %d/%d, want 80/60 unmerged", a.Quality, b.Quality)
+	}
+	if a.ContextK != 128 || b.ContextK != 32 {
+		t.Errorf("context_k = %d/%d, want 128/32 unmerged", a.ContextK, b.ContextK)
+	}
+	if strings.Join(a.Features, ",") != "chat,tools,vision" {
+		t.Errorf("a features = %v, want its own, not an intersection", a.Features)
+	}
+	if !a.Thinking || b.Thinking {
+		t.Errorf("thinking = %v/%v, want a's true and b's false — no union", a.Thinking, b.Thinking)
+	}
+	if a.MaxConcurrency != 4 || b.MaxConcurrency != 2 {
+		t.Errorf("max_concurrency = %d/%d, want 4/2 unsummed", a.MaxConcurrency, b.MaxConcurrency)
+	}
+	if a.ActiveRequests != 1 || b.ActiveRequests != 2 {
+		t.Errorf("active_requests = %d/%d, want 1/2 unsummed", a.ActiveRequests, b.ActiveRequests)
+	}
+}
+
+// The worker id is the ADDRESS: the downstream stores it as ServedID, it is
+// stamped into the outbound "model", and backendServesModel resolves it back to
+// that exact worker upstream. Without this the two halves disagree and a relayed
+// request lands on whichever worker the upstream felt like.
+func TestRelayEntryAddressesTheExactWorker(t *testing.T) {
+	reg := newTestRegistry()
+	relayReady(t, reg, "w-endpoint-id", "Qwen3.8-27B", 80, 128, 4, "chat")
+
+	got := relayFleetFor(&identity{Role: roleClient, Relay: true}, reg.eligible())
 	if len(got) != 1 {
-		t.Fatalf("want one aggregated entry, got %d: %+v", len(got), got)
+		t.Fatalf("want 1 entry, got %d", len(got))
 	}
-	e := got[0]
-	if e.Endpoints != 2 {
-		t.Errorf("endpoints = %d, want 2", e.Endpoints)
+	if got[0].ID != "w-endpoint-id" {
+		t.Fatalf("id = %q, want the worker id", got[0].ID)
 	}
-	if e.Quality != 60 {
-		t.Errorf("quality = %d, want the minimum 60 — a request may land on either", e.Quality)
-	}
-	if e.ContextK != 32 {
-		t.Errorf("context_k = %d, want the minimum 32", e.ContextK)
-	}
-	if strings.Join(e.Features, ",") != "chat,tools" {
-		t.Errorf("features = %v, want the intersection [chat tools]", e.Features)
-	}
-	if !e.Thinking {
-		t.Error("thinking = false, want the union true — the upstream hard-filters within the model")
-	}
-	if e.MaxConcurrency != 6 {
-		t.Errorf("max_concurrency = %d, want the sum 6", e.MaxConcurrency)
-	}
-	if e.ActiveRequests != 3 {
-		t.Errorf("active_requests = %d, want the sum 3", e.ActiveRequests)
+	// The round trip that matters: the published id must resolve upstream.
+	if !backendServesModel(reg.backends["w-endpoint-id"], got[0].ID) {
+		t.Fatal("upstream would not resolve its own published id back to the worker")
 	}
 }
 
@@ -348,10 +444,10 @@ func TestRouterIDIsStableAndPersisted(t *testing.T) {
 
 func TestRelayProfileImport(t *testing.T) {
 	entry := relayModelEntry{
-		Model: "m", Quality: 77, BenchVersion: benchmarkVersion, ContextK: 128,
+		ID: "m", Model: "m", Quality: 77, BenchVersion: benchmarkVersion, ContextK: 128,
 		Features: []string{"chat", "tools"}, Thinking: true,
 		BaselineTPS: 90, PrefillTPS: 4000, TTFTMillis: 300,
-		MaxConcurrency: 6, ActiveRequests: 2, Endpoints: 2,
+		MaxConcurrency: 6, ActiveRequests: 2,
 	}
 	prof := relayProfile(entry)
 	// Both latency terms describe the far ENDPOINT, link excluded — prefillSeconds
@@ -378,10 +474,10 @@ func TestRelayProfileImport(t *testing.T) {
 // import, certify — and prune when the upstream stops serving the model.
 func TestRelayRefreshRegistersAndPrunes(t *testing.T) {
 	models := []relayModelEntry{{
-		Model: "qwen3.8-uncensored", Quality: 82, BenchVersion: benchmarkVersion,
+		ID: "qwen3.8-uncensored", Model: "qwen3.8-uncensored", Quality: 82, BenchVersion: benchmarkVersion,
 		ContextK: 116, Features: []string{"chat", "tools", "vision"}, Thinking: true,
 		BaselineTPS: 108, PrefillTPS: 2816, TTFTMillis: 250,
-		MaxConcurrency: 4, ActiveRequests: 1, Endpoints: 1,
+		MaxConcurrency: 4, ActiveRequests: 1,
 	}}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.URL.Path != "/relay/fleet" {
@@ -478,8 +574,8 @@ func TestRelayDeleteDeregistersItsRows(t *testing.T) {
 		writeJSON(w, http.StatusOK, relayFleetResponse{
 			RouterID: "r-up", BenchVersion: benchmarkVersion,
 			Models: []relayModelEntry{
-				{Model: "m1", Quality: 70, BenchVersion: benchmarkVersion, MaxConcurrency: 2, Endpoints: 1},
-				{Model: "m2", Quality: 75, BenchVersion: benchmarkVersion, MaxConcurrency: 2, Endpoints: 1},
+				{ID: "m1", Model: "m1", Quality: 70, BenchVersion: benchmarkVersion, MaxConcurrency: 2},
+				{ID: "m2", Model: "m2", Quality: 75, BenchVersion: benchmarkVersion, MaxConcurrency: 2},
 			},
 		})
 	}))
@@ -516,7 +612,7 @@ func TestRelayRefusesItself(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, relayFleetResponse{
 			RouterID: self, BenchVersion: benchmarkVersion,
-			Models: []relayModelEntry{{Model: "m", Quality: 50, BenchVersion: benchmarkVersion, Endpoints: 1}},
+			Models: []relayModelEntry{{ID: "m", Model: "m", Quality: 50, BenchVersion: benchmarkVersion}},
 		})
 	}))
 	defer upstream.Close()
@@ -539,7 +635,7 @@ func TestRelayKeepsRowsWhenFetchFails(t *testing.T) {
 		}
 		writeJSON(w, http.StatusOK, relayFleetResponse{
 			RouterID: "r-up", BenchVersion: benchmarkVersion,
-			Models: []relayModelEntry{{Model: "m", Quality: 70, BenchVersion: benchmarkVersion, MaxConcurrency: 2, Endpoints: 1}},
+			Models: []relayModelEntry{{ID: "m", Model: "m", Quality: 70, BenchVersion: benchmarkVersion, MaxConcurrency: 2}},
 		})
 	}))
 	defer upstream.Close()
@@ -569,8 +665,8 @@ func TestRelayBenchmarkMismatchHoldsProvisionalQuality(t *testing.T) {
 		writeJSON(w, http.StatusOK, relayFleetResponse{
 			RouterID: "r-up", BenchVersion: benchmarkVersion + 1,
 			Models: []relayModelEntry{{
-				Model: "m", Quality: 99, BenchVersion: benchmarkVersion + 1,
-				ContextK: 64, MaxConcurrency: 3, Endpoints: 1, Features: []string{"chat"},
+				ID: "m", Model: "m", Quality: 99, BenchVersion: benchmarkVersion + 1,
+				ContextK: 64, MaxConcurrency: 3, Features: []string{"chat"},
 			}},
 		})
 	}))
@@ -704,9 +800,9 @@ func TestOccupancyPrefersUpstreamCount(t *testing.T) {
 // against a local worker.
 func TestRelayLatencyIncludesTheLink(t *testing.T) {
 	entry := relayModelEntry{
-		Model: "m", Quality: 80, BenchVersion: benchmarkVersion, ContextK: 128,
+		ID: "m", Model: "m", Quality: 80, BenchVersion: benchmarkVersion, ContextK: 128,
 		Features: []string{"chat"}, BaselineTPS: 100, PrefillTPS: 4000, TTFTMillis: 250,
-		MaxConcurrency: 4, Endpoints: 1,
+		MaxConcurrency: 4,
 	}
 	build := func(id string, rtt float64) *Backend {
 		reg := newTestRegistry()
@@ -732,8 +828,8 @@ func TestRelayPrefillScalesWithThePrompt(t *testing.T) {
 	reg := newTestRegistry()
 	reg.upsert(BackendRegistration{ID: "far", URL: "http://far", Model: "m"})
 	reg.applyProfileIfGen(id0(t, reg, "far"), 0, relayProfile(relayModelEntry{
-		Model: "m", Quality: 80, BenchVersion: benchmarkVersion, ContextK: 256,
-		BaselineTPS: 100, PrefillTPS: 2800, TTFTMillis: 300, MaxConcurrency: 4, Endpoints: 1,
+		ID: "m", Model: "m", Quality: 80, BenchVersion: benchmarkVersion, ContextK: 256,
+		BaselineTPS: 100, PrefillTPS: 2800, TTFTMillis: 300, MaxConcurrency: 4,
 	}))
 	reg.setRelayLoad("far", 0, 4, 137)
 	b := reg.get("far")

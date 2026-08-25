@@ -747,8 +747,31 @@ func envCredentials(cfg *Config) []envCredential {
 
 // enforceKeyLimits applies a key's allow-list and budget. It writes the refusal
 // itself and returns false, so a handler is one `if` away from being correct.
+// mayNameWorker reports whether `name` addresses a WORKER this key is already
+// allowed to be SERVED BY, which allowsModel cannot see: it compares the
+// caller's spelling to the allow-list literally, so a key restricted to
+// "shared-model" refuses the id of a worker serving shared-model.
+//
+// That gap is why relay discovery used to publish the allow-list's own spelling
+// rather than the worker's id. Now that a relay publishes one entry per WORKER
+// and addresses it by id, the id has to be sayable — and letting it be said
+// grants nothing, because allowsBackend already lets the auto route and an
+// X-LLM-Backend-ID pin reach that same worker. It is the same permission,
+// spelled the way /relay/fleet advertises it.
+func (r *Router) mayNameWorker(id *identity, name string) bool {
+	if id == nil || name == "" || len(id.Models) == 0 {
+		return false
+	}
+	for _, b := range r.registry.snapshot() {
+		if backendServesModel(b, name) && id.allowsBackend(b) {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *Router) enforceKeyLimits(w http.ResponseWriter, id *identity, model string) bool {
-	if !id.allowsModel(model) {
+	if !id.allowsModel(model) && !r.mayNameWorker(id, model) {
 		writeJSON(w, http.StatusForbidden, validationError{
 			Message: fmt.Sprintf("this key may not use model %q (allowed: %s)", model, strings.Join(id.Models, ", ")),
 			Param:   "model",

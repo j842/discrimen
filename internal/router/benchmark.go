@@ -645,8 +645,10 @@ func (r *Router) runNoThinkQualityBenchmark(b *Backend, concurrency int, mixed [
 // re-benchmark: the mixed run's per-question results, aligned with the CURRENT
 // question set (the caller has already gated on BenchVersion, so a length match
 // means the same questions). A non-thinking worker needs nothing — its mixed
-// score already is its no-think score, and qualityFor's fallback covers the
-// window until its profile is rewritten anyway.
+// score already is its no-think score, and qualityFor reads Quality for it
+// (exact) until its profile is rewritten anyway. A THINKING worker awaiting
+// backfill ranks as unmeasured on no-think requests, which is the pressure to
+// run this promptly rather than a reason to widen the fallback.
 func needsNoThinkBackfill(p *WorkerProfile) bool {
 	return p.Thinking && p.QualityNoThink == 0 && len(p.BenchResults) == len(benchmarkQuestions)
 }

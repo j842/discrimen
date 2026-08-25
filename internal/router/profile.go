@@ -26,10 +26,12 @@ type WorkerProfile struct {
 	// client actually talks to. The headline Quality grades hard tiers
 	// thinking-on, and the two can diverge sharply on MoE reasoners (measured
 	// 2026-08-24: a 35B A3B at q=84 thinking wrote deterministic garbage SQL
-	// no-think). Zero means NOT MEASURED (a profile cached before this field
-	// existed, or a worker that cannot think — where the mixed score already IS
-	// the no-think score); selection falls back to Quality then, which is
-	// exactly the pre-two-score behaviour. See qualityFor.
+	// no-think). Zero means NOT MEASURED. On a thinking worker that zero is
+	// what selection reads for no-think requests — unmeasured ranks below
+	// every measured worker rather than inheriting the mixed score (which
+	// once let a still-profiling worker outrank the whole measured fleet); a
+	// non-thinking worker falls back to Quality, which for it is exact. See
+	// qualityFor.
 	QualityNoThink       int     `json:"quality_nothink,omitempty"`
 	QualityNoThinkDetail string  `json:"quality_nothink_detail,omitempty"`
 	ContextK             int     `json:"context_k"`
@@ -387,9 +389,11 @@ func (r *Router) profileBackend(b *Backend, model string) (*WorkerProfile, error
 			p.Checks["quality_nothink"] = Check{OK: true,
 				Message: fmt.Sprintf("%d%% %s", ntScore, ntBreakdown)}
 		}
-		// A failed no-think pass leaves the field zero → selection falls back to
-		// the mixed score, the pre-two-score behaviour; not worth aborting a
-		// profile the main benchmark already earned.
+		// A failed no-think pass leaves the field zero → the worker ranks
+		// below every measured worker on no-think requests until the next
+		// certification retries the pass (unmeasured must not inherit the
+		// mixed score — see qualityFor); not worth aborting a profile the
+		// main benchmark already earned.
 	} else {
 		p.QualityNoThink = quality
 		p.QualityNoThinkDetail = qBreakdown

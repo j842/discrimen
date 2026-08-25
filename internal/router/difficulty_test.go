@@ -595,6 +595,52 @@ func TestAutoTargetQuality(t *testing.T) {
 	}
 }
 
+// TestUnmeasuredNoThinkQuality: a thinking worker whose no-think benchmark has
+// not run yet must not inherit its mixed-mode Quality on a no-think request.
+// Being unmeasured once OUTRANKED the measured fleet (2026-08-25: a
+// still-profiling 284B CPU worker at mixed q=93 drew every thinking:"off"
+// planner call onto its 10 tok/s single slot while measured GPU workers idled
+// at 2s latency), and the inflated score also anchored autoTargetQuality's
+// clamp above every measured worker's real no-think ability — defeating the
+// clamp's whole purpose.
+func TestUnmeasuredNoThinkQuality(t *testing.T) {
+	measured := mkBackend("gpu", 84, 140, 2, 0)
+	measured.Thinking = true
+	measured.QualityNoThink = 45
+
+	unmeasured := mkBackend("cpu", 93, 10, 1, 0)
+	unmeasured.Thinking = true // backfill still running → QualityNoThink zero
+
+	plain := mkBackend("plain", 60, 40, 2, 0) // non-thinker, pre-two-score profile
+
+	if q := qualityFor(measured, true); q != 45 {
+		t.Fatalf("measured no-think read %d, want 45", q)
+	}
+	if q := qualityFor(unmeasured, true); q != 0 {
+		t.Fatalf("unmeasured thinking worker read %d on no-think, want 0 (unmeasured, not inherited)", q)
+	}
+	if q := qualityFor(unmeasured, false); q != 93 {
+		t.Fatalf("thinking-mode read %d, want 93 (mixed score untouched)", q)
+	}
+	if q := qualityFor(plain, true); q != 60 {
+		t.Fatalf("non-thinking worker read %d on no-think, want 60 (its mixed score IS the no-think score)", q)
+	}
+
+	// The clamp anchors to the best MEASURED no-think ability: 45, not the
+	// unmeasured worker's mixed 93 — else the bar strands above every worker
+	// whose no-think quality is actually known.
+	if q := autoTargetQuality([]*Backend{measured, unmeasured}, 0.66, true); q != 45 {
+		t.Fatalf("no-think target %d, want 45 (anchored to measured scores only)", q)
+	}
+
+	// Ranking on a no-think job: the measured worker leads at any target; the
+	// unmeasured one stays routable as the below-bar last resort, not excluded.
+	got := rankByDifficulty([]*Backend{unmeasured, measured}, 66, nominalJob(), true)
+	if len(got) != 2 || got[0].ID != "gpu" {
+		t.Fatalf("no-think ranking = %v, want measured gpu first with unmeasured cpu as last resort", ids(got))
+	}
+}
+
 // TestAutoBandsSelection: with no configured bands the router derives tiers from
 // the registered fleet — no ROUTER_DIFFICULTY_QUALITY_BANDS needed.
 func TestAutoBandsSelection(t *testing.T) {

@@ -172,9 +172,10 @@ type Backend struct {
 	QualityDetail  string   `json:"quality_detail,omitempty"` // benchmark per-tier + truncation breakdown
 	// QualityNoThink is the benchmark scored with thinking DISABLED on every
 	// question — what a requirements.thinking="off" client is actually served
-	// by. Zero means not measured (pre-two-score profile, or provisional);
-	// selection then falls back to Quality via qualityFor. See
-	// WorkerProfile.QualityNoThink for the full story.
+	// by. Zero means not measured (pre-two-score profile, or provisional): a
+	// thinking worker then ranks below every measured worker on no-think
+	// requests, while a non-thinking worker falls back to Quality, which for
+	// it is exact. See qualityFor and WorkerProfile.QualityNoThink.
 	QualityNoThink int `json:"quality_nothink,omitempty"`
 	// QualityNoThinkDetail is the per-tier breakdown behind QualityNoThink, the
 	// no-think counterpart of QualityDetail — what `ask -ls` renders as the
@@ -2069,13 +2070,32 @@ type acquirePreference struct {
 
 // qualityFor is the quality score to judge b by for a request served in the
 // given thinking mode. A no-think request reads the no-think benchmark score —
-// the model that client actually talks to — falling back to the mixed-mode
-// Quality when no no-think score was measured (an old cached profile, a
-// provisional worker, a failed no-think pass), which is exactly the
-// pre-two-score behaviour.
+// the model that client actually talks to.
+//
+// A THINKING worker whose no-think score is not measured yet reads ZERO, not
+// its mixed-mode Quality: the mixed score was earned with reasoning on and
+// says nothing about the model a no-think client gets. The old fallback made
+// being unmeasured an advantage — a still-profiling 284B CPU worker inherited
+// its mixed q=93 on no-think requests, outranked every honestly-measured
+// worker (whose real no-think scores it also held the target above, via
+// autoTargetQuality's qmax) and drew all of Atlas's planner traffic onto a
+// 10 tok/s single slot (2026-08-25). Unmeasured now ranks below every
+// measured worker and cannot anchor the target; it is still routable as the
+// below-bar graceful fallback when nothing measured is available — "almost
+// never", not "never".
+//
+// A NON-thinking worker keeps reading Quality: it serves the same model in
+// either mode, so the mixed score IS its no-think score — exact, and also
+// what covers a pre-two-score cached profile where the profile-time copy
+// into QualityNoThink has not happened yet (see needsNoThinkBackfill).
 func qualityFor(b *Backend, thinkOff bool) int {
-	if thinkOff && b.QualityNoThink > 0 {
-		return b.QualityNoThink
+	if thinkOff {
+		if b.QualityNoThink > 0 {
+			return b.QualityNoThink
+		}
+		if b.Thinking {
+			return 0 // unmeasured: never inherit the mixed score
+		}
 	}
 	return b.Quality
 }
@@ -3201,9 +3221,9 @@ func (r *Router) certifyBackend(id string) {
 					score, ok, breakdown := r.runNoThinkQualityBenchmark(backend, conc, prof.BenchResults)
 					if !ok {
 						// Worker likely blipped mid-run. Keep the single-score profile —
-						// qualityFor falls back to the mixed score, the pre-two-score
-						// behaviour — and the next certification (router restart, changed
-						// registration, recovery) retries.
+						// the worker ranks as unmeasured (below every measured worker) on
+						// no-think requests, see qualityFor — and the next certification
+						// (router restart, changed registration, recovery) retries.
 						log.Printf("no-think quality backfill for %s failed — keeping the single-score profile until the next certification", id)
 						return
 					}

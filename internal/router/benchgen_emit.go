@@ -162,8 +162,19 @@ func benchEmit() error {
 	top, bottom := fleet[:half], fleet[len(fleet)-half:]
 
 	var scored, floor, ceiling []scoredQuestion
-	var noData, tooEasy, tooHard, backwards int
+	var noData, tooEasy, tooHard, backwards, ungradeable int
 	for _, q := range pool.Questions {
+		// A question the grader cannot score is not a hard question, it is a
+		// broken one — and it fails for EVERY worker, so unfiltered it lands in
+		// the p==0 pool and masquerades as headroom. That is exactly how the
+		// first headroom band shipped LiveBench list answers the numeric/mcq/
+		// contains modes cannot match. benchmark_test.go asserts the same
+		// property for tier >= 9; checking it here keeps a broken item out of
+		// every band rather than failing the build after emit.
+		if !benchSelfGrades(q) {
+			ungradeable++
+			continue
+		}
 		graded, passes := 0, 0
 		for _, f := range fleet {
 			ok, seen := f.pass[q.ID]
@@ -197,8 +208,8 @@ func benchEmit() error {
 		}
 		scored = append(scored, scoredQuestion{q: q, p: p, d: d})
 	}
-	fmt.Fprintf(os.Stderr, "\n%d candidates: %d usable; dropped %d all-pass, %d all-fail, %d negative-discrimination, %d ungraded\n",
-		len(pool.Questions), len(scored), tooEasy, tooHard, backwards, noData)
+	fmt.Fprintf(os.Stderr, "\n%d candidates: %d usable; dropped %d all-pass, %d all-fail, %d negative-discrimination, %d ungraded, %d ungradeable\n",
+		len(pool.Questions), len(scored), tooEasy, tooHard, backwards, noData, ungradeable)
 
 	var selected []scoredQuestion
 	for _, band := range benchTierTargets {
@@ -206,6 +217,24 @@ func benchEmit() error {
 			src := floor
 			if band.Reserve == reserveCeiling {
 				src = ceiling
+			}
+			// The coding bucket has shape rules of its own (benchmark_test.go's
+			// TestCodingTierShape): no multiple choice, because at this tier the
+			// grader would be measuring option length rather than the answer, and
+			// no empty or negative Expect. Filter here so a headroom band cannot
+			// break the build with a question it had no way to grade anyway.
+			if band.Tier >= benchCodingTier {
+				kept := src[:0:0]
+				for _, s := range src {
+					if s.q.Match == "mcq" || s.q.Match == "mcq-repeat" {
+						continue
+					}
+					if s.q.Expect == "" || strings.HasPrefix(s.q.Expect, "-") {
+						continue
+					}
+					kept = append(kept, s)
+				}
+				src = kept
 			}
 			pick := benchStratifyByTask(src, band.Target)
 			for i := range pick {
@@ -427,4 +456,27 @@ func benchStratifyByTask(src []scoredQuestion, n int) []scoredQuestion {
 		}
 	}
 	return out
+}
+
+// benchSelfGrades reports whether the production grader accepts the question's
+// OWN expected answer, in the reply shapes a model actually produces. Mirrors
+// benchmark_test.go's TestExpertTierAnswersGrade so a question that would fail
+// the build is never selected in the first place.
+func benchSelfGrades(q poolQuestion) bool {
+	bq := benchmarkQ{Prompt: q.Prompt, Expect: q.Expect, Match: q.Match}
+	shapes := []string{q.Expect, "The answer is " + q.Expect + "."}
+	switch q.Match {
+	case "mcq":
+		shapes = append(shapes, "Working through each option, the correct one is "+q.Expect)
+	case "contains":
+		shapes = append(shapes, "Applying the rules in order gives "+q.Expect+".")
+	default:
+		shapes = append(shapes, "Substituting into the formula gives "+q.Expect)
+	}
+	for _, a := range shapes {
+		if !checkAnswer(bq, a) {
+			return false
+		}
+	}
+	return true
 }

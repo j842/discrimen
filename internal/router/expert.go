@@ -288,6 +288,14 @@ func (r *Router) serveExpert(w http.ResponseWriter, req *http.Request, ident *id
 	tally := &usageTally{}
 	defer func() {
 		logEntry.DurationMillis = time.Since(start).Milliseconds()
+		// Summed across the whole ensemble, which is what this row describes.
+		// Thinking, concurrency and TTFT stay unset on purpose: an expert request
+		// has no single backend to attribute them to, and their zero values read
+		// as "not recorded" rather than as measurements. A timing model keyed on
+		// (backend, thinking) therefore skips these rows instead of learning from
+		// an average over N different workers.
+		logEntry.PromptTokens = tally.prompt
+		logEntry.CompletionTokens = tally.completion
 		// Async, exactly as on the proxy path: a synchronous SQLite write against a
 		// pool capped at one connection would extend every request by it.
 		charged, caller, entry := tally.charged, ident, redactForRelay(logEntry, ident)

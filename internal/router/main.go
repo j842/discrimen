@@ -468,9 +468,49 @@ type RequestLog struct {
 	Stream         bool      `json:"stream"`
 	StatusCode     int       `json:"status_code"`
 	DurationMillis int64     `json:"duration_ms"`
-	Input          string    `json:"input"`
-	Output         string    `json:"output"`
-	Error          string    `json:"error,omitempty"`
+	// The four fields below exist to make request_logs usable as TRAINING DATA
+	// for predicting how long a request will take, not just as an audit trail.
+	//
+	// Timing and correctness are separate problems with wildly different data:
+	// correctness needs a graded answer and comes only from the benchmark (a few
+	// hundred rows, hours of fleet time), while timing is observable on every
+	// request for free — thousands a day, and unlike any fixed question bank they
+	// are drawn from the traffic actually being served. Recording these makes the
+	// cheap, plentiful half learnable.
+	//
+	// PromptTokens/CompletionTokens come from the endpoint's own usage block,
+	// which was already being parsed for per-key budgeting and then discarded.
+	// The learnable quantity is CompletionTokens: tok/s is already measured, so
+	// what the router cannot currently predict is how MANY tokens a given prompt
+	// will draw out of a given model — 200 for a greeting, 12000 for hard maths.
+	PromptTokens     int `json:"prompt_tokens,omitempty"`
+	CompletionTokens int `json:"completion_tokens,omitempty"`
+	// TTFTMillis is time to first token, and is only meaningful on a STREAMED
+	// reply — a buffered one arrives whole, so its first byte is its last and the
+	// number would just restate DurationMillis. Zero means "not measured", not
+	// "instant". It matters most at long context, where prefill dominates and
+	// almost all of the latency lands before the first token.
+	TTFTMillis int64 `json:"ttft_ms,omitempty"`
+	// Thinking is the resolved enable_thinking decision: 1 on, 0 off, -1 unknown
+	// (a passthrough route, or a request whose mode was never decided). Recorded
+	// because a model with thinking on and the same model with it off are, for
+	// timing purposes, two different models — same tok/s, output lengths that
+	// differ by more than an order of magnitude. Averaging the two regimes
+	// produces a prediction that describes neither.
+	Thinking thinkingMode `json:"thinking"`
+	// Concurrency is how many requests this router had in flight on the chosen
+	// backend when this one was dispatched, INCLUDING this one. Without it
+	// DurationMillis conflates "this model is slow" with "the fleet was busy",
+	// and a timing model trained on it would learn to avoid whichever worker
+	// happened to be popular.
+	//
+	// Always read after the in-flight count is incremented, so a recorded value
+	// is at least 1 — which makes zero mean "not recorded" with no separate
+	// sentinel, and keeps the struct's zero value honest.
+	Concurrency int    `json:"concurrency"`
+	Input       string `json:"input"`
+	Output      string `json:"output"`
+	Error       string `json:"error,omitempty"`
 	// KeyID identifies the caller: the api_keys row id as a decimal string, "env"
 	// for one of the bootstrap environment tokens, empty when the router required
 	// no credential (every row written before P3, and a trusted-LAN deployment
@@ -1942,9 +1982,27 @@ type replyMeter struct {
 	bytes   int64
 	frames  int
 	partial []byte // bytes after the last newline, held over for the next Write
+	// first is when the first byte of the reply went past, for TTFT. Only
+	// meaningful on a streamed reply: a buffered one is written in a single
+	// Write at the very end, where first-byte and last-byte are the same instant
+	// and the number would merely restate the total duration. ttftMillis reports
+	// 0 rather than that, so a timing model can tell "not measured" from "fast".
+	first time.Time
+}
+
+// ttftMillis is the time from start to the first byte of the reply, or 0 if
+// nothing was ever written.
+func (m *replyMeter) ttftMillis(start time.Time) int64 {
+	if m == nil || m.first.IsZero() {
+		return 0
+	}
+	return m.first.Sub(start).Milliseconds()
 }
 
 func (m *replyMeter) Write(p []byte) (int, error) {
+	if m.first.IsZero() && len(p) > 0 {
+		m.first = time.Now()
+	}
 	m.bytes += int64(len(p))
 	m.partial = append(m.partial, p...)
 	for {
@@ -2007,6 +2065,9 @@ func (r *Router) proxyPassthrough(w http.ResponseWriter, req *http.Request, iden
 		SpeedScore:   speedScore(backend),
 		KeyID:        ident.logKeyID(),
 		ClientIP:     clientIP(req),
+		// This route never resolves a thinking mode — it forwards the body
+		// verbatim — so the field stays unknown rather than claiming "off".
+		Thinking: thinkingUnknown,
 	}
 	// Small capture, kept only to read the endpoint's usage block for per-key
 	// budgeting. Head-and-tail bounded, and usage sits at the tail in both the
@@ -2023,6 +2084,9 @@ func (r *Router) proxyPassthrough(w http.ResponseWriter, req *http.Request, iden
 		// the ordinary case for a streamed /v1/completions — and charging zero for
 		// it meant a budgeted key could stream this endpoint in a loop without
 		// tokens_used moving at all. The chat path has had this fallback all along.
+		logEntry.PromptTokens = lastJSONInt(usage.Bytes(), "prompt_tokens")
+		logEntry.CompletionTokens = lastJSONInt(usage.Bytes(), "completion_tokens")
+		logEntry.TTFTMillis = meter.ttftMillis(start)
 		charged := usageTotalTokens(usage.Bytes())
 		if charged == 0 {
 			charged = estimatePromptTokens(body)
@@ -2047,6 +2111,7 @@ func (r *Router) proxyPassthrough(w http.ResponseWriter, req *http.Request, iden
 
 	r.registry.incActive(backend.ID, 1)
 	defer r.registry.incActive(backend.ID, -1)
+	logEntry.Concurrency = r.registry.activeCount(backend.ID)
 
 	proxyReq, err := http.NewRequestWithContext(req.Context(), http.MethodPost, upstreamPathURL(backend, openAIPath), bytes.NewReader(body))
 	if err != nil {
@@ -2622,6 +2687,11 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 		Input:        string(body),
 		KeyID:        ident.logKeyID(),
 		ClientIP:     clientIP(req),
+		Thinking:     thinkingLogValue(tr),
+		// Read AFTER incActive above, so this request is included: "how loaded was
+		// the worker while serving this" is what inflates the duration, and a count
+		// taken before dispatch would read 0 for the only request in flight.
+		Concurrency: r.registry.activeCount(backend.ID),
 	}
 	capture := newBoundedCapture(r.cfg.LogMaxBodyBytes)
 	var stats *sseStats
@@ -2650,6 +2720,13 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 		// back to what routing estimated when it reported nothing (or when the
 		// capture dropped the usage block). A budget is a spending bound, not an
 		// invoice, so an approximation in the fallback is the right trade.
+		// Prompt/completion counts as the ENDPOINT reported them, kept separately
+		// from the single `charged` total that budgeting uses. Budgeting only needs
+		// a sum and happily estimates one; a timing model needs the completion
+		// count specifically, and needs to know when it is real rather than
+		// inferred — so these stay 0 when the endpoint reported nothing.
+		logEntry.PromptTokens = lastJSONInt(capture.Bytes(), "prompt_tokens")
+		logEntry.CompletionTokens = lastJSONInt(capture.Bytes(), "completion_tokens")
 		charged := usageTotalTokens(capture.Bytes())
 		if charged == 0 {
 			charged = job.promptTokens
@@ -2847,6 +2924,14 @@ func (r *Router) dispatchStreaming(w http.ResponseWriter, req *http.Request, bac
 	// count comes from the full-stream stats, not the (possibly truncated) capture.
 	if !firstByte.IsZero() && stats != nil {
 		r.registry.observe(backend.ID, firstByte.Sub(ttftBase), time.Since(firstByte), stats.genTokens(), job.promptTokens, thinking)
+		// Keep the per-request value as well as the EWMA it feeds. The EWMA answers
+		// "how fast is this worker right now", which is what ranking needs; the row
+		// answers "how long did THIS prompt take on this worker", which is what a
+		// timing model has to be trained on. The average cannot be un-averaged
+		// later, so a measurement discarded here is gone.
+		if logEntry != nil {
+			logEntry.TTFTMillis = firstByte.Sub(ttftBase).Milliseconds()
+		}
 	}
 }
 
@@ -5306,6 +5391,24 @@ func recertBackoff(failures int) time.Duration {
 	return d
 }
 
+// activeCount is how many requests this router currently has in flight on a
+// backend. Recorded on each request so DurationMillis can later be read as
+// "slow model" or "busy fleet" rather than an unresolvable mixture of the two —
+// a timing model trained without it learns to avoid whichever worker is
+// popular.
+//
+// Call it AFTER incActive, so the returned count includes the request being
+// logged. Returns 0 for a backend that is no longer registered, which reads as
+// "not recorded" — the same as any other row that never captured it.
+func (r *Registry) activeCount(id string) int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if b := r.backends[id]; b != nil {
+		return b.ActiveRequests
+	}
+	return 0
+}
+
 func (r *Registry) incActive(id string, delta int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -5569,6 +5672,11 @@ func (s *LogStore) init(ctx context.Context) error {
 			stream INTEGER NOT NULL,
 			status_code INTEGER NOT NULL,
 			duration_ms INTEGER NOT NULL,
+			prompt_tokens INTEGER NOT NULL DEFAULT 0,
+			completion_tokens INTEGER NOT NULL DEFAULT 0,
+			ttft_ms INTEGER NOT NULL DEFAULT 0,
+			thinking INTEGER NOT NULL DEFAULT 0,
+			concurrency INTEGER NOT NULL DEFAULT 0,
 			input TEXT NOT NULL,
 			output TEXT NOT NULL,
 			error TEXT NOT NULL
@@ -5668,6 +5776,18 @@ func (s *LogStore) init(ctx context.Context) error {
 		// Whether a key belongs to a downstream router rather than a client
 		// (see relay.go). Every key issued before relays existed is not one, and
 		// 0 is what the default gives them.
+		// Timing-model columns. Existing rows keep their defaults and there is
+		// nothing to backfill them from: token counts were parsed and dropped,
+		// and TTFT, thinking mode and concurrency were never recorded at all. A
+		// timing model must therefore treat 0 as MISSING rather than as a
+		// measurement, which is why thinkingMode's zero value is "unknown" and
+		// why concurrency is recorded including the current request (so a real
+		// value is never 0).
+		`ALTER TABLE request_logs ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE request_logs ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE request_logs ADD COLUMN ttft_ms INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE request_logs ADD COLUMN thinking INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE request_logs ADD COLUMN concurrency INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE api_keys ADD COLUMN relay INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -5683,8 +5803,8 @@ func (s *LogStore) Close() error {
 
 func (s *LogStore) Insert(ctx context.Context, entry RequestLog) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO request_logs
-		(created_at, backend_id, backend_model, route, observed_tps, certified_tps, baseline_tps, speed_score, stream, status_code, duration_ms, input, output, error, key_id, client_ip)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		(created_at, backend_id, backend_model, route, observed_tps, certified_tps, baseline_tps, speed_score, stream, status_code, duration_ms, prompt_tokens, completion_tokens, ttft_ms, thinking, concurrency, input, output, error, key_id, client_ip)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		entry.CreatedAt.Format(time.RFC3339Nano),
 		entry.BackendID,
 		entry.BackendModel,
@@ -5696,6 +5816,11 @@ func (s *LogStore) Insert(ctx context.Context, entry RequestLog) error {
 		boolInt(entry.Stream),
 		entry.StatusCode,
 		entry.DurationMillis,
+		entry.PromptTokens,
+		entry.CompletionTokens,
+		entry.TTFTMillis,
+		entry.Thinking,
+		entry.Concurrency,
 		clipLog(entry.Input, s.maxBody),
 		clipLog(entry.Output, s.maxBody),
 		clipLog(entry.Error, s.maxBody),
@@ -5725,10 +5850,10 @@ func (s *LogStore) List(ctx context.Context, backendID string, limit int, offset
 		err  error
 	)
 	if backendID == "" {
-		rows, err = s.db.QueryContext(ctx, `SELECT id, created_at, backend_id, backend_model, route, observed_tps, certified_tps, baseline_tps, speed_score, stream, status_code, duration_ms, input, output, error, key_id, client_ip
+		rows, err = s.db.QueryContext(ctx, `SELECT id, created_at, backend_id, backend_model, route, observed_tps, certified_tps, baseline_tps, speed_score, stream, status_code, duration_ms, prompt_tokens, completion_tokens, ttft_ms, thinking, concurrency, input, output, error, key_id, client_ip
 			FROM request_logs ORDER BY created_at DESC LIMIT ? OFFSET ?`, limit, offset)
 	} else {
-		rows, err = s.db.QueryContext(ctx, `SELECT id, created_at, backend_id, backend_model, route, observed_tps, certified_tps, baseline_tps, speed_score, stream, status_code, duration_ms, input, output, error, key_id, client_ip
+		rows, err = s.db.QueryContext(ctx, `SELECT id, created_at, backend_id, backend_model, route, observed_tps, certified_tps, baseline_tps, speed_score, stream, status_code, duration_ms, prompt_tokens, completion_tokens, ttft_ms, thinking, concurrency, input, output, error, key_id, client_ip
 			FROM request_logs WHERE backend_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`, backendID, limit, offset)
 	}
 	if err != nil {
@@ -5741,7 +5866,7 @@ func (s *LogStore) List(ctx context.Context, backendID string, limit int, offset
 		var entry RequestLog
 		var created string
 		var stream int
-		if err := rows.Scan(&entry.ID, &created, &entry.BackendID, &entry.BackendModel, &entry.Route, &entry.ObservedTPS, &entry.CertifiedTPS, &entry.BaselineTPS, &entry.SpeedScore, &stream, &entry.StatusCode, &entry.DurationMillis, &entry.Input, &entry.Output, &entry.Error, &entry.KeyID, &entry.ClientIP); err != nil {
+		if err := rows.Scan(&entry.ID, &created, &entry.BackendID, &entry.BackendModel, &entry.Route, &entry.ObservedTPS, &entry.CertifiedTPS, &entry.BaselineTPS, &entry.SpeedScore, &stream, &entry.StatusCode, &entry.DurationMillis, &entry.PromptTokens, &entry.CompletionTokens, &entry.TTFTMillis, &entry.Thinking, &entry.Concurrency, &entry.Input, &entry.Output, &entry.Error, &entry.KeyID, &entry.ClientIP); err != nil {
 			return nil, err
 		}
 		entry.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
@@ -6498,4 +6623,41 @@ func boolInt(value bool) int {
 		return 1
 	}
 	return 0
+}
+
+// thinkingMode is what a request's thinking state was recorded as.
+//
+// The ZERO value is "unknown", and that is the whole point of the type. A
+// RequestLog built without setting the field — a route added later, a path
+// nobody thought about — must not silently claim a measurement. Recording
+// unknown as "off" would pool two regimes whose output lengths differ by more
+// than an order of magnitude, and the resulting timing model would describe
+// neither.
+type thinkingMode int
+
+const (
+	thinkingUnknown thinkingMode = iota
+	thinkingOff
+	thinkingOn
+)
+
+// thinkingLogValue flattens a thinking resolution to what the log stores.
+//
+// noThink is the field that means "this request WILL be served with thinking
+// disabled" — the same one selection uses to pick between a worker's two
+// quality scores. Reading `enable` instead would be wrong: it is only
+// meaningful when `patch` is set, so a request that inherits the worker's
+// default would be recorded as thinking-off regardless of what the worker
+// actually did.
+func thinkingLogValue(tr thinkingResolution) thinkingMode {
+	if tr.noThink {
+		return thinkingOff
+	}
+	if tr.patch && tr.enable {
+		return thinkingOn
+	}
+	if tr.hardThink || tr.softThink {
+		return thinkingOn
+	}
+	return thinkingUnknown
 }

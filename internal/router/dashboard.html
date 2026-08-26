@@ -96,6 +96,34 @@
     .members { display: grid; gap: 6px; }
     .member { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     .member .idx { color: #9aa4b2; font-size: 12px; min-width: 18px; }
+    /* Usage chart. The plot sits on the same inset surface as the Try panel, and
+       that colour is load-bearing twice over: it is the surface the categorical
+       palette was validated against for contrast, and it is the colour of the
+       2px gap that separates one stacked segment from the next. Separation there
+       is done by the surface showing through, never by a stroke around a mark —
+       a border is ink that carries no data and at six pixels of bar it would be
+       most of what you see. */
+    .chart-wrap { position: relative; padding: 14px 12px 8px; background: #0f141d; border: 1px solid #2a2f3a; border-radius: 6px; }
+    .chart { display: block; width: 100%; height: auto; }
+    .chart text { fill: #9aa4b2; font-size: 11px; font-variant-numeric: tabular-nums; }
+    .chart .hit { fill: #e9edf3; fill-opacity: 0; }
+    .chart .hit:hover { fill-opacity: .06; }
+    .chart-empty { position: absolute; inset: 14px 12px 8px; display: flex; align-items: center; justify-content: center; padding: 20px; pointer-events: none; }
+    /* The note sits on its own surface rather than straight on the gridlines —
+       text laid over a grid is legible in a screenshot and tiring to read. */
+    .chart-empty span { max-width: 62ch; text-align: center; background: #0f141d; border-radius: 6px; padding: 8px 12px; color: #9aa4b2; font-size: 13px; }
+    .tip { position: absolute; z-index: 5; pointer-events: none; min-width: 170px; max-width: 300px; background: #111827; border: 1px solid #303847; border-radius: 6px; padding: 8px 10px; font-size: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.5); }
+    .tip-head { color: #cbd5e1; }
+    .tip-units { color: #6b7688; font-size: 11px; text-align: right; margin-bottom: 4px; }
+    .tip-row { display: flex; align-items: center; gap: 8px; margin-top: 3px; }
+    /* A short stroke, not a filled box: at tooltip density a swatch is data-weight
+       ink doing a label's job. The legend below the chart keys bars, so it uses
+       the box. */
+    .tip-key { flex: none; width: 12px; height: 3px; border-radius: 2px; }
+    .tip-name { flex: 1; color: #9aa4b2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tip-value { color: #e9edf3; font-variant-numeric: tabular-nums; }
+    .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 8px; vertical-align: -1px; }
+    .num { font-variant-numeric: tabular-nums; }
     @media (max-width: 900px) { .wide { display: none; } .grid { grid-template-columns: 1fr; } table { font-size: 12px; } }
   </style>
 </head>
@@ -135,6 +163,7 @@
     <div id="admin-view" hidden>
       <nav class="tabbar" id="main-tabs">
         <button class="secondary" id="mtab-fleet">Fleet</button>
+        <button class="secondary" id="mtab-usage">Usage</button>
         <button class="secondary" id="mtab-providers">Providers</button>
         <button class="secondary" id="mtab-keys">Keys</button>
         <button class="secondary" id="mtab-groups">Groups</button>
@@ -153,6 +182,40 @@
             <tr><td colspan="10" class="muted">Loading backends…</td></tr>
           </tbody>
         </table>
+      </section>
+
+      <section class="view" id="view-usage">
+        <section class="panel">
+          <h2>Active slots by client</h2>
+          <div class="panel-body stack">
+            <div class="rowline"><span class="muted" id="usage-summary">Loading…</span></div>
+            <div class="chart-wrap" id="usage-wrap">
+              <svg class="chart" id="usage-chart" viewBox="0 0 1200 320" preserveAspectRatio="xMidYMid meet"
+                   role="img" aria-label="Requests in flight over the last twelve hours, stacked by the address they came from."></svg>
+              <div class="chart-empty" id="usage-empty" hidden></div>
+            </div>
+            <table id="usage-legend-table">
+              <thead>
+                <tr><th>Client</th><th>Average slots</th><th>Busiest bucket</th><th>Requests</th></tr>
+              </thead>
+              <tbody id="usage-legend">
+                <tr><td colspan="4" class="muted">Loading…</td></tr>
+              </tbody>
+            </table>
+            <div class="hint">
+              One <strong>slot</strong> is one request in flight. Each column is the mean number in flight over
+              five minutes, so a column at 2 means two workers were busy for the whole five minutes — or four
+              were busy for half of it. It is not a request count: a burst of embedding calls barely registers
+              here, and one long generation fills a slot for as long as it runs, which is what makes the next
+              caller queue.
+            </div>
+            <div class="hint">
+              A request is written to the log when it <em>finishes</em>, so anything still running right now is
+              not on this chart yet and appears when it lands. That is why the newest column is drawn faded —
+              it is both incomplete and still filling in. Individual requests are in the Logs tab.
+            </div>
+          </div>
+        </section>
       </section>
 
       <section class="view" id="view-providers">
@@ -399,7 +462,7 @@
     // revoked server-side by /admin/logout, and expires on its own.
     let signedIn = false;
     let activeTab = 'fleet';
-    const TABS = ['fleet', 'providers', 'keys', 'groups', 'relays', 'logs'];
+    const TABS = ['fleet', 'usage', 'providers', 'keys', 'groups', 'relays', 'logs'];
 
     // Any key the previous version of this page left behind. Removed rather than
     // migrated: it is a live admin credential in a store this page no longer has
@@ -506,6 +569,7 @@
     function loadTab(name) {
       if (!signedIn) return;
       if (name === 'fleet') refreshBackends();
+      else if (name === 'usage') loadUsage();
       else if (name === 'providers') loadProviders();
       else if (name === 'keys') loadKeys();
       else if (name === 'groups') loadGroups();
@@ -538,6 +602,17 @@
     }
     function td(children, attrs) {
       return el('td', attrs || {}, children);
+    }
+    // svgEl is el for SVG. It has to be a second builder rather than a flag,
+    // because createElement puts <rect> in the HTML namespace, where it is an
+    // unknown element that the renderer lays out as nothing and draws as
+    // nothing — no error, no warning, an empty chart and a DOM inspector full
+    // of elements that look exactly right.
+    function svgEl(tag, attrs, children) {
+      const node = document.createElementNS('http://www.w3.org/2000/svg', tag);
+      if (attrs) for (const k in attrs) node.setAttribute(k, attrs[k]);
+      (children || []).forEach(c => node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c));
+      return node;
     }
     function emptyRow(bodyID, columns, message, kind) {
       const body = document.getElementById(bodyID);
@@ -1040,6 +1115,302 @@
         if (b.id === id) return b;
       }
       return null;
+    }
+
+    // ── Usage graph ─────────────────────────────────────────────────────────
+    //
+    // Twelve hours of active slots, stacked by the address each request came
+    // from. GET /admin/usage does every bit of the arithmetic in SQL and answers
+    // with 144 columns and at most ten bands; this page never sees a request row,
+    // which is the point — twelve hours of the log table is tens of thousands of
+    // rows carrying stored prompts and completions, and it is refetched every ten
+    // seconds.
+    //
+    // See the constants above handleUsage in main.go for why the window is twelve
+    // hours, why the bucket is five minutes, and why the buckets are aligned to
+    // the clock rather than to the moment of the poll.
+
+    // The eight categorical slots, stepped for a dark surface and validated as a
+    // SET against this page's #0f141d plot: lightness band, chroma floor,
+    // contrast, and colour-blind separation between every adjacent pair. They are
+    // an ordering, not a list — the order is what keeps confusable hues apart in
+    // a stack — so do not reorder or substitute one without re-validating.
+    const SERIES_FILL = ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#008300', '#9085e9', '#e66767'];
+    // The two bands that are not an identity get greys rather than a ninth and
+    // tenth hue: neither is a client you could go and talk to, and a hue would
+    // claim they were. Both clear 3:1 on the plot surface.
+    const NEUTRAL_FILL = {other: '#5a6577', unknown: '#7d8896'};
+    const USAGE_NOTE = {
+      unknown: 'Requests logged before this router recorded where they came from. The address was never ' +
+               'stored for these, so there is nothing to attribute them to — they are shown rather than ' +
+               'dropped, because hiding them would make a busy router look idle.',
+      other: 'Everything past the eight busiest addresses, added together. Eight is the palette: a ninth ' +
+             'colour would be indistinguishable from one of the others to a colour-blind reader.',
+    };
+    const PLOT = {w: 1200, h: 320, left: 52, right: 14, top: 14, bottom: 30, gap: 2};
+    PLOT.iw = PLOT.w - PLOT.left - PLOT.right;
+    PLOT.ih = PLOT.h - PLOT.top - PLOT.bottom;
+    let usageLoading = false;
+
+    // usageFill is the address→colour map, and the reason it lives out here
+    // rather than being recomputed from each response is that a colour has to be
+    // a property of the CLIENT, not of its position in the list.
+    //
+    // The list arrives ranked by busy time over a sliding twelve hours, and that
+    // ranking drifts on its own — no one has to touch anything. Colouring by
+    // position would mean two clients silently trading colours between one poll
+    // and the next, with nothing on screen to say they had; a reader who has
+    // learned that the laptop is blue would then be reading someone else's
+    // traffic and would have no way to know. So the first time an address is
+    // seen it is given a slot, and it keeps it.
+    //
+    // Seeded IN RANK ORDER on that first sight, which is the other half of the
+    // problem. The eight slots are an ordering, not a set: what was validated is
+    // that every ADJACENT pair stays apart under colour-blind simulation, and in
+    // a stack "adjacent" means the band above and the band below. Handing out
+    // slots by, say, a hash of the address would satisfy stability and put
+    // arbitrary pairs against each other — the two greens are slots 3 and 6 and
+    // were never checked as neighbours. Rank order makes the stack and the
+    // palette the same sequence.
+    //
+    // A slot is released when its address falls out of the window, so a router
+    // that sees a lot of one-off addresses does not exhaust the palette.
+    let usageFill = {};
+    function seriesFill(clients) {
+      const present = (clients || []).map(c => c.client_ip).filter(ip => !NEUTRAL_FILL[ip]);
+      const kept = {};
+      const taken = {};
+      present.forEach(ip => {
+        if (usageFill[ip] === undefined) return;
+        kept[ip] = usageFill[ip];
+        taken[SERIES_FILL.indexOf(kept[ip])] = true;
+      });
+      present.forEach(ip => {
+        if (kept[ip]) return;
+        let slot = 0;
+        while (slot < SERIES_FILL.length && taken[slot]) slot++;
+        // Unreachable while the server caps named bands at eight, which it does
+        // for exactly this reason. Reusing slot 1 is still better than undefined.
+        if (slot >= SERIES_FILL.length) slot = 0;
+        taken[slot] = true;
+        kept[ip] = SERIES_FILL[slot];
+      });
+      usageFill = kept;
+      return Object.assign({}, kept, NEUTRAL_FILL);
+    }
+
+    // axisTicks picks round gridline values covering zero to max. An axis
+    // labelled 0 / 0.85 / 1.7 / 2.55 is correct and unreadable; the ticks carry
+    // every value that is not directly labelled, so they have to be numbers
+    // someone can hold in their head.
+    function axisTicks(max) {
+      if (!(max > 0)) return [0, 0.5, 1];
+      const rough = max / 4;
+      const mag = Math.pow(10, Math.floor(Math.log10(rough)));
+      const step = ([1, 2, 2.5, 5, 10].find(m => m * mag >= rough) || 10) * mag;
+      const out = [0];
+      while (out[out.length - 1] < max - 1e-9) out.push(Number((out[out.length - 1] + step).toFixed(6)));
+      if (out.length < 2) out.push(step);
+      return out;
+    }
+    function slotText(v) {
+      const n = Number(v) || 0;
+      if (n === 0) return '0';
+      if (n >= 10) return n.toFixed(0);
+      return String(Number(n.toFixed(n >= 1 ? 1 : 2)));
+    }
+    function clockLabel(epoch) {
+      const at = new Date(epoch * 1000);
+      return String(at.getHours()).padStart(2, '0') + ':' + String(at.getMinutes()).padStart(2, '0');
+    }
+
+    async function loadUsage() {
+      usageLoading = true;
+      const res = await request('/admin/usage');
+      usageLoading = false;
+      if (!res.ok) {
+        // The previous render stays on screen. A transient 500 on a ten-second
+        // poll should not blank a chart someone is reading.
+        document.getElementById('usage-summary').textContent = res.error;
+        return;
+      }
+      drawUsage(res.data || {});
+    }
+
+    function drawUsage(series) {
+      const svg = document.getElementById('usage-chart');
+      const buckets = series.buckets || [];
+      const clients = series.clients || [];
+      const fill = seriesFill(clients);
+      const totals = buckets.map(b => (b.slots || []).reduce((a, v) => a + v, 0));
+      const busiest = totals.reduce((a, v) => Math.max(a, v), 0);
+      const ticks = axisTicks(busiest);
+      const ceiling = ticks[ticks.length - 1];
+      const slot = PLOT.iw / Math.max(buckets.length, 1);
+      const yOf = v => PLOT.top + PLOT.ih - (v / ceiling) * PLOT.ih;
+
+      svg.innerHTML = '';
+      // Gridlines: solid hairlines one step off the surface, and the baseline a
+      // shade stronger because it is where the bars are measured from. Never
+      // dashed — dashing reads as "projected" or "threshold" when it is a grid.
+      ticks.forEach(t => {
+        svg.appendChild(svgEl('line', {
+          x1: PLOT.left, x2: PLOT.left + PLOT.iw, y1: yOf(t), y2: yOf(t),
+          stroke: t === 0 ? '#39414f' : '#212734', 'stroke-width': '1',
+        }));
+        svg.appendChild(svgEl('text', {x: PLOT.left - 8, y: yOf(t) + 4, 'text-anchor': 'end'}, [slotText(t)]));
+      });
+      // The time axis every two hours on the hour, so the labels are wall-clock
+      // times an operator can line up against something else that happened.
+      buckets.forEach((b, i) => {
+        const at = new Date(b.t * 1000);
+        if (at.getMinutes() !== 0 || at.getHours() % 2 !== 0) return;
+        const x = PLOT.left + i * slot;
+        svg.appendChild(svgEl('line', {
+          x1: x, x2: x, y1: PLOT.top, y2: PLOT.top + PLOT.ih, stroke: '#212734', 'stroke-width': '1',
+        }));
+        svg.appendChild(svgEl('text', {x: x, y: PLOT.h - 10, 'text-anchor': 'middle'}, [clockLabel(b.t)]));
+      });
+
+      const width = Math.max(slot - PLOT.gap, 1);
+      buckets.forEach((b, i) => {
+        const x = PLOT.left + i * slot + PLOT.gap / 2;
+        // The newest column is both incomplete (the bucket is still running) and
+        // still filling in (a request in flight has not been logged yet), so it
+        // is drawn faded. Reading a half-elapsed bucket as a drop in traffic is
+        // the one wrong conclusion this chart invites.
+        const live = i === buckets.length - 1;
+        let base = 0;
+        (b.slots || []).forEach((v, s) => {
+          if (!(v > 0)) return;
+          const top = yOf(base + v);
+          const full = yOf(base) - top;
+          base += v;
+          // The 2px surface gap that separates one segment from the next, taken
+          // off the bottom of each. Skipped where the segment is too short to
+          // survive it: a band that is one pixel tall would vanish entirely, and
+          // a missing band is a worse lie than two that touch. The legend and the
+          // tooltip carry identity in that case.
+          const drawn = full > PLOT.gap + 1 ? full - PLOT.gap : full;
+          const rect = svgEl('rect', {
+            x: x, y: top, width: width, height: Math.max(drawn, 0.75), rx: '1',
+            fill: fill[(clients[s] || {}).client_ip] || NEUTRAL_FILL.other,
+          });
+          if (live) rect.setAttribute('opacity', '.55');
+          svg.appendChild(rect);
+        });
+      });
+
+      // The hover layer goes on last so it sits above every bar. One target per
+      // column, the full width of the slot and the full height of the plot: the
+      // reader aims at a TIME, not at a five-pixel segment, and the readout names
+      // every band at that time so nothing has to be landed on.
+      buckets.forEach((b, i) => {
+        const hit = svgEl('rect', {
+          class: 'hit', x: PLOT.left + i * slot, y: PLOT.top, width: slot, height: PLOT.ih,
+        });
+        hit.addEventListener('pointermove', ev => showUsageTip(ev, series, i, fill, totals[i]));
+        hit.addEventListener('pointerleave', hideUsageTip);
+        svg.appendChild(hit);
+      });
+
+      const anyTraffic = clients.length > 0;
+      const empty = document.getElementById('usage-empty');
+      empty.hidden = anyTraffic;
+      if (!anyTraffic) {
+        // An empty chart with an axis and an explanation, not a broken one. A
+        // router that has served nothing for twelve hours is a real state and has
+        // to be legible as one.
+        empty.innerHTML = '';
+        empty.appendChild(el('span', {}, [
+          'No requests in the last 12 hours. The axis is drawn so you can see that this is a router with ' +
+          'nothing to do, rather than a chart that failed to load.',
+        ]));
+      }
+      const requests = clients.reduce((a, c) => a + (c.requests || 0), 0);
+      const span = Math.round((series.to - series.from) / 3600);
+      document.getElementById('usage-summary').textContent =
+        'Last ' + span + ' hours · ' + Math.round((series.bucket_seconds || 300) / 60) + '-minute buckets · ' +
+        numberText(requests) + ' request' + (requests === 1 ? '' : 's') + ' · peak ' + slotText(busiest) + ' slots';
+      renderUsageLegend(clients, fill);
+    }
+
+    // The legend and the table view are the same table. A legend has to exist for
+    // two or more bands — colour alone is never the identity channel — and every
+    // number the tooltip shows has to be reachable without hovering, which a
+    // table of totals does for the aggregates. (Per-column values live in the
+    // tooltip and, request by request, in the Logs tab. 144 tab stops across the
+    // chart would be worse for a keyboard reader than this table is.)
+    function renderUsageLegend(clients, fill) {
+      if (!clients.length) {
+        emptyRow('usage-legend', 4, 'Nothing to attribute yet.');
+        return;
+      }
+      const body = document.getElementById('usage-legend');
+      body.innerHTML = '';
+      clients.forEach(c => {
+        const swatch = el('span', {class: 'swatch'});
+        swatch.style.background = fill[c.client_ip] || NEUTRAL_FILL.other;
+        const name = NEUTRAL_FILL[c.client_ip]
+          ? el('span', {class: 'muted', title: USAGE_NOTE[c.client_ip] || ''}, [c.client_ip])
+          : el('code', {}, [String(c.client_ip)]);
+        const tr = el('tr', {});
+        tr.appendChild(td([swatch, name]));
+        tr.appendChild(td([slotText(c.slots)], {class: 'num', title: 'Averaged over the whole window, so it ranks the bands against each other rather than describing any one column.'}));
+        tr.appendChild(td([slotText(c.peak)], {class: 'num', title: 'The busiest five minutes this client had.'}));
+        tr.appendChild(td([numberText(c.requests)], {class: 'num'}));
+        body.appendChild(tr);
+      });
+    }
+
+    // One tooltip listing every band at that time. Values lead and names follow —
+    // the reader already has the series and wants the number, which is the
+    // legend's hierarchy inverted. Names are addresses off the wire and reach the
+    // DOM as text nodes, never as concatenated markup.
+    function showUsageTip(event, series, i, fill, total) {
+      const wrap = document.getElementById('usage-wrap');
+      hideUsageTip();
+      const bucket = (series.buckets || [])[i];
+      if (!bucket) return;
+      const clients = series.clients || [];
+      const live = i === (series.buckets || []).length - 1;
+      const head = clockLabel(bucket.t) + '–' + clockLabel(bucket.t + (series.bucket_seconds || 300)) +
+        ' · ' + slotText(total) + ' slots' + (live ? ' · still filling' : '');
+      const tip = el('div', {class: 'tip'}, [
+        el('div', {class: 'tip-head'}, [head]),
+        el('div', {class: 'tip-units'}, ['slots · requests']),
+      ]);
+      let shown = 0;
+      clients.forEach((c, s) => {
+        const slots = (bucket.slots || [])[s] || 0;
+        const requests = (bucket.requests || [])[s] || 0;
+        if (!slots && !requests) return;
+        shown++;
+        const key = el('span', {class: 'tip-key'});
+        key.style.background = fill[c.client_ip] || NEUTRAL_FILL.other;
+        tip.appendChild(el('div', {class: 'tip-row'}, [
+          key,
+          el('span', {class: 'tip-name'}, [String(c.client_ip)]),
+          el('span', {class: 'tip-value'}, [slotText(slots) + ' · ' + numberText(requests)]),
+        ]));
+      });
+      if (!shown) tip.appendChild(el('div', {class: 'muted'}, ['Nothing in flight.']));
+      wrap.appendChild(tip);
+      // Positioned off the pointer and clamped inside the plot, so a column at
+      // either edge does not push the readout off the panel.
+      const box = wrap.getBoundingClientRect();
+      const x = event.clientX - box.left;
+      const y = event.clientY - box.top;
+      // Above the pointer, flipping below when it will not fit — ten bands make a
+      // tall readout, and pinning it to the top instead would park it over the
+      // busiest part of the plot for most of the chart's height.
+      let above = y - tip.offsetHeight - 12;
+      if (above < 4) above = Math.min(y + 16, box.height - tip.offsetHeight - 4);
+      tip.style.left = Math.max(4, Math.min(x + 14, box.width - tip.offsetWidth - 4)) + 'px';
+      tip.style.top = Math.max(4, above) + 'px';
+    }
+    function hideUsageTip() {
+      document.querySelectorAll('#usage-wrap .tip').forEach(n => n.remove());
     }
 
     // ── Providers ───────────────────────────────────────────────────────────
@@ -1657,10 +2028,14 @@
     }
     function logPrev() { if (logOffset >= LOG_LIMIT) { logOffset -= LOG_LIMIT; loadLogs(activeLogBackend); } }
     function logNext() { if (lastLogData.length === LOG_LIMIT) { logOffset += LOG_LIMIT; loadLogs(activeLogBackend); } }
+    // Who made the request, in the two senses that differ: the credential, and
+    // the machine. One shared key is routinely several machines, which is the
+    // whole reason the address is recorded alongside it.
     function callerLabel(row) {
-      if (!row.key_id) return 'no credential required';
-      if (row.key_id === 'env') return 'environment token';
-      return 'key ' + row.key_id;
+      let who = 'key ' + row.key_id;
+      if (!row.key_id) who = 'no credential required';
+      else if (row.key_id === 'env') who = 'environment token';
+      return row.client_ip ? who + ' from ' + row.client_ip : who;
     }
     // ── Transcript rendering ────────────────────────────────────────────────
     //
@@ -2025,8 +2400,14 @@
 
     // Auto-refresh the fleet, but only while it is on screen and the session is
     // live: polling an admin endpoint from a signed-out page just answers 401.
+    // The usage chart rides the same cadence — its window is aligned to the
+    // clock, so a poll changes the newest column and leaves the other 143 exactly
+    // where they were. usageLoading guards against a slow query overlapping the
+    // next tick and two responses racing to draw.
     setInterval(() => {
-      if (signedIn && activeTab === 'fleet') refreshBackends();
+      if (!signedIn) return;
+      if (activeTab === 'fleet') refreshBackends();
+      else if (activeTab === 'usage' && !usageLoading) loadUsage();
     }, 10000);
 
     activeTab = TABS.indexOf(location.hash.slice(1)) === -1 ? 'fleet' : location.hash.slice(1);

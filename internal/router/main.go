@@ -626,6 +626,9 @@ type Router struct {
 	// relays holds the upstream routers this one may route through, and the last
 	// fleet each reported (see relay.go). A value for the same reason as groups.
 	relays relayStore
+	// usage caches the last render of the dashboard's usage chart. A value for
+	// the same reason as groups. See usageCache.
+	usage usageCache
 	// relayRefresh serialises the reconcile pass, which the ticker and both admin
 	// write paths can all start. See refreshRelays.
 	relayRefresh sync.Mutex
@@ -1107,6 +1110,60 @@ func (r *Router) handleLogs(w http.ResponseWriter, req *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"logs": rows})
 }
 
+// usageCache holds the last render of the usage chart, and exists because of one
+// number: this query costs about 150ms over twenty thousand log rows and about
+// 1.2 SECONDS over two hundred thousand, and the SQLite pool is capped at a
+// single connection. A page polling every ten seconds would hand a fifth of that
+// connection to a chart on a busy router — and every open browser tab would want
+// its own copy.
+//
+// The lifetime is derived from what the query cost rather than fixed, because
+// the two deployments want opposite things. A quiet router answers in
+// milliseconds and should have a genuinely live chart; a router with a
+// quarter-million rows in the window should not be re-deriving them on every
+// tick, and would rather show a figure that is half a minute old. Twenty times
+// the query's own cost holds the database's share at about five percent either
+// way: ~3s at 150ms, so a ten-second poll is never served stale, and ~24s at
+// 1.2s, where the chart visibly settles into updating less often.
+//
+// The cached frame is keyed on its end, so it also expires the instant the
+// five-minute window rolls over. A cache that could pin the chart to a stale
+// window would be far worse than a slow one.
+type usageCache struct {
+	mu     sync.Mutex
+	series *UsageSeries
+	until  time.Time
+}
+
+const (
+	usageCacheRatio = 20
+	usageCacheMin   = 2 * time.Second
+	usageCacheMax   = time.Minute
+)
+
+func (c *usageCache) get(frameEnd int64, now time.Time) *UsageSeries {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.series == nil || c.series.To != frameEnd || now.After(c.until) {
+		return nil
+	}
+	return c.series
+}
+
+func (c *usageCache) put(series *UsageSeries, now time.Time, cost time.Duration) {
+	ttl := cost * usageCacheRatio
+	if ttl < usageCacheMin {
+		ttl = usageCacheMin
+	}
+	if ttl > usageCacheMax {
+		ttl = usageCacheMax
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.series = series
+	c.until = now.Add(ttl)
+}
+
 // handleUsage answers the dashboard's usage chart: the last twelve hours of
 // request logs as mean concurrency per five-minute bucket, split by the address
 // each request came from.
@@ -1129,17 +1186,25 @@ func (r *Router) handleUsage(w http.ResponseWriter, req *http.Request) {
 	if !r.requireAdmin(w, req) {
 		return
 	}
+	now := time.Now()
+	frame := newUsageSeries(now, usageWindow, usageBucket)
 	// No database configured at all. An empty frame rather than an error: the
 	// chart is not broken, there is simply nothing recording.
 	if r.logs == nil {
-		writeJSON(w, http.StatusOK, newUsageSeries(time.Now(), usageWindow, usageBucket))
+		writeJSON(w, http.StatusOK, frame)
 		return
 	}
-	series, err := r.logs.UsageSeries(req.Context(), time.Now(), usageWindow, usageBucket, usageTopClients)
+	if cached := r.usage.get(frame.To, now); cached != nil {
+		writeJSON(w, http.StatusOK, cached)
+		return
+	}
+	started := time.Now()
+	series, err := r.logs.UsageSeries(req.Context(), now, usageWindow, usageBucket, usageTopClients)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, validationError{Message: err.Error()})
 		return
 	}
+	r.usage.put(series, now, time.Since(started))
 	writeJSON(w, http.StatusOK, series)
 }
 
@@ -5801,7 +5866,11 @@ WITH RECURSIVE
 	-- Clamped to the window, so a request straddling either edge contributes only
 	-- the part of itself that is on screen. e0 >= lo drops the rows that the
 	-- look-back above dragged in but that had already finished.
-	spans AS (
+	--
+	-- MATERIALIZED because this is read twice below, and the alternative is
+	-- scanning and clamping the whole window a second time to work out who the
+	-- busiest callers were. Measured at 200k rows: 1.64s down to 1.21s.
+	spans AS MATERIALIZED (
 		SELECT ip, max(s0, ?) AS s, min(e0, ?) AS e FROM raw WHERE e0 >= ?
 	),
 	-- Which addresses get a band of their own. Ranked on busy time rather than on

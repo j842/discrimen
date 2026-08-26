@@ -89,10 +89,52 @@ const (
 // benchRanked is one backend's calibration outcome, ordered by the score it got
 // on this pool.
 type benchRanked struct {
-	id      string
-	score   float64
-	routerQ int
-	pass    map[string]bool
+	id       string
+	score    float64 // pass rate over MEASURED observations (censored ones excluded)
+	routerQ  int
+	pass     map[string]bool
+	censored map[string]bool
+	usable   int  // observations that produced an answer rather than a deadline
+	total    int  // observations attempted
+	observer bool // counts towards item statistics — see benchIsObserver
+}
+
+// benchMinObservers is how many MEASURED observations an item needs before its
+// pass rate means anything. Below this the item is dropped rather than scored
+// from one or two workers, because p is what assigns the tier and a tier drawn
+// from two observations is a guess with a number on it.
+const benchMinObservers = 3
+
+// benchIsObserver decides whether a backend may vote on how hard a QUESTION is.
+//
+// Two ways to be disqualified, and neither is a judgement about the worker:
+//
+//   - Almost everything it attempted was CENSORED — it hit the deadline rather
+//     than answering. Measured on llm-cpu-gemma-26B-silver, which needed 6.9
+//     minutes for a math_comp question that finished and did not finish three
+//     others inside eight. Its failures are a statement about tokens per second.
+//   - Its measured pass rate is ~0 or ~1. A worker that answers everything the
+//     same way separates nothing, which is the same reason all-pass and all-fail
+//     ITEMS are dropped below. Standard item analysis excludes both.
+//
+// It keeps its production quality score either way; that score is SUPPOSED to
+// count slowness as a fail, because a worker that cannot answer inside the
+// deadline genuinely cannot serve the request. What it must not do is carry
+// that verdict over into a claim about the question.
+func benchIsObserver(f benchRanked) (bool, string) {
+	if f.total == 0 {
+		return false, "no observations"
+	}
+	if rate := float64(f.usable) / float64(f.total); rate < 0.25 {
+		return false, fmt.Sprintf("%.0f%% of answers hit the deadline — measures throughput, not difficulty", (1-rate)*100)
+	}
+	if f.usable < benchMinObservers {
+		return false, "too few measured answers"
+	}
+	if f.score < 0.05 || f.score > 0.95 {
+		return false, fmt.Sprintf("pass rate %.0f%% separates nothing", f.score*100)
+	}
+	return true, ""
 }
 
 type scoredQuestion struct {
@@ -120,13 +162,29 @@ func benchEmit(sandboxURL string) error {
 		if len(r.Pass) == 0 {
 			continue
 		}
-		n := 0
-		for _, ok := range r.Pass {
+		// Scored over MEASURED answers only. Dividing by every attempt would rank
+		// a slow worker by how often it beat the clock, and this ranking decides
+		// the top/bottom halves that discrimination is measured against.
+		passes, usable := 0, 0
+		for id, ok := range r.Pass {
+			if r.Censored[id] {
+				continue
+			}
+			usable++
 			if ok {
-				n++
+				passes++
 			}
 		}
-		fleet = append(fleet, benchRanked{r.Backend, float64(n) / float64(len(r.Pass)), r.RouterQuality, r.Pass})
+		score := 0.0
+		if usable > 0 {
+			score = float64(passes) / float64(usable)
+		}
+		f := benchRanked{
+			id: r.Backend, score: score, routerQ: r.RouterQuality,
+			pass: r.Pass, censored: r.Censored, usable: usable, total: len(r.Pass),
+		}
+		f.observer, _ = benchIsObserver(f)
+		fleet = append(fleet, f)
 	}
 	if len(fleet) < 2 {
 		return fmt.Errorf("need at least 2 calibrated backends to measure discrimination, have %d", len(fleet))
@@ -136,11 +194,23 @@ func benchEmit(sandboxURL string) error {
 	fmt.Fprintln(os.Stderr, "fleet on this pool:")
 	poolScores := make([]float64, 0, len(fleet))
 	routerScores := make([]float64, 0, len(fleet))
+	var observers []benchRanked
 	for _, f := range fleet {
-		fmt.Fprintf(os.Stderr, "  %-30s pool=%3.0f%%  router q=%d\n", f.id, f.score*100, f.routerQ)
+		note := ""
+		if censored := f.total - f.usable; censored > 0 {
+			note = fmt.Sprintf("  %d censored", censored)
+		}
+		if ok, why := benchIsObserver(f); !ok {
+			fmt.Fprintf(os.Stderr, "  %-30s pool=%3.0f%%  router q=%-3d%s  EXCLUDED from item stats: %s\n",
+				f.id, f.score*100, f.routerQ, note, why)
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "  %-30s pool=%3.0f%%  router q=%-3d%s\n", f.id, f.score*100, f.routerQ, note)
+		observers = append(observers, f)
 		poolScores = append(poolScores, f.score)
 		routerScores = append(routerScores, float64(f.routerQ))
 	}
+	fleet = observers
 
 	// The correlation check: do the two instruments RANK the fleet the same way?
 	// A high value means the hand-authored set is tracking real capability and
@@ -179,7 +249,11 @@ func benchEmit(sandboxURL string) error {
 		graded, passes := 0, 0
 		for _, f := range fleet {
 			ok, seen := f.pass[q.ID]
-			if !seen {
+			// A censored observation is skipped, not counted as a miss. Counting it
+			// makes a LONG question look like a HARD one, and since the fast half of
+			// the fleet is also the strong half, it inflates discrimination on
+			// exactly the items where the difference is throughput.
+			if !seen || f.censored[q.ID] {
 				continue
 			}
 			graded++
@@ -187,7 +261,7 @@ func benchEmit(sandboxURL string) error {
 				passes++
 			}
 		}
-		if graded < len(fleet) {
+		if graded < benchMinObservers {
 			noData++ // an interrupted calibration is not evidence about the question
 			continue
 		}
@@ -296,17 +370,28 @@ func benchEmit(sandboxURL string) error {
 	return nil
 }
 
+// benchHalfRate is one half of the fleet's pass rate on one question, over the
+// observations that were actually measured. A censored observation is excluded
+// from the numerator AND the denominator: counting it as a miss would credit
+// the fast half with discrimination it did not demonstrate.
 func benchHalfRate(half []benchRanked, id string) float64 {
-	if len(half) == 0 {
-		return 0
-	}
-	n := 0
+	n, seen := 0, 0
 	for _, f := range half {
+		if f.censored[id] {
+			continue
+		}
+		if _, ok := f.pass[id]; !ok {
+			continue
+		}
+		seen++
 		if f.pass[id] {
 			n++
 		}
 	}
-	return float64(n) / float64(len(half))
+	if seen == 0 {
+		return 0
+	}
+	return float64(n) / float64(seen)
 }
 
 func benchRenderFile(selected []scoredQuestion, pool *benchPool, rho float64, sandboxURL string) ([]byte, error) {

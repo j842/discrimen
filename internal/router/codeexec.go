@@ -82,6 +82,27 @@ type codeGradeResult struct {
 	CasesRun    int    `json:"cases_run"`
 	CasesPassed int    `json:"cases_passed"`
 	Error       string `json:"error"`
+	// PrefixApplied is the sidecar confirming it understood Prefix. A POINTER
+	// because the three states differ: true (applied), false (none was sent) and
+	// ABSENT (a sidecar too old to know about prefixes at all). Only the last is
+	// a problem, and a plain bool could not express it.
+	PrefixApplied *bool `json:"prefix_applied"`
+}
+
+// checkPrefixHonoured fails a grade whose prefix the sidecar ignored.
+//
+// Version skew here is silent and total: an older sidecar drops the field, runs
+// the fragment alone, and returns a confident pass:false for every completion
+// question and every worker. The task then looks hard rather than broken, which
+// is the exact failure this whole path was rewritten to fix. Reporting an error
+// routes it to the ungraded path instead, where an outage already lives — a
+// question we could not grade must never count as one the model got wrong.
+func checkPrefixHonoured(sentPrefix string, out codeGradeResult) error {
+	if sentPrefix == "" || (out.PrefixApplied != nil && *out.PrefixApplied) {
+		return nil
+	}
+	return fmt.Errorf("sandbox ignored the completion prefix — it predates prefix support "+
+		"and would grade the answer as a bare fragment; redeploy discrimen-sandbox (cases_run=%d)", out.CasesRun)
 }
 
 // codeExecDefaults. The timeout is per RUN, not per case: a submission gets one
@@ -140,6 +161,9 @@ func (r *Router) gradeCode(ctx context.Context, code string, q benchmarkQ) (bool
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return false, err
 	}
+	if err := checkPrefixHonoured(q.Code.Prefix, out); err != nil {
+		return false, err
+	}
 	// A submission that crashed or timed out is a WRONG ANSWER, not an outage —
 	// the sidecar answered, and its answer is "this program does not work". Only
 	// a sidecar that could not be reached or could not reply reaches the error
@@ -195,6 +219,9 @@ func benchGradeCodeStandalone(sandboxURL string, q poolQuestion, code string) (b
 	}
 	var out codeGradeResult
 	if err := benchSandboxPost(sandboxURL, "/grade", body, &out); err != nil {
+		return false, err
+	}
+	if err := checkPrefixHonoured(benchCodePrefixFor(q), out); err != nil {
 		return false, err
 	}
 	return out.Pass, nil

@@ -407,12 +407,13 @@ func runBenchCommand(argv []string) bool {
 		conc := fs.Int("concurrency", 2, "concurrent questions per backend")
 		limit := fs.Int("limit", 0, "max questions per task (0 = all) — for a smoke test before the full run")
 		sandbox := fs.String("sandbox", os.Getenv("SANDBOX_URL"), "code-execution sidecar base URL — required to grade the coding tasks")
+		skip := fs.String("skip", "", "comma-separated backend ids to exclude — for a row the registry still calls ready whose engine is gone")
 		_ = fs.Parse(args)
 		if *router == "" {
 			benchUsage()
 			os.Exit(2)
 		}
-		err = benchCalibrate(*router, *token, *sandbox, *conc, *limit)
+		err = benchCalibrate(*router, *token, *sandbox, *conc, *limit, benchSplitCSV(*skip))
 	case "emit":
 		fs := flag.NewFlagSet("emit", flag.ExitOnError)
 		// Only needed when the selection contains coding questions: their test

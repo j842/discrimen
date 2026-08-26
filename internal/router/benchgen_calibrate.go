@@ -32,6 +32,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -50,6 +51,14 @@ type calibResult struct {
 	// old instrument and the new one.
 	RouterQuality int             `json:"router_quality"`
 	Pass          map[string]bool `json:"pass"`
+	// Censored records the observations where the worker hit the answer deadline
+	// instead of producing a gradeable answer. Pass stays false for those — too
+	// slow to be usable IS a fail, and production scores it that way — but item
+	// analysis must be able to tell the two apart. A censored observation says
+	// something about the WORKER's throughput and nothing about the QUESTION's
+	// difficulty, and letting it vote on difficulty is how a long question gets
+	// mistaken for a hard one.
+	Censored map[string]bool `json:"censored,omitempty"`
 }
 
 func (c *calibration) forBackend(id string) *calibResult {
@@ -106,7 +115,7 @@ func benchLimitPerTask(qs []poolQuestion, n int) []poolQuestion {
 	return out
 }
 
-func benchCalibrate(routerURL, token, sandboxURL string, concurrency, limit int) error {
+func benchCalibrate(routerURL, token, sandboxURL string, concurrency, limit int, skip map[string]bool) error {
 	pool, err := benchLoadPool()
 	if err != nil {
 		return err
@@ -115,6 +124,21 @@ func benchCalibrate(routerURL, token, sandboxURL string, concurrency, limit int)
 	backends, err := benchFetchBackends(routerURL, token)
 	if err != nil {
 		return err
+	}
+	// Excluding a backend is not the same as it failing: a row whose engine is
+	// gone but whose cached profile still says ready will answer every question
+	// with a fast 404, and recording that as evidence about the QUESTIONS is how
+	// a dead worker gets to vote on difficulty.
+	if len(skip) > 0 {
+		kept := backends[:0]
+		for _, b := range backends {
+			if skip[b.ID] {
+				fmt.Fprintf(os.Stderr, "  skipping %s (excluded)\n", b.ID)
+				continue
+			}
+			kept = append(kept, b)
+		}
+		backends = kept
 	}
 	if len(backends) == 0 {
 		return fmt.Errorf("no ready chat backends to calibrate against")
@@ -168,14 +192,21 @@ func benchCalibrate(routerURL, token, sandboxURL string, concurrency, limit int)
 				go func(q poolQuestion) {
 					defer qwg.Done()
 					defer func() { <-sem }()
-					pass, graded := benchGradeOne(routerURL, token, b.ID, sandboxURL, q, busy)
+					pass, kind := benchGradeOne(routerURL, token, b.ID, sandboxURL, q, busy)
 					mu.Lock()
 					// An ungraded pair is left absent rather than recorded false, so
 					// the resume path above picks it up again. Recording it would turn
 					// a sidecar outage or a dead worker into permanent evidence that
 					// the question is hard.
-					if graded {
+					switch kind {
+					case benchGradeGraded:
 						res.Pass[q.ID] = pass
+					case benchGradeCensored:
+						res.Pass[q.ID] = false
+						if res.Censored == nil {
+							res.Censored = map[string]bool{}
+						}
+						res.Censored[q.ID] = true
 					}
 					done++
 					// Checkpoint often: this runs for hours and will be interrupted.
@@ -214,7 +245,7 @@ func benchCalibrate(routerURL, token, sandboxURL string, concurrency, limit int)
 // question calibrated under different conditions than it will be graded under
 // is calibrated for nothing. The tiers this pool replaces are all at or above
 // benchHardTier, so thinking is unconditionally on.
-func benchGradeOne(routerURL, token, backendID, sandboxURL string, q poolQuestion, busy *benchBusyTracker) (pass, graded bool) {
+func benchGradeOne(routerURL, token, backendID, sandboxURL string, q poolQuestion, busy *benchBusyTracker) (pass bool, kind benchGradeKind) {
 	payload := map[string]any{
 		"model":                "default",
 		"stream":               false,
@@ -225,7 +256,7 @@ func benchGradeOne(routerURL, token, backendID, sandboxURL string, q poolQuestio
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return false, false
+		return false, benchGradeUngraded
 	}
 	for attempt := 1; attempt <= benchMaxAttempts; attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), benchAnswerDeadline)
@@ -233,7 +264,7 @@ func benchGradeOne(routerURL, token, backendID, sandboxURL string, q poolQuestio
 			trimSlash(routerURL)+"/v1/chat/completions", bytes.NewReader(body))
 		if err != nil {
 			cancel()
-			return false, false
+			return false, benchGradeUngraded
 		}
 		req.Header.Set("Content-Type", "application/json")
 		if token != "" {
@@ -247,7 +278,7 @@ func benchGradeOne(routerURL, token, backendID, sandboxURL string, q poolQuestio
 		if err != nil {
 			cancel()
 			if isTimeout(err) {
-				return false, true // too slow to be usable is a FAIL, and is never retried
+				return false, benchGradeCensored // too slow to be usable is a FAIL, but a fail about SPEED
 			}
 			time.Sleep(benchRetryBackoff * time.Duration(attempt))
 			continue
@@ -265,7 +296,7 @@ func benchGradeOne(routerURL, token, backendID, sandboxURL string, q poolQuestio
 			// against a sibling's 82/111 on identical questions.
 			if benchBusyStatus(fmt.Errorf("completion returned %d: busy", resp.StatusCode)) {
 				if busy.busy() {
-					return false, false // streak breaker: the worker is gone, not congested
+					return false, benchGradeUngraded // streak breaker: the worker is gone, not congested
 				}
 				time.Sleep(benchBusyWait)
 				attempt-- // a queue is not one of the three real attempts
@@ -277,7 +308,7 @@ func benchGradeOne(routerURL, token, backendID, sandboxURL string, q poolQuestio
 		busy.ok()
 		var decoded map[string]any
 		if json.Unmarshal(raw, &decoded) != nil {
-			return false, false
+			return false, benchGradeUngraded
 		}
 		content, _ := completionContent(decoded)
 		// A coding question has no Expect to compare against — its ground truth is
@@ -294,16 +325,16 @@ func benchGradeOne(routerURL, token, backendID, sandboxURL string, q poolQuestio
 				// the pair unrecorded and a later run retries it; a question that can
 				// never be graded is reported separately and dropped from the pool.
 				fmt.Fprintf(os.Stderr, "  sandbox: %v\n", err)
-				return false, false
+				return false, benchGradeUngraded
 			}
-			return pass, true
+			return pass, benchGradeGraded
 		}
-		return checkAnswer(benchmarkQ{Prompt: q.Prompt, Expect: q.Expect, Match: q.Match}, content), true
+		return checkAnswer(benchmarkQ{Prompt: q.Prompt, Expect: q.Expect, Match: q.Match}, content), benchGradeGraded
 	}
 	// Out of attempts without ever reaching a gradeable answer. That is a
 	// transport failure, not a wrong answer: leave it unrecorded so a later run
 	// retries rather than baking a network blip into the item's difficulty.
-	return false, false
+	return false, benchGradeUngraded
 }
 
 type benchBackend struct {
@@ -370,3 +401,32 @@ func trimSlash(s string) string {
 	}
 	return s
 }
+
+// benchSplitCSV parses a comma-separated flag into a set, ignoring blanks.
+func benchSplitCSV(s string) map[string]bool {
+	out := map[string]bool{}
+	for _, part := range strings.Split(s, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out[part] = true
+		}
+	}
+	return out
+}
+
+// benchGradeKind separates the three things that can come back from one
+// (worker, question) attempt. They are NOT interchangeable and collapsing any
+// two of them has caused a real miscalibration:
+//
+//	graded    the worker answered and the answer was checked — the only kind
+//	          that is evidence about the question
+//	censored  the worker hit the deadline. Scored a fail (production does too),
+//	          but it measures throughput, not difficulty
+//	ungraded  nothing was learned — sidecar down, transport failure, dead row.
+//	          Recorded nowhere, so a later run retries it
+type benchGradeKind int
+
+const (
+	benchGradeUngraded benchGradeKind = iota
+	benchGradeGraded
+	benchGradeCensored
+)

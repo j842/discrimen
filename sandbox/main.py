@@ -177,7 +177,16 @@ def handle_grade(request: dict) -> dict:
         "stop_on_first_failure": bool(request.get("stop_on_first_failure")),
     }
     outcome = _run("grade", payload, timeout_ms)
-    return _assemble(outcome, len(tests), timeout_ms)
+    result = _assemble(outcome, len(tests), timeout_ms)
+    # Version marker, and the only defence against a silent regrade. A sidecar
+    # that predates prefix support drops the field and grades a completion
+    # answer as a standalone fragment — which never compiles, so every
+    # completion question fails for every worker and the task reads as merely
+    # hard. That is precisely the bug this field exists to make impossible to
+    # reintroduce by deploying an old image: the caller checks for it and treats
+    # its absence as "could not grade", not as a wrong answer.
+    result["prefix_applied"] = bool(prefix)
+    return result
 
 
 def _assemble(outcome: supervisor.Outcome, requested: int, timeout_ms: int) -> dict:

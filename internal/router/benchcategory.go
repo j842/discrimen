@@ -1,6 +1,7 @@
 package router
 
 import (
+	"fmt"
 	"math"
 	"regexp"
 	"sort"
@@ -318,4 +319,41 @@ func benchCategoryRank(cat string) int {
 		}
 	}
 	return len(benchCategoryOrder)
+}
+
+// benchCategorySummary renders the breakdown as one compact line for a LIST
+// view: "coding 47%→11%  maths 90%→85%  reasoning 78%→31%".
+//
+// It exists so `ask -l` can show where a worker's quality comes from without a
+// round trip per backend. The full breakdown lives on
+// GET /backends/{id}/benchmark, which is per-worker by nature; asking a list
+// command to fetch it N times to render one line each is the wrong trade, and
+// putting the whole structure on /backends instead would bloat a payload the
+// dashboard polls every ten seconds.
+//
+// The arrow is the thinking-on → thinking-off pair, which is the number worth
+// seeing at a glance: a category with a small gap is a genuine ability, a large
+// one is a scratchpad doing the work. When the no-think run's per-question
+// results were not stored the arrow is omitted rather than shown as →0 — a
+// worker really can score zero with thinking off, so "not measured" and
+// "measured as nothing" must not render alike.
+//
+// Computed ONCE when a profile is applied and carried on the row, not derived
+// per request: the inputs only change when the worker is re-profiled.
+func benchCategorySummary(think, nothink []BenchResult) string {
+	cats := benchCategoryBreakdown(think, nothink)
+	if len(cats) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, c := range cats {
+		if b.Len() > 0 {
+			b.WriteString("  ")
+		}
+		fmt.Fprintf(&b, "%s %d%%", c.Category, c.Think.Percent)
+		if c.NoThink != nil {
+			fmt.Fprintf(&b, "→%d%%", c.NoThink.Percent)
+		}
+	}
+	return b.String()
 }

@@ -60,11 +60,16 @@ type WorkerProfile struct {
 	// verdict. Unknown falls back to chat_template_kwargs, the spelling the whole
 	// fleet has always spoken — a zero value that meant "cannot think" would
 	// silently switch thinking off across the fleet on the first warm restart.
-	ThinkingDialect string        `json:"thinking_dialect,omitempty"`
-	BenchVersion    int           `json:"bench_version"`            // question-set version this quality was measured against
-	QualityDetail   string        `json:"quality_detail,omitempty"` // per-tier + truncation breakdown
-	Failed          []string      `json:"failed,omitempty"`         // labels of benchmark questions the worker missed
-	BenchResults    []BenchResult `json:"bench_results,omitempty"`  // full per-question Q&A from the most recent run
+	ThinkingDialect string `json:"thinking_dialect,omitempty"`
+	BenchVersion    int    `json:"bench_version"`            // question-set version this quality was measured against
+	QualityDetail   string `json:"quality_detail,omitempty"` // per-tier + truncation breakdown
+	// CategorySummary is the one-line "coding 47%→11%  maths 90%→85%" form,
+	// rendered once here rather than per request. A tier is a difficulty band and
+	// cuts across every subject, so the per-tier line above cannot answer "how is
+	// it at coding?" — this can. See benchCategorySummary.
+	CategorySummary string        `json:"category_summary,omitempty"`
+	Failed          []string      `json:"failed,omitempty"`        // labels of benchmark questions the worker missed
+	BenchResults    []BenchResult `json:"bench_results,omitempty"` // full per-question Q&A from the most recent run
 	// BenchResultsNoThink is the same, for the no-think pass: aligned index-for-
 	// index with BenchResults (and so with benchmarkQuestions), or empty.
 	//
@@ -410,6 +415,7 @@ func (r *Router) profileBackend(b *Backend, model string) (*WorkerProfile, error
 	p.Quality = quality
 	p.BenchVersion = benchmarkVersion
 	p.QualityDetail = qBreakdown
+	p.CategorySummary = benchCategorySummary(qResults, nil)
 	p.Failed = qFailed
 	p.BenchResults = qResults
 	qMsg := fmt.Sprintf("%d%%", quality)
@@ -430,6 +436,9 @@ func (r *Router) profileBackend(b *Backend, model string) (*WorkerProfile, error
 			// a tier does not map to one category, so the per-tier line alone
 			// cannot answer "how is it at coding with thinking off?".
 			p.BenchResultsNoThink = ntResults
+			// Recompute now that both runs are in hand, so the summary carries the
+			// thinking-on→off arrow rather than the thinking-only half.
+			p.CategorySummary = benchCategorySummary(qResults, ntResults)
 			p.Checks["quality_nothink"] = Check{OK: true,
 				Message: fmt.Sprintf("%d%% %s", ntScore, ntBreakdown)}
 		}
@@ -1042,6 +1051,7 @@ func (r *Registry) applyProfileIfGen(id string, gen int64, p *WorkerProfile) boo
 	b.Thinking = p.Thinking
 	b.ThinkingDialect = p.ThinkingDialect
 	b.QualityDetail = p.QualityDetail
+	b.CategorySummary = p.CategorySummary
 	// No operator-declared analog exists for the no-think score: it is purely
 	// measured, so the profile is always authoritative. Zero (old profile, or a
 	// failed no-think pass) means qualityFor falls back to Quality.

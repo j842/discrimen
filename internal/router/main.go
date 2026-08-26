@@ -173,6 +173,12 @@ type Backend struct {
 	// forgiven on the next restart as well.
 	RejectedFields []string `json:"rejected_fields,omitempty"`
 	QualityDetail  string   `json:"quality_detail,omitempty"` // benchmark per-tier + truncation breakdown
+	// CategorySummary is the compact per-subject line `ask -l` renders. Kept as a
+	// pre-rendered string rather than a structure because /backends is polled
+	// every ten seconds by the dashboard: one short line per worker is affordable,
+	// the full breakdown is not, and it already has a home on
+	// GET /backends/{id}/benchmark.
+	CategorySummary string `json:"category_summary,omitempty"`
 	// QualityNoThink is the benchmark scored with thinking DISABLED on every
 	// question — what a requirements.thinking="off" client is actually served
 	// by. Zero means not measured (pre-two-score profile, or provisional): a
@@ -3476,6 +3482,7 @@ func (r *Router) certifyBackend(id string) {
 					prof.QualityNoThink = score
 					prof.QualityNoThinkDetail = breakdown
 					prof.BenchResultsNoThink = ntResults
+					prof.CategorySummary = benchCategorySummary(prof.BenchResults, ntResults)
 					if prof.Checks == nil {
 						prof.Checks = map[string]Check{}
 					}

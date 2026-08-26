@@ -246,13 +246,22 @@ func benchCalibrate(routerURL, token, sandboxURL string, concurrency, limit int,
 // is calibrated for nothing. The tiers this pool replaces are all at or above
 // benchHardTier, so thinking is unconditionally on.
 func benchGradeOne(routerURL, token, backendID, sandboxURL string, q poolQuestion, busy *benchBusyTracker) (pass bool, kind benchGradeKind) {
+	// Built by the SAME function production grading uses, rather than
+	// reimplemented here. The two had drifted — this path sent q.Prompt verbatim
+	// while benchOne appended " Give the number only." — so a question's measured
+	// difficulty came from a prompt it would never be asked in production. The
+	// tier is not known yet at calibration time (it is assigned FROM these
+	// results), so every candidate is graded at the hard-tier budget, which is
+	// where the whole pool is destined.
+	bq := benchmarkQ{Tier: benchHardTier, Prompt: q.Prompt, Expect: q.Expect, Match: q.Match}
+	prompt, maxTokens := benchRequestFor(bq, true)
 	payload := map[string]any{
 		"model":                "default",
 		"stream":               false,
-		"max_tokens":           benchThinkMaxTokens,
+		"max_tokens":           maxTokens,
 		"temperature":          0,
 		"chat_template_kwargs": map[string]bool{"enable_thinking": true},
-		"messages":             []map[string]string{{"role": "user", "content": q.Prompt}},
+		"messages":             []map[string]string{{"role": "user", "content": prompt}},
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -329,7 +338,7 @@ func benchGradeOne(routerURL, token, backendID, sandboxURL string, q poolQuestio
 			}
 			return pass, benchGradeGraded
 		}
-		return checkAnswer(benchmarkQ{Prompt: q.Prompt, Expect: q.Expect, Match: q.Match}, content), benchGradeGraded
+		return checkAnswer(bq, content), benchGradeGraded
 	}
 	// Out of attempts without ever reaching a gradeable answer. That is a
 	// transport failure, not a wrong answer: leave it unrecorded so a later run

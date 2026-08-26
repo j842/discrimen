@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"math"
 	"net"
@@ -119,6 +120,31 @@ import (
 // measured formatting, not knowledge. Strict grading is unchanged — nobody's full
 // credit moved — loose only ADDS credit, and the tally keeps the formatting cost
 // visible per worker.
+// v39: GRADING correctness. Four confirmed defects, each of which changed scores
+// silently — a mis-graded question is indistinguishable from a wrong answer:
+//
+//	exact-list (31% of the set) failed a CORRECT answer whose lead-in contained a
+//	comma, because the element count was gated before anything was compared.
+//	"So," and "Therefore," are among the most common things a model writes.
+//
+//	exact-list with a single-element answer PASSED a wrong one: almost any prose
+//	line parses as a one-element list, so the scan walked up into abandoned
+//	working and graded a value the model had explicitly retracted.
+//
+//	"contains" was a bare substring, so a reply that mentioned the expected token
+//	while ruling it out ("Thursday, Friday, Saturday. So it is Saturday.") passed.
+//
+//	loose half-credit rewarded FORMATTING: bolding the option labels matched the
+//	expected letter whichever option was chosen, and bolding step headers matched
+//	on the step number. It was gameable outright — "**40**, **41**, **42**, **43**
+//	or **44**. I'll say 44." collected half credit for an expected 42.
+//
+// Also v39: the token budget is a property of the QUESTION rather than of the
+// thinking mode, so Quality and QualityNoThink differ only in the thing they are
+// named for (they were 16384 and 1024 on the same hard questions); calibration
+// and production now build the request through one shared function; and the
+// headroom bands move off tier 12 (benchCodingTier), which they were filling
+// with unpassable maths.
 // v38: the per-question answer deadline goes 2m -> 6m and the per-tier split is removed.
 // Every cached profile is invalidated because a profile is only comparable to another
 // measured under the same clock: at 2 minutes, 75% of llm-6000pro's recorded misses were
@@ -127,7 +153,7 @@ import (
 // FRAGMENTS continuing a partial solution shown in the prompt), which had scored the two
 // strongest workers 0% on that task while the weakest scored highest. See
 // benchAnswerDeadline and poolCode.Prefix.
-const benchmarkVersion = 38
+const benchmarkVersion = 39
 
 // benchmarkQ is one graded question in the cold-start quality benchmark. The
 // question set lives in benchmark_data.go.
@@ -361,20 +387,7 @@ type benchOutcome struct {
 // main benchmark does — a second copy of the request/grading logic would drift.
 func (r *Router) benchOne(b *Backend, q benchmarkQ, think bool, busy *benchBusyTracker) benchOutcome {
 	res := benchOutcome{tier: q.Tier}
-	maxTokens := benchMaxTokens
-	prompt := q.Prompt
-	// Only NUMERIC grading is fooled by a verbose reasoned reply (an intermediate or a
-	// trailing restatement gets read as the answer), so make the worker answer with
-	// just the number — unless the prompt already says so. mcq (letter) and contains
-	// (substring) grade fine through a long reply, so they need no extra instruction.
-	if q.Match == "numeric" && !strings.Contains(q.Prompt, "number only") && !strings.Contains(q.Prompt, "only the output") {
-		prompt += " Give the number only."
-	}
-	if think {
-		maxTokens = benchThinkMaxTokens
-	} else {
-		prompt += " /no_think" // belt-and-suspenders with the kwarg (matches chatProbe)
-	}
+	prompt, maxTokens := benchRequestFor(q, think)
 	// Greedy decoding (temperature 0): a graded benchmark must be
 	// deterministic, so the same (model, question) returns the same answer on
 	// every run and two identical models on different hosts score identically.
@@ -1001,6 +1014,12 @@ func normalizeBenchAnswer(answer string) string {
 // numeric tiers and loose grading.
 func benchDigits(a string) string {
 	digits := benchCompoundRe.ReplaceAllStringFunc(strings.ToLower(a), compoundNumber)
+	// Magnitudes multiply; they are not values. Mapping bare "hundred" to 100
+	// turned "two hundred" into "2 100", whose LAST number is 100 — so a reply of
+	// two hundred graded correct against an expected 100. Resolved before the
+	// word map runs, and after the compound pass so "twenty-two hundred" arrives
+	// here as "22 hundred".
+	digits = benchMagnitudeRe.ReplaceAllStringFunc(digits, benchMagnitude)
 	digits = numberWordRe.ReplaceAllStringFunc(digits, func(w string) string { return numberWords[w] })
 	digits = benchThousandsRe.ReplaceAllStringFunc(digits, func(w string) string { return strings.ReplaceAll(w, ",", "") })
 	return digits
@@ -1010,6 +1029,15 @@ func benchDigits(a string) string {
 func checkAnswer(q benchmarkQ, answer string) bool {
 	a := normalizeBenchAnswer(answer)
 	exp := strings.TrimSpace(q.Expect)
+	// An empty expectation cannot be satisfied by anything, and the check belongs
+	// HERE rather than in each branch: the modes that fell through to the
+	// substring default — "contains", "final-contains", "code-exec" and any
+	// unrecognised string — all returned true for arbitrary text, so one
+	// malformed question graded every answer correct and lifted the entire
+	// fleet's score. A per-mode guard is exactly what left those four behind.
+	if exp == "" {
+		return false
+	}
 	switch q.Match {
 	case "numeric":
 		// Tiered like mcq: a declared value, then a leading-clause assertion, then
@@ -1040,8 +1068,23 @@ func checkAnswer(q benchmarkQ, answer string) bool {
 		// is one token, so every AMC question would grade as a miss. Read the last
 		// run of repeated letters first, then fall back to the ordinary rules for
 		// a model that ignored the instruction and simply answered "D".
-		if pick, ok := lastRepeatedLetter(a); ok {
-			return strings.EqualFold(pick, exp)
+		// Every one of these prompts carries "if the answer is F, write FFFFF" as
+		// its worked example, and F is never a valid AMC option. A model that
+		// quotes the instruction after answering ("CCCCC — had it been F I'd have
+		// written FFFFF") therefore ends with a repeated run that is the PROMPT's
+		// letter, not its own, and reading the last run blindly graded it on F.
+		runs := repeatedLetters(a)
+		if ex, ok := lastRepeatedLetter(q.Prompt); ok && !strings.EqualFold(ex, exp) {
+			kept := runs[:0]
+			for _, r := range runs {
+				if !strings.EqualFold(r, ex) {
+					kept = append(kept, r)
+				}
+			}
+			runs = kept
+		}
+		if len(runs) > 0 {
+			return strings.EqualFold(runs[len(runs)-1], exp)
 		}
 		return matchesMCQ(a, exp)
 	case "exact-list":
@@ -1060,8 +1103,16 @@ func checkAnswer(q benchmarkQ, answer string) bool {
 		// restates the premise ("Mary's father's fifth daughter is Lulu"), so the
 		// token only counts where an answer is asserted (see containsFinalAnswer).
 		return containsFinalAnswer(a, exp)
-	default: // "contains" — case-insensitive substring
-		return strings.Contains(strings.ToLower(a), strings.ToLower(exp))
+	default:
+		// "contains" — the expected token, where the reply ASSERTS it. Formerly a
+		// bare substring, which passed a reply that mentioned the token while
+		// ruling it out ("Thursday, Friday, Saturday. So it is Saturday." for
+		// Friday) or explicitly negated it ("definitely not UnboundLocalError").
+		// Both are wrong answers reading as right, which is the direction that
+		// inflates a score. This is the same rule "final-contains" already used;
+		// the two modes now differ only in name, kept because the question data
+		// distinguishes them.
+		return containsFinalAnswer(a, exp)
 	}
 }
 
@@ -1082,36 +1133,121 @@ func checkAnswer(q benchmarkQ, answer string) bool {
 func checkAnswerLoose(q benchmarkQ, answer string) bool {
 	a := normalizeBenchAnswer(answer)
 	exp := strings.TrimSpace(q.Expect)
+	if exp == "" {
+		return false
+	}
 	switch q.Match {
 	case "numeric":
-		digits := benchDigits(a)
-		for _, m := range benchEmphasisRe.FindAllStringSubmatch(digits, -1) {
-			for _, n := range benchNumberRe.FindAllString(m[1], -1) {
-				if numericMatches(n, exp) {
-					return true
-				}
-			}
-		}
-		if ms := benchLastEqRe.FindAllStringSubmatch(digits, -1); len(ms) > 0 {
-			return numericMatches(ms[len(ms)-1][1], exp)
-		}
+		return looseNumeric(benchDigits(a), exp)
 	case "mcq", "mcq-repeat":
-		for _, m := range benchEmphasisRe.FindAllStringSubmatch(a, -1) {
-			s := strings.TrimSpace(m[1])
-			if s == "" || !strings.EqualFold(s[:1], exp) {
-				continue
+		return looseMCQ(a, exp, q.Prompt)
+	}
+	return false
+}
+
+// looseNumeric decides half credit for a numeric answer in the wrong format.
+//
+// The organising idea is POSITION: a reply's later assertions supersede its
+// earlier ones. Emphasis says the model considered a value; a declaration
+// ("the total is 7") says it chose one; whichever comes LAST is what it meant.
+// Searching the whole reply for the expected value — the previous behaviour —
+// credited a model for any value it happened to mention, which made the mode
+// gameable outright ("**40**, **41**, **42**, **43** or **44**. I'll say 44.").
+func looseNumeric(digits, exp string) bool {
+	// Where the reply last asserted the expected value in an emphasised span,
+	// and where it last declared any value. Both are byte offsets, or -1.
+	lastExpEmphasis, lastBare, bareAt := -1, "", -1
+	for _, loc := range benchEmphasisRe.FindAllStringSubmatchIndex(digits, -1) {
+		span := strings.TrimSpace(digits[loc[2]:loc[3]])
+		// A span that is a BARE number is an asserted value; one with words around
+		// it ("Step 3", "30 feet", "Total cupcakes:") is a label.
+		if t := strings.Trim(span, ".,;:!?()[]"); benchBareNumberRe.MatchString(t) {
+			lastBare, bareAt = t, loc[0]
+		}
+		for _, n := range benchNumberRe.FindAllString(span, -1) {
+			if numericMatches(n, exp) {
+				lastExpEmphasis = loc[0]
 			}
-			// "**B**" or a span opening "B)"/"B."/"B:"/"B," is a pick; "**Braking**"
-			// is prose that merely starts with the letter.
-			if len(s) == 1 || s[1] == ')' || s[1] == '.' || s[1] == ':' || s[1] == ',' {
+		}
+	}
+	declared, declaredAt := "", -1
+	if locs := benchNumDeclaredRe.FindAllStringSubmatchIndex(digits, -1); len(locs) > 0 {
+		l := locs[len(locs)-1]
+		for g := 1; g <= 2; g++ {
+			if l[2*g] >= 0 {
+				declared, declaredAt = digits[l[2*g]:l[2*g+1]], l[0]
+			}
+		}
+	}
+	// A declaration vetoes only what comes BEFORE it. "Total = 76 … = **114**"
+	// is bookkeeping followed by a result, not a commitment to 76.
+	if declared != "" && declaredAt > lastExpEmphasis && !numericMatches(declared, exp) {
+		return false
+	}
+	// Among asserted bare values, only the last one counts.
+	if lastBare != "" && bareAt > lastExpEmphasis {
+		return numericMatches(lastBare, exp)
+	}
+	if lastExpEmphasis >= 0 {
+		return true
+	}
+	// No emphasis carried the value: fall back to the final stated equation.
+	if ms := benchLastEqRe.FindAllStringSubmatch(digits, -1); len(ms) > 0 {
+		return numericMatches(ms[len(ms)-1][1], exp)
+	}
+	return false
+}
+
+// looseMCQ decides half credit for a multiple-choice answer in the wrong format.
+//
+// Only the LAST emphasised span counts. Scanning every span credited formatting
+// rather than knowledge: a model that walks the options in bold ("**A)** no.
+// **B)** no. **C)** no.") contains an emphasised span for the right letter
+// whichever option it finally picks.
+func looseMCQ(a, exp, prompt string) bool {
+	spans := benchEmphasisRe.FindAllStringSubmatch(a, -1)
+	if len(spans) > 0 {
+		last := strings.TrimSpace(spans[len(spans)-1][1])
+		if last != "" && strings.EqualFold(last[:1], exp) {
+			// "**B**" or a span opening "B)"/"B."/"B:"/"B," is a pick;
+			// "**Braking**" is prose that merely starts with the letter.
+			if len(last) == 1 || last[1] == ')' || last[1] == '.' || last[1] == ':' || last[1] == ',' {
 				return true
 			}
 		}
-		if opt := benchOptionText(q.Prompt, exp); opt != "" {
-			return benchLooseTextMatch(a, opt)
-		}
+	}
+	// The option's own words, for a reply that answered in prose. Vetoed by an
+	// UNAMBIGUOUS declaration of a different option — "one might think it goes
+	// backward … I choose D" states the right option's text while choosing
+	// another. Ambiguity does not veto, because a bare "A" is also the article.
+	if pick, ok := soleDeclaredMCQPick(a); ok && !strings.EqualFold(pick, exp) {
+		return false
+	}
+	if opt := benchOptionText(prompt, exp); opt != "" {
+		return benchLooseTextMatch(a, opt)
 	}
 	return false
+}
+
+// soleDeclaredMCQPick reports the option the reply committed to, but only when
+// exactly ONE option reads as declared.
+//
+// Ambiguity must not veto: matchesMCQ accepts a standalone letter, and "A" is
+// also the English article — "A helium balloon moves the other way" reads as a
+// declaration of option A. Requiring uniqueness keeps that from cancelling a
+// correct emphasised pick elsewhere in the same reply.
+func soleDeclaredMCQPick(a string) (string, bool) {
+	found := ""
+	for _, letter := range []string{"A", "B", "C", "D", "E"} {
+		if !matchesMCQ(a, letter) {
+			continue
+		}
+		if found != "" {
+			return "", false // more than one reads as declared — not a commitment
+		}
+		found = letter
+	}
+	return found, found != ""
 }
 
 // benchOptionText returns the text of option letter in an MCQ prompt ("backward,
@@ -1221,7 +1357,22 @@ func matchesMCQ(a, exp string) bool {
 // reasoning model echoes the instruction's own example ("if the answer is F,
 // then write FFFFF") before committing to its own pick.
 func lastRepeatedLetter(s string) (string, bool) {
-	found, ok := "", false
+	runs := repeatedLetters(s)
+	if len(runs) == 0 {
+		return "", false
+	}
+	return runs[len(runs)-1], true
+}
+
+// repeatedLetters returns every standalone run of one repeated option letter in
+// s, in order of appearance.
+//
+// lastRepeatedLetter answers "what did the model finish with"; the full list is
+// what filtering the PROMPT's own worked example needs — every mcq-repeat prompt
+// carries "if the answer is F, write FFFFF", and a model that quotes it after
+// answering would otherwise be graded on F.
+func repeatedLetters(s string) []string {
+	var out []string
 	for i := 0; i < len(s); {
 		c := s[i]
 		if c < 'A' || c > 'J' {
@@ -1236,11 +1387,11 @@ func lastRepeatedLetter(s string) (string, bool) {
 		boundedLeft := i == 0 || !isBenchWordByte(s[i-1])
 		boundedRight := j == len(s) || !isBenchWordByte(s[j])
 		if j-i >= 3 && boundedLeft && boundedRight {
-			found, ok = string(c), true
+			out = append(out, string(c))
 		}
 		i = j
 	}
-	return found, ok
+	return out
 }
 
 func isBenchWordByte(b byte) bool {
@@ -1265,38 +1416,102 @@ func matchesAnswerList(answer, expect string) bool {
 		return false
 	}
 	lines := strings.Split(benchTagRe.ReplaceAllString(answer, " "), "\n")
-	// Scan from the end for the line the model COMMITTED to — the last one that
-	// parses as a list of the right length — and grade only that. Not the last
-	// one that happens to MATCH: a reasoning model enumerates candidate orderings
-	// while it works, and letting an abandoned intermediate rescue a wrong final
-	// answer is precisely the failure TestCheckAnswerExactList pins.
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := lines[i]
-		// Drop a leading label ("Answer:", "The final answer is:") so the list is
-		// compared, not the sentence around it.
-		if idx := strings.LastIndex(line, ":"); idx >= 0 && idx < len(line)-1 {
-			line = line[idx+1:]
-		}
-		got := splitAnswerList(line)
-		if len(got) != len(want) {
-			continue
-		}
-		for j := range got {
-			// Element 0 carries whatever prose preceded the list — "The answer is
-			// 2,8,6,…" splits to ["the answer is 2","8",…] — so it is the only one
-			// allowed to differ, and only by a prefix on a word boundary. Every
-			// other element must match exactly: these are permutation answers, so
-			// a partial overlap is simply wrong.
-			if j == 0 && listHeadMatches(got[0], want[0]) {
+
+	// A SINGLE-element expectation cannot use the scan below. Almost any prose
+	// line parses as a one-element list, so "the last line that parses" is every
+	// line, and walking upward finds the value inside abandoned working —
+	// "considering asparagus … but clue 3 rules that out, so the answer is
+	// carrot" graded as asparagus. For n=1 only the model's final line counts.
+	if len(want) == 1 {
+		for i := len(lines) - 1; i >= 0; i-- {
+			if strings.TrimSpace(lines[i]) == "" {
 				continue
 			}
-			if got[j] != want[j] {
-				return false
-			}
+			return listLineMatches(lines[i], want)
 		}
-		return true
+		return false
+	}
+
+	// Scan upward for the last CANDIDATE line and grade only that one.
+	//
+	// A candidate is a line that parses as a list AND shares at least one element
+	// with the expected answer. Both halves are load-bearing:
+	//
+	//	requiring a parse alone lets a trailing pleasantry consume the scan —
+	//	"Let me know if you want the reasoning, the clues, or the grid." is three
+	//	comma-separated parts, so a correct answer on the line above never gets read
+	//
+	//	scanning for a MATCH instead lets an abandoned intermediate rescue a wrong
+	//	conclusion — a reasoning model enumerates orderings while it works, and the
+	//	discarded one would be graded in place of the one it committed to
+	//
+	// Sharing vocabulary separates them, because these are permutation answers:
+	// a candidate ordering is built from the same items, while a pleasantry is
+	// built from different words entirely.
+	for i := len(lines) - 1; i >= 0; i-- {
+		if !listLineIsCandidate(lines[i], want) {
+			continue
+		}
+		return listLineMatches(lines[i], want)
 	}
 	return false
+}
+
+// listLineIsCandidate reports whether a line is plausibly the model's answer
+// list rather than surrounding prose: it parses into at least as many elements
+// as the answer has, and at least one of them is an item from the answer.
+func listLineIsCandidate(line string, want []string) bool {
+	if idx := strings.LastIndex(line, ":"); idx >= 0 && idx < len(line)-1 {
+		line = line[idx+1:]
+	}
+	got := splitAnswerList(line)
+	if len(got) < len(want) {
+		return false
+	}
+	inWant := make(map[string]bool, len(want))
+	for _, w := range want {
+		inWant[w] = true
+	}
+	for _, g := range got {
+		if inWant[g] {
+			return true
+		}
+	}
+	return false
+}
+
+// listLineMatches reports whether one line states the wanted list.
+//
+// The elements are read from the TAIL of the line, not the head. A lead-in is
+// prose and may contain commas of its own — "So, the answer is 1, fisherman,
+// coffee, musician" splits into five parts for a four-element answer — and
+// gating on the total count (the previous behaviour) failed every correct answer
+// whose lead-in contained a comma. "So," and "Therefore," are among the most
+// common things a model writes, so this was rejecting right answers across 31%
+// of the question set.
+func listLineMatches(line string, want []string) bool {
+	// Drop a leading label ("Answer:", "The final answer is:") so the list is
+	// compared, not the sentence around it.
+	if idx := strings.LastIndex(line, ":"); idx >= 0 && idx < len(line)-1 {
+		line = line[idx+1:]
+	}
+	got := splitAnswerList(line)
+	if len(got) < len(want) {
+		return false
+	}
+	got = got[len(got)-len(want):] // tail-align: drop whatever the lead-in contributed
+	for j := range got {
+		// The first surviving element may still carry prose ("the answer is 1"),
+		// and only it may — every later element must match exactly, because these
+		// are permutation answers where a partial overlap is simply wrong.
+		if j == 0 && listHeadMatches(got[0], want[0]) {
+			continue
+		}
+		if got[j] != want[j] {
+			return false
+		}
+	}
+	return true
 }
 
 // listHeadMatches compares the first element of an answer list, tolerating a
@@ -1652,6 +1867,20 @@ func benchStratifiedOrder(qs []benchmarkQ) []int {
 		byTier[q.Tier] = append(byTier[q.Tier], i)
 	}
 	sort.Ints(tiers)
+	// Shuffled WITHIN each tier as well as across them, deterministically by
+	// content hash. Index order put the hand-authored questions before the
+	// generated ones in every tier, so a truncated profile sampled a biased slice
+	// of each — and where a tier mixes answerable and unpassable items, that bias
+	// had a direction: a worker too slow to finish collected the answerable ones
+	// and skipped the rest, scoring HIGHER for being slower. Hashing keeps the
+	// order stable across runs (two profiles of the same worker ask the same
+	// questions in the same order) while making any prefix representative.
+	for _, t := range tiers {
+		idx := byTier[t]
+		sort.SliceStable(idx, func(a, b int) bool {
+			return benchQuestionHash(qs[idx[a]]) < benchQuestionHash(qs[idx[b]])
+		})
+	}
 	out := make([]int, 0, len(qs))
 	for round := 0; len(out) < len(qs); round++ {
 		progressed := false
@@ -1677,4 +1906,86 @@ func benchStratifiedOrderOf(idx []int) []int {
 		qs[j] = benchmarkQuestions[i]
 	}
 	return benchStratifiedOrder(qs)
+}
+
+// benchBareNumberRe matches a span that is a number and nothing else — the only
+// shape loose numeric grading accepts. "114" qualifies; "Step 3" does not.
+var benchBareNumberRe = regexp.MustCompile(`^-?\d+(?:\.\d+)?$`)
+
+// benchMagnitudeRe matches a count followed by a magnitude word, in either
+// digits ("22 hundred") or words ("two hundred").
+var benchMagnitudeRe = regexp.MustCompile(`(?i)\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)\s+(hundred|thousand|million)\b`)
+
+// benchMagnitude folds "<count> <magnitude>" into its product. A bare magnitude
+// with no count in front of it is left alone for the word map to handle, which
+// keeps "a hundred" reading as 100.
+func benchMagnitude(m string) string {
+	parts := benchMagnitudeRe.FindStringSubmatch(m)
+	if len(parts) != 3 {
+		return m
+	}
+	count, err := strconv.Atoi(parts[1])
+	if err != nil {
+		n, ok := numberWords[strings.ToLower(parts[1])]
+		if !ok {
+			return m
+		}
+		if count, err = strconv.Atoi(n); err != nil {
+			return m
+		}
+	}
+	scale := map[string]int{"hundred": 100, "thousand": 1000, "million": 1000000}[strings.ToLower(parts[2])]
+	if scale == 0 {
+		return m
+	}
+	return strconv.Itoa(count * scale)
+}
+
+// benchRequestFor builds the prompt and token budget for one graded question.
+//
+// SHARED with `bench calibrate` (benchGradeOne) on purpose. The two had drifted:
+// this path appended " Give the number only." and calibration did not, so 47 of
+// the generated questions had their difficulty measured on a prompt production
+// never sends — and that suffix exists precisely because numeric grading is the
+// mode a verbose reply fools. A question calibrated under different conditions
+// than it is graded under is calibrated for nothing, which the calibration file
+// asserts in a comment while doing the opposite.
+func benchRequestFor(q benchmarkQ, think bool) (prompt string, maxTokens int) {
+	prompt = q.Prompt
+	// Only NUMERIC grading is fooled by a verbose reasoned reply (an intermediate
+	// or a trailing restatement gets read as the answer), so make the worker
+	// answer with just the number — unless the prompt already says so. mcq
+	// (letter) and contains (substring) grade fine through a long reply.
+	if q.Match == "numeric" && !strings.Contains(q.Prompt, "number only") && !strings.Contains(q.Prompt, "only the output") {
+		prompt += " Give the number only."
+	}
+	// The budget is a property of the QUESTION, not of the thinking mode. Tying
+	// it to the mode made the two quality scores differ in two variables at once:
+	// Quality was measured with 16384 tokens and QualityNoThink with 1024 on the
+	// same hard-tier questions — LiveBench maths, olympiad and AMC, where the
+	// working does not fit in 1024 and truncation is scored a fail. So
+	// QualityNoThink largely measured "can you fit the working into a sixteenth
+	// of the room" rather than "how good are you without a scratchpad", and every
+	// no-think routing decision was made against a systematically depressed
+	// number. The two scores now differ ONLY in the thing they are named for.
+	maxTokens = benchMaxTokens
+	if q.Tier >= benchHardTier {
+		maxTokens = benchThinkMaxTokens
+	}
+	if !think {
+		prompt += " /no_think" // belt-and-suspenders with the kwarg (matches chatProbe)
+	}
+	return prompt, maxTokens
+}
+
+// benchQuestionHash is a stable content hash used to order questions within a
+// tier. Content-based rather than positional so inserting a question does not
+// reshuffle the rest, and stable across processes so a re-profile of the same
+// worker asks the same questions in the same order.
+func benchQuestionHash(q benchmarkQ) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(q.Prompt))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(q.Expect))
+	return h.Sum64()
 }

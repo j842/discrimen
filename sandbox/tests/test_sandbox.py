@@ -904,3 +904,50 @@ class TestJail(SandboxCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestGradingRobustness(unittest.TestCase):
+    """Grading must not resolve ambiguity in the direction of a pass.
+
+    Both of these were confirmed live before being fixed: the first graded a
+    model on a draft it had explicitly retracted, the second passed an integer
+    answer that was off by one.
+    """
+
+    def test_last_code_block_wins(self):
+        # Every string-graded mode in the router reads the answer the model
+        # COMMITTED to, which is the one it wrote last. This path read the first.
+        reply = (
+            "Here is an attempt:\n```python\ndef f(n):\n    return n - 1  # BUG\n```\n\n"
+            "Wait, that is wrong. Corrected:\n```python\ndef f(n):\n    return n + 1\n```"
+        )
+        self.assertNotIn("BUG", compare.extract_source(reply),
+                         "graded on the retracted draft rather than the correction")
+
+    def test_tag_priority_survives_the_last_block_rule(self):
+        # The reversal must be per tag group. Reversing the whole candidate list
+        # would prefer a ```text block to a ```python one.
+        reply = (
+            "Sketch:\n```text\ndef f(n):\n    return 0  # TEXTBLOCK\n```\n"
+            "Answer:\n```python\ndef f(n):\n    return n + 1\n```"
+        )
+        self.assertNotIn("TEXTBLOCK", compare.extract_source(reply))
+
+    def test_stdout_integers_compare_exactly(self):
+        # The float tolerance exists for accumulated rounding error. An integer
+        # result off by one is a wrong answer, and values_equal already knew
+        # that — _tokens_match did not, so stdin-graded questions had a false
+        # pass the functional ones did not.
+        self.assertFalse(compare.compare_stdout("1000000", "1000001"))
+        self.assertFalse(compare.compare_stdout("123456789", "123456790"))
+        self.assertFalse(compare.compare_stdout("0", "0.0000001"))
+        # ...while genuine float tolerance still applies.
+        self.assertTrue(compare.compare_stdout("1.0", "1.0000000001"))
+        self.assertTrue(compare.compare_stdout("3", "3"))
+        self.assertTrue(compare.compare_stdout("1 2\n3", "1 2\n3"))
+
+    def test_integer_expectation_against_float_answer_is_exact(self):
+        # An integral float still matches its integer (2.0 == 2), but a
+        # near-miss does not.
+        self.assertTrue(compare.compare_stdout("2", "2.0"))
+        self.assertFalse(compare.compare_stdout("2", "2.0000001"))

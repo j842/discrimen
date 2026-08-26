@@ -160,9 +160,20 @@ def assemble_source(prefix: str, code: str) -> str:
     # Python-tagged blocks first, then untagged, then everything else — a reply
     # that shows the wrong answer in a ```text block and the real one in
     # ```python must be graded on the ```python one.
-    ordered = [body for tag, body in blocks if tag.lower() in ("python", "python3", "py")]
-    ordered += [body for tag, body in blocks if tag == ""]
-    ordered += [body for tag, body in blocks if tag.lower() not in ("python", "python3", "py", "")]
+    #
+    # Within each tag group the LAST block wins, because every string-graded mode
+    # in the router reads the answer the model committed to and that is the one
+    # it wrote last: a reply that drafts a solution, spots the error and posts a
+    # correction was otherwise graded on the draft. The reversal is per group
+    # rather than over the whole list, or it would invert the tag priority above
+    # and prefer a ```text block to a ```python one.
+    def _group(pred):
+        return [body for tag, body in reversed(blocks) if pred(tag.lower())]
+
+    py = ("python", "python3", "py")
+    ordered = _group(lambda t: t in py)
+    ordered += _group(lambda t: t == "")
+    ordered += _group(lambda t: t not in py and t != "")
     candidates = [code] + ordered
 
     # Continuation first, then the reply standing alone. BOTH are accepted, and
@@ -303,15 +314,31 @@ def _tokens_match(expected: str, got: str) -> bool:
     for a, b in zip(left, right):
         if a == b:
             continue
+        # An INTEGER expectation is compared exactly. The module docstring has
+        # always said so and values_equal implements it, but this path did not:
+        # the float tolerance was applied to every token, so a stdout answer of
+        # 1000001 passed an expected 1000000, and 0.0000001 passed an expected 0.
+        # A tolerance exists for accumulated floating-point error; an integer
+        # result that is off by one is a wrong answer, not a rounding artefact.
+        if _INT_RE.match(a) and _INT_RE.match(b):
+            return False
         try:
             fa, fb = float(a), float(b)
         except ValueError:
             return False
         if math.isnan(fa) or math.isnan(fb):
             return False
+        # An integer expectation against a non-integer answer is still exact:
+        # tolerating it would re-admit the same class through the other door.
+        if _INT_RE.match(a) and fa != fb:
+            return False
         if not math.isclose(fa, fb, rel_tol=FLOAT_REL_TOL, abs_tol=FLOAT_ABS_TOL):
             return False
     return True
+
+
+# _INT_RE marks a token that is an integer literal, which must match exactly.
+_INT_RE = re.compile(r"^[+-]?\d+$")
 
 
 # ── Rendering a value for the failure report ────────────────────────────────

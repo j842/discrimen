@@ -49,12 +49,26 @@ var benchTierTargets = []struct {
 	MaxRate float64 // exclusive; p==1 is handled by the reserve bands instead
 	Reserve int     // reserveNone | reserveFloor | reserveCeiling
 }{
-	{Tier: 2, Target: 12, Reserve: reserveFloor},
+	// Tier 3, not 2: benchHardTier is 3, so anything below it is graded
+	// thinking-OFF at the short budget in production while calibration grades
+	// every candidate thinking-ON at the long one. A floor item measured under
+	// one set of conditions and served under the other is calibrated for nothing
+	// — and these are AMC competition questions chosen because every worker
+	// passed them, which at 1024 no-think tokens they would not.
+	{Tier: 3, Target: 12, Reserve: reserveFloor},
 	{Tier: 4, Target: 25, MinRate: 0.75, MaxRate: 1.00},
 	{Tier: 5, Target: 60, MinRate: 0.50, MaxRate: 0.75},
 	{Tier: 7, Target: 70, MinRate: 0.25, MaxRate: 0.50},
 	{Tier: 8, Target: 70, MinRate: 0.00, MaxRate: 0.25},
-	{Tier: 12, Target: 40, Reserve: reserveCeiling},
+	// Tier 10, not 12. Tier 12 is benchCodingTier, so the ceiling band was
+	// filling the 20-point CODING bucket with maths, olympiad and spatial items
+	// that no worker passes — 40 of its 68 questions, none of them code. Two
+	// consequences, both bad: a worker that aced every real coding question
+	// capped at 8.2 of 20 coding points, and because truncation samples a tier in
+	// order, a profile cut short by the time budget got the 28 answerable coding
+	// questions and few of the 40 impossible ones — worth up to +10 points of
+	// quality for being too slow to finish.
+	{Tier: 10, Target: 40, Reserve: reserveCeiling},
 }
 
 // reserveFloor / reserveCeiling mark the two HEADROOM bands, which exist for a

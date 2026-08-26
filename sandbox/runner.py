@@ -299,7 +299,7 @@ def run_grade(payload: dict) -> None:
     is what the wall clock is for. Callers who only need the boolean can send
     stop_on_first_failure.
     """
-    source = compare.extract_source(payload.get("code") or "")
+    source = compare.assemble_source(payload.get("prefix") or "", payload.get("code") or "")
     tests = payload.get("tests") or []
     entry = payload.get("entry") or {}
     stop_early = bool(payload.get("stop_on_first_failure"))

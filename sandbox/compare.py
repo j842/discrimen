@@ -128,8 +128,33 @@ def extract_source(code: str) -> str:
     possible pass. A model that wraps its answer in a code block is answering
     the question; scoring it zero measures its formatting.
     """
-    if _compiles(code):
-        return code
+    return assemble_source("", code)
+
+
+def assemble_source(prefix: str, code: str) -> str:
+    """The runnable program, given an optional partial solution to continue.
+
+    With no prefix this is plain unfencing. With one, the submission is only
+    ever a FRAGMENT — a function body resumed part-way through — and the
+    difference matters more than it looks: a fragment never compiles on its own,
+    so applying the usual "does it compile" gate to the fragment alone rejects
+    every candidate and falls through to returning the raw reply, fences and
+    all. Every completion answer would then be a syntax error.
+
+    So the compile test is applied to prefix+candidate, which is the thing that
+    actually has to run. That also makes the fenced-block choice meaningful for
+    completions: the right block is the one that continues THIS prefix.
+    """
+    def joined(body: str) -> str:
+        if not prefix:
+            return body
+        # The task specifies literal appending ("directly appending your code
+        # after the partial code should produce a correct completion"), so the
+        # join must not reindent or strip leading whitespace — the fragment's
+        # own indentation is what places it inside the function. Only the
+        # newline between the two is normalised, since a fenced block arrives
+        # without the prefix's trailing newline.
+        return prefix.rstrip("\n") + "\n" + body.lstrip("\n")
 
     blocks = _FENCE_RE.findall(code)
     # Python-tagged blocks first, then untagged, then everything else — a reply
@@ -138,10 +163,41 @@ def extract_source(code: str) -> str:
     ordered = [body for tag, body in blocks if tag.lower() in ("python", "python3", "py")]
     ordered += [body for tag, body in blocks if tag == ""]
     ordered += [body for tag, body in blocks if tag.lower() not in ("python", "python3", "py", "")]
-    for body in ordered:
-        if _compiles(body):
-            return body
-    return code
+    candidates = [code] + ordered
+
+    # Continuation first, then the reply standing alone. BOTH are accepted, and
+    # that is a deliberate choice about what this benchmark measures.
+    #
+    # A completion prompt asks for the missing portion only. Some models comply
+    # and some restate the whole function, and grading only the continuation
+    # scores the restaters zero while grading only the standalone scores the
+    # compliant ones zero. Either way the task stops measuring whether the model
+    # can solve the problem and starts measuring whether it followed a
+    # formatting instruction — which is exactly the confound that made the two
+    # strongest workers score 0% here and the weakest score highest.
+    #
+    # Accepting whichever interpretation actually runs drops the format axis
+    # entirely. It cannot manufacture a pass: the tests still have to agree with
+    # the reference implementation, and a wrong program fails under both
+    # readings.
+    for cand in candidates:
+        if _compiles(joined(cand)):
+            return joined(cand)
+    if prefix:
+        for cand in candidates:
+            if _compiles(cand):
+                return cand
+    # Nothing compiled. Return the best-effort join rather than the bare reply,
+    # so a completion still fails as "this program is wrong" with the prefix in
+    # the traceback, not as an unexplained syntax error in a fragment.
+    return joined(ordered[0]) if ordered else joined(code)
+
+
+def join_prefix(prefix: str, body: str) -> str:
+    """Append an already-extracted body to a partial solution."""
+    if not prefix:
+        return body
+    return prefix.rstrip("\n") + "\n" + body.lstrip("\n")
 
 
 def _compiles(source: str) -> bool:

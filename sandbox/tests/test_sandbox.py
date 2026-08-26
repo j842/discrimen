@@ -110,6 +110,63 @@ class SandboxCase(unittest.TestCase):
 # ── comparison semantics ────────────────────────────────────────────────────
 
 
+class TestCompletionPrefix(unittest.TestCase):
+    """A coding_completion answer is a FRAGMENT, graded as prefix+fragment.
+
+    These pin the bug that made the task measure formatting instead of ability:
+    the fragment does not compile alone, so the ordinary "does it compile" gate
+    rejected every candidate and fell through to the raw reply — scoring the two
+    strongest workers 0% on this task while the weakest, which ignored the
+    instruction and restated the whole function, scored highest.
+    """
+
+    PREFIX = (
+        "class Solution(object):\n"
+        "    def f(self, n):\n"
+        "        total = 0\n"
+        "        for i in range(n):"
+    )
+
+    def _f5(self, answer: str):
+        ns = {}
+        exec(compile(compare.assemble_source(self.PREFIX, answer), "<s>", "exec"), ns)
+        return ns["Solution"]().f(5)
+
+    def test_compliant_fenced_fragment(self):
+        self.assertEqual(self._f5("Sure:\n```python\n            total += i\n        return total\n```"), 10)
+
+    def test_bare_fragment_without_fences(self):
+        self.assertEqual(self._f5("            total += i\n        return total"), 10)
+
+    def test_disobedient_whole_function_also_accepted(self):
+        # Restating the whole class is not the requested format, but it is a
+        # correct solution; grading it zero would measure instruction-following.
+        whole = "```python\nclass Solution(object):\n    def f(self, n):\n        return sum(range(n))\n```"
+        self.assertEqual(self._f5(whole), 10)
+
+    def test_prose_around_the_block_is_ignored(self):
+        self.assertEqual(
+            self._f5("Here you go:\n```\n            total += i\n        return total\n```\nHope that helps!"),
+            10,
+        )
+
+    def test_wrong_fragment_still_wrong(self):
+        # The join must not manufacture a pass out of a wrong answer.
+        self.assertEqual(self._f5("```python\n            total += i * 2\n        return total\n```"), 20)
+
+    def test_no_prefix_is_unchanged(self):
+        # Every non-completion question must grade exactly as before.
+        self.assertEqual(compare.assemble_source("", "x = 1"), "x = 1")
+        self.assertEqual(compare.extract_source("```python\nx = 1\n```").strip(), "x = 1")
+
+    def test_indentation_is_preserved_verbatim(self):
+        # The task specifies literal appending; reindenting would change meaning.
+        out = compare.assemble_source(self.PREFIX, "            total += i\n        return total")
+        self.assertIn("\n            total += i\n", out)
+
+
+
+
 class TestComparison(unittest.TestCase):
     def test_json_spacing_is_irrelevant(self):
         # The whole point of comparing parsed values rather than strings.

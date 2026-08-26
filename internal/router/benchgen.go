@@ -162,10 +162,23 @@ type poolQuestion struct {
 // the sidecar exists to contain, so the blob is carried opaquely and handed to
 // the sidecar's /decode-private, which unpickles inside the jail.
 type poolCode struct {
-	Class      string `json:"class"`   // e.g. "Solution" — LeetCode entry class
-	Func       string `json:"func"`    // metadata.func_name, the method to call
-	Starter    string `json:"starter"` // starter_code, so a completion task has its stub
-	PublicJSON string `json:"public"`  // plain JSON list of {input,output,testtype}
+	Class   string `json:"class"`   // e.g. "Solution" — LeetCode entry class
+	Func    string `json:"func"`    // metadata.func_name, the method to call
+	Starter string `json:"starter"` // starter_code, so a completion task has its stub
+	// Prefix is the PARTIAL SOLUTION a coding_completion answer continues, and
+	// is empty for every other task. Starter is not a substitute: it holds the
+	// three-line LeetCode stub, while the prompt shows a function truncated
+	// part-way through its body and asks for "only the missing portion of the
+	// code ... directly appending your code after the partial code should
+	// produce a correct completion solution".
+	//
+	// Grading the answer on its own therefore grades a fragment, which never
+	// compiles. That is not a hypothetical: it scored the two strongest workers
+	// 0% on this task while the weakest scored 16%, because obeying the
+	// instruction guaranteed a fail and ignoring it (emitting the whole
+	// function) was the only way to pass. The task measured disobedience.
+	Prefix     string `json:"prefix,omitempty"`
+	PublicJSON string `json:"public"` // plain JSON list of {input,output,testtype}
 	// PrivateB64 is deliberately NOT serialised into pool.json. The blobs total
 	// ~250 MB across 128 questions and pool.json is a committed source artefact;
 	// carrying them inline made it a 244 MB file. Each blob is written beside the
@@ -256,6 +269,60 @@ func benchCodePayload(row map[string]any) (*poolCode, bool) {
 		PublicJSON: pub,
 		PrivateB64: priv,
 	}, true
+}
+
+// benchFillPrefixes stamps the completion prefix onto every coding_completion
+// question. Run over the pool rather than at row-parse time because the prefix
+// is derived from the assembled prompt, and because it has to be backfillable
+// onto a pool.json fetched before the field existed — re-fetching 128 questions
+// and ~250 MB of test blobs to recover something already sitting in the prompt
+// would be a lot of network for no new information.
+func benchFillPrefixes(qs []poolQuestion) (filled, missing int) {
+	for i := range qs {
+		if qs[i].Task != "coding_completion" || qs[i].Code == nil {
+			continue
+		}
+		p := benchCompletionPrefix(qs[i].Prompt)
+		if p == "" {
+			missing++
+			continue
+		}
+		qs[i].Code.Prefix = p
+		filled++
+	}
+	return filled, missing
+}
+
+// benchCompletionFence matches a fenced code block, capturing its body.
+var benchCompletionFence = regexp.MustCompile("(?s)```[ \t]*[A-Za-z0-9_+-]*[ \t]*\r?\n(.*?)```")
+
+// benchCompletionPrefix pulls the partial solution out of a coding_completion
+// prompt: the answer is graded as prefix+answer, so without this the answer is
+// graded as a bare fragment. See poolCode.Prefix for why that inverted the task.
+//
+// Derived from the prompt rather than from a dataset column because LiveBench
+// does not ship one — starter_code is the empty stub, and the truncated body
+// exists only inside the prompt's fenced block. Every one of the 50 completion
+// prompts carries exactly one such block, so "the last fence" is unambiguous;
+// returning "" when it is not leaves the old behaviour rather than inventing a
+// prefix, and benchCodePrefixFor reports the question so it can be dropped.
+func benchCompletionPrefix(prompt string) string {
+	m := benchCompletionFence.FindAllStringSubmatch(prompt, -1)
+	if len(m) == 0 {
+		return ""
+	}
+	return m[len(m)-1][1]
+}
+
+// benchCodePrefixFor is the single place that decides whether a question's
+// answer needs a prefix, so calibration and production grading cannot disagree
+// about it — a question calibrated under one grader and served under another is
+// calibrated for nothing.
+func benchCodePrefixFor(q poolQuestion) string {
+	if q.Task != "coding_completion" {
+		return ""
+	}
+	return benchCompletionPrefix(q.Prompt)
 }
 
 // benchEntryClass reads the entry class out of the starter code ("class Solution:"
@@ -527,6 +594,13 @@ func benchLoadPool() (*benchPool, error) {
 	var p benchPool
 	if err := json.Unmarshal(buf, &p); err != nil {
 		return nil, err
+	}
+	// Backfill on every load, so calibrate and emit see identical questions
+	// whether pool.json predates the field or not. Cheap: one regexp over 50
+	// prompts.
+	if _, missing := benchFillPrefixes(p.Questions); missing > 0 {
+		fmt.Fprintf(os.Stderr, "warning: %d coding_completion questions have no partial solution in their prompt "+
+			"and would be graded as bare fragments — they are excluded\n", missing)
 	}
 	return &p, nil
 }

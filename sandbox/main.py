@@ -152,11 +152,20 @@ def handle_grade(request: dict) -> dict:
     if entry is not None and not isinstance(entry, dict):
         raise Rejected(400, "entry must be an object or null")
 
+    # The partial solution a completion answer continues, or "" for the ordinary
+    # case. Validated but NOT executed here — it is joined to the submission
+    # inside the jail, on the far side of the isolation boundary, because a
+    # prefix is untrusted dataset content exactly as the submission is.
+    prefix = request.get("prefix") or ""
+    if not isinstance(prefix, str):
+        raise Rejected(400, "prefix must be a string")
+
     timeout_ms = _bounded(request.get("timeout_ms"), DEFAULT_TIMEOUT_MS, 100, MAX_TIMEOUT_MS)
     memory_mb = _bounded(request.get("memory_mb"), DEFAULT_MEMORY_MB, 16, MAX_MEMORY_MB)
 
     payload = {
         "code": code,
+        "prefix": prefix,
         "entry": entry or {},
         "tests": tests,
         "memory_mb": memory_mb,

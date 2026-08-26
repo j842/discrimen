@@ -26,6 +26,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -47,17 +48,24 @@ type benchCase struct {
 // Nil on every string-graded question, so nothing about the existing questions
 // changes shape.
 type benchCode struct {
-	Class string      `json:"class"` // LeetCode entry class, "" for a module-level function
-	Func  string      `json:"func"`  // method to call; "" for a stdin-only question
-	Tests []benchCase `json:"tests"`
+	Class  string      `json:"class"`            // LeetCode entry class, "" for a module-level function
+	Func   string      `json:"func"`             // method to call; "" for a stdin-only question
+	Prefix string      `json:"prefix,omitempty"` // partial solution a completion answer continues
+	Tests  []benchCase `json:"tests"`
 }
 
 // codeGradeRequest / codeGradeResult mirror the sidecar's HTTP contract. Kept as
 // explicit structs rather than map[string]any so a field rename on either side
 // is a compile error here rather than a question that silently grades as wrong.
 type codeGradeRequest struct {
-	Language  string      `json:"language"`
-	Code      string      `json:"code"`
+	Language string `json:"language"`
+	Code     string `json:"code"`
+	// Prefix is prepended to the submission before it runs, after the sidecar has
+	// stripped markdown fences — a completion task's answer is only valid as a
+	// continuation of the partial solution it was shown. Empty for every other
+	// task. The join happens in the sidecar rather than here because the fences
+	// have to come off first, and only the sidecar knows where they were.
+	Prefix    string      `json:"prefix,omitempty"`
 	Entry     codeEntry   `json:"entry"`
 	Tests     []benchCase `json:"tests"`
 	TimeoutMS int         `json:"timeout_ms"`
@@ -102,7 +110,7 @@ func (r *Router) gradeCode(ctx context.Context, code string, q benchmarkQ) (bool
 		return false, fmt.Errorf("code-exec question carries no test cases")
 	}
 	body, err := json.Marshal(codeGradeRequest{
-		Language: "python", Code: code,
+		Language: "python", Code: code, Prefix: q.Code.Prefix,
 		Entry:     codeEntry{Class: q.Code.Class, Func: q.Code.Func},
 		Tests:     q.Code.Tests,
 		TimeoutMS: codeExecTimeoutMS, MemoryMB: codeExecMemoryMB,
@@ -168,7 +176,7 @@ func benchGradeCodeStandalone(sandboxURL string, q poolQuestion, code string) (b
 		return false, fmt.Errorf("code-exec question %s has no test cases", q.ID)
 	}
 	body, err := json.Marshal(codeGradeRequest{
-		Language: "python", Code: code,
+		Language: "python", Code: code, Prefix: benchCodePrefixFor(q),
 		Entry:     codeEntry{Class: q.Code.Class, Func: q.Code.Func},
 		Tests:     tests,
 		TimeoutMS: codeExecTimeoutMS, MemoryMB: codeExecMemoryMB,
@@ -176,12 +184,32 @@ func benchGradeCodeStandalone(sandboxURL string, q poolQuestion, code string) (b
 	if err != nil {
 		return false, err
 	}
+	// A body the sidecar will refuse is a question that can never be graded, not
+	// a worker that got it wrong. Caught here so it reports as ungradeable and is
+	// dropped from the pool, rather than arriving as a 413 that every worker
+	// records as a failure — which would make the question look maximally hard
+	// and promote it straight into the top tier.
+	if len(body) > benchSandboxBodyLimit {
+		return false, fmt.Errorf("%w: %s needs %d bytes of test data, over the %d byte sidecar limit",
+			errBenchUngradeable, q.ID, len(body), benchSandboxBodyLimit)
+	}
 	var out codeGradeResult
 	if err := benchSandboxPost(sandboxURL, "/grade", body, &out); err != nil {
 		return false, err
 	}
 	return out.Pass, nil
 }
+
+// benchSandboxBodyLimit mirrors the sidecar's own request cap (main.py). Kept in
+// sync by hand: the sidecar must keep enforcing it regardless of what a client
+// believes, so this is a courtesy check, not the boundary.
+const benchSandboxBodyLimit = 32 << 20
+
+// errBenchUngradeable marks a question that no worker can ever be scored on —
+// as distinct from a sidecar that happens to be down. The first must be dropped
+// from the pool; the second must be retried, and recording it as a wrong answer
+// is how a whole task silently calibrates to zero.
+var errBenchUngradeable = errors.New("ungradeable question")
 
 // benchCodeTests assembles a question's cases: the public ones, which are plain
 // JSON, plus the private ones, which only the sidecar may decode.

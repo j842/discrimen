@@ -163,6 +163,33 @@ func TestDashboardDistinguishesUnmeasuredProfileCostFromFree(t *testing.T) {
 	}
 }
 
+// The fleet table's per-category benchmark view. Two things here are contracts
+// with the Go side that no compiler checks: the field names it reads out of
+// GET /backends/{id}/benchmark, and — the one that matters — the difference
+// between a no-think score that was never stored and one that is zero. A worker
+// really can score 0 with thinking off, so a page that rendered both as "0%"
+// would be inventing a measurement.
+func TestDashboardRendersTheBenchmarkCategoryBreakdown(t *testing.T) {
+	body := renderDashboard(t)
+	for _, needle := range []string{
+		"function openBenchmarkDialog", "function benchCategoryTable", "function benchGapCell",
+		"'Benchmark'",            // the button that opens it, on every fleet row
+		"nothink_results_stored", // the flag that says which kind of missing it is
+		"quality_nothink_detail", // the per-tier line, shown when the split cannot be
+		"'not stored'",           // …and what an absent per-category score renders as
+		"by difficulty tier",     // the tier axis, kept and folded away
+	} {
+		if !strings.Contains(body, needle) {
+			t.Errorf("the benchmark category view is missing %q", needle)
+		}
+	}
+	// Both scores in the fleet table itself. The gap between them decides which
+	// worker should get a no-think request, so it does not belong behind a click.
+	if !strings.Contains(body, "quality_nothink") || !strings.Contains(body, "no-think not measured") {
+		t.Error("the fleet table does not show the no-think quality beside the headline one")
+	}
+}
+
 // A log row's bodies are rendered as a conversation rather than as raw JSON,
 // and the pieces that has to cover are the ones a fleet actually produces:
 // both reply shapes (a buffered completion and a captured event stream), the

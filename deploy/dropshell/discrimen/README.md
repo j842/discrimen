@@ -1,10 +1,15 @@
 # discrimen — dropshell template
 
-Deploys `ghcr.io/j842/discrimen:latest` as a single container on `--network host`,
-with one Docker volume mounted at `/data` holding the SQLite database.
+Deploys two containers:
 
-The image is built and published by GitHub Actions. The target host pulls it, so
-nothing needs a Go toolchain and every host runs the same binary.
+- `${SERVICE}` — `ghcr.io/j842/discrimen:latest` on `--network host`, with one
+  Docker volume mounted at `/data` holding the SQLite database.
+- `${SERVICE}_sandbox` — `ghcr.io/j842/discrimen-sandbox:latest` on the default
+  bridge, published to `127.0.0.1:8587` and nowhere else. See
+  [The grading sandbox](#the-grading-sandbox).
+
+Both images are built and published by GitHub Actions. The target host pulls
+them, so nothing needs a Go toolchain and every host runs the same binaries.
 
 ## Deploying over an existing llm-router service
 
@@ -73,6 +78,84 @@ starts.
 | `DEFAULT_MAX_TOKENS` | `4096` | Token budget applied when a client declares none of its own. |
 | `ROUTER_AUTO_ROUTING` | `true` | One switch for the whole automatic layer: difficulty classification, thinking mode, online adaptation and background judging. `false` makes discrimen a plain load balancer and drops the dependency on the embeddings worker (`ghcr.io/j842/discrimen-embeddings`, port 8586). |
 
+Plus seven for the sandbox: `SANDBOX_PORT`, `SANDBOX_TOKEN`,
+`SANDBOX_MAX_CONCURRENCY`, `SANDBOX_DEFAULT_TIMEOUT_MS`,
+`SANDBOX_DEFAULT_MEMORY_MB`, `SANDBOX_CONTAINER_MEMORY`, `SANDBOX_PIDS_LIMIT`
+and `SANDBOX_SCRATCH_MB`. Each is commented in `config/service.env`.
+
+## The grading sandbox
+
+LiveBench's coding questions carry an **empty `ground_truth`**. That is not an
+oversight in the data: the answer to "write `minimumArrayLength`" is a function,
+and the only thing that can tell a correct one from a plausible one is running
+it against the test cases. So grading those questions needs an interpreter, and
+the router must not be the thing holding it — it is a long-lived process with
+the fleet's credentials, its request log and its database in one address space.
+
+`${SERVICE}_sandbox` is that interpreter, in a different container:
+
+```
+POST /grade            code + tests   → {"pass":…, "cases_run":…, "cases_passed":…}
+POST /decode-private   base64 blob    → {"tests":[…]}
+GET  /health                          → {"status":"ok"}
+```
+
+`/decode-private` exists because LiveBench's `private_test_cases` are base64 of
+zlib of a **pickle**, and unpickling is arbitrary code execution by design.
+Doing it inside the jail is the whole reason it is an endpoint rather than a
+function in the router.
+
+### What contains what
+
+Four layers, none sufficient alone:
+
+| Layer | Where | Against |
+| --- | --- | --- |
+| `RLIMIT_CPU`, `RLIMIT_AS`, `RLIMIT_FSIZE`, `RLIMIT_NPROC`, `RLIMIT_CORE` | `sandbox/jail.py`, set by the child on itself | busy loops, memory bombs, disk filling, fork bombs |
+| a seccomp BPF filter removing `socket()` | `sandbox/jail.py` | exfiltration; there is no network namespace to take away |
+| own session, wall-clock `SIGKILL` on the process group, a `/proc` sweep for anything that escaped it, a scratch dir destroyed on every path | `sandbox/supervisor.py` | sleeping processes, `setsid()` escapes, leftover files |
+| `--read-only`, `--cap-drop=ALL`, `no-new-privileges`, `--pids-limit`, `--memory`, `--init`, non-root uid, tmpfs `noexec` scratch | `start.sh` | everything above being wrong |
+
+The layers cover different things on purpose. An rlimit does not stop a process
+that is asleep — it consumes no CPU and allocates nothing. A wall clock does not
+stop a fork bomb from spawning while it waits. seccomp does not stop a memory
+bomb. And the container flags stop none of them happening; they stop them
+mattering to anything else on the host.
+
+`no-new-privileges` is the one flag that is not merely defence in depth: the
+kernel refuses `PR_SET_SECCOMP` from an unprivileged process without it, so
+removing that line removes the network isolation too.
+
+### Why the port is on 127.0.0.1
+
+The router is on `--network host`; the sandbox is not. It sits on the default
+bridge with `-p 127.0.0.1:${SANDBOX_PORT}:${SANDBOX_PORT}`, so the router
+reaches it over the loopback interface they share and nothing off the machine
+can reach a code-execution endpoint at all.
+
+`ports.sh` deliberately does not report it. A loopback-only port listed as a
+service port is an invitation to expose it.
+
+That is also why `SANDBOX_TOKEN` is empty by default — an attacker who can
+already connect to `127.0.0.1` can run code on the box anyway. Set it before you
+publish the port anywhere else, and be clear that publishing it means publishing
+remote code execution.
+
+### When it is missing
+
+A router with no sandbox still routes, still serves `/v1/*` and still benchmarks
+every question that is not a coding question. So `install.sh` **warns** rather
+than failing when the sandbox does not come up — failing would take a working
+fleet offline over a feature that degrades.
+
+But it degrades silently: an ungradeable coding question reads as a worker that
+got it wrong, so a dead sandbox shows up as the whole fleet being worse at code
+than it is. That is why `status.sh` reports a stopped or unhealthy sandbox as
+`Error`, the same as a dead router.
+
+A service installed before the sandbox existed has no such container, and that
+is not an error — it is a template that has not been reinstalled yet.
+
 ## Reachability
 
 A worker registers a URL and the router dials it. The URL has to be reachable
@@ -93,14 +176,19 @@ Check `/backends` and the container log.
 `IDEMPOTENT=true`, so dropshell skips the uninstall step and the router keeps
 serving while template files are swapped.
 
-- `install-pre.sh` pulls the image while the old container is still up, and
-  aborts the whole install if the pull fails, before anything is torn down.
-- `install.sh` does not stop or remove anything. It calls `start.sh`, then polls
-  `/health` for up to 10 seconds.
-- `start.sh` converges: it hashes the run command into a `ds.spec` label and
-  inspects the image reference separately, so a newly pulled image or an edited
-  service.env recreates the container, while an install that changed neither
-  leaves it running.
+- `install-pre.sh` pulls both images while the old containers are still up, and
+  aborts the whole install if either pull fails, before anything is torn down.
+- `install.sh` does not stop or remove anything. It calls `start.sh`, polls the
+  router's `/health` for up to 10 seconds and dies if it never answers, then
+  polls the sandbox's for up to 15 and only warns.
+- `start.sh` converges both containers: it hashes each run command into a
+  `ds.spec` label and inspects the image reference separately, so a newly pulled
+  image or an edited service.env recreates that container, while an install that
+  changed neither leaves it running. The sandbox is started first, because a
+  router that comes up to find nothing on the port scores coding questions zero
+  rather than failing visibly.
 
 `uninstall.sh` preserves the volume. Only `destroy.sh` removes it, and doing so
-throws away the measured fleet.
+throws away the measured fleet. Neither has anything to preserve for the
+sandbox: it has no volume, and every run's scratch space is a tmpfs directory
+deleted with the run.

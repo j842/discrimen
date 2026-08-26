@@ -280,6 +280,10 @@ func (r *Router) serveExpert(w http.ResponseWriter, req *http.Request, ident *id
 		Stream:    chatReq.Stream,
 		Input:     string(body),
 		KeyID:     ident.logKeyID(),
+		// The INBOUND request, read once here. An ensemble reaches N endpoints
+		// without going through proxyToBackend, so there is no single outbound
+		// request further down that this could have been taken off instead.
+		ClientIP: clientIP(req),
 	}
 	tally := &usageTally{}
 	defer func() {

@@ -593,10 +593,14 @@
 
     // ── Modal dialogs ───────────────────────────────────────────────────────
     let dialogDismissable = true;
-    function openDialog(node, dismissable) {
+    function openDialog(node, dismissable, wide) {
       const card = document.getElementById('dialog-card');
       card.innerHTML = '';
       card.appendChild(node);
+      // Narrow suits a form or a one-line secret. A four-column table with a
+      // tier breakdown folded under every row does not fit in 520px, and set on
+      // every open rather than reset on close so the two cannot drift.
+      card.classList.toggle('narrow', !wide);
       dialogDismissable = dismissable !== false;
       document.getElementById('dialog-modal').classList.add('open');
     }
@@ -707,6 +711,149 @@
         cell.innerHTML = '';
         costNodes(cell.dataset.costFor).forEach(n => cell.appendChild(n));
       });
+    }
+    // benchmarkRun is profileRun awaited rather than painted: the cost cells can
+    // fill in whenever the fetch lands, but a dialog has to have the data before
+    // it can draw anything. Same cache, so opening the breakdown for a backend
+    // whose cost cell is already filled costs no request.
+    async function benchmarkRun(id) {
+      const cached = profileRuns[id];
+      if (cached && cached.state !== 'loading') return cached;
+      const res = await request('/backends/' + encodeURIComponent(id) + '/benchmark');
+      if (res.ok) profileRuns[id] = {state: 'ready', data: res.data || {}};
+      else if (res.status === 404) profileRuns[id] = {state: 'none'};
+      else profileRuns[id] = {state: 'error', error: res.error};
+      paintProfileCells();
+      return profileRuns[id];
+    }
+
+    // ── Benchmark by category ───────────────────────────────────────────────
+    //
+    // The per-tier line the router logs — "t1=4/4 t2=3/4 … t12=25/28" — answers
+    // how far up the difficulty ladder a worker gets. It cannot answer the
+    // question anyone actually asks before handing a worker a job, which is what
+    // it is GOOD AT: a tier is a difficulty band, and several of them hold
+    // questions from more than one category (tier 4 mixes compiler gotchas with
+    // arithmetic; the generated half lands maths and reasoning items in the same
+    // tiers). GET /backends/{id}/benchmark carries the same run grouped by
+    // category instead, and this renders it.
+    //
+    // BOTH MODES SIDE BY SIDE, because that gap is the entire point of the
+    // two-score benchmark: a worker measured 93 thinking-on and 41 thinking-off
+    // is not a 93 to any client that forces thinking off, and the loss is rarely
+    // spread evenly — it tends to land on one category.
+    function benchScoreCell(score, absentNote) {
+      if (!score) return td([el('span', {class: 'muted', title: absentNote || ''}, ['not stored'])]);
+      const cell = td([el('span', {}, [score.percent + '%'])]);
+      const detail = score.strict + ' / ' + score.total +
+        (score.loose ? ' · ' + score.loose + ' loose' : '');
+      cell.appendChild(el('div', {class: 'muted'}, [detail]));
+      return cell;
+    }
+    // The drop from thinking-on to thinking-off, in percentage points. The
+    // colours are a reading aid and nothing else — no routing decision keys off
+    // them — but a category that collapses without a scratchpad has to be
+    // findable at a glance in a table of four rows.
+    function benchGapCell(think, nothink) {
+      if (!nothink) return td([el('span', {class: 'muted'}, ['—'])]);
+      const gap = think.percent - nothink.percent;
+      const cls = gap >= 25 ? 'bad' : (gap >= 10 ? 'warn' : '');
+      const sign = gap > 0 ? '−' : (gap < 0 ? '+' : '');
+      return td([el('span', {class: cls}, [sign + Math.abs(gap) + ' pts'])]);
+    }
+    const BENCH_CATEGORY_NOTE = {
+      coding: 'Read a program exactly and say what it does — the only measurement that answers whether this worker can be handed a codebase.',
+      maths: 'Arithmetic, number theory, combinatorics and competition maths.',
+      reasoning: 'Traps, world models, rules invented in the prompt, constraint puzzles — the questions a scratchpad does not answer on its own.',
+      general: 'The control and floor tiers. Every working model passes these, so they are not a discriminator; a miss here means something is broken.',
+      unclassified: 'Questions this router could not place. A tier or a question format was added without saying what it measures — see benchcategory.go.',
+    };
+    function benchCategoryTable(data) {
+      const stored = !!data.nothink_results_stored;
+      const absent = 'The no-think pass records a score and a per-tier line, not its per-question results, ' +
+        'so it cannot be split by category. This is NOT a score of zero.';
+      const table = el('table', {});
+      table.appendChild(el('thead', {}, [el('tr', {}, [
+        el('th', {}, ['Category']), el('th', {}, ['Thinking on']),
+        el('th', {}, ['Thinking off']), el('th', {}, ['Difference']),
+      ])]));
+      const body = el('tbody', {});
+      (data.categories || []).forEach(row => {
+        const tr = el('tr', {});
+        const nameTd = td([el('span', {title: BENCH_CATEGORY_NOTE[row.category] || ''}, [row.category])]);
+        nameTd.appendChild(el('div', {class: 'muted'}, [row.think.total + ' questions']));
+        tr.appendChild(nameTd);
+        tr.appendChild(benchScoreCell(row.think));
+        tr.appendChild(benchScoreCell(stored ? row.nothink : null, absent));
+        tr.appendChild(benchGapCell(row.think, stored ? row.nothink : null));
+        body.appendChild(tr);
+        const tiers = benchTierRow(row, stored, absent);
+        if (tiers) body.appendChild(tiers);
+      });
+      table.appendChild(body);
+      return table;
+    }
+    // The difficulty axis, kept but folded away. 60% on maths reads very
+    // differently when every miss is in the frontier tiers than when they start
+    // at tier 4, and that is the question the tier line was always answering.
+    function benchTierRow(row, stored, absent) {
+      if (!(row.tiers || []).length) return null;
+      const inner = el('table', {style: 'background:#0f141d'});
+      const body = el('tbody', {});
+      (row.tiers || []).forEach(t => {
+        const tr = el('tr', {});
+        tr.appendChild(td([el('code', {}, ['tier ' + t.tier])]));
+        tr.appendChild(benchScoreCell(t.think));
+        tr.appendChild(benchScoreCell(stored ? t.nothink : null, absent));
+        tr.appendChild(benchGapCell(t.think, stored ? t.nothink : null));
+        body.appendChild(tr);
+      });
+      inner.appendChild(body);
+      const wrap = el('details', {}, [el('summary', {}, ['by difficulty tier']), inner]);
+      return el('tr', {}, [td([wrap], {colspan: '4', style: 'padding:0 12px 10px'})]);
+    }
+    async function openBenchmarkDialog(id) {
+      openDialog(dialogPanel('Benchmark — ' + id, [el('div', {class: 'muted'}, ['Loading…'])]), true, true);
+      const run = await benchmarkRun(id);
+      if (run.state === 'none') {
+        openDialog(dialogPanel('Benchmark — ' + id, [el('div', {class: 'banner'}, [
+          'No profiling run is stored for this backend yet. Certify it to measure one.',
+        ])]), true, true);
+        return;
+      }
+      if (run.state !== 'ready') {
+        openDialog(dialogPanel('Benchmark — ' + id, [el('div', {class: 'banner bad'}, [run.error || 'Could not load the run.'])]), true, true);
+        return;
+      }
+      const d = run.data;
+      const head = el('div', {class: 'rowline'}, [
+        el('code', {}, [String(d.model || '')]),
+        chip('benchmark v' + (d.bench_version || '?')),
+        chip('quality ' + (d.quality || 0) + '%'),
+      ]);
+      // The headline no-think score is worth showing even when the per-question
+      // results behind it were not kept: the gap it reveals is the reason to open
+      // this dialog, and the per-tier line below it is the finest split that
+      // exists in that case.
+      if (d.thinking) {
+        head.appendChild(d.quality_nothink
+          ? chip('no-think ' + d.quality_nothink + '%', 'The same benchmark with thinking disabled — what a client forcing thinking off talks to.')
+          : chip('no-think not measured', 'This worker thinks, but the no-think pass has not run or did not complete.'));
+      }
+      const parts = [head, benchCategoryTable(d)];
+      if (!d.nothink_results_stored && d.quality_nothink_detail) {
+        parts.push(el('div', {class: 'hint'}, [
+          'Thinking-off per question was not stored for this run, so it cannot be split by category. ' +
+          'The per-tier line it did record: ' + d.quality_nothink_detail,
+        ]));
+      }
+      parts.push(el('div', {class: 'hint'}, [
+        'Each figure is a flat pass rate within the category — strict passes plus half a point per loose ' +
+        'one, the arithmetic the headline score uses. It is not the headline score itself: that is weighted ' +
+        'by difficulty bucket (60 general / 20 insight / 20 coding) and a category cuts across all three.',
+      ]));
+      parts.push(el('div', {class: 'rowline'}, [btn('Close', () => closeDialog())]));
+      openDialog(dialogPanel('Benchmark — ' + id, parts), true, true);
     }
 
     // ── Fleet ───────────────────────────────────────────────────────────────
@@ -835,7 +982,20 @@
         idTd.appendChild(el('div', {class: 'muted'}, [String(b.url || '')]));
         tr.appendChild(idTd);
         tr.appendChild(td([String(b.model || '')]));
-        tr.appendChild(td([(b.quality != null ? b.quality : 0) + '%']));
+        // Both scores, because they are two different workers as far as a client
+        // is concerned: the headline grades hard questions with a scratchpad, and
+        // a request that forces thinking off is served by the second number. On a
+        // thinking worker the two diverge far enough to change which backend
+        // should get the request (measured: 93 against 41).
+        const qualityTd = td([(b.quality != null ? b.quality : 0) + '%']);
+        if (b.thinking) {
+          qualityTd.appendChild(b.quality_nothink
+            ? el('div', {class: 'muted', title: 'The same benchmark with thinking disabled.'},
+                ['no-think ' + b.quality_nothink + '%'])
+            : el('div', {class: 'muted', title: 'The no-think pass has not run or did not complete. Unmeasured ranks below every measured worker on no-think requests — it does not inherit the score above.'},
+                ['no-think not measured']));
+        }
+        tr.appendChild(qualityTd);
         const speedTd = td([tokensPerSecOf(b).toFixed(1) + ' tok/s']);
         speedTd.appendChild(el('div', {class: 'muted'}, ['score ' + speedScoreOf(b)]));
         tr.appendChild(speedTd);
@@ -848,7 +1008,7 @@
         tr.appendChild(td([feats], {class: 'wide'}));
         const tryBtn = el('button', {}, ['Try']);
         tryBtn.addEventListener('click', () => toggleTry(b.id));
-        tr.appendChild(td([tryBtn, btn('Certify', () => certify(b.id))]));
+        tr.appendChild(td([tryBtn, btn('Certify', () => certify(b.id)), btn('Benchmark', () => openBenchmarkDialog(b.id))]));
         body.appendChild(tr);
         body.appendChild(keptPanels[b.id] || buildTryPanel(b.id));
       });

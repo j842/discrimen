@@ -90,7 +90,20 @@ var benchAllowedTasks = map[string]string{ // LiveBench task -> checkAnswer matc
 	"spatial":      "numeric",
 	"zebra_puzzle": "exact-list",
 	"olympiad":     "exact-list",
+	// LiveBench's coding tasks carry NO ground_truth: the answer is a program,
+	// and the only way to grade it is to run it against the question's test
+	// cases. "code-exec" is therefore not a checkAnswer mode at all — checkAnswer
+	// is pure and does no I/O — it is a marker that routes the question to the
+	// execution sidecar instead. See codeexec.go.
+	"LCB_generation":    benchMatchCodeExec,
+	"coding_completion": benchMatchCodeExec,
 }
+
+// benchMatchCodeExec marks a question graded by RUNNING the answer. Kept as a
+// named constant because it is tested for in three places and a typo would
+// silently route a coding question into the "contains" default, where every
+// program would grade as wrong.
+const benchMatchCodeExec = "code-exec"
 
 // benchAMCAnswerRe is a bare option letter — the AMC half of math_comp.
 var benchAMCAnswerRe = regexp.MustCompile(`^[A-E]$`)
@@ -121,7 +134,7 @@ func benchMatchFor(task, groundTruth string) (string, bool) {
 const benchMaxPromptChars = 6000
 
 // benchDatasets are the LiveBench HF datasets holding the allowlisted tasks.
-var benchDatasets = []string{"math", "reasoning"}
+var benchDatasets = []string{"math", "reasoning", "coding"}
 
 // poolQuestion is one candidate. ID is LiveBench's own content hash, so it is
 // stable across refreshes and is what calibration keys on — a question that
@@ -135,6 +148,131 @@ type poolQuestion struct {
 	Expect      string `json:"expect"`
 	ReleaseDate string `json:"release_date"`
 	Retired     bool   `json:"retired"` // LiveBench has rotated it out of the live set
+	// Code is set only for benchMatchCodeExec questions and carries what the
+	// sidecar needs to run the answer. Nil for every string-graded question, so
+	// pool.json for the maths/reasoning tasks is unchanged.
+	Code *poolCode `json:"code,omitempty"`
+}
+
+// poolCode is the execution payload for a coding question.
+//
+// PrivateB64 stays COMPRESSED AND UNDECODED here on purpose. LiveBench ships it
+// base64(zlib(pickle)) — one row is 3.4 MB — and unpickling runs arbitrary code.
+// Decoding it on the machine running `bench fetch` would be doing exactly what
+// the sidecar exists to contain, so the blob is carried opaquely and handed to
+// the sidecar's /decode-private, which unpickles inside the jail.
+type poolCode struct {
+	Class      string `json:"class"`   // e.g. "Solution" — LeetCode entry class
+	Func       string `json:"func"`    // metadata.func_name, the method to call
+	Starter    string `json:"starter"` // starter_code, so a completion task has its stub
+	PublicJSON string `json:"public"`  // plain JSON list of {input,output,testtype}
+	// PrivateB64 is deliberately NOT serialised into pool.json. The blobs total
+	// ~250 MB across 128 questions and pool.json is a committed source artefact;
+	// carrying them inline made it a 244 MB file. Each blob is written beside the
+	// pool under private/<id>.b64 (gitignored) and read back on demand — see
+	// benchWritePrivate / benchLoadPrivate.
+	PrivateB64 string `json:"-"`
+	HasPrivate bool   `json:"has_private,omitempty"`
+}
+
+// benchPrivateDir holds the undecoded private-test blobs, one file per question.
+func benchPrivateDir() string { return filepath.Join(benchDataDir(), "private") }
+
+func benchPrivatePath(id string) string {
+	// LiveBench ids are content hashes, so they are already filename-safe; the
+	// replace is belt and braces against a future id format with a separator in it.
+	return filepath.Join(benchPrivateDir(), strings.NewReplacer("/", "_", "\\", "_", "..", "_").Replace(id)+".b64")
+}
+
+// benchWritePrivate stores one question's undecoded blob. Failure is fatal to the
+// fetch rather than silent: a coding question whose private tests went missing
+// would still look gradable and would quietly grade on public cases alone, which
+// a model can satisfy by reading them out of its own prompt.
+func benchWritePrivate(id, blob string) error {
+	if blob == "" {
+		return nil
+	}
+	if err := os.MkdirAll(benchPrivateDir(), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(benchPrivatePath(id), []byte(blob), 0o644)
+}
+
+// benchLoadPrivate reads one back. Empty (not an error) when the question has
+// none, so callers can treat "no private tests" and "public only" alike.
+func benchLoadPrivate(id string) (string, error) {
+	buf, err := os.ReadFile(benchPrivatePath(id))
+	if os.IsNotExist(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return string(buf), nil
+}
+
+// benchCodePayload pulls the execution payload out of a LiveBench coding row.
+// Returns false when the row is missing anything the sidecar would need, which
+// is better than shipping a question that can only ever grade as wrong.
+func benchCodePayload(row map[string]any) (*poolCode, bool) {
+	// original_json arrives as a nested OBJECT from the datasets server, not as
+	// the JSON string its name suggests — and asserting .(string) on it silently
+	// rejected all 128 coding rows. Re-marshal whatever shape it is and decode
+	// once, so either form works.
+	rawOJ, ok := row["original_json"]
+	if !ok || rawOJ == nil {
+		return nil, false
+	}
+	buf, err := json.Marshal(rawOJ)
+	if err != nil {
+		return nil, false
+	}
+	if s, isStr := rawOJ.(string); isStr {
+		buf = []byte(s)
+	}
+	var oj struct {
+		StarterCode string `json:"starter_code"`
+		Metadata    string `json:"metadata"`
+	}
+	if json.Unmarshal(buf, &oj) != nil {
+		return nil, false
+	}
+	// metadata is a JSON string nested inside the JSON row, not an object.
+	var md struct {
+		FuncName string `json:"func_name"`
+	}
+	if oj.Metadata != "" {
+		_ = json.Unmarshal([]byte(oj.Metadata), &md)
+	}
+	pub, _ := row["public_test_cases"].(string)
+	priv, _ := row["private_test_cases"].(string)
+	if pub == "" && priv == "" {
+		return nil, false // nothing to grade against
+	}
+	return &poolCode{
+		Class:      benchEntryClass(oj.StarterCode),
+		Func:       md.FuncName,
+		Starter:    oj.StarterCode,
+		PublicJSON: pub,
+		PrivateB64: priv,
+	}, true
+}
+
+// benchEntryClass reads the entry class out of the starter code ("class Solution:"
+// -> "Solution"). Empty for a task with no class wrapper, which the sidecar reads
+// as "call the function at module scope".
+func benchEntryClass(starter string) string {
+	for _, line := range strings.Split(starter, "\n") {
+		line = strings.TrimSpace(line)
+		rest, ok := strings.CutPrefix(line, "class ")
+		if !ok {
+			continue
+		}
+		if i := strings.IndexAny(rest, "(:"); i > 0 {
+			return strings.TrimSpace(rest[:i])
+		}
+	}
+	return ""
 }
 
 type benchPool struct {
@@ -162,7 +300,7 @@ func benchUsage() {
 
   bench fetch                     Pull candidate questions from HuggingFace
   bench calibrate -router URL     Grade the pool against every ready backend
-  bench emit                      Select items and write benchmark_data_live.go
+  bench emit [-sandbox URL]       Select items and write benchmark_data_live.go
 
 Quarterly refresh. Each one is a benchmarkVersion bump and therefore a full
 fleet re-benchmark, so monthly is not worth it for a set that only turns over
@@ -201,16 +339,20 @@ func runBenchCommand(argv []string) bool {
 		token := fs.String("token", os.Getenv("ROUTER_ADMIN_KEY"), "router admin key — calibration lists the fleet via /backends, which is admin scope")
 		conc := fs.Int("concurrency", 2, "concurrent questions per backend")
 		limit := fs.Int("limit", 0, "max questions per task (0 = all) — for a smoke test before the full run")
+		sandbox := fs.String("sandbox", os.Getenv("SANDBOX_URL"), "code-execution sidecar base URL — required to grade the coding tasks")
 		_ = fs.Parse(args)
 		if *router == "" {
 			benchUsage()
 			os.Exit(2)
 		}
-		err = benchCalibrate(*router, *token, *conc, *limit)
+		err = benchCalibrate(*router, *token, *sandbox, *conc, *limit)
 	case "emit":
 		fs := flag.NewFlagSet("emit", flag.ExitOnError)
+		// Only needed when the selection contains coding questions: their test
+		// cases arrive base64(zlib(pickle)) and only the sidecar may decode them.
+		sandbox := fs.String("sandbox", os.Getenv("SANDBOX_URL"), "code-execution sidecar base URL — required if any code-exec question is selected")
 		_ = fs.Parse(args)
-		err = benchEmit()
+		err = benchEmit(*sandbox)
 	default:
 		benchUsage()
 		os.Exit(2)
@@ -265,6 +407,17 @@ func benchFetch(includeRetired bool) error {
 	if err := os.MkdirAll(benchDataDir(), 0o755); err != nil {
 		return err
 	}
+	// Blobs to their own files before the pool is written, so a pool.json on disk
+	// always has its private tests beside it.
+	for i := range all {
+		if all[i].Code == nil || all[i].Code.PrivateB64 == "" {
+			continue
+		}
+		if err := benchWritePrivate(all[i].ID, all[i].Code.PrivateB64); err != nil {
+			return fmt.Errorf("private tests for %s: %w", all[i].ID, err)
+		}
+		all[i].Code.HasPrivate = true
+	}
 	path := filepath.Join(benchDataDir(), "pool.json")
 	buf, err := json.MarshalIndent(benchPool{
 		FetchedAt: time.Now().UTC().Format(time.RFC3339),
@@ -317,12 +470,25 @@ func benchToPoolQuestion(row map[string]any, ds string) (poolQuestion, bool) {
 	task, _ := row["task"].(string)
 	gt, _ := row["ground_truth"].(string)
 	id, _ := row["question_id"].(string)
-	if gt == "" || id == "" {
+	if id == "" {
 		return poolQuestion{}, false
 	}
 	match, allowed := benchMatchFor(task, gt)
 	if !allowed {
 		return poolQuestion{}, false
+	}
+	// Every other task is graded by comparing a string, so no ground truth means
+	// nothing to compare against. A code-exec question is the exception by
+	// design: its ground truth IS its test cases, carried separately below.
+	if gt == "" && match != benchMatchCodeExec {
+		return poolQuestion{}, false
+	}
+	var code *poolCode
+	if match == benchMatchCodeExec {
+		var ok bool
+		if code, ok = benchCodePayload(row); !ok {
+			return poolQuestion{}, false
+		}
 	}
 	// Every allowlisted task is single-turn, so turns[0] is the whole prompt.
 	// Anything else is a task shape this tool doesn't understand — skip rather
@@ -340,7 +506,7 @@ func benchToPoolQuestion(row map[string]any, ds string) (poolQuestion, bool) {
 	return poolQuestion{
 		ID: id, Category: ds, Task: task, Match: match,
 		Prompt: prompt, Expect: gt, ReleaseDate: release,
-		Retired: removal != "",
+		Retired: removal != "", Code: code,
 	}, true
 }
 

@@ -1,3 +1,17 @@
+# Three services. The router cannot do two of its jobs alone, and they fail in
+# opposite ways — which is why one is a depends_on and the other is not.
+#
+# The embeddings worker is a HARD dependency of auto-routing, and its absence is
+# reported: /health says "auto_routing": "degraded" and the router drops back to
+# plain quality/speed ranking. So the router waits for it.
+#
+# The grading sandbox is not waited on. A router with no sandbox still routes
+# and still benchmarks every question that is not a coding question, so gating
+# startup on it would take a working fleet offline over a feature that degrades.
+# But it degrades SILENTLY — an ungradeable coding question reads as a worker
+# that got it wrong — so the sidecar carries a healthcheck and the dropshell
+# template's status.sh reports its absence as an error.
+#
 # Both services, because auto-routing is not something the router can do alone.
 # The difficulty and thinking classifiers work by embedding the prompt, and the
 # only thing that can embed it is a registered embeddings worker. Without one
@@ -38,8 +52,17 @@ services:
       BACKEND_TIMEOUT_SECONDS: "${BACKEND_TIMEOUT_SECONDS:-600}"
       BACKEND_IDLE_TIMEOUT_SECONDS: "${BACKEND_IDLE_TIMEOUT_SECONDS:-120}"
       ROUTER_SLOT_MAX_WAIT_SECONDS: "${ROUTER_SLOT_MAX_WAIT_SECONDS:-600}"
-      DEFAULT_MAX_TOKENS: "${DEFAULT_MAX_TOKENS:-4096}"
+      DEFAULT_MAX_TOKENS: "${DEFAULT_MAX_TOKENS:-16384}"
       ROUTER_AUTO_ROUTING: "${ROUTER_AUTO_ROUTING:-true}"
+      # The service name, not 127.0.0.1 — under compose these are two containers
+      # on one bridge network, and loopback inside the router's namespace is the
+      # router. The dropshell template says 127.0.0.1 for the opposite reason:
+      # there the router is on --network host and the sidecar's port is
+      # published to the host's loopback. Same address in two spellings; getting
+      # it wrong in either direction fails silently, as coding questions that
+      # every worker gets wrong.
+      SANDBOX_URL: "http://discrimen-sandbox:${SANDBOX_PORT:-8587}"
+      SANDBOX_TOKEN: "${SANDBOX_TOKEN:-}"
     volumes:
       # The request log, the tier adapter state and the generated persist.key all
       # live here. persist.key is the one you cannot regenerate: without it every
@@ -106,6 +129,50 @@ services:
       # is waiting on this check. Declared here rather than left to the image so
       # it can be tuned without rebuilding.
       start_period: 300s
+
+  discrimen-sandbox:
+    image: ghcr.io/j842/discrimen-sandbox:latest
+    build:
+      context: ./sandbox
+      dockerfile: Dockerfile
+    container_name: discrimen-sandbox
+    restart: unless-stopped
+    # 127.0.0.1 is not decoration. This endpoint executes arbitrary code by
+    # design, and the default "${PORT}:${PORT}" form binds every interface on
+    # the host — publishing a remote-code-execution service to the LAN. The
+    # router reaches it over the compose network and does not need the mapping
+    # at all; it is here so a developer can curl /health.
+    ports:
+      - "127.0.0.1:${SANDBOX_PORT:-8587}:${SANDBOX_PORT:-8587}"
+    environment:
+      SANDBOX_PORT: "${SANDBOX_PORT:-8587}"
+      SANDBOX_TOKEN: "${SANDBOX_TOKEN:-}"
+      SANDBOX_MAX_CONCURRENCY: "${SANDBOX_MAX_CONCURRENCY:-4}"
+      SANDBOX_DEFAULT_TIMEOUT_MS: "${SANDBOX_DEFAULT_TIMEOUT_MS:-10000}"
+      SANDBOX_DEFAULT_MEMORY_MB: "${SANDBOX_DEFAULT_MEMORY_MB:-512}"
+    # A real pid 1, to reap the orphans a forking submission leaves behind. The
+    # service reaps them itself as well; this is the layer that still works if
+    # that code is ever wrong.
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      # Also the precondition for the seccomp filter the service installs on
+      # itself — the kernel refuses PR_SET_SECCOMP from an unprivileged process
+      # without no_new_privs, so dropping this line does not just remove a
+      # defence, it removes the network isolation as well.
+      - no-new-privileges:true
+    pids_limit: ${SANDBOX_PIDS_LIMIT:-512}
+    mem_limit: ${SANDBOX_CONTAINER_MEMORY:-3g}
+    tmpfs:
+      # The only writable path. noexec so nothing a submission writes can be
+      # run, and size-capped so filling the disk means filling 256 MB of RAM and
+      # then getting ENOSPC.
+      - /scratch:rw,noexec,nosuid,nodev,size=256m,mode=1777
+      # Python's default temp dir. Without it a read-only rootfs turns an
+      # ordinary tempfile call into a crash.
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
+    # healthcheck is inherited from the image.
 
 volumes:
   discrimen-data:

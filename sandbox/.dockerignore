@@ -1,0 +1,13 @@
+# Trimming the build context, on the same reasoning as the repository root's:
+# anything in here that changes re-uploads the context and can invalidate a
+# layer the build never reads.
+#
+# The Dockerfile COPYs five files by name rather than the directory, so nothing
+# below could reach the image even without this. It is here so that the context
+# for the one image whose selling point is having no dependencies does not
+# quietly carry a test suite and a pile of bytecode.
+tests/
+**/__pycache__/
+**/*.pyc
+Dockerfile
+.dockerignore

@@ -1,12 +1,15 @@
 #!/bin/bash
 source "${AGENT_PATH}/common.sh"
-_check_required_env_vars "CONTAINER_NAME" "IMAGE_REGISTRY" "IMAGE_REPO" "IMAGE_TAG"
+_check_required_env_vars "CONTAINER_NAME" "IMAGE_REGISTRY" "IMAGE_REPO" "IMAGE_TAG" \
+    "SANDBOX_IMAGE_REPO" "SANDBOX_IMAGE_TAG"
 _check_docker_installed || _die "Docker test failed"
 
-# install-pre.sh has normally pulled this already; repeated because install.sh
+# install-pre.sh has normally pulled these already; repeated because install.sh
 # is also runnable on its own, and a pull of an image already present is free.
 docker pull "$IMAGE_REGISTRY/$IMAGE_REPO:$IMAGE_TAG" \
     || _die "Failed to pull $IMAGE_REGISTRY/$IMAGE_REPO:$IMAGE_TAG"
+docker pull "$IMAGE_REGISTRY/$SANDBOX_IMAGE_REPO:$SANDBOX_IMAGE_TAG" \
+    || _die "Failed to pull $IMAGE_REGISTRY/$SANDBOX_IMAGE_REPO:$SANDBOX_IMAGE_TAG"
 
 # No teardown here: start.sh converges, so a newly pulled image or a changed run
 # command recreates the container while an install that changed neither leaves
@@ -20,6 +23,29 @@ for _ in $(seq 1 10); do
 done
 curl -sf "http://localhost:${ROUTER_PORT:-8585}/health" >/dev/null 2>&1 \
     || _die "discrimen failed to start"
+
+# The sidecar is polled separately and is NOT fatal.
+#
+# The asymmetry is deliberate. A router with no grading sandbox still routes,
+# still serves /v1/*, and still benchmarks every question that is not a coding
+# question — so failing the install would take a working fleet offline over a
+# feature that degrades. But it degrades SILENTLY, as coding questions that
+# every worker gets wrong, so the warning has to be loud and has to name the
+# container to look in.
+echo "Waiting for the grading sandbox..."
+for _ in $(seq 1 15); do
+    curl -sf "http://127.0.0.1:${SANDBOX_PORT:-8587}/health" >/dev/null 2>&1 && break
+    sleep 1
+done
+if ! curl -sf "http://127.0.0.1:${SANDBOX_PORT:-8587}/health" >/dev/null 2>&1; then
+    echo
+    echo "WARNING: the grading sandbox on port ${SANDBOX_PORT:-8587} is not answering."
+    echo "  The router is up and routing. Coding benchmark questions cannot be graded"
+    echo "  without it, and they fail as wrong answers rather than as errors — so every"
+    echo "  worker's coding tier will read as zero until this is fixed."
+    echo "  Look at:  docker logs ${CONTAINER_NAME}_sandbox"
+    echo
+fi
 
 echo "Installation of ${CONTAINER_NAME} complete"
 

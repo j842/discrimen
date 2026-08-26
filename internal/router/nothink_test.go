@@ -197,7 +197,13 @@ func TestNoThinkBenchmarkMergesEasyTiers(t *testing.T) {
 		t.Fatalf("mixed run asked %d questions, want 4", mixedRequests)
 	}
 
-	nt, ntOK, _ := r.runNoThinkQualityBenchmark(b, 2, details)
+	nt, ntOK, _, ntResults := r.runNoThinkQualityBenchmark(b, 2, details)
+	// The per-question record is what lets the category breakdown split the
+	// no-think half; a score with no results behind it can only ever be shown
+	// as one number.
+	if ntOK && len(ntResults) != len(benchmarkQuestions) {
+		t.Errorf("no-think details = %d, want one per question (%d)", len(ntResults), len(benchmarkQuestions))
+	}
 	if !ntOK {
 		t.Fatal("no-think pass should have scored")
 	}

@@ -52,6 +52,20 @@ jobs:
             dockerfile: embeddings/Dockerfile
             platform: linux/arm64
             runner: ubuntu-24.04-arm
+          # The sandbox builds per-arch like the others even though it compiles
+          # nothing: jail.py carries a syscall number per architecture for its
+          # seccomp filter, so an amd64-only manifest would run under emulation
+          # on an arm64 host and the filter would be checking the wrong table.
+          - image: discrimen-sandbox
+            context: ./sandbox
+            dockerfile: sandbox/Dockerfile
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - image: discrimen-sandbox
+            context: ./sandbox
+            dockerfile: sandbox/Dockerfile
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
 
     steps:
       - uses: actions/checkout@v7
@@ -116,6 +130,7 @@ jobs:
         include:
           - image: discrimen
           - image: discrimen-embeddings
+          - image: discrimen-sandbox
     steps:
       # "-linux-" is load-bearing: "discrimen" is a prefix of
       # "discrimen-embeddings", so "digests-discrimen-*" would also download

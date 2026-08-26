@@ -7,6 +7,7 @@ import (
 	"log"
 	"math"
 	"net"
+	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
@@ -123,7 +124,11 @@ type benchmarkQ struct {
 	Tier   int    // difficulty band 1 (control) … 11 (budget-bounded insight) … 12 (programming); also sets grading mode — tiers >= benchHardTier are graded thinking-on (see benchmark_data.go)
 	Prompt string // user prompt sent to the worker
 	Expect string // expected answer token (see Match)
-	Match  string // "contains" | "numeric" | "mcq" | "final-contains" (see checkAnswer)
+	Match  string // "contains" | "numeric" | "mcq" | "final-contains" | "code-exec" (see checkAnswer)
+	// Code is set only when Match == benchMatchCodeExec. Such a question has no
+	// Expect: its ground truth is its test cases, and grading means running the
+	// answer in the sandbox sidecar (codeexec.go) rather than comparing strings.
+	Code *benchCode
 }
 
 // BenchResult is one graded question's full outcome, stored in the worker's
@@ -242,6 +247,21 @@ const (
 	benchMaxAttempts  = 3
 	benchRetryBackoff = time.Second
 
+	// A BUSY worker is not a wrong answer and not an outage — it is a worker with
+	// no free slot right now, which is the normal state of a fleet being profiled
+	// while it also serves production. Failing the question would grade the queue
+	// rather than the model, so a busy response waits benchBusyWait and tries
+	// again, for as long as it takes.
+	//
+	// benchBusyMaxStreak is the circuit breaker on that patience: a worker that
+	// has been busy this many times CONSECUTIVELY (across the whole run, reset by
+	// any successful answer) is not congested, it is gone — a relay row whose
+	// upstream dropped it, or an endpoint that 404s everything. Profiling is
+	// abandoned rather than spinning forever, and the run is reported incomplete
+	// so it can be resumed deliberately instead of silently scoring a zero.
+	benchBusyWait      = time.Second
+	benchBusyMaxStreak = 100
+
 	// benchAnswerDeadline is the hard per-question usability bound. A worker that needs
 	// longer than this to answer ANY question is too slow to be usable at that
 	// difficulty, so the question is scored a FAIL (a speed fail, counted like a wrong
@@ -300,7 +320,7 @@ type benchOutcome struct {
 // grades the answer. Extracted from runQualityBenchmark's loop so the no-think
 // scoring pass (runNoThinkQualityBenchmark) asks questions EXACTLY the way the
 // main benchmark does — a second copy of the request/grading logic would drift.
-func (r *Router) benchOne(b *Backend, q benchmarkQ, think bool) benchOutcome {
+func (r *Router) benchOne(b *Backend, q benchmarkQ, think bool, busy *benchBusyTracker) benchOutcome {
 	res := benchOutcome{tier: q.Tier}
 	maxTokens := benchMaxTokens
 	prompt := q.Prompt
@@ -348,22 +368,47 @@ func (r *Router) benchOne(b *Backend, q benchmarkQ, think bool) benchOutcome {
 	if q.Tier >= benchFrontierTier {
 		deadline = benchAnswerDeadlineFrontier // v33: frontier tiers measure capability, not patience
 	}
-	for attempt := 1; attempt <= benchMaxAttempts; attempt++ {
+	abandoned := false
+	for attempt := 1; ; attempt++ {
+		if busy != nil && busy.abandoned() {
+			abandoned = true
+			break
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), deadline)
 		raw, err = r.benchCompletion(ctx, b, payload)
 		cancel()
 		if err == nil {
+			if busy != nil {
+				busy.ok()
+			}
 			break
 		}
 		if isTimeout(err) {
 			slow = true
 			break // too slow → a usability fail for this question, never retried
 		}
-		if attempt < benchMaxAttempts {
-			time.Sleep(benchRetryBackoff * time.Duration(attempt))
+		// A busy worker is a queue, not an answer: wait a beat and ask again for
+		// as long as the streak breaker allows, rather than grading the congestion.
+		if benchBusyStatus(err) {
+			if busy != nil && busy.busy() {
+				abandoned = true
+				break
+			}
+			time.Sleep(benchBusyWait)
+			continue
 		}
+		if attempt >= benchMaxAttempts {
+			break
+		}
+		time.Sleep(benchRetryBackoff * time.Duration(attempt))
 	}
 	switch {
+	case abandoned:
+		// Not a wrong answer and not this question's fault: the worker stopped
+		// responding for the whole run. Marked errored so the score is reported
+		// incomplete rather than as a zero the worker did not earn.
+		res.errd = true
+		res.got = "(abandoned — worker busy)"
 	case slow:
 		res.slow = true // answered too slowly to be usable — counts as a wrong answer, not an outage
 		res.got = "(too slow)"
@@ -374,6 +419,21 @@ func (r *Router) benchOne(b *Backend, q benchmarkQ, think bool) benchOutcome {
 		content, finish := completionContent(raw)
 		res.trunc = finish == "length"
 		res.got = answerTail(content)
+		if q.Match == benchMatchCodeExec {
+			// Graded by RUNNING it. A sandbox that cannot be reached leaves the
+			// question errored rather than failed — see gradeCode.
+			ctx, cancel := context.WithTimeout(context.Background(), codeExecHTTPGrace)
+			pass, err := r.gradeCode(ctx, content, q)
+			cancel()
+			switch {
+			case err != nil:
+				res.errd = true
+				res.got = "(sandbox: " + err.Error() + ")"
+			case pass:
+				res.pass = true
+			}
+			return res
+		}
 		if checkAnswer(q, content) {
 			res.pass = true
 		} else if checkAnswerLoose(q, content) {
@@ -416,6 +476,7 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 	// score is what router-decided traffic experiences; a request whose client
 	// forces thinking OFF is scored separately — see runNoThinkQualityBenchmark.
 	results := make([]benchOutcome, len(benchmarkQuestions))
+	busy := &benchBusyTracker{}
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	for i := range benchmarkQuestions {
@@ -425,7 +486,7 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 			defer wg.Done()
 			defer func() { <-sem }()
 			q := benchmarkQuestions[i]
-			results[i] = r.benchOne(b, q, q.Tier >= benchHardTier)
+			results[i] = r.benchOne(b, q, q.Tier >= benchHardTier, busy)
 		}(i)
 	}
 	wg.Wait()
@@ -548,9 +609,15 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 // outcomes are merged with the mixed run's easy-tier results and scored with the
 // same weighted arithmetic. `mixed` is the detail list runQualityBenchmark
 // returned, aligned index-for-index with benchmarkQuestions.
-func (r *Router) runNoThinkQualityBenchmark(b *Backend, concurrency int, mixed []BenchResult) (score int, ok bool, breakdown string) {
+// The fourth return is the per-question record for THIS pass. Without it the
+// no-think outcomes were tallied into per-tier counters and then discarded, so
+// the stored profile could say a worker scored 41 with thinking off but not
+// which questions it lost — and a tier does not map to one category, so the
+// category breakdown could only ever show the thinking-on half. Building it
+// costs one append per question in a loop that already visits every outcome.
+func (r *Router) runNoThinkQualityBenchmark(b *Backend, concurrency int, mixed []BenchResult) (score int, ok bool, breakdown string, details []BenchResult) {
 	if len(benchmarkQuestions) == 0 || len(mixed) != len(benchmarkQuestions) {
-		return 0, false, ""
+		return 0, false, "", nil
 	}
 	if concurrency < 1 {
 		concurrency = 1
@@ -562,6 +629,7 @@ func (r *Router) runNoThinkQualityBenchmark(b *Backend, concurrency int, mixed [
 		}
 	}
 	rerun := make([]benchOutcome, len(hardIdx))
+	busy := &benchBusyTracker{}
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	for j, i := range hardIdx {
@@ -570,7 +638,7 @@ func (r *Router) runNoThinkQualityBenchmark(b *Backend, concurrency int, mixed [
 		go func(j, i int) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			rerun[j] = r.benchOne(b, benchmarkQuestions[i], false)
+			rerun[j] = r.benchOne(b, benchmarkQuestions[i], false, busy)
 		}(j, i)
 	}
 	wg.Wait()
@@ -594,8 +662,14 @@ func (r *Router) runNoThinkQualityBenchmark(b *Backend, concurrency int, mixed [
 	for j, i := range hardIdx {
 		outcomes[i] = rerun[j]
 	}
-	for _, res := range outcomes {
+	for i, res := range outcomes {
 		count[res.tier]++
+		q := benchmarkQuestions[i]
+		details = append(details, BenchResult{
+			Tier: q.Tier, Prompt: q.Prompt, Expect: q.Expect,
+			Got: res.got, Pass: res.pass, Truncated: res.trunc, Errored: res.errd, Slow: res.slow,
+			Loose: res.loose,
+		})
 		switch {
 		case res.errd:
 			errored++
@@ -614,11 +688,11 @@ func (r *Router) runNoThinkQualityBenchmark(b *Backend, concurrency int, mixed [
 	// actually asked: a worker that went unreachable mid-run is unmeasurable,
 	// not bad.
 	if errored*2 > len(hardIdx) {
-		return 0, false, ""
+		return 0, false, "", nil
 	}
 	ok2, score2 := benchWeightedScore(pass, loose, count, maxTier)
 	if !ok2 {
-		return 0, false, ""
+		return 0, false, "", nil
 	}
 	var bd strings.Builder
 	for t := 1; t <= maxTier; t++ {
@@ -637,7 +711,7 @@ func (r *Router) runNoThinkQualityBenchmark(b *Backend, concurrency int, mixed [
 	}
 	log.Printf("benchmark %s (no-think): q=%d%% (errored=%d, slow=%d, conc=%d) %s",
 		b.ID, score2, errored, slowFailed, concurrency, strings.TrimSpace(bd.String()))
-	return score2, true, strings.TrimSpace(bd.String())
+	return score2, true, strings.TrimSpace(bd.String()), details
 }
 
 // needsNoThinkBackfill reports whether a cached profile is missing its no-think
@@ -1100,6 +1174,11 @@ func matchesAnswerList(answer, expect string) bool {
 		return false
 	}
 	lines := strings.Split(benchTagRe.ReplaceAllString(answer, " "), "\n")
+	// Scan from the end for the line the model COMMITTED to — the last one that
+	// parses as a list of the right length — and grade only that. Not the last
+	// one that happens to MATCH: a reasoning model enumerates candidate orderings
+	// while it works, and letting an abandoned intermediate rescue a wrong final
+	// answer is precisely the failure TestCheckAnswerExactList pins.
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := lines[i]
 		// Drop a leading label ("Answer:", "The final answer is:") so the list is
@@ -1111,16 +1190,42 @@ func matchesAnswerList(answer, expect string) bool {
 		if len(got) != len(want) {
 			continue
 		}
-		same := true
 		for j := range got {
+			// Element 0 carries whatever prose preceded the list — "The answer is
+			// 2,8,6,…" splits to ["the answer is 2","8",…] — so it is the only one
+			// allowed to differ, and only by a prefix on a word boundary. Every
+			// other element must match exactly: these are permutation answers, so
+			// a partial overlap is simply wrong.
+			if j == 0 && listHeadMatches(got[0], want[0]) {
+				continue
+			}
 			if got[j] != want[j] {
-				same = false
-				break
+				return false
 			}
 		}
-		if same {
-			return true
-		}
+		return true
+	}
+	return false
+}
+
+// listHeadMatches compares the first element of an answer list, tolerating a
+// prose lead-in. The suffix has to sit on a word boundary: without that check
+// "the answer is 21" would match a wanted "1", turning a wrong permutation into
+// a pass.
+func listHeadMatches(got, want string) bool {
+	if got == want {
+		return true
+	}
+	if !strings.HasSuffix(got, want) {
+		return false
+	}
+	pre := got[:len(got)-len(want)]
+	if pre == "" {
+		return true
+	}
+	switch pre[len(pre)-1] {
+	case ' ', ':', '*', '_', '`', '"', '\'', '=', '-':
+		return true
 	}
 	return false
 }
@@ -1374,4 +1479,54 @@ func thinkLabel(think bool) string {
 		return "think"
 	}
 	return "no_think"
+}
+
+// benchBusyStatus reports whether a completion error means "no capacity right
+// now" rather than "wrong" or "broken".
+//
+// 404 is in the list, which looks wrong and is not: a relayed row whose upstream
+// is saturated gets health-pruned and re-added on the next refresh, so a pin
+// lands on a row that momentarily does not exist. That is congestion wearing a
+// 404, and treating it as a permanent failure is what silently recorded 100+
+// questions as wrong answers during the first calibration run.
+func benchBusyStatus(err error) bool {
+	switch completionStatusCode(err) {
+	case http.StatusNotFound, http.StatusRequestTimeout, http.StatusTooManyRequests,
+		http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
+
+// benchBusyTracker counts CONSECUTIVE busy responses across a profiling run.
+// Shared by every concurrent question, so the streak measures the worker rather
+// than any one question.
+type benchBusyTracker struct {
+	mu     sync.Mutex
+	streak int
+	gaveUp bool
+}
+
+// busy records a busy response and reports whether the run should be abandoned.
+func (t *benchBusyTracker) busy() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.streak++
+	if t.streak >= benchBusyMaxStreak {
+		t.gaveUp = true
+	}
+	return t.gaveUp
+}
+
+// ok clears the streak: any answer at all proves the worker is reachable.
+func (t *benchBusyTracker) ok() {
+	t.mu.Lock()
+	t.streak = 0
+	t.mu.Unlock()
+}
+
+func (t *benchBusyTracker) abandoned() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.gaveUp
 }

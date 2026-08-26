@@ -106,7 +106,7 @@ func benchLimitPerTask(qs []poolQuestion, n int) []poolQuestion {
 	return out
 }
 
-func benchCalibrate(routerURL, token string, concurrency, limit int) error {
+func benchCalibrate(routerURL, token, sandboxURL string, concurrency, limit int) error {
 	pool, err := benchLoadPool()
 	if err != nil {
 		return err
@@ -135,6 +135,7 @@ func benchCalibrate(routerURL, token string, concurrency, limit int) error {
 		wg.Add(1)
 		go func(b benchBackend) {
 			defer wg.Done()
+			busy := &benchBusyTracker{}
 			mu.Lock()
 			res := calib.forBackend(b.ID)
 			if res == nil {
@@ -167,7 +168,7 @@ func benchCalibrate(routerURL, token string, concurrency, limit int) error {
 				go func(q poolQuestion) {
 					defer qwg.Done()
 					defer func() { <-sem }()
-					pass := benchGradeOne(routerURL, token, b.ID, q)
+					pass := benchGradeOne(routerURL, token, b.ID, sandboxURL, q, busy)
 					mu.Lock()
 					res.Pass[q.ID] = pass
 					done++
@@ -207,7 +208,7 @@ func benchCalibrate(routerURL, token string, concurrency, limit int) error {
 // question calibrated under different conditions than it will be graded under
 // is calibrated for nothing. The tiers this pool replaces are all at or above
 // benchHardTier, so thinking is unconditionally on.
-func benchGradeOne(routerURL, token, backendID string, q poolQuestion) bool {
+func benchGradeOne(routerURL, token, backendID, sandboxURL string, q poolQuestion, busy *benchBusyTracker) bool {
 	payload := map[string]any{
 		"model":                "default",
 		"stream":               false,
@@ -249,14 +250,46 @@ func benchGradeOne(routerURL, token, backendID string, q poolQuestion) bool {
 		resp.Body.Close()
 		cancel()
 		if readErr != nil || resp.StatusCode != http.StatusOK {
+			// Same rule as the production benchmark (benchOne): a BUSY worker is a
+			// queue, not a wrong answer. Calibration runs against a live fleet and
+			// saturates it, and a relayed row whose upstream is loaded gets
+			// health-pruned and re-added — so a pin lands on a row that briefly
+			// does not exist and comes back 404. Recording that as a failure is
+			// exactly what poisoned the first run: two work: backends scored 46/100
+			// against a sibling's 82/111 on identical questions.
+			if benchBusyStatus(fmt.Errorf("completion returned %d: busy", resp.StatusCode)) {
+				if busy.busy() {
+					return false // streak breaker: the worker is gone, not congested
+				}
+				time.Sleep(benchBusyWait)
+				attempt-- // a queue is not one of the three real attempts
+				continue
+			}
 			time.Sleep(benchRetryBackoff * time.Duration(attempt))
 			continue
 		}
+		busy.ok()
 		var decoded map[string]any
 		if json.Unmarshal(raw, &decoded) != nil {
 			return false
 		}
 		content, _ := completionContent(decoded)
+		// A coding question has no Expect to compare against — its ground truth is
+		// its test cases, and grading means running the answer. Calibration has to
+		// grade it EXACTLY as production will or the measured difficulty is a
+		// difficulty for a different grader, so this goes through the same sidecar
+		// the router uses rather than a second copy of the logic.
+		if q.Match == benchMatchCodeExec {
+			pass, err := benchGradeCodeStandalone(sandboxURL, q, content)
+			if err != nil {
+				// Unreachable sandbox is not a wrong answer. Returning false here
+				// would record every coding question as failed for every worker,
+				// which is exactly how the exact-list bug poisoned the last run.
+				fmt.Fprintf(os.Stderr, "  sandbox: %v\n", err)
+				return false
+			}
+			return pass
+		}
 		return checkAnswer(benchmarkQ{Prompt: q.Prompt, Expect: q.Expect, Match: q.Match}, content)
 	}
 	return false

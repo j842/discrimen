@@ -19,6 +19,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -89,6 +90,8 @@ type Config struct {
 	// ProfileWorkers measures quality/speed/capacity/capabilities/context at cold
 	// start instead of trusting declared values (the worker declares ~nothing).
 	// CapacityProbeMax caps the concurrency ramp used for the capacity test.
+	SandboxURL       string // sandbox sidecar base URL; empty disables code-exec questions
+	SandboxToken     string // optional bearer for the sidecar
 	ProfileWorkers   bool
 	CapacityProbeMax int
 
@@ -467,6 +470,14 @@ type RequestLog struct {
 	// no credential (every row written before P3, and a trusted-LAN deployment
 	// with no tokens configured). See identity.logKeyID.
 	KeyID string `json:"key_id,omitempty"`
+	// ClientIP is the address the request arrived from, and answers a question
+	// KeyID cannot: one shared key is one credential and often several machines.
+	// Empty on every row written before the column existed and on anything whose
+	// origin could not be read as an address — the usage graph draws those as
+	// "unknown" rather than dropping them, because a fresh column on an old
+	// database is otherwise indistinguishable from an idle router. See clientIP
+	// for how it is derived and, more to the point, what it must not be used for.
+	ClientIP string `json:"client_ip,omitempty"`
 }
 
 type LogStore struct {
@@ -679,6 +690,28 @@ const (
 	difficultyTimeoutFallback = 2 * time.Second
 )
 
+// defaultMaxTokensFallback is the budget a client that declares none gets.
+//
+// 16384, not 4096, and the difference is not a comfort margin. On a hybrid
+// reasoning worker a thinking block cut off at the limit returns
+// finish_reason=length with an EMPTY content field — no answer at all, not a
+// short one. Measured 2026-08-20 on llm-6000pro-qwen38-27b-ninfer: 48 requests
+// at 4096, 4.2% came back empty, every one a counting question whose chain ran
+// past the cap. Those empties then look like a WORKER problem to the escalation
+// path, which re-dispatches them to a better model, so a budget too small to
+// think in gets diagnosed as inadequate quality.
+//
+// It also matches benchThinkMaxTokens: at 4096 ordinary traffic was getting a
+// quarter of the budget this router's own benchmark requires before it will
+// judge a model competent.
+//
+// The trade, from the same measurement: this does not fix a true runaway. It
+// converts the chains that would have concluded between 4k and 16k into
+// answers and makes the rest fail slower (~50s to ~3min of silence). On a slow
+// worker an unbounded client's worst case is now governed by
+// ROUTER_SLOT_MAX_WAIT_SECONDS rather than by this cap.
+const defaultMaxTokensFallback = 16384
+
 func loadConfig() *Config {
 	// Clamp the health interval to >=1s: time.NewTicker(0) panics, so a
 	// misconfigured HEALTH_INTERVAL_SECONDS=0 (or negative) must not reach it.
@@ -707,7 +740,7 @@ func loadConfig() *Config {
 		WorkerToken:        os.Getenv("ROUTER_WORKER_TOKEN"),
 		ClientTokens:       parseTokenList(os.Getenv("ROUTER_CLIENT_TOKENS")),
 		AdminPassword:      os.Getenv("ROUTER_ADMIN_PASSWORD"),
-		DefaultMaxTokens:   envInt("DEFAULT_MAX_TOKENS", 4096),
+		DefaultMaxTokens:   envInt("DEFAULT_MAX_TOKENS", defaultMaxTokensFallback),
 		HealthInterval:     time.Duration(healthSecs) * time.Second,
 		BackendHTTPTimeout: time.Duration(envInt("BACKEND_TIMEOUT_SECONDS", 600)) * time.Second,
 		BackendIdleTimeout: time.Duration(envInt("BACKEND_IDLE_TIMEOUT_SECONDS", 120)) * time.Second,
@@ -743,6 +776,12 @@ func loadConfig() *Config {
 
 		ProfileWorkers:   true,
 		CapacityProbeMax: capacityProbeMax,
+
+		// Empty disables code-exec grading entirely rather than failing those
+		// questions: a deployment without the sidecar should score the questions
+		// it can grade, not record every coding question as a wrong answer.
+		SandboxURL:   strings.TrimSpace(os.Getenv("SANDBOX_URL")),
+		SandboxToken: strings.TrimSpace(os.Getenv("SANDBOX_TOKEN")),
 
 		EscalateInline: true,
 	}
@@ -793,6 +832,10 @@ func (r *Router) routes() *http.ServeMux {
 	mux.HandleFunc("/v1/embeddings", r.handleEmbeddings)
 	mux.HandleFunc("/embeddings", r.handleEmbeddings)
 	mux.HandleFunc("/logs", r.handleLogs)
+	// The other view of the same table, kept beside it rather than down with the
+	// admin block: /logs is unprefixed only because the compatibility contract
+	// froze it there, and anything new is admin-scoped under /admin.
+	mux.HandleFunc("/admin/usage", r.handleUsage)
 	mux.HandleFunc("/v1/route-feedback", r.handleRouteFeedback)
 	mux.HandleFunc("/route-feedback", r.handleRouteFeedback)
 	mux.HandleFunc("/v1/route-preview", r.handleRoutePreview)
@@ -906,6 +949,17 @@ func (r *Router) handleBackends(w http.ResponseWriter, req *http.Request) {
 // run: GET /backends/{id}/benchmark. Read-only, ADMIN scope since P3 — it is the
 // grading set and one worker's answers to it, which is both fleet detail and the
 // benchmark's own answer key.
+//
+// It also carries the per-CATEGORY breakdown (benchcategory.go), which is the
+// same run grouped by what each question measures rather than by how hard it is.
+// Derived here on request rather than stored on the profile: it is a pure
+// function of results the profile already holds, so computing it costs a walk
+// over ~400 records and cannot go stale, where a stored copy would survive a
+// change to the categorisation and quietly contradict it.
+//
+// One endpoint rather than a second one beside it, because the dashboard already
+// fetches this per backend for the profile-cost cell — a /categories route would
+// double the round trips to show two halves of one run.
 func (r *Router) serveBenchmark(w http.ResponseWriter, req *http.Request, id string) {
 	if req.Method != http.MethodGet {
 		methodNotAllowed(w)
@@ -929,6 +983,19 @@ func (r *Router) serveBenchmark(w http.ResponseWriter, req *http.Request, id str
 		"measured_at":     prof.MeasuredAt,
 		"profile_ms":      prof.ProfileMillis,
 		"profiled_in":     fmtProfileDuration(prof.ProfileMillis),
+		// The two per-tier lines the benchmark logs. They stay even though
+		// "categories" supersedes them for most reading: a tier line is what the
+		// CLI prints and what the router's own log holds, so it is what an
+		// operator will be comparing against.
+		"quality_detail":         prof.QualityDetail,
+		"quality_nothink_detail": prof.QualityNoThinkDetail,
+		"categories":             benchCategoryBreakdown(prof.BenchResults, prof.BenchResultsNoThink),
+		// Whether the no-think half of that breakdown exists at all. A consumer
+		// must not read a missing per-category no-think score as a zero — see
+		// WorkerProfile.BenchResultsNoThink — so say which it is rather than
+		// leaving it to be inferred from an absent field.
+		"nothink_results_stored": len(prof.BenchResultsNoThink) > 0 &&
+			len(prof.BenchResultsNoThink) == len(prof.BenchResults),
 		// What the run cost. Omitted entirely for a profile measured before the
 		// accounting existed, so a UI renders nothing rather than a confident zero
 		// (see WorkerProfile.ProfilePromptTokens).
@@ -1038,6 +1105,42 @@ func (r *Router) handleLogs(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"logs": rows})
+}
+
+// handleUsage answers the dashboard's usage chart: the last twelve hours of
+// request logs as mean concurrency per five-minute bucket, split by the address
+// each request came from.
+//
+// Admin scope, for the same reason /logs is. This is the request log with the
+// bodies taken out, and the set of addresses talking to a router is not less
+// sensitive than the requests themselves — it is a map of who runs what and
+// from where, and on a public deployment it is the reconnaissance half of the
+// log without the volume that makes the log tedious to read.
+//
+// The window and the bucket are not query parameters. There is one chart, it
+// answers one question, and an operator who wants a different window has the log
+// table; a knob here would only mean two callers disagreeing about what the
+// numbers mean.
+func (r *Router) handleUsage(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	if !r.requireAdmin(w, req) {
+		return
+	}
+	// No database configured at all. An empty frame rather than an error: the
+	// chart is not broken, there is simply nothing recording.
+	if r.logs == nil {
+		writeJSON(w, http.StatusOK, newUsageSeries(time.Now(), usageWindow, usageBucket))
+		return
+	}
+	series, err := r.logs.UsageSeries(req.Context(), time.Now(), usageWindow, usageBucket, usageTopClients)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, validationError{Message: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, series)
 }
 
 func (r *Router) handleRegisterBackend(w http.ResponseWriter, req *http.Request) {
@@ -1816,7 +1919,7 @@ func (r *Router) proxyPassthrough(w http.ResponseWriter, req *http.Request, iden
 
 	backend, slot, slotErr := r.pickAndAcquire(req.Context(), candidates)
 	if slotErr != nil {
-		r.logSlotUnavailable(ident, candidates[0], route, false, nil, start, slotErr)
+		r.logSlotUnavailable(ident, clientIP(req), candidates[0], route, false, nil, start, slotErr)
 		writeUnavailable(w, r.retryAfterSaturated(), fmt.Sprintf("no backend slot available: %s", slotErr))
 		return
 	}
@@ -1832,6 +1935,7 @@ func (r *Router) proxyPassthrough(w http.ResponseWriter, req *http.Request, iden
 		BaselineTPS:  backend.BaselineTPS,
 		SpeedScore:   speedScore(backend),
 		KeyID:        ident.logKeyID(),
+		ClientIP:     clientIP(req),
 	}
 	// Small capture, kept only to read the endpoint's usage block for per-key
 	// budgeting. Head-and-tail bounded, and usage sits at the tail in both the
@@ -1948,7 +2052,62 @@ func (r *Router) proxyPassthrough(w http.ResponseWriter, req *http.Request, iden
 // It takes the caller for the same reason the success path does: a relayed
 // request's prompt must not reach the log store on the failure path either, and
 // a redaction that only covered the requests that worked would be no redaction.
-func (r *Router) logSlotUnavailable(ident *identity, primary *Backend, route string, stream bool, input []byte, start time.Time, cause error) {
+// clientIP is the address a request came in from, for the usage graph and for
+// the caller line on a log row.
+//
+// X-Forwarded-For is preferred over RemoteAddr whenever it parses, because this
+// router is normally deployed behind Caddy and behind Cloudflare: RemoteAddr
+// there is the proxy's own address, so every request in the fleet would stack
+// into one band and the graph would be a solid block saying nothing. The
+// LEFTMOST entry is the original client — each hop appends itself on the right.
+//
+// That header is trivially forged by anything that can reach this router
+// directly, and it is taken at face value here with no list of trusted proxies.
+// That is a deliberate trade, and it is only safe because of what this value
+// decides: which coloured band a bar is drawn in, on a chart only an admin
+// session can load. Nothing authenticates against it, nothing is rate-limited
+// by it, nothing is refused because of it — the api_keys row does all of that
+// (see identity, which is why this is NOT a field on it: a spoofable value
+// living inside the struct called "identity" is an invitation to grant
+// something on the strength of it). If that ever changes, this function is the
+// wrong place to get the answer from: it would first need a configured set of
+// trusted hops, because as it stands the caller chooses what the leftmost entry
+// says.
+//
+// An entry that is not an IP address is discarded rather than stored, which is
+// also what bounds what a forged header can put in the column and in the chart
+// legend.
+func clientIP(req *http.Request) string {
+	if req == nil {
+		return ""
+	}
+	forwarded, _, _ := strings.Cut(req.Header.Get("X-Forwarded-For"), ",")
+	if ip := parseHost(forwarded); ip != "" {
+		return ip
+	}
+	return parseHost(req.RemoteAddr)
+}
+
+// parseHost strips any port from an address and keeps it only if what is left is
+// an IP. net.SplitHostPort rather than a cut at the last colon: a bare IPv6
+// address is nothing but colons, and cutting one leaves a different address that
+// still looks plausible. It fails on the bracketless bare form, which is exactly
+// the case where there was no port to strip.
+func parseHost(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		addr = host
+	}
+	addr = strings.Trim(addr, "[]")
+	if net.ParseIP(addr) == nil {
+		return ""
+	}
+	return addr
+}
+
+// from is the caller's address, threaded in because this is the one place a
+// request is logged without the *http.Request still being in scope.
+func (r *Router) logSlotUnavailable(ident *identity, from string, primary *Backend, route string, stream bool, input []byte, start time.Time, cause error) {
 	entry := redactForRelay(RequestLog{
 		CreatedAt:      start.UTC(),
 		BackendID:      primary.ID,
@@ -1960,6 +2119,7 @@ func (r *Router) logSlotUnavailable(ident *identity, primary *Backend, route str
 		Error:          cause.Error(),
 		DurationMillis: time.Since(start).Milliseconds(),
 		KeyID:          ident.logKeyID(),
+		ClientIP:       from,
 	}, ident)
 	if err := r.logs.Insert(context.Background(), entry); err != nil {
 		log.Printf("request log insert failed backend=%s: %v", primary.ID, err)
@@ -2321,7 +2481,7 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 	}
 	backend, slot, missedPref, slotErr := r.pickAndAcquirePreferred(req.Context(), candidates, pref)
 	if slotErr != nil {
-		r.logSlotUnavailable(ident, candidates[0], route, chatReq.Stream, body, start, slotErr)
+		r.logSlotUnavailable(ident, clientIP(req), candidates[0], route, chatReq.Stream, body, start, slotErr)
 		writeUnavailable(w, r.retryAfterSaturated(), fmt.Sprintf("no backend slot available: %s", slotErr))
 		return
 	}
@@ -2390,6 +2550,7 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 		Stream:       chatReq.Stream,
 		Input:        string(body),
 		KeyID:        ident.logKeyID(),
+		ClientIP:     clientIP(req),
 	}
 	capture := newBoundedCapture(r.cfg.LogMaxBodyBytes)
 	var stats *sseStats
@@ -3238,7 +3399,7 @@ func (r *Router) certifyBackend(id string) {
 					if conc < 1 {
 						conc = 1
 					}
-					score, ok, breakdown := r.runNoThinkQualityBenchmark(backend, conc, prof.BenchResults)
+					score, ok, breakdown, ntResults := r.runNoThinkQualityBenchmark(backend, conc, prof.BenchResults)
 					if !ok {
 						// Worker likely blipped mid-run. Keep the single-score profile —
 						// the worker ranks as unmeasured (below every measured worker) on
@@ -3249,6 +3410,7 @@ func (r *Router) certifyBackend(id string) {
 					}
 					prof.QualityNoThink = score
 					prof.QualityNoThinkDetail = breakdown
+					prof.BenchResultsNoThink = ntResults
 					if prof.Checks == nil {
 						prof.Checks = map[string]Check{}
 					}
@@ -5424,6 +5586,13 @@ func (s *LogStore) init(ctx context.Context) error {
 		// default, which reads as "the router required no credential" — true of
 		// every request made under the old client-token-or-nothing scheme.
 		`ALTER TABLE request_logs ADD COLUMN key_id TEXT NOT NULL DEFAULT ''`,
+		// Where the request came in from, for the dashboard's usage graph. Every
+		// row already in the table keeps the empty default and there is nothing to
+		// backfill it from — the address was never recorded — so an existing
+		// database shows twelve hours of "unknown" until it has been running with
+		// this build for twelve hours. That is the honest rendering; the
+		// alternative of hiding those rows would make a busy router look idle.
+		`ALTER TABLE request_logs ADD COLUMN client_ip TEXT NOT NULL DEFAULT ''`,
 		// Whether a key belongs to a downstream router rather than a client
 		// (see relay.go). Every key issued before relays existed is not one, and
 		// 0 is what the default gives them.
@@ -5442,8 +5611,8 @@ func (s *LogStore) Close() error {
 
 func (s *LogStore) Insert(ctx context.Context, entry RequestLog) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO request_logs
-		(created_at, backend_id, backend_model, route, observed_tps, certified_tps, baseline_tps, speed_score, stream, status_code, duration_ms, input, output, error, key_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		(created_at, backend_id, backend_model, route, observed_tps, certified_tps, baseline_tps, speed_score, stream, status_code, duration_ms, input, output, error, key_id, client_ip)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		entry.CreatedAt.Format(time.RFC3339Nano),
 		entry.BackendID,
 		entry.BackendModel,
@@ -5459,6 +5628,7 @@ func (s *LogStore) Insert(ctx context.Context, entry RequestLog) error {
 		clipLog(entry.Output, s.maxBody),
 		clipLog(entry.Error, s.maxBody),
 		entry.KeyID,
+		entry.ClientIP,
 	)
 	return err
 }
@@ -5483,10 +5653,10 @@ func (s *LogStore) List(ctx context.Context, backendID string, limit int, offset
 		err  error
 	)
 	if backendID == "" {
-		rows, err = s.db.QueryContext(ctx, `SELECT id, created_at, backend_id, backend_model, route, observed_tps, certified_tps, baseline_tps, speed_score, stream, status_code, duration_ms, input, output, error, key_id
+		rows, err = s.db.QueryContext(ctx, `SELECT id, created_at, backend_id, backend_model, route, observed_tps, certified_tps, baseline_tps, speed_score, stream, status_code, duration_ms, input, output, error, key_id, client_ip
 			FROM request_logs ORDER BY created_at DESC LIMIT ? OFFSET ?`, limit, offset)
 	} else {
-		rows, err = s.db.QueryContext(ctx, `SELECT id, created_at, backend_id, backend_model, route, observed_tps, certified_tps, baseline_tps, speed_score, stream, status_code, duration_ms, input, output, error, key_id
+		rows, err = s.db.QueryContext(ctx, `SELECT id, created_at, backend_id, backend_model, route, observed_tps, certified_tps, baseline_tps, speed_score, stream, status_code, duration_ms, input, output, error, key_id, client_ip
 			FROM request_logs WHERE backend_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`, backendID, limit, offset)
 	}
 	if err != nil {
@@ -5499,7 +5669,7 @@ func (s *LogStore) List(ctx context.Context, backendID string, limit int, offset
 		var entry RequestLog
 		var created string
 		var stream int
-		if err := rows.Scan(&entry.ID, &created, &entry.BackendID, &entry.BackendModel, &entry.Route, &entry.ObservedTPS, &entry.CertifiedTPS, &entry.BaselineTPS, &entry.SpeedScore, &stream, &entry.StatusCode, &entry.DurationMillis, &entry.Input, &entry.Output, &entry.Error, &entry.KeyID); err != nil {
+		if err := rows.Scan(&entry.ID, &created, &entry.BackendID, &entry.BackendModel, &entry.Route, &entry.ObservedTPS, &entry.CertifiedTPS, &entry.BaselineTPS, &entry.SpeedScore, &stream, &entry.StatusCode, &entry.DurationMillis, &entry.Input, &entry.Output, &entry.Error, &entry.KeyID, &entry.ClientIP); err != nil {
 			return nil, err
 		}
 		entry.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
@@ -5507,6 +5677,307 @@ func (s *LogStore) List(ctx context.Context, backendID string, limit int, offset
 		out = append(out, entry)
 	}
 	return out, rows.Err()
+}
+
+// ── Usage graph ─────────────────────────────────────────────────────────────
+//
+// What the dashboard's usage chart plots is ACTIVE SLOTS: how many requests were
+// in flight at once, split by the address they came from. Not a request count —
+// forty one-second embedding calls and one four-minute generation are wildly
+// different load on a fleet whose workers have a max_concurrency in the single
+// digits, and it is the second one that fills a slot and makes the next caller
+// queue. Counting requests would draw those the same way round the wrong way.
+//
+// Per bucket the figure is the MEAN number in flight: busy seconds accumulated
+// inside the bucket, over the length of the bucket (Little's law). It is a real
+// number rather than an integer, and a value of 0.1 on a five-minute bucket
+// means one thirty-second request, not "almost none".
+const (
+	usageWindow = 12 * time.Hour
+	// Five minutes, which makes 144 columns across twelve hours. That is about
+	// as many stacked columns as a chart a thousand pixels wide can draw and
+	// still have each one readable — roughly six pixels of bar plus the two-pixel
+	// gap that separates the segments of a stack. One-minute buckets would be 720
+	// columns at under two pixels apiece: the stack ordering stops being legible,
+	// and any client that is not the busiest disappears into a sub-pixel sliver.
+	//
+	// Buckets are aligned to absolute multiples of five minutes, never to "now".
+	// The graph reloads every ten seconds, and a window anchored to the poll
+	// instant would give every one of the 144 columns a slightly different value
+	// each time — the whole chart would shimmer. Aligned, a refresh changes the
+	// newest column and, twice an hour, drops the oldest.
+	usageBucket = 5 * time.Minute
+	// The page's categorical palette has eight validated slots and a ninth colour
+	// would be indistinguishable from one of them under colour-blind simulation,
+	// so the ninth-busiest client onwards is folded into a single grey band. See
+	// seriesFill in dashboard.html.
+	usageTopClients = 8
+	// What a row with no address is drawn as. Every row written before the
+	// client_ip column existed is one of these.
+	usageUnknownClient = "unknown"
+	usageOtherClients  = "other"
+	// How long before the window a request may have STARTED and still have the
+	// part of it that lands inside the window drawn.
+	//
+	// The scan has to be a range over created_at, because that is the indexed
+	// column; "which requests were still running at 04:00" is not a question that
+	// index can answer without reading the whole table, which this query does
+	// every ten seconds. So it asks for rows that started within an hour of the
+	// window and clamps them. A request that ran for longer than an hour loses
+	// its in-window tail. Nothing this router serves comes close — slotMaxWait is
+	// ten minutes and a generation on top of it is minutes, not hours — and the
+	// alternative is a full table scan on every poll.
+	usageMaxRequestAge = time.Hour
+)
+
+// UsageSeries is one render of the usage chart: a fixed frame of buckets and the
+// bands stacked inside it.
+type UsageSeries struct {
+	BucketSeconds int64 `json:"bucket_seconds"`
+	From          int64 `json:"from"`
+	To            int64 `json:"to"`
+	// Clients is the stacking order, busiest first, with "other" and "unknown"
+	// pinned last so the identified traffic sits at the bottom of the stack where
+	// it is easiest to compare between columns.
+	Clients []UsageClient `json:"clients"`
+	// Buckets always covers the whole window, empty ones included. The browser
+	// gets a complete axis rather than a set of points with holes to interpolate,
+	// which is what keeps a quiet hour looking quiet instead of looking absent.
+	Buckets []UsageBucket `json:"buckets"`
+}
+
+// UsageClient is one band. Slots is the mean over the WHOLE window, so it ranks
+// the bands against each other but is not the height of any single column; Peak
+// is the busiest bucket that band had.
+type UsageClient struct {
+	ClientIP string  `json:"client_ip"`
+	Slots    float64 `json:"slots"`
+	Peak     float64 `json:"peak"`
+	Requests int64   `json:"requests"`
+}
+
+// UsageBucket is one column. Slots and Requests are positional against
+// UsageSeries.Clients: the addresses are written once for the whole payload
+// instead of once per bucket, which is the difference between about 25KB every
+// ten seconds and several times that.
+type UsageBucket struct {
+	At       int64     `json:"t"`
+	Slots    []float64 `json:"slots"`
+	Requests []int64   `json:"requests"`
+}
+
+// usageSeriesQuery buckets the request log into mean concurrency per client.
+//
+// All of the work is here rather than in the browser on purpose: twelve hours of
+// this table is tens of thousands of rows carrying stored prompts and completions,
+// and shipping that to a page to bucket it in JavaScript would move megabytes
+// every ten seconds to draw a chart with 144 columns in it.
+const usageSeriesQuery = `
+WITH RECURSIVE
+	-- Each logged request as a half-open interval of epoch seconds.
+	--
+	-- created_at is the moment the request STARTED, not the moment it finished:
+	-- every insert site sets it from the same instant duration_ms is later measured
+	-- against (proxyToBackend, proxyPassthrough, serveExpert and logSlotUnavailable
+	-- all do CreatedAt: start.UTC(), where start := time.Now() on the way in, and
+	-- their deferred DurationMillis is time.Since(start) on the way out). So the
+	-- interval runs FORWARD from created_at.
+	-- If that ever became a completion time this arithmetic has to run backwards
+	-- instead, and until it does every column on the chart is displaced by one
+	-- request duration — which is invisible, because the chart still looks
+	-- perfectly reasonable.
+	--
+	-- strftime('%s') truncates to whole seconds, moving a request at most one
+	-- second earlier. Against a five-minute bucket that is not worth the
+	-- julianday arithmetic it would take to avoid.
+	raw AS (
+		SELECT
+			CASE WHEN client_ip = '' THEN ? ELSE client_ip END AS ip,
+			CAST(strftime('%s', created_at) AS INTEGER) AS s0,
+			CAST(strftime('%s', created_at) AS INTEGER) + max(duration_ms, 0) / 1000.0 AS e0
+		FROM request_logs
+		WHERE created_at >= ? AND created_at < ?
+	),
+	-- Clamped to the window, so a request straddling either edge contributes only
+	-- the part of itself that is on screen. e0 >= lo drops the rows that the
+	-- look-back above dragged in but that had already finished.
+	spans AS (
+		SELECT ip, max(s0, ?) AS s, min(e0, ?) AS e FROM raw WHERE e0 >= ?
+	),
+	-- Which addresses get a band of their own. Ranked on busy time rather than on
+	-- request count, for the same reason the chart plots slots rather than
+	-- requests: the heaviest caller is the one holding workers, not the one
+	-- making the most calls. Ties break on the address so the ranking is stable
+	-- between two polls that see identical data.
+	busiest AS (
+		SELECT ip FROM spans GROUP BY ip ORDER BY sum(e - s) DESC, ip LIMIT ?
+	),
+	-- One row per (request, bucket it overlapped). The seed is the bucket the
+	-- request started in; the recursion walks forward for as long as it was still
+	-- running. That is what puts a four-minute generation into every bucket it
+	-- spanned instead of only into the one it began in — the difference between a
+	-- graph that shows sustained load and one that shows a spike at the start of
+	-- it. It cannot run away: e is already clamped to the end of the window.
+	covered(ip, s, e, b) AS (
+		SELECT ip, s, e, (s / ?) * ? FROM spans
+		UNION ALL
+		SELECT ip, s, e, b + ? FROM covered WHERE b + ? < e
+	)
+SELECT
+	c.b,
+	coalesce(busiest.ip, ?) AS series,
+	sum(min(c.e, c.b + ?) - max(c.s, c.b)) AS busy_seconds,
+	count(*) AS requests
+FROM covered c
+LEFT JOIN busiest ON busiest.ip = c.ip
+GROUP BY c.b, series
+ORDER BY c.b`
+
+// UsageSeries returns the chart frame for the window ending at now. It always
+// returns a complete frame: an error is an error, but an empty table is a valid
+// answer with every bucket at zero, because "nothing has happened for twelve
+// hours" is a thing an operator needs to be able to see.
+func (s *LogStore) UsageSeries(ctx context.Context, now time.Time, window, bucket time.Duration, top int) (*UsageSeries, error) {
+	out := newUsageSeries(now, window, bucket)
+	if top < 1 {
+		top = 1
+	}
+	lo, hi, bucketSecs := out.From, out.To, out.BucketSeconds
+	rows, err := s.db.QueryContext(ctx, usageSeriesQuery,
+		usageUnknownClient,
+		time.Unix(lo, 0).UTC().Add(-usageMaxRequestAge).Format(time.RFC3339Nano),
+		time.Unix(hi, 0).UTC().Format(time.RFC3339Nano),
+		lo, hi, lo,
+		top,
+		bucketSecs, bucketSecs, bucketSecs, bucketSecs,
+		usageOtherClients,
+		bucketSecs,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	type cell struct {
+		bucket   int
+		busy     float64
+		requests int64
+	}
+	cells := map[string][]cell{}
+	totals := map[string]*UsageClient{}
+	for rows.Next() {
+		var (
+			at       int64
+			series   string
+			busy     float64
+			requests int64
+		)
+		if err := rows.Scan(&at, &series, &busy, &requests); err != nil {
+			return nil, err
+		}
+		// The window bounds are compared against created_at as TEXT, and RFC3339
+		// sorts one fractional second the wrong way round at an exact boundary
+		// (".5Z" sorts before "Z"), so a row up to a second outside the window can
+		// survive the WHERE. Discarding an out-of-frame bucket here is both the
+		// fix and the guard against ever indexing outside the slice.
+		idx := int((at - lo) / bucketSecs)
+		if idx < 0 || idx >= len(out.Buckets) || busy < 0 {
+			continue
+		}
+		cells[series] = append(cells[series], cell{bucket: idx, busy: busy, requests: requests})
+		total, ok := totals[series]
+		if !ok {
+			total = &UsageClient{ClientIP: series}
+			totals[series] = total
+		}
+		total.Slots += busy
+		total.Requests += requests
+		if slots := busy / float64(bucketSecs); slots > total.Peak {
+			total.Peak = slots
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	windowSecs := float64(hi - lo)
+	for _, total := range totals {
+		total.Slots = roundSlots(total.Slots / windowSecs)
+		total.Peak = roundSlots(total.Peak)
+		out.Clients = append(out.Clients, *total)
+	}
+	// Busiest first, with the two bands that are not an identity — the tail fold
+	// and the rows that predate the column — pinned to the end. They stack on top,
+	// above the addresses, so that a band an operator can actually act on never
+	// has an unattributable one wobbling underneath it and moving its baseline.
+	sort.Slice(out.Clients, func(i, j int) bool {
+		a, b := out.Clients[i], out.Clients[j]
+		if ra, rb := usageBandRank(a.ClientIP), usageBandRank(b.ClientIP); ra != rb {
+			return ra < rb
+		}
+		if a.Slots != b.Slots {
+			return a.Slots > b.Slots
+		}
+		return a.ClientIP < b.ClientIP
+	})
+	for i := range out.Buckets {
+		out.Buckets[i].Slots = make([]float64, len(out.Clients))
+		out.Buckets[i].Requests = make([]int64, len(out.Clients))
+	}
+	for i, client := range out.Clients {
+		for _, c := range cells[client.ClientIP] {
+			out.Buckets[c.bucket].Slots[i] = roundSlots(c.busy / float64(bucketSecs))
+			out.Buckets[c.bucket].Requests[i] = c.requests
+		}
+	}
+	return out, nil
+}
+
+// newUsageSeries builds the empty frame: every bucket in the window, at zero.
+// The nil-database case and the never-used-router case both answer with this, so
+// the page has one shape to draw and no special case for "no data".
+func newUsageSeries(now time.Time, window, bucket time.Duration) *UsageSeries {
+	bucketSecs := int64(bucket / time.Second)
+	if bucketSecs < 1 {
+		bucketSecs = 60
+	}
+	count := int(int64(window/time.Second) / bucketSecs)
+	if count < 1 {
+		count = 1
+	}
+	// The frame ends at the end of the bucket currently in progress, so the newest
+	// column is always the live one rather than a stale complete bucket.
+	hi := (now.UTC().Unix()/bucketSecs + 1) * bucketSecs
+	lo := hi - int64(count)*bucketSecs
+	out := &UsageSeries{
+		BucketSeconds: bucketSecs,
+		From:          lo,
+		To:            hi,
+		Clients:       []UsageClient{},
+		Buckets:       make([]UsageBucket, count),
+	}
+	for i := range out.Buckets {
+		out.Buckets[i] = UsageBucket{At: lo + int64(i)*bucketSecs, Slots: []float64{}, Requests: []int64{}}
+	}
+	return out
+}
+
+// usageBandRank sorts the two non-identity bands after every real address.
+func usageBandRank(client string) int {
+	switch client {
+	case usageOtherClients:
+		return 1
+	case usageUnknownClient:
+		return 2
+	}
+	return 0
+}
+
+// roundSlots trims a concurrency figure to three decimals. Purely a payload
+// size decision — 144 buckets times ten bands of full float64 precision is most
+// of the JSON, and the chart cannot draw a thousandth of a slot anyway.
+func roundSlots(v float64) float64 {
+	return math.Round(v*1000) / 1000
 }
 
 func (s *LogStore) DeleteOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {

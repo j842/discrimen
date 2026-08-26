@@ -40,6 +40,31 @@ jobs:
             exit 1
           fi
 
+  # The sandbox is the one component whose tests are not about whether it
+  # computes the right answer. Most of them run a genuinely hostile submission —
+  # an infinite loop, a fork bomb, a ten-gigabyte allocation — and assert that it
+  # was contained and that nothing was left running. They need a real Linux
+  # kernel for rlimits, seccomp and /proc, which is what this runner is, and they
+  # take about ten seconds.
+  #
+  # 3.12 to match the image. The jail raises Python's recursion limit past the
+  # point where a pre-3.11 interpreter would segfault instead of raising, so
+  # testing on a different minor is testing a different jail.
+  sandbox:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # No install step, because there is nothing to install. The service is
+      # stdlib-only and the tests are unittest — see sandbox/Dockerfile for why
+      # that is a property worth keeping rather than a stage nobody got round to.
+      - name: test
+        run: python3 -m unittest discover -s sandbox/tests -v
+
   images:
     runs-on: ubuntu-latest
     steps:
@@ -71,3 +96,12 @@ jobs:
           push: false
           cache-from: type=gha,scope=ci-discrimen-embeddings
           cache-to: type=gha,mode=max,scope=ci-discrimen-embeddings
+
+      - name: sandbox image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./sandbox
+          file: sandbox/Dockerfile
+          push: false
+          cache-from: type=gha,scope=ci-discrimen-sandbox
+          cache-to: type=gha,mode=max,scope=ci-discrimen-sandbox

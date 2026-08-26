@@ -208,6 +208,33 @@ served from `GET /backends/{id}/benchmark`. The per-tier breakdown is logged as
 `t1=4/4 t2=4/4 …`, with `trunc=`, `slow=` and `err=` counts appended when
 non-zero.
 
+**Categories.** The same run, grouped by what each question measures rather than
+by how hard it is: `coding`, `maths`, `reasoning`, and `general` for the control
+and floor tiers. It ships in the same response, under `categories`, with the tier
+split kept underneath each one. A tier answers "how far up does this worker get";
+a category answers "can it be handed a codebase", which is a different question
+and one the tier line cannot be read for — tier 4 mixes compiler gotchas in with
+arithmetic, and the generated half lands maths and reasoning items in the same
+tiers.
+
+The category is DERIVED, not stored (`internal/router/benchcategory.go`), so it
+changes no bytes of the question set and cannot invalidate a cached profile.
+Three rules in order: the answer-format boilerplate LiveBench pastes onto every
+generated item identifies its task and therefore its category; a language name
+identifies a hand-authored code trace; anything left is hand-authored and takes
+its tier's charter. A figure is a flat pass rate within the category — strict
+passes plus half a point per loose one — and deliberately not the headline score,
+which is weighted per difficulty bucket and so cannot be split by a category that
+cuts across all three.
+
+Both thinking modes appear side by side, which is the point: a worker measured 93
+thinking-on and 41 thinking-off is not a 93 to any client that forces thinking
+off, and the loss usually lands on one category. The thinking-off half needs the
+no-think pass's per-question results (`bench_results_nothink` on the profile);
+where a run did not keep them, the endpoint reports `nothink_results_stored:
+false` and omits those figures rather than sending zeroes, because a worker
+really can score zero with thinking off.
+
 **Gate audit.** `auditThinkingGate` runs the router's own learned reasoning gate
 over these prompts once per router lifetime and logs where its decision disagrees
 with the hand-labelled `benchHardTier` boundary. It is an independent

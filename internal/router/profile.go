@@ -60,14 +60,38 @@ type WorkerProfile struct {
 	// verdict. Unknown falls back to chat_template_kwargs, the spelling the whole
 	// fleet has always spoken — a zero value that meant "cannot think" would
 	// silently switch thinking off across the fleet on the first warm restart.
-	ThinkingDialect string           `json:"thinking_dialect,omitempty"`
-	BenchVersion    int              `json:"bench_version"`            // question-set version this quality was measured against
-	QualityDetail   string           `json:"quality_detail,omitempty"` // per-tier + truncation breakdown
-	Failed          []string         `json:"failed,omitempty"`         // labels of benchmark questions the worker missed
-	BenchResults    []BenchResult    `json:"bench_results,omitempty"`  // full per-question Q&A from the most recent run
-	Checks          map[string]Check `json:"checks,omitempty"`
-	MeasuredAt      time.Time        `json:"measured_at"`
-	ProfileMillis   int64            `json:"profile_ms,omitempty"` // wall time of the full cold-start profile (capacity ramp + quality benchmark)
+	ThinkingDialect string        `json:"thinking_dialect,omitempty"`
+	BenchVersion    int           `json:"bench_version"`            // question-set version this quality was measured against
+	QualityDetail   string        `json:"quality_detail,omitempty"` // per-tier + truncation breakdown
+	Failed          []string      `json:"failed,omitempty"`         // labels of benchmark questions the worker missed
+	BenchResults    []BenchResult `json:"bench_results,omitempty"`  // full per-question Q&A from the most recent run
+	// BenchResultsNoThink is the same, for the no-think pass: aligned index-for-
+	// index with BenchResults (and so with benchmarkQuestions), or empty.
+	//
+	// It exists because QualityNoThinkDetail — the per-tier line "t1=4/4 t2=3/4 …"
+	// — cannot be split by anything except tier. A per-CATEGORY no-think score
+	// needs to know WHICH questions were missed, not how many, and no tier maps
+	// to one category: tier 4 mixes compiler gotchas with arithmetic, and the
+	// generated half lands maths and reasoning items in the same tiers. Without
+	// the per-question record the breakdown can show one mode only, which is the
+	// mode a no-think client never talks to.
+	//
+	// EMPTY IS NOT ZERO, and every consumer has to keep that straight: a worker
+	// really can score 0 with thinking off (measured 2026-08-24, a 35B A3B at
+	// q=84 thinking wrote deterministic garbage no-think), so a missing run and a
+	// terrible one must not render the same. serveBenchmark omits the no-think
+	// half of the category breakdown rather than sending zeroes.
+	//
+	// NOT POPULATED YET: runNoThinkQualityBenchmark discards its per-question
+	// outcomes, so this is empty on every profile written today. Filling it is a
+	// four-line change in benchmark.go — return the `outcomes` slice it already
+	// builds, as []BenchResult — which is owned by another workstream at the time
+	// of writing. Nothing here breaks in the meantime; the breakdown degrades to
+	// thinking-on only.
+	BenchResultsNoThink []BenchResult    `json:"bench_results_nothink,omitempty"`
+	Checks              map[string]Check `json:"checks,omitempty"`
+	MeasuredAt          time.Time        `json:"measured_at"`
+	ProfileMillis       int64            `json:"profile_ms,omitempty"` // wall time of the full cold-start profile (capacity ramp + quality benchmark)
 	// What the run that produced this profile consumed, and what that cost at the
 	// endpoint's declared prices. Profiling a paid model spends real money — the
 	// set is 130 questions, 122 of them graded thinking-on with a 16k ceiling, so a
@@ -304,7 +328,23 @@ func (r *Router) profileQuick(b *Backend, model string) (*WorkerProfile, error) 
 	}
 	checks["speed"] = Check{OK: true, Message: fmt.Sprintf("%.1f tok/s, ttft %dms", tps, ttft)}
 
-	quality := b.Quality // declared seed, if any
+	// Only a MANUAL row's declared quality is honoured. On a manual row the
+	// number was typed by an operator reading a provider's documentation, and it
+	// is authoritative by design (see providers.go). On a beacon row it is
+	// whatever the worker said about itself — the exact self-declared quality the
+	// measured benchmark replaced, and the README's registration contract
+	// promises is not accepted ("No quality, no speed, no context window, no
+	// concurrency").
+	//
+	// The window this closes is not small: a full benchmark is 8-30 minutes per
+	// worker and has run to five hours on a slow one. A beacon claiming 100 would
+	// have drawn the fleet's hardest prompts for all of it, on its own say-so.
+	// Nothing deployed sends the field, so this changes no live behaviour — it
+	// removes the way in.
+	quality := 0
+	if isManualRow(b) {
+		quality = b.Quality
+	}
 	if quality <= 0 {
 		quality = provisionalQuality
 	}
@@ -382,10 +422,14 @@ func (r *Router) profileBackend(b *Backend, model string) (*WorkerProfile, error
 	// workers diverge — for the rest the mixed run already asked every question
 	// no-think, so the score is the same number and costs nothing to reuse.
 	if p.Thinking {
-		ntScore, ntOK, ntBreakdown := r.runNoThinkQualityBenchmark(b, benchConc, qResults)
+		ntScore, ntOK, ntBreakdown, ntResults := r.runNoThinkQualityBenchmark(b, benchConc, qResults)
 		if ntOK {
 			p.QualityNoThink = ntScore
 			p.QualityNoThinkDetail = ntBreakdown
+			// Stored so the category breakdown can split the no-think half too:
+			// a tier does not map to one category, so the per-tier line alone
+			// cannot answer "how is it at coding with thinking off?".
+			p.BenchResultsNoThink = ntResults
 			p.Checks["quality_nothink"] = Check{OK: true,
 				Message: fmt.Sprintf("%d%% %s", ntScore, ntBreakdown)}
 		}
@@ -741,12 +785,6 @@ func probeModel(b *Backend) string {
 		return b.Model
 	}
 	return "default"
-}
-
-// queryModel asks the worker its served model id (the profile fingerprint).
-func (r *Router) queryModel(b *Backend) string {
-	id, _ := r.queryModelInfo(b)
-	return id
 }
 
 // shardSuffix matches the multi-part GGUF shard counter ("-00001-of-00005")

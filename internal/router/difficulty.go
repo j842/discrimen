@@ -1472,12 +1472,3 @@ func envBool(key string, fallback bool) bool {
 		return fallback
 	}
 }
-
-func envFloat(key string, fallback float64) float64 {
-	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			return f
-		}
-	}
-	return fallback
-}

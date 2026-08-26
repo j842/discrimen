@@ -6,8 +6,9 @@ _check_required_env_vars "CONTAINER_NAME" "DATA_VOLUME"
 # worker profiles, so the next start re-benchmarks the entire fleet from cold.
 echo "WARNING: This will PERMANENTLY DELETE all data for ${CONTAINER_NAME}"
 
-docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+bash ./stop.sh
 _remove_container "$CONTAINER_NAME" || true
+_remove_container "${CONTAINER_NAME}_sandbox" >/dev/null 2>&1 || true
 _remove_volume "$DATA_VOLUME"
 
 echo "Service and all data destroyed"

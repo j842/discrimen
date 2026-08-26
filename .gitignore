@@ -15,7 +15,9 @@
 # Calibration output from `discrimen bench calibrate`. It is a per-fleet
 # measurement, not a source artefact — pool.json and benchmark_data.go are the
 # committed halves of that pipeline.
-internal/router/benchdata/calibration.json
+# calibration.json* — the trailing glob catches the .bak a purge leaves behind,
+# which is the same per-fleet measurement and slipped into a commit once.
+internal/router/benchdata/calibration.json*
 
 # Test binary, built with `go test -c`
 *.test
@@ -43,3 +45,7 @@ go.work.sum
 # Python bytecode from the embeddings worker
 __pycache__/
 *.pyc
+
+# Private coding test blobs: ~250MB of base64(zlib(pickle)) fetched beside
+# pool.json. Reproducible from `discrimen bench fetch`, so not a source artefact.
+internal/router/benchdata/private/

@@ -406,7 +406,7 @@ judge learn nothing from it.
 | DELETE | `/backends/{id}` | worker or admin | Remove an entry, its persisted row and its cached profile |
 | GET | `/backends` | admin | The fleet: quality, throughput, features, status |
 | GET | `/backends/{id}` | admin | One endpoint's row in full |
-| GET | `/backends/{id}/benchmark` | admin | Per-question results from that endpoint's last profiling run |
+| GET | `/backends/{id}/benchmark` | admin | Per-question results from that endpoint's last profiling run, plus the per-category breakdown (coding / maths / reasoning) in both thinking modes |
 | POST | `/debug/backends/{id}/certify`, `/debug/backends/{id}/chat` | admin | Re-profile one endpoint, or prompt it directly |
 | GET | `/logs` | admin | Stored request logs |
 | any | `/admin/providers[/{id}]` | admin | CRUD over manually-entered endpoints |
@@ -472,7 +472,7 @@ problem the router exists to solve. They are constants in the binary.
 | `BACKEND_TIMEOUT_SECONDS` | `600` | Whole-exchange cap for non-streaming requests |
 | `BACKEND_IDLE_TIMEOUT_SECONDS` | `120` | Streaming idle watchdog. 0 disables |
 | `ROUTER_SLOT_MAX_WAIT_SECONDS` | `600` | How long a caller queues before a 503 |
-| `DEFAULT_MAX_TOKENS` | `4096` | Used when the client declares no budget |
+| `DEFAULT_MAX_TOKENS` | `16384` | Used when the client declares no budget |
 | `ROUTER_AUTO_ROUTING` | `true` | One switch for the whole automatic layer |
 
 `ROUTER_AUTO_ROUTING=false` turns discrimen into a plain load balancer with no
@@ -608,6 +608,55 @@ answer was right but a cheaper endpoint was also right, and **undershoot**,
 where the answer was wrong and some endpoint had it. Grading uses the production
 `checkAnswer`, so the harness cannot score a policy that never ran.
 
+## The grading sandbox
+
+LiveBench's coding questions carry an **empty `ground_truth`**, and that is not
+a gap in the data. The answer to "write `minimumArrayLength`" is a function, and
+the only thing that can tell a correct one from a plausible one is running it
+against the test cases. Grading them needs an interpreter.
+
+The router must not be the thing holding it. It is a long-lived process with the
+fleet's credentials, the request log and the database in one address space, and
+`exec`-ing a language model's output next to any of that is not a risk to reason
+about carefully — it is a risk to move into another container.
+
+So `sandbox/` is a separate service, on loopback, holding nothing worth
+stealing:
+
+```
+POST /grade            code + tests   → {"pass":…, "cases_run":…, "cases_passed":…, "first_failure":…}
+POST /decode-private   base64 blob    → {"tests":[…]}
+GET  /health                          → {"status":"ok"}
+```
+
+`/decode-private` is an endpoint rather than a function because LiveBench's
+`private_test_cases` are base64 of zlib of a **pickle**, and unpickling is
+arbitrary code execution by design — the format works by naming callables and
+calling them. There is no way to validate the bytes first that is not itself a
+pickle implementation, so the decode happens under the same containment a
+submission gets.
+
+Every submission runs in a fresh subprocess with `RLIMIT_CPU`, `RLIMIT_AS`,
+`RLIMIT_FSIZE` and `RLIMIT_NPROC` set, a seccomp filter that removes `socket()`,
+its own session, a wall-clock `SIGKILL` on the process group, a `/proc` sweep
+for anything that escaped the group, and a scratch directory destroyed on every
+exit path. The container is non-root, read-only, capability-free and pid-capped.
+Details, and the reasoning for each layer, are in `sandbox/main.py` and
+[`deploy/dropshell/discrimen/README.md`](deploy/dropshell/discrimen/README.md).
+
+It is stdlib-only Python with no pip install layer at all: the one container in
+the deployment whose job is to be the blast radius should not have a dependency
+tree.
+
+```bash
+python3 -m unittest discover -s sandbox/tests -v
+```
+
+Most of those tests run a genuinely hostile submission — an infinite loop, a
+fork bomb, a ten-gigabyte allocation, a `setsid()` escape — and assert that the
+answer came back, that it came back as a clean `pass:false`, and that nothing
+was left running.
+
 ## Deploying
 
 The compose file is the supported path and it is enough for most people.
@@ -625,8 +674,11 @@ restic. Its README covers the one migration trap: the Docker volume name is
 derived from the container name, so renaming the container orphans the volume,
 takes the cached profiles with it, and re-benchmarks the entire fleet from cold.
 
-Images are published multi-arch (amd64 and arm64) to `ghcr.io/j842/discrimen`
-and `ghcr.io/j842/discrimen-embeddings` on every push to main.
+Images are published multi-arch (amd64 and arm64) to `ghcr.io/j842/discrimen`,
+`ghcr.io/j842/discrimen-embeddings` and `ghcr.io/j842/discrimen-sandbox` on every
+push to main. The sandbox builds per-arch despite compiling nothing: its seccomp
+filter carries a syscall number per architecture, so an amd64-only manifest run
+under emulation on an arm64 host would be checking the wrong table.
 
 ## Building
 
@@ -656,7 +708,17 @@ standard library.
 | `arena.go` | the router-level regression gate |
 | `benchgen*.go` | the benchmark refresh pipeline: fetch, calibrate, emit |
 
-Everything lives in `internal/router/`.
+Everything above lives in `internal/router/`. The two sidecars are separate
+services and separate images:
+
+| | |
+|---|---|
+| `embeddings/main.py` | the embeddings worker auto-routing needs, self-registering |
+| `sandbox/main.py` | the grading sidecar's HTTP surface and the request/response contract |
+| `sandbox/supervisor.py` | one jailed run: spawn, drain, wall-clock kill, straggler sweep, scratch teardown |
+| `sandbox/jail.py` | what the child does to itself: rlimits and the seccomp filter |
+| `sandbox/runner.py` | the child. The only file that shares an address space with model-generated code |
+| `sandbox/compare.py` | test-case decoding and the answer-comparison semantics |
 
 ## Licence
 

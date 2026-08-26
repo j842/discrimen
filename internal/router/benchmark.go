@@ -64,8 +64,10 @@ import (
 // now sits beside Johnny's mother, the identical trap, which has always been tier 3.
 // benchHardTier stays 3 and the audit stays an INDEPENDENT cross-check: the fix here is the
 // labels, not the gate.
-// v33: the frontier tiers (>= benchFrontierTier) got a longer answer deadline, and tier 11
-// was added. See benchAnswerDeadlineFrontier below.
+// v33: the frontier tiers got a longer answer deadline, and tier 11 was added.
+// v38: that split is gone — every question now gets the long deadline, because the short
+// one was measured censoring 75% of the strongest home worker's misses. See
+// benchAnswerDeadline below.
 // v34: quality became a WEIGHTED two-bucket score instead of a flat percentage. See
 // runQualityBenchmark.
 //
@@ -116,7 +118,15 @@ import (
 // measured formatting, not knowledge. Strict grading is unchanged — nobody's full
 // credit moved — loose only ADDS credit, and the tally keeps the formatting cost
 // visible per worker.
-const benchmarkVersion = 37
+// v38: the per-question answer deadline goes 2m -> 6m and the per-tier split is removed.
+// Every cached profile is invalidated because a profile is only comparable to another
+// measured under the same clock: at 2 minutes, 75% of llm-6000pro's recorded misses were
+// answers it was cut off part-way through, and its score was that much a measure of
+// throughput. Also: coding_completion answers are now graded as prefix+answer (they are
+// FRAGMENTS continuing a partial solution shown in the prompt), which had scored the two
+// strongest workers 0% on that task while the weakest scored highest. See
+// benchAnswerDeadline and poolCode.Prefix.
+const benchmarkVersion = 38
 
 // benchmarkQ is one graded question in the cold-start quality benchmark. The
 // question set lives in benchmark_data.go.
@@ -262,25 +272,43 @@ const (
 	benchBusyWait      = time.Second
 	benchBusyMaxStreak = 100
 
-	// benchAnswerDeadline is the hard per-question usability bound. A worker that needs
-	// longer than this to answer ANY question is too slow to be usable at that
-	// difficulty, so the question is scored a FAIL (a speed fail, counted like a wrong
-	// answer) and is NOT retried — a retry would only burn another deadline for the same
-	// verdict. This is a benchmark criterion, independent of the live-proxy
-	// BACKEND_TIMEOUT_SECONDS: benchCompletion uses a no-timeout client so this deadline
-	// alone decides whether the answer arrived in time.
-	benchAnswerDeadline = 2 * time.Minute // cut from 5m (v26): too-slow answers fail, spreading slow reasoning models
-
-	// v33: the frontier tiers (>= benchFrontierTier) get a longer deadline. The 2-minute
-	// bound scored a 284B MoE (18 tok/s thinking-on) BELOW a saturated 27B on nothing but
-	// tier-10 speed-fails — its only misses in the whole set were "(too slow)", every
-	// answer it finished was right. At these tiers the question is whether the model can
-	// reason at all, and production already prices patience: the router ranks candidates
-	// by expected completion time per request, so a slow-but-right worker loses the race
-	// for quick prompts without its QUALITY being falsified first. Tiers 3–8 keep the
-	// 2-minute bound — that spread of slow mid-tier reasoners (v26) is real and wanted.
-	benchFrontierTier           = 9
-	benchAnswerDeadlineFrontier = 6 * time.Minute
+	// benchAnswerDeadline is the hard per-question bound. A worker that needs
+	// longer is scored a FAIL for that question and is NOT retried — a retry
+	// would only burn another deadline for the same verdict. This is a benchmark
+	// criterion, independent of the live-proxy BACKEND_TIMEOUT_SECONDS:
+	// benchCompletion uses a no-timeout client so this deadline alone decides
+	// whether the answer arrived in time.
+	//
+	// v38: 2m -> 6m, and the per-tier split is gone. v33 had already given tiers
+	// >= 9 six minutes after the 2-minute bound scored a 284B MoE below a
+	// saturated 27B on nothing but speed-fails. That reasoning was right and the
+	// scope was too narrow — MEASURED on the LiveBench pool, the 2-minute bound
+	// was censoring:
+	//
+	//	work:llm-5090-ornith-35b-a3b  244 tok/s    0% of its failures
+	//	llm-6000pro-qwen38-27b         44 tok/s   75% (all 12 sampled finished
+	//	                                               inside 5 min, median 192s)
+	//	llm-naples-ornith15-397B       12 tok/s   88%
+	//
+	// Three quarters of the strongest home worker's recorded misses were answers
+	// it was cut off mid-way through, not answers it got wrong. A bound that
+	// falls hardest on the slowest hardware measures tokens per second, and the
+	// pool it grades — LiveBench maths, olympiad and code — needs a long
+	// scratchpad by construction.
+	//
+	// Slowness is NOT thereby unpriced: the router ranks candidates by expected
+	// completion time per request, so a slow-but-right worker loses the race for
+	// interactive prompts without its QUALITY being falsified first. That is the
+	// right split of concerns — speed belongs in the ranking, capability in the
+	// score — and it is what lets a slow worker serve as overflow instead of
+	// being scored into uselessness.
+	//
+	// A worker too slow to finish inside SIX minutes is still scored a fail, and
+	// llm-cpu-gemma-26B-silver (6.9 min on a math_comp question that finished,
+	// three of four unfinished at eight) is one. That is a true statement about
+	// what it can serve. What it must not do is vote on how hard the QUESTION is
+	// — see benchIsObserver.
+	benchAnswerDeadline = 6 * time.Minute
 
 	// v34/v35: weighted scoring split (see runQualityBenchmark). Three buckets now, each
 	// internally count-independent so questions can still be added freely within one:
@@ -365,9 +393,6 @@ func (r *Router) benchOne(b *Backend, q benchmarkQ, think bool, busy *benchBusyT
 	var err error
 	var slow bool
 	deadline := benchAnswerDeadline
-	if q.Tier >= benchFrontierTier {
-		deadline = benchAnswerDeadlineFrontier // v33: frontier tiers measure capability, not patience
-	}
 	abandoned := false
 	for attempt := 1; ; attempt++ {
 		if busy != nil && busy.abandoned() {

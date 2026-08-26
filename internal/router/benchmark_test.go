@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // timeoutErr is a net.Error reporting a timeout, like an http client/context deadline.
@@ -478,8 +479,8 @@ func TestCheckAnswerLoose(t *testing.T) {
 	}
 }
 
-// Tier 12 is the coding tier. It is graded thinking-on (>= benchHardTier) and gets the
-// frontier answer deadline (>= benchFrontierTier), and it must stay TRACE-shaped: the 47
+// Tier 12 is the coding tier. It is graded thinking-on (>= benchHardTier), and it must
+// stay TRACE-shaped: the 47
 // multiple-choice candidates written alongside these were all cut, because in every one
 // the correct option was the longest and an 8B with no thinking mode scored 79% on them
 // by picking the elaborate one. A trace question cannot be gamed that way — its answer is
@@ -507,8 +508,15 @@ func TestCodingTierShape(t *testing.T) {
 	if benchCodingTier <= benchInsightTier {
 		t.Fatalf("benchCodingTier (%d) must sit above benchInsightTier (%d), or coding and insight share a bucket", benchCodingTier, benchInsightTier)
 	}
-	if benchCodingTier < benchFrontierTier {
-		t.Errorf("benchCodingTier (%d) is below benchFrontierTier (%d), so coding questions would get the short answer deadline", benchCodingTier, benchFrontierTier)
+	// v38 removed the per-tier deadline split, so there is no longer a "short"
+	// deadline for a coding question to fall into. The property that mattered —
+	// enough wall clock for a long scratchpad — is now structural, but only while
+	// the single deadline stays generous: at the 2 minutes this replaced, 75% of
+	// the strongest home worker's recorded misses were answers cut off mid-way.
+	if benchAnswerDeadline < 5*time.Minute {
+		t.Errorf("benchAnswerDeadline is %s; below ~5 min the pool grades throughput rather than capability "+
+			"(measured: llm-6000pro at 44 tok/s had a 192s median on questions it answered correctly given time)",
+			benchAnswerDeadline)
 	}
 }
 

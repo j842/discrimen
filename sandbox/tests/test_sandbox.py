@@ -760,8 +760,14 @@ class TestHTTP(SandboxCase):
             },
         )
         self.assertEqual(status, 200)
-        self.assertEqual(set(body), {"pass", "cases_run", "cases_passed", "first_failure", "error"})
+        # prefix_applied is part of the wire contract, not an optional extra: the
+        # caller treats its ABSENCE as "this sidecar predates prefix support" and
+        # refuses to grade, rather than accepting a completion answer that was
+        # silently run without its partial solution. Removing it here would make
+        # every deployed router think every sandbox is stale.
+        self.assertEqual(set(body), {"pass", "cases_run", "cases_passed", "first_failure", "error", "prefix_applied"})
         self.assertTrue(body["pass"], body)
+        self.assertFalse(body["prefix_applied"], "no prefix was sent, so none can have been applied")
 
     def test_decode_over_http(self):
         status, body = self.post("/decode-private", {"blob": encode_private([{"input": "1", "output": "1"}])})

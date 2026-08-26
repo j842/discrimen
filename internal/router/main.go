@@ -2086,7 +2086,15 @@ func (r *Router) proxyPassthrough(w http.ResponseWriter, req *http.Request, iden
 		// tokens_used moving at all. The chat path has had this fallback all along.
 		logEntry.PromptTokens = lastJSONInt(usage.Bytes(), "prompt_tokens")
 		logEntry.CompletionTokens = lastJSONInt(usage.Bytes(), "completion_tokens")
-		logEntry.TTFTMillis = meter.ttftMillis(start)
+		// ONLY on a genuinely streamed reply. A buffered one does not reach this
+		// router until the upstream has finished generating, so its first chunk
+		// arrives at the end and "time to first byte" would just restate
+		// DurationMillis — a fabricated prefill measurement, and on /v1/embeddings
+		// (which never streams) every row would carry one. Left at 0, meaning not
+		// measured, which is what a timing model must see.
+		if logEntry.Stream {
+			logEntry.TTFTMillis = meter.ttftMillis(start)
+		}
 		charged := usageTotalTokens(usage.Bytes())
 		if charged == 0 {
 			charged = estimatePromptTokens(body)
@@ -2148,6 +2156,11 @@ func (r *Router) proxyPassthrough(w http.ResponseWriter, req *http.Request, iden
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	logEntry.StatusCode = resp.StatusCode
+	// Taken from the reply the upstream actually sent rather than from what the
+	// caller asked for: this path forwards the body verbatim and never parses it,
+	// so the request's stream flag was never read here, and an endpoint may
+	// decline to stream regardless. It gates the TTFT measurement above.
+	logEntry.Stream = isEventStream(resp.Header)
 
 	// Flush per chunk: this path serves stream:true /v1/completions too, and a
 	// bare io.Copy buffers the whole generation before the client sees a byte.

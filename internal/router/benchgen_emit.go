@@ -211,6 +211,17 @@ func benchEmit(sandboxURL string) error {
 		routerScores = append(routerScores, float64(f.routerQ))
 	}
 	fleet = observers
+	// Re-checked AFTER exclusion, not just before it. The guard above counts
+	// calibrated backends; this counts the ones allowed to vote on difficulty,
+	// and the two differ by however many were censored or degenerate. Without
+	// this an over-eager exclusion leaves top and bottom empty, every D computes
+	// as 0-0, every question is discarded as "negative discrimination", and emit
+	// writes a valid-looking file with nothing in it.
+	if len(fleet) < 2 {
+		return fmt.Errorf("only %d backend(s) qualify as difficulty observers (need 2); "+
+			"the rest were excluded as censored or non-separating — calibrate more workers, "+
+			"or give the slow ones a deadline they can finish inside", len(fleet))
+	}
 
 	// The correlation check: do the two instruments RANK the fleet the same way?
 	// A high value means the hand-authored set is tracking real capability and
@@ -453,8 +464,14 @@ var benchmarkQuestionsLive = []benchmarkQ{
 			if err != nil {
 				return nil, fmt.Errorf("tests for %s: %w", s.q.ID, err)
 			}
-			fmt.Fprintf(&b, "\t{Tier: %d, Match: %q, Prompt: %q, Code: &benchCode{Class: %q, Func: %q, Tests: []benchCase{\n",
-				s.tier, s.q.Match, s.q.Prompt, s.q.Code.Class, s.q.Code.Func)
+			// Prefix travels WITH the question. A completion answer is a fragment
+			// that only runs when appended to the partial solution the prompt
+			// showed, so a generated file that omitted it would grade bare
+			// fragments in production — the original bug, restored silently, and
+			// invisible to checkPrefixHonoured because that only fires when a
+			// prefix was actually sent.
+			fmt.Fprintf(&b, "\t{Tier: %d, Match: %q, Prompt: %q, Code: &benchCode{Class: %q, Func: %q, Prefix: %q, Tests: []benchCase{\n",
+				s.tier, s.q.Match, s.q.Prompt, s.q.Code.Class, s.q.Code.Func, s.q.Code.Prefix)
 			for _, c := range cases {
 				fmt.Fprintf(&b, "\t\t{Input: %q, Output: %q, Testtype: %q},\n", c.Input, c.Output, c.Testtype)
 			}
@@ -568,6 +585,27 @@ func benchStratifyByTask(src []scoredQuestion, n int) []scoredQuestion {
 // benchmark_test.go's TestExpertTierAnswersGrade so a question that would fail
 // the build is never selected in the first place.
 func benchSelfGrades(q poolQuestion) bool {
+	// A code-exec question has no Expect by construction — its ground truth is a
+	// set of test cases — so the string-shape probes below cannot say anything
+	// about it. Worse, they would PASS it vacuously: checkAnswer against an empty
+	// Expect returns true for any text at all, including a wrong program. Check
+	// what grading such a question actually requires instead.
+	if q.Match == benchMatchCodeExec {
+		if q.Code == nil || (q.Code.PublicJSON == "" && !q.Code.HasPrivate) {
+			return false // nothing to run the answer against
+		}
+		// A completion answer is a fragment and is only runnable when appended to
+		// the partial solution. Emitting one without its prefix restores the bug
+		// that scored the two strongest workers 0% on this task, so it is caught
+		// here rather than in production.
+		return q.Task != "coding_completion" || q.Code.Prefix != ""
+	}
+	// Every other mode compares against Expect, and an EMPTY one grades every
+	// answer correct — a single malformed question would lift the whole fleet's
+	// score. The shapes below cannot catch it, because they are built from Expect.
+	if strings.TrimSpace(q.Expect) == "" {
+		return false
+	}
 	bq := benchmarkQ{Prompt: q.Prompt, Expect: q.Expect, Match: q.Match}
 	shapes := []string{q.Expect, "The answer is " + q.Expect + "."}
 	switch q.Match {

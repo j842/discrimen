@@ -79,3 +79,59 @@ func TestReplyMeterTTFTUnmeasuredUntilWritten(t *testing.T) {
 		t.Error("an empty Write started the TTFT clock")
 	}
 }
+
+// benchSelfGrades exists to keep a question the grader cannot score out of the
+// emitted set. For a code-exec question the string probes it uses are not just
+// uninformative but actively misleading — checkAnswer against an empty Expect
+// returns true for ANY text — so these pin the checks that replaced them.
+func TestSelfGradesCodeExec(t *testing.T) {
+	tests := []benchCase{{Input: "1", Output: "1", Testtype: "functional"}}
+	_ = tests
+	base := func() poolQuestion {
+		return poolQuestion{
+			ID: "q", Task: "coding_completion", Match: benchMatchCodeExec, Prompt: "p",
+			Code: &poolCode{Class: "Solution", Func: "f", PublicJSON: `[{"input":"1","output":"1"}]`, Prefix: "class Solution:"},
+		}
+	}
+	if !benchSelfGrades(base()) {
+		t.Error("a well-formed completion question was rejected")
+	}
+	// The bug this guards: a completion question with no prefix is graded as a
+	// bare fragment, which never compiles, so the task measures formatting.
+	q := base()
+	q.Code.Prefix = ""
+	if benchSelfGrades(q) {
+		t.Error("a coding_completion question with no Prefix was accepted — it would grade fragments standalone")
+	}
+	// LCB_generation answers are whole programs and need no prefix.
+	q = base()
+	q.Task, q.Code.Prefix = "LCB_generation", ""
+	if !benchSelfGrades(q) {
+		t.Error("a generation question was rejected for having no prefix, which it does not need")
+	}
+	// Nothing to run the answer against.
+	q = base()
+	q.Code.PublicJSON, q.Code.HasPrivate = "", false
+	if benchSelfGrades(q) {
+		t.Error("a code question with no test cases was accepted")
+	}
+	q = base()
+	q.Code = nil
+	if benchSelfGrades(q) {
+		t.Error("a code-exec question with no payload was accepted")
+	}
+}
+
+// An empty Expect makes checkAnswer return true for every answer, so one
+// malformed question would lift the whole fleet's score rather than being
+// discarded. The shapes benchSelfGrades probes with are built FROM Expect, so
+// they cannot catch this on their own.
+func TestSelfGradesRejectsEmptyExpect(t *testing.T) {
+	q := poolQuestion{ID: "q", Task: "math_comp", Match: "numeric", Prompt: "p", Expect: ""}
+	if benchSelfGrades(q) {
+		t.Error("a question with an empty Expect was accepted — it grades every answer correct")
+	}
+	if !benchSelfGrades(poolQuestion{ID: "q", Task: "math_comp", Match: "numeric", Prompt: "p", Expect: "42"}) {
+		t.Error("a well-formed numeric question was rejected")
+	}
+}

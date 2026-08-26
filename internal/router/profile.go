@@ -32,12 +32,17 @@ type WorkerProfile struct {
 	// once let a still-profiling worker outrank the whole measured fleet); a
 	// non-thinking worker falls back to Quality, which for it is exact. See
 	// qualityFor.
-	QualityNoThink       int     `json:"quality_nothink,omitempty"`
-	QualityNoThinkDetail string  `json:"quality_nothink_detail,omitempty"`
-	ContextK             int     `json:"context_k"`
-	MaxConcurrency       int     `json:"max_concurrency"`
-	BaselineTPS          float64 `json:"baseline_tps"`
-	TTFTMillis           int64   `json:"ttft_millis"`
+	QualityNoThink       int    `json:"quality_nothink,omitempty"`
+	QualityNoThinkDetail string `json:"quality_nothink_detail,omitempty"`
+	ContextK             int    `json:"context_k"`
+	// ContextProbe is the measured usable window (contextprobe.go). Persisted
+	// with the profile so a warm restart keeps it, but NOT keyed by
+	// benchmarkVersion: it is a capability measurement like speed, not part of
+	// the quality score, so changing the ladder does not re-profile the fleet.
+	ContextProbe   *ContextProbe `json:"context_probe,omitempty"`
+	MaxConcurrency int           `json:"max_concurrency"`
+	BaselineTPS    float64       `json:"baseline_tps"`
+	TTFTMillis     int64         `json:"ttft_millis"`
 	// PrefillTPS is prompt tokens per second, measured on a prompt of known length.
 	// Unlike TTFTMillis it scales with the request, which is what routing needs: the
 	// spread across the fleet is far wider for prefill than for decode (0.67s vs 37.2s
@@ -450,6 +455,14 @@ func (r *Router) profileBackend(b *Backend, model string) (*WorkerProfile, error
 	} else {
 		p.QualityNoThink = quality
 		p.QualityNoThinkDetail = qBreakdown
+	}
+	// Usable context, measured rather than believed. Last because it is the one
+	// probe whose cost scales with the worker's own claim — a model advertising
+	// 256K spends real minutes in prefill proving it — and because a failure here
+	// must not cost the quality score already earned above.
+	if probe := r.runContextProbe(b, false); probe.AdvertisedTokens > 0 {
+		p.ContextProbe = &probe
+		p.Checks["context_usable"] = Check{OK: true, Message: contextProbeMessage(&probe)}
 	}
 	p.MeasuredAt = time.Now()
 	p.ProfileMillis = time.Since(start).Milliseconds()
@@ -1023,6 +1036,9 @@ func (r *Registry) applyProfileIfGen(id string, gen int64, p *WorkerProfile) boo
 	}
 	if p.Quality > 0 && declared.Quality == 0 {
 		b.Quality = p.Quality
+	}
+	if p.ContextProbe != nil {
+		b.ContextProbe = p.ContextProbe
 	}
 	if p.ContextK > 0 && declared.ContextK == 0 {
 		b.ContextK = p.ContextK

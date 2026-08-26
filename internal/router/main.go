@@ -149,7 +149,14 @@ type Backend struct {
 	Profiling      bool      `json:"profiling,omitempty"` // a cold-start profile is in flight (quality/capacity still provisional)
 	Healthy        bool      `json:"healthy"`
 	ActiveRequests int       `json:"active_requests"`
-	ObservedTPS    float64   `json:"observed_tps,omitempty"` // live EWMA of DECODE throughput (TTFT excluded), BOTH modes pooled
+	// ContextProbe is the MEASURED usable window (contextprobe.go). It lives here
+	// rather than on BackendRegistration on purpose: a registration is what a
+	// worker CLAIMS about itself, and the whole point of this field is that it is
+	// not a claim. Keeping it out also keeps registrations stable — upsert treats
+	// a registration content change as a re-registration, which resets
+	// certification and rebuilds the slot channel.
+	ContextProbe *ContextProbe `json:"context_probe,omitempty"`
+	ObservedTPS  float64       `json:"observed_tps,omitempty"` // live EWMA of DECODE throughput (TTFT excluded), BOTH modes pooled
 	// Per-thinking-mode measurements. A model with thinking on and the same model
 	// with it off are treated as two models here rather than assumed equivalent:
 	// decode rate ought to be mode-independent and the generated LENGTH certainly
@@ -3054,8 +3061,18 @@ func admitReason(b *Backend, f hardFilter) string {
 	if f.wantModel != "" && !backendServesModel(b, f.wantModel) {
 		return fmt.Sprintf("does not serve model %q", f.wantModel)
 	}
-	if f.neededContext > 0 && b.ContextK > 0 && b.ContextK < f.neededContext {
-		return fmt.Sprintf("context %dK < %dK required", b.ContextK, f.neededContext)
+	// Filter on the window retrieval was MEASURED to survive, not the one the
+	// server advertises. A model claiming 256K that loses facts past 64K passes an
+	// advertised-context filter for a 100K prompt and then answers it badly —
+	// which shows up as "the agent got confused", never as an error. Falls back to
+	// the claim when no probe has run, so an unprobed worker is not filtered out
+	// of everything. See usableContextTokens.
+	if usableK := usableContextTokens(b) / 1024; f.neededContext > 0 && usableK > 0 && usableK < f.neededContext {
+		if b.ContextProbe != nil && b.ContextProbe.UsableTokens > 0 && usableK < b.ContextK {
+			return fmt.Sprintf("context %dK < %dK required (measured; %dK advertised)",
+				usableK, f.neededContext, b.ContextK)
+		}
+		return fmt.Sprintf("context %dK < %dK required", usableK, f.neededContext)
 	}
 	if f.needTools && !hasFeature(b, "tools") {
 		return "no tools support"

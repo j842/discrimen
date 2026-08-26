@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -154,6 +155,11 @@ type BenchResult struct {
 	Errored   bool   `json:"errored,omitempty"`
 	Slow      bool   `json:"slow,omitempty"`  // exceeded benchAnswerDeadline — too slow to be usable, scored a fail (not a transport error)
 	Loose     bool   `json:"loose,omitempty"` // failed strict extraction but asserts the expected answer — half credit (see checkAnswerLoose)
+	// Skipped means the profile budget stopped before this question was asked.
+	// Deliberately phrased as "skipped" rather than "ran": false is the zero
+	// value, so a result recorded before this field existed reads as HAVING run,
+	// which is what those profiles did.
+	Skipped bool `json:"skipped,omitempty"`
 }
 
 var (
@@ -335,13 +341,18 @@ const (
 
 // benchOutcome is the graded result of one benchmark question against one worker.
 type benchOutcome struct {
-	tier  int
-	pass  bool
-	errd  bool
-	slow  bool
-	trunc bool
-	loose bool
-	got   string
+	// skipped means the question was never asked, because the profile budget ran
+	// out before it was dispatched. It is NOT a miss and must not be scored as
+	// one; it exists so the results slice can stay index-aligned with
+	// benchmarkQuestions, which runNoThinkQualityBenchmark consumes positionally.
+	skipped bool
+	tier    int
+	pass    bool
+	errd    bool
+	slow    bool
+	trunc   bool
+	loose   bool
+	got     string
 }
 
 // benchOne asks the worker one benchmark question in the given thinking mode and
@@ -504,7 +515,25 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 	busy := &benchBusyTracker{}
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
-	for i := range benchmarkQuestions {
+	// Bounded, and dispatched tier-first-then-round-robin so that stopping early
+	// leaves a balanced sample rather than every easy question and no hard one.
+	//
+	// The bound exists because the deadline and the question count multiply: at
+	// six minutes a question, a worker with one slot and 277 questions is a
+	// 27-hour profile, and benchmarkVersion bumps re-profile the whole fleet at
+	// once. That worker would be saturated for a day while still serving traffic.
+	ran := make([]bool, len(benchmarkQuestions))
+	started := time.Now()
+	dispatched := 0
+	for _, i := range benchStratifiedOrder(benchmarkQuestions) {
+		// The floor wins over the budget: a score from a handful of questions is
+		// worse than a slow profile, so the budget can only stop dispatch once
+		// enough questions are already in flight to score on.
+		if dispatched >= benchMinProfileQuestions && time.Since(started) > benchProfileBudget {
+			break
+		}
+		ran[i] = true
+		dispatched++
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(i int) {
@@ -515,6 +544,10 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 		}(i)
 	}
 	wg.Wait()
+	if dispatched < len(benchmarkQuestions) {
+		log.Printf("quality benchmark %s: stopped after %d/%d questions (%s budget) — scoring the sample",
+			b.ID, dispatched, len(benchmarkQuestions), benchProfileBudget)
+	}
 
 	maxTier := 1
 	for _, q := range benchmarkQuestions {
@@ -528,6 +561,17 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 	errored, slowFailed, truncated, looseTotal := 0, 0, 0, 0
 	for i, res := range results {
 		q := benchmarkQuestions[i]
+		// A question that was never dispatched is not a miss — excluded from every
+		// tally, but still emitted so the slice stays index-aligned with
+		// benchmarkQuestions. runNoThinkQualityBenchmark indexes into it and
+		// refuses to run at all if the lengths disagree, so dropping the entry
+		// would silently disable no-think scoring on any truncated profile.
+		if !ran[i] {
+			details = append(details, BenchResult{
+				Tier: q.Tier, Prompt: q.Prompt, Expect: q.Expect, Skipped: true,
+			})
+			continue
+		}
 		count[res.tier]++
 		switch {
 		case res.errd:
@@ -657,7 +701,17 @@ func (r *Router) runNoThinkQualityBenchmark(b *Backend, concurrency int, mixed [
 	busy := &benchBusyTracker{}
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
-	for j, i := range hardIdx {
+	// Bounded on the same terms as the mixed pass — this is a second full pass
+	// over the hard tiers, so leaving it unbounded would undo the bound there.
+	started := time.Now()
+	dispatched := 0
+	for _, j := range benchStratifiedOrderOf(hardIdx) {
+		if dispatched >= benchMinProfileQuestions && time.Since(started) > benchProfileBudget {
+			rerun[j].skipped = true
+			continue
+		}
+		dispatched++
+		i := hardIdx[j]
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(j, i int) {
@@ -667,6 +721,10 @@ func (r *Router) runNoThinkQualityBenchmark(b *Backend, concurrency int, mixed [
 		}(j, i)
 	}
 	wg.Wait()
+	if dispatched < len(hardIdx) {
+		log.Printf("no-think benchmark %s: stopped after %d/%d questions (%s budget)",
+			b.ID, dispatched, len(hardIdx), benchProfileBudget)
+	}
 
 	maxTier := 1
 	for _, q := range benchmarkQuestions {
@@ -680,16 +738,24 @@ func (r *Router) runNoThinkQualityBenchmark(b *Backend, concurrency int, mixed [
 	errored, slowFailed, truncated := 0, 0, 0
 	outcomes := make([]benchOutcome, len(benchmarkQuestions))
 	for i, m := range mixed {
-		// Easy tiers ran thinking-off in the mixed pass; carry them over verbatim.
+		// Easy tiers ran thinking-off in the mixed pass; carry them over verbatim,
+		// INCLUDING whether they were asked at all.
 		outcomes[i] = benchOutcome{tier: m.Tier, pass: m.Pass, loose: m.Loose,
-			errd: m.Errored, slow: m.Slow, trunc: m.Truncated}
+			errd: m.Errored, slow: m.Slow, trunc: m.Truncated, skipped: m.Skipped}
 	}
 	for j, i := range hardIdx {
 		outcomes[i] = rerun[j]
 	}
 	for i, res := range outcomes {
-		count[res.tier]++
 		q := benchmarkQuestions[i]
+		// Same rule as the mixed pass: never asked is not wrong.
+		if res.skipped {
+			details = append(details, BenchResult{
+				Tier: q.Tier, Prompt: q.Prompt, Expect: q.Expect, Skipped: true,
+			})
+			continue
+		}
+		count[res.tier]++
 		details = append(details, BenchResult{
 			Tier: q.Tier, Prompt: q.Prompt, Expect: q.Expect,
 			Got: res.got, Pass: res.pass, Truncated: res.trunc, Errored: res.errd, Slow: res.slow,
@@ -1554,4 +1620,61 @@ func (t *benchBusyTracker) abandoned() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.gaveUp
+}
+
+// benchProfileBudget bounds one quality-benchmark pass. It is a wall-clock
+// bound, not a question bound, because the thing that varies between workers by
+// two orders of magnitude is time per question, not count.
+//
+// benchMinProfileQuestions is the floor the budget cannot cut into: below it the
+// sample is too small to place a worker on a 0-100 scale, and a confidently
+// wrong quality score is worse than a slow profile. A worker slow enough to need
+// longer than the budget for even this many still gets scored — it just takes as
+// long as it takes.
+const (
+	benchProfileBudget       = 90 * time.Minute
+	benchMinProfileQuestions = 48
+)
+
+// benchStratifiedOrder returns question indices ordered so that any PREFIX of
+// the result is spread across tiers, by taking one question from each tier in
+// turn. Index order would walk the tiers in blocks, so a truncated run would
+// score a worker entirely on whichever tiers happen to come first — and since
+// the set is authored easy-to-hard, that means a run cut short would report a
+// weak worker as strong.
+func benchStratifiedOrder(qs []benchmarkQ) []int {
+	byTier := map[int][]int{}
+	tiers := []int{}
+	for i, q := range qs {
+		if _, seen := byTier[q.Tier]; !seen {
+			tiers = append(tiers, q.Tier)
+		}
+		byTier[q.Tier] = append(byTier[q.Tier], i)
+	}
+	sort.Ints(tiers)
+	out := make([]int, 0, len(qs))
+	for round := 0; len(out) < len(qs); round++ {
+		progressed := false
+		for _, t := range tiers {
+			if round < len(byTier[t]) {
+				out = append(out, byTier[t][round])
+				progressed = true
+			}
+		}
+		if !progressed {
+			break // defensive: cannot happen while len(out) < len(qs)
+		}
+	}
+	return out
+}
+
+// benchStratifiedOrderOf is benchStratifiedOrder for a list of INDICES into
+// benchmarkQuestions, returning positions within that list. Used by the no-think
+// pass, which works over the hard-tier subset rather than the whole set.
+func benchStratifiedOrderOf(idx []int) []int {
+	qs := make([]benchmarkQ, len(idx))
+	for j, i := range idx {
+		qs[j] = benchmarkQuestions[i]
+	}
+	return benchStratifiedOrder(qs)
 }

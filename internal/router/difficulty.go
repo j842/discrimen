@@ -93,6 +93,70 @@ type jobCost struct {
 	// priced the incumbent as a cold worker could drop the very candidate the
 	// ranker was about to prefer.
 	incumbent string
+	// mode is the thinking decision already resolved for this request. It selects
+	// which of the backend's two measured profiles to price against — the same
+	// split selection uses to choose between a worker's two quality scores.
+	mode thinkingMode
+	// maxTokens is the caller's own ceiling (0 = none), kept separately from
+	// outputTokens so it can still cap a per-backend MEASUREMENT, not just the
+	// nominal estimate. Without it a backend measured at 4000 tokens would be
+	// priced for 4000 even when the caller allowed 200.
+	maxTokens int
+}
+
+// expectedGenTokens is how many tokens THIS backend is expected to emit for this
+// job, which is the largest term in how long the request takes.
+//
+// Prefers what the backend has actually been measured doing in this thinking
+// mode over the fleet-wide nominal figure. The nominal one is a single constant
+// applied to every worker, so it necessarily misprices any model that is more or
+// less verbose than average — and a reasoning model with thinking on is far more
+// verbose than average, which is exactly when decode dominates the wall clock.
+func expectedGenTokens(b *Backend, job jobCost) float64 {
+	est := float64(job.outputTokens)
+	if measured := observedGenFor(b, job.mode); measured > 0 {
+		est = measured
+	}
+	// The caller's ceiling still binds: it is a hard cap on the reply, so a
+	// backend measured above it cannot spend more than the caller allowed.
+	if job.maxTokens > 0 && float64(job.maxTokens) < est {
+		est = float64(job.maxTokens)
+	}
+	if est < 1 {
+		est = 1
+	}
+	return est
+}
+
+// observedGenFor returns the measured generated length for one thinking mode, or
+// 0 when that mode has not been seen on this backend. Unknown deliberately does
+// NOT fall back to the pooled figure: there is no pooled generated-length EWMA,
+// because averaging a 200-token direct answer with a 12000-token reasoning trace
+// produces a number that describes neither.
+func observedGenFor(b *Backend, mode thinkingMode) float64 {
+	switch mode {
+	case thinkingOn:
+		return b.ObservedGenThink
+	case thinkingOff:
+		return b.ObservedGenNoThink
+	}
+	return 0
+}
+
+// liveTPSFor is liveTPS restricted to one thinking mode, falling back to the
+// pooled figure for a mode this backend has not served yet.
+func liveTPSFor(b *Backend, mode thinkingMode) float64 {
+	switch mode {
+	case thinkingOn:
+		if b.ObservedTPSThink > 0 {
+			return b.ObservedTPSThink
+		}
+	case thinkingOff:
+		if b.ObservedTPSNoThink > 0 {
+			return b.ObservedTPSNoThink
+		}
+	}
+	return liveTPS(b)
 }
 
 // nominalJob is the request-independent fallback for callers with no request in
@@ -122,7 +186,14 @@ func costForRequest(req *ChatRequest, thinking bool) jobCost {
 	if req != nil && req.MaxTokens > 0 && req.MaxTokens < out {
 		out = req.MaxTokens
 	}
-	return jobCost{promptTokens: promptTokensFor(req), outputTokens: out}
+	job := jobCost{promptTokens: promptTokensFor(req), outputTokens: out, mode: thinkingOff}
+	if thinking {
+		job.mode = thinkingOn
+	}
+	if req != nil && req.MaxTokens > 0 {
+		job.maxTokens = req.MaxTokens
+	}
+	return job
 }
 
 // contextAnswerReserve is the output room the HARD context filter charges when
@@ -720,11 +791,11 @@ func liveTPS(b *Backend) float64 {
 // better. Both work terms scale with the job, so a long prompt or a thinking turn
 // ranks a slow worker correctly instead of looking identical to a short chat turn.
 func expectedLatency(b *Backend, job jobCost) float64 {
-	tps := liveTPS(b)
+	tps := liveTPSFor(b, job.mode)
 	if tps <= 0 {
 		tps = 1
 	}
-	gen := float64(job.outputTokens) / tps       // decode time for this output
+	gen := expectedGenTokens(b, job) / tps       // decode time for this output
 	first := prefillSeconds(b, job.promptTokens) // time to first token for this prompt
 	// Session affinity: the worker that served the previous turn of this
 	// conversation should still hold its prefix, so most of this prompt's prefill

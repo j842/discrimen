@@ -135,3 +135,139 @@ func TestSelfGradesRejectsEmptyExpect(t *testing.T) {
 		t.Error("a well-formed numeric question was rejected")
 	}
 }
+
+// A truncated profile must still be representative. The question set is authored
+// easy-to-hard, so dispatching in index order and stopping early would score a
+// worker on easy tiers alone — reporting a weak worker as strong, which is the
+// direction that does damage (it draws hard traffic it cannot answer).
+func TestStratifiedOrderKeepsPrefixesBalanced(t *testing.T) {
+	var qs []benchmarkQ
+	for tier := 1; tier <= 4; tier++ {
+		for i := 0; i < 10; i++ {
+			qs = append(qs, benchmarkQ{Tier: tier})
+		}
+	}
+	order := benchStratifiedOrder(qs)
+	if len(order) != len(qs) {
+		t.Fatalf("order has %d entries, want %d — questions would be silently dropped", len(order), len(qs))
+	}
+	seen := map[int]bool{}
+	for _, i := range order {
+		if seen[i] {
+			t.Fatalf("index %d dispatched twice", i)
+		}
+		seen[i] = true
+	}
+	// Every tier represented within the first round.
+	tiers := map[int]int{}
+	for _, i := range order[:4] {
+		tiers[qs[i].Tier]++
+	}
+	if len(tiers) != 4 {
+		t.Errorf("first 4 dispatched cover tiers %v, want one of each", tiers)
+	}
+	// And a half-length prefix is still balanced.
+	half := map[int]int{}
+	for _, i := range order[:len(order)/2] {
+		half[qs[i].Tier]++
+	}
+	for tier, n := range half {
+		if n < 4 || n > 6 {
+			t.Errorf("half-length prefix has %d of tier %d, want ~5 — the sample is skewed", n, tier)
+		}
+	}
+}
+
+func TestStratifiedOrderHandlesRaggedTiers(t *testing.T) {
+	// Tiers with very different counts must not lose questions.
+	qs := []benchmarkQ{{Tier: 1}, {Tier: 2}, {Tier: 2}, {Tier: 2}, {Tier: 9}}
+	order := benchStratifiedOrder(qs)
+	if len(order) != len(qs) {
+		t.Fatalf("ragged tiers: got %d indices, want %d", len(order), len(qs))
+	}
+	seen := map[int]bool{}
+	for _, i := range order {
+		seen[i] = true
+	}
+	if len(seen) != len(qs) {
+		t.Errorf("ragged tiers: %d distinct indices, want %d", len(seen), len(qs))
+	}
+	if len(benchStratifiedOrder(nil)) != 0 {
+		t.Error("empty input should produce an empty order, not a hang")
+	}
+}
+
+// The per-mode split exists because assuming the two modes behave alike is what
+// the goal explicitly forbids. These pin that an unmeasured mode falls back
+// rather than reporting zero, and that generated LENGTH never pools the modes.
+func TestPerModeEstimates(t *testing.T) {
+	b := &Backend{ObservedTPS: 100, ObservedTPSThink: 40, ObservedGenThink: 3000, ObservedGenNoThink: 150}
+	if got := liveTPSFor(b, thinkingOn); got != 40 {
+		t.Errorf("thinking tps = %v, want the thinking-specific 40", got)
+	}
+	// No no-think measurement yet: fall back to the pooled figure, not to zero.
+	if got := liveTPSFor(b, thinkingOff); got != 100 {
+		t.Errorf("unmeasured no-think tps = %v, want pooled 100", got)
+	}
+	if got := liveTPSFor(b, thinkingUnknown); got != 100 {
+		t.Errorf("unknown-mode tps = %v, want pooled 100", got)
+	}
+	// Generated length must NOT fall back to a pooled value — there isn't one,
+	// because averaging a 150-token answer with a 3000-token trace describes
+	// neither. An unknown mode uses the caller's nominal estimate instead.
+	job := jobCost{outputTokens: 256, mode: thinkingUnknown}
+	if got := expectedGenTokens(b, job); got != 256 {
+		t.Errorf("unknown mode gen = %v, want the nominal 256", got)
+	}
+	if got := expectedGenTokens(b, jobCost{outputTokens: 256, mode: thinkingOn}); got != 3000 {
+		t.Errorf("thinking gen = %v, want measured 3000", got)
+	}
+	// The caller's ceiling binds even against a measurement.
+	if got := expectedGenTokens(b, jobCost{outputTokens: 256, mode: thinkingOn, maxTokens: 200}); got != 200 {
+		t.Errorf("gen with a 200-token ceiling = %v, want 200", got)
+	}
+}
+
+// The profile budget and the no-think pass interact, and got this wrong once:
+// runNoThinkQualityBenchmark indexes into the mixed pass's results positionally
+// and refuses to run if the lengths disagree, so dropping skipped entries would
+// have silently disabled no-think scoring on every truncated profile.
+func TestSkippedResultsStayIndexAligned(t *testing.T) {
+	if len(benchmarkQuestions) == 0 {
+		t.Skip("no questions compiled in")
+	}
+	// A BenchResult recorded before the field existed must read as HAVING run —
+	// those profiles did. That is why the field is "Skipped" and not "Ran".
+	var old BenchResult
+	if old.Skipped {
+		t.Error("zero-value BenchResult reads as skipped; an existing cached profile would score as unasked")
+	}
+	var out benchOutcome
+	if out.skipped {
+		t.Error("zero-value benchOutcome reads as skipped")
+	}
+	// A skipped question is neither a pass nor a miss: it must not appear as a
+	// failure, which is what would drag a slow worker's score down for questions
+	// the budget never let it see.
+	skipped := BenchResult{Tier: 5, Skipped: true}
+	if skipped.Pass || skipped.Errored || skipped.Slow || skipped.Loose {
+		t.Error("a skipped result carries a failure flag")
+	}
+}
+
+// The bound must never cut below the floor, or a worker gets placed on a 0-100
+// scale from a handful of questions.
+func TestProfileBudgetConstantsAreSane(t *testing.T) {
+	if benchMinProfileQuestions < 24 {
+		t.Errorf("benchMinProfileQuestions is %d — too few to place a worker on a 0-100 scale", benchMinProfileQuestions)
+	}
+	if benchProfileBudget < 30*time.Minute {
+		t.Errorf("benchProfileBudget is %s — short enough that ordinary workers would be truncated", benchProfileBudget)
+	}
+	// The floor has to be reachable within the question set, or every profile is
+	// forced to run to completion and the bound does nothing.
+	if len(benchmarkQuestions) > 0 && benchMinProfileQuestions > len(benchmarkQuestions) {
+		t.Errorf("floor %d exceeds the %d questions available, so the budget can never apply",
+			benchMinProfileQuestions, len(benchmarkQuestions))
+	}
+}

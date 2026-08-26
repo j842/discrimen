@@ -143,16 +143,32 @@ type Backend struct {
 	// rather than cached with the profile — see queryModelInfo. Never persisted:
 	// only the registration survives a restart, so this is always re-measured.
 	ModelMeta
-	LastSeen           time.Time `json:"last_seen"`
-	LastHealthy        time.Time `json:"last_healthy,omitempty"`
-	Status             string    `json:"status"`
-	Profiling          bool      `json:"profiling,omitempty"` // a cold-start profile is in flight (quality/capacity still provisional)
-	Healthy            bool      `json:"healthy"`
-	ActiveRequests     int       `json:"active_requests"`
-	ObservedTPS        float64   `json:"observed_tps,omitempty"`         // live EWMA of DECODE throughput (TTFT excluded)
-	ObservedTTFTMillis float64   `json:"observed_ttft_ms,omitempty"`     // live EWMA of first-token latency (prefill + queue), ms
-	ObservedPrefillTPS float64   `json:"observed_prefill_tps,omitempty"` // live EWMA of PREFILL throughput (prompt tokens / TTFT), tok/s
-	ThinkingDialect    string    `json:"thinking_dialect,omitempty"`     // measured spelling of the thinking gate (see WorkerProfile.ThinkingDialect)
+	LastSeen       time.Time `json:"last_seen"`
+	LastHealthy    time.Time `json:"last_healthy,omitempty"`
+	Status         string    `json:"status"`
+	Profiling      bool      `json:"profiling,omitempty"` // a cold-start profile is in flight (quality/capacity still provisional)
+	Healthy        bool      `json:"healthy"`
+	ActiveRequests int       `json:"active_requests"`
+	ObservedTPS    float64   `json:"observed_tps,omitempty"` // live EWMA of DECODE throughput (TTFT excluded), BOTH modes pooled
+	// Per-thinking-mode measurements. A model with thinking on and the same model
+	// with it off are treated as two models here rather than assumed equivalent:
+	// decode rate ought to be mode-independent and the generated LENGTH certainly
+	// is not, but "ought to" is the kind of assumption that produced a q=84 worker
+	// writing deterministic garbage, so both are measured separately and the
+	// pooled figures above are kept only as a fallback for a mode not yet seen.
+	//
+	// ObservedGen* is the one that changes routing most: it is how many tokens
+	// this backend actually emits, which drives decode time and is the single
+	// largest term in how long a request takes. A greeting and a hard maths
+	// question differ by ~50x on the same worker, and thinking-on and -off differ
+	// by about as much again.
+	ObservedTPSThink   float64 `json:"observed_tps_think,omitempty"`
+	ObservedTPSNoThink float64 `json:"observed_tps_nothink,omitempty"`
+	ObservedGenThink   float64 `json:"observed_gen_think,omitempty"`
+	ObservedGenNoThink float64 `json:"observed_gen_nothink,omitempty"`
+	ObservedTTFTMillis float64 `json:"observed_ttft_ms,omitempty"`     // live EWMA of first-token latency (prefill + queue), ms
+	ObservedPrefillTPS float64 `json:"observed_prefill_tps,omitempty"` // live EWMA of PREFILL throughput (prompt tokens / TTFT), tok/s
+	ThinkingDialect    string  `json:"thinking_dialect,omitempty"`     // measured spelling of the thinking gate (see WorkerProfile.ThinkingDialect)
 	// RemoteActive is how many requests the UPSTREAM says are in flight against a
 	// relay row's model, refreshed on every relay poll. It exists because
 	// ActiveRequests counts only what this router dispatched, and the point of a
@@ -5488,6 +5504,18 @@ func (r *Registry) observe(id string, ttft, decodeWindow time.Duration, tokens, 
 	} else {
 		b.ObservedTPS = b.ObservedTPS*(1-alpha) + decodeTPS*alpha
 	}
+	// The same two samples again, kept per mode. Nothing here assumes the modes
+	// agree; if they turn out to, the two EWMAs simply converge and cost nothing.
+	// The generated-length EWMA uses a fixed weight rather than the
+	// tokens-weighted alpha above: alpha exists to trust a long sample more about
+	// a RATE, but for a length the long samples are precisely the observations
+	// that must not dominate — they are what we are trying to predict.
+	tpsSlot, genSlot := &b.ObservedTPSNoThink, &b.ObservedGenNoThink
+	if thinking {
+		tpsSlot, genSlot = &b.ObservedTPSThink, &b.ObservedGenThink
+	}
+	ewma(tpsSlot, decodeTPS, alpha)
+	ewma(genSlot, float64(tokens), 0.2)
 	if thinking || ttft <= 0 {
 		return
 	}
@@ -6673,4 +6701,15 @@ func thinkingLogValue(tr thinkingResolution) thinkingMode {
 		return thinkingOn
 	}
 	return thinkingUnknown
+}
+
+// ewma folds a sample into an exponentially weighted average in place, seeding
+// it on the first observation so a cold metric does not spend its early life
+// being dragged up from zero.
+func ewma(slot *float64, sample, alpha float64) {
+	if *slot == 0 {
+		*slot = sample
+		return
+	}
+	*slot = *slot*(1-alpha) + sample*alpha
 }

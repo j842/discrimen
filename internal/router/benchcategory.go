@@ -190,6 +190,15 @@ type benchCatScore struct {
 }
 
 func (s *benchCatScore) add(r BenchResult) {
+	// A question the profile budget never asked is not a category weakness. It
+	// has to stay out of the DENOMINATOR as well as the numerator: counting it in
+	// Total alone reads as a miss, so a truncated profile would report a model as
+	// bad at whichever categories it ran out of time in — the exact opposite of a
+	// strengths-and-weaknesses map, and worst on the slow workers that get
+	// truncated most.
+	if r.Skipped {
+		return
+	}
 	s.Total++
 	switch {
 	case r.Pass:

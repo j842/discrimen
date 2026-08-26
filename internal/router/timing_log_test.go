@@ -271,3 +271,29 @@ func TestProfileBudgetConstantsAreSane(t *testing.T) {
 			benchMinProfileQuestions, len(benchmarkQuestions))
 	}
 }
+
+// A skipped question must leave the category breakdown alone. Counting it in
+// Total but never in Passed reads as a miss, so a truncated profile would report
+// a model as weak in whichever categories the budget ran out in — and it runs
+// out most on the slow workers, which is where a wrong reading does most harm.
+func TestCategorySummaryIgnoresSkipped(t *testing.T) {
+	var s benchCatScore
+	s.add(BenchResult{Tier: 5, Pass: true})
+	s.add(BenchResult{Tier: 5, Skipped: true})
+	s.add(BenchResult{Tier: 5, Skipped: true})
+	s.finish()
+	if s.Total != 1 {
+		t.Errorf("Total = %d, want 1 — skipped questions entered the denominator", s.Total)
+	}
+	if s.Percent != 100 {
+		t.Errorf("Percent = %d, want 100 — two unasked questions were scored as misses", s.Percent)
+	}
+	// A genuine failure still counts, or the fix would hide real weaknesses.
+	var s2 benchCatScore
+	s2.add(BenchResult{Tier: 5, Pass: true})
+	s2.add(BenchResult{Tier: 5})
+	s2.finish()
+	if s2.Total != 2 || s2.Percent != 50 {
+		t.Errorf("Total=%d Percent=%d, want 2/50 — an ordinary miss must still count", s2.Total, s2.Percent)
+	}
+}

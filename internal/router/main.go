@@ -3383,13 +3383,65 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 		filtered = trimmed
 	}
 
-	// NOTE: the tier/difficulty branch that used to sit here is gone. It compared
-	// a benchmark percentage against a difficulty score from an embedding
-	// classifier — two numbers never on the same scale, one of them from a
-	// classifier measured to be a topic detector — and once the outcome matrix
-	// was tried first it became structurally unreachable, because
-	// chooseByOutcome always returns an ordering when there are candidates. It
-	// was dead code that still looked like policy. See outcomes.go.
+	// Auto difficulty routing infers a target quality tier from the prompt, then
+	// lets rankByDifficulty pick the backend that clears it and will finish
+	// soonest. This is the ONLY model-tier mechanism — there are no client-tunable
+	// quality/speed levers. Best-effort: if the classifier is unavailable (no
+	// embeddings worker) or the request carries no messages (a bare /v1/completions
+	// call), fall through to the quality-ranked fallback below.
+	// FIRST: the outcome matrix, which answers the routing question directly —
+	// which of these workers got questions like this one right, and which of
+	// those is fastest. No quality score, no difficulty target, nothing compared
+	// against anything. It supersedes the tier path below wherever it has
+	// evidence, and declines (leaving the tier path in place) where it does not,
+	// so the two can run side by side until the tier machinery is removed.
+	if cl != nil && r.outcomes != nil && len(cl.vec) > 0 {
+		// Self-healing: cheap when already filled (one atomic load), and the only
+		// thing that fills the bank after a warm restart.
+		r.ensureBankVectorsAsync()
+		if ordered, reason := r.outcomes.chooseByOutcome(filtered, cl.vec, !tr.noThink, job); len(ordered) > 0 {
+			return &routePlan{
+				candidates: ordered,
+				// A client-named model is never "auto" however it was ranked: the
+				// caller made the choice, so escalating or judging it would be
+				// second-guessing an instruction.
+				auto:     wantModel == "",
+				route:    fmt.Sprintf("%s:%s", routeKind(wantModel), reason),
+				cl:       cl,
+				job:      job,
+				tr:       tr,
+				session:  sess,
+				group:    gr,
+				expert:   expert,
+				rejected: rejected,
+			}, nil
+		}
+	}
+
+	if cl != nil && r.cfg.AutoDifficulty {
+		target := r.classifier.targetForFleet(filtered, r.adapter.adjust(cl.difficulty), tr.noThink)
+		// target is surfaced as the quality floor so the acquire step prefers to
+		// wait BRIEFLY for an above-target worker before spilling below it (fix #2);
+		// routing too cheap is the quality-risky direction.
+		//
+		// A client-named model reports as "model:…" rather than "route:…" on
+		// purpose: parseRouteScore only reads the "route:d=" form, so the online
+		// tier adapter and the background judge learn from tiers the ROUTER chose
+		// and not from ones a harness chose for it.
+		return &routePlan{
+			candidates: rankByDifficulty(filtered, target, job, tr.noThink),
+			auto:       wantModel == "",
+			route:      fmt.Sprintf("%s:d=%.2f,q>=%d", routeKind(wantModel), cl.difficulty, target),
+			cl:         cl,
+			target:     target,
+			job:        job,
+			tr:         tr,
+			session:    sess,
+			group:      gr,
+			expert:     expert,
+			rejected:   rejected,
+		}, nil
+	}
 
 	// Fallback when auto-tiering can't run: rank by quality, with speed and
 	// current load breaking ties. No hard filter — every eligible backend stays a

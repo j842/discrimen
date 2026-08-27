@@ -108,7 +108,7 @@ func (b *judgeBudget) charge(tokens int) {
 // verdict can be recorded in the outcome matrix against the right (worker, mode)
 // pair. Without the mode a judged result would be filed against whichever mode
 // the matrix happened to be queried for, which is the one thing goal 3 forbids.
-func (r *Router) maybeJudge(messages []Message, stream bool, served *Backend, route, output string, thinking bool, latencyMS int64) {
+func (r *Router) maybeJudge(messages []Message, stream bool, served *Backend, route, output string, thinking bool, latencyMS int64, vec []float64) {
 	// The adapter is NO LONGER required. Judging serves two consumers now: the
 	// tier adapter, which needs a numeric difficulty score and therefore only
 	// learns from tier-routed requests, and the outcome matrix, which needs
@@ -124,7 +124,7 @@ func (r *Router) maybeJudge(messages []Message, stream bool, served *Backend, ro
 	if r.judgeCount.Add(1)%n != 0 {
 		return // not in this sample
 	}
-	grader, paid := r.judgeGrader(served)
+	grader, paid := r.judgeGrader(served, vec)
 	// The question here is "is there anyone else who can look at this", NOT "was
 	// the served worker beaten by someone". Those were the same question under
 	// the quality scalar and have not been since the outcome matrix became the
@@ -268,7 +268,7 @@ func parseJudgeVerdict(content string) (bad, ok bool) {
 //
 // eligible() already guarantees Healthy && Certification.Ready && !isExpired;
 // only the embeddings-only skip and the never-itself rule are needed here.
-func (r *Router) judgeGrader(served *Backend) (grader *Backend, paid bool) {
+func (r *Router) judgeGrader(served *Backend, vec []float64) (grader *Backend, paid bool) {
 	if served == nil || r.registry == nil {
 		return nil, false
 	}
@@ -281,10 +281,10 @@ func (r *Router) judgeGrader(served *Backend) (grader *Backend, paid bool) {
 			continue
 		}
 		if isFreeBackend(b) {
-			if r.betterGrader(b, bestFree) {
+			if r.betterGrader(b, bestFree, vec) {
 				bestFree = b
 			}
-		} else if r.betterGrader(b, bestPaid) {
+		} else if r.betterGrader(b, bestPaid, vec) {
 			bestPaid = b
 		}
 	}
@@ -298,11 +298,11 @@ func (r *Router) judgeGrader(served *Backend) (grader *Backend, paid bool) {
 }
 
 // betterGrader reports whether candidate should displace best.
-func (r *Router) betterGrader(candidate, best *Backend) bool {
+func (r *Router) betterGrader(candidate, best *Backend, vec []float64) bool {
 	if best == nil {
 		return true
 	}
-	cs, bs := r.graderStrength(candidate), r.graderStrength(best)
+	cs, bs := r.graderStrength(candidate, vec), r.graderStrength(best, vec)
 	if cs != bs {
 		return cs > bs
 	}
@@ -328,17 +328,30 @@ func (r *Router) betterGrader(candidate, best *Backend) bool {
 // a mixed-mode score here would rank a grader on a model nobody is about to
 // call. qualityFor carries the same rule for the scalar fallback.
 //
-// Deliberately the OVERALL rate rather than a per-prompt prediction. The matrix
-// can answer "how would this worker do on a prompt like this one", and that is
-// the better question — but predict() needs the prompt's embedding, and
-// maybeJudge is handed the messages, not the classification that carries the
-// vector. Re-embedding here would either double the embedding cost of every
-// sampled request or plant a vector with no observations behind it, which
-// neighboursOf would then count towards outcomeNeighbours while supplying no
-// evidence to anyone. Grader selection is also exactly the "no neighbours to
-// consult" case summary() documents itself as existing for.
-func (r *Router) graderStrength(b *Backend) float64 {
+// Per-prompt when the router has the prompt's embedding, overall otherwise.
+//
+// "How would this worker do on a prompt LIKE THIS ONE" is the better question
+// than "how does it do in general", and the matrix can answer it — a worker that
+// is mediocre overall but strong on this topic is the right grader for this
+// answer. The vector is the classification's, computed once for routing and
+// passed down rather than re-derived: re-embedding here would either double the
+// embedding cost of every sampled request or plant a vector with no observations
+// behind it, which neighboursOf would then count towards outcomeNeighbours while
+// supplying no evidence to anyone.
+//
+// It falls back to the overall rate when the request was not classified (no
+// embeddings worker) or the matrix has no neighbours for this prompt — which is
+// exactly the "no neighbours to consult" case summary() documents itself for —
+// and to the retired scalar only before any worker has been profiled. The scalar
+// is shifted below zero so that ANY measured evidence outranks it: an unprofiled
+// worker should never beat one the router has actually observed.
+func (r *Router) graderStrength(b *Backend, vec []float64) float64 {
 	if r.outcomes != nil {
+		if len(vec) > 0 {
+			if p := r.outcomes.predict(vec, b.ID, false); p.known() {
+				return p.Correct
+			}
+		}
 		if rate, n := r.outcomes.summary(b.ID, false); n > 0 {
 			return rate
 		}
@@ -393,4 +406,17 @@ func extractAnswer(body []byte, stream bool) string {
 		}
 	}
 	return sb.String()
+}
+
+// classificationVec is the prompt embedding a classification carries, or nil.
+//
+// A helper rather than an inline `if plan.cl != nil` at the call site because
+// "missing" has to stay distinguishable from "present but empty": both mean the
+// judge falls back to the overall rate, and neither should ever panic on a
+// request the embeddings worker never saw.
+func classificationVec(cl *classification) []float64 {
+	if cl == nil {
+		return nil
+	}
+	return cl.vec
 }

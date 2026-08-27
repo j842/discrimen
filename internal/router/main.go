@@ -77,9 +77,15 @@ type Config struct {
 	AdaptLRDown  float64
 	AdaptBins    int
 
-	// JudgeSampleRate is the fraction of cheaper-than-best answers graded in the
-	// background by the best model; a "bad" verdict raises that difficulty bin's
-	// tier bias. 0 disables. Requires the online adapter.
+	// JudgeSampleRate is the fraction of served answers graded in the background
+	// by another worker; the verdict is recorded in the outcome matrix, which is
+	// the only evidence the router ever gets about the traffic it actually serves
+	// (the question bank is fixed and synthetic). 0 disables.
+	//
+	// It was "the fraction of CHEAPER-THAN-BEST answers", gated on the retired
+	// Quality scalar — which meant the fleet's strongest worker was never graded
+	// at all, so the matrix could never learn anything about the worker it was
+	// most likely to pick.
 	JudgeSampleRate float64
 
 	// AdminPassword bootstraps the admin session on a database that has no
@@ -2937,8 +2943,11 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 			// skipped when truncation removed part of it — a half answer grades as
 			// garbage.
 			if autoRoute && learnFromRelay(caller) && clean && capture.truncated() <= 0 {
+				// plan.cl carries the embedding the classifier already computed for
+				// routing; the judge reuses it to pick a grader that is strong on
+				// THIS KIND of prompt rather than strong on average.
 				r.maybeJudge(chatReq.Messages, chatReq.Stream, served, route, entry.Output,
-					entry.Thinking == thinkingOn, entry.DurationMillis)
+					entry.Thinking == thinkingOn, entry.DurationMillis, classificationVec(plan.cl))
 			}
 			if err := r.logs.Insert(context.Background(), entry); err != nil {
 				log.Printf("request log insert failed backend=%s: %v", served.ID, err)

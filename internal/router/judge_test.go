@@ -29,21 +29,21 @@ func TestJudgeGraderPrefersFree(t *testing.T) {
 	r := &Router{registry: reg}
 
 	// The strongest free worker that is not the one being graded.
-	if got, paid := r.judgeGrader(reg.get("cheapie")); got == nil || got.ID != "free-mid" || paid {
+	if got, paid := r.judgeGrader(reg.get("cheapie"), nil); got == nil || got.ID != "free-mid" || paid {
 		t.Errorf("grading a cheap answer: got %v (paid=%v), want free-mid for free", got, paid)
 	}
 	// Including when the served worker IS the best free one: the runner-up grades
 	// it, for nothing, rather than the fleet paying to mark its own homework.
-	if got, paid := r.judgeGrader(reg.get("free-mid")); got == nil || got.ID != "cheapie" || paid {
+	if got, paid := r.judgeGrader(reg.get("free-mid"), nil); got == nil || got.ID != "cheapie" || paid {
 		t.Errorf("grading the best FREE worker: got %v (paid=%v), want cheapie for free", got, paid)
 	}
 	// And the paid worker is graded free too, which is the ordinary case.
-	if got, paid := r.judgeGrader(reg.get("paid-top")); got == nil || got.ID != "free-mid" || paid {
+	if got, paid := r.judgeGrader(reg.get("paid-top"), nil); got == nil || got.ID != "free-mid" || paid {
 		t.Errorf("grading the paid worker: got %v (paid=%v), want free-mid for free", got, paid)
 	}
 	// A paid grader only when there is no other free chat worker at all.
 	reg.remove("cheapie")
-	if got, paid := r.judgeGrader(reg.get("free-mid")); got == nil || got.ID != "paid-top" || !paid {
+	if got, paid := r.judgeGrader(reg.get("free-mid"), nil); got == nil || got.ID != "paid-top" || !paid {
 		t.Errorf("sole free worker: got %v (paid=%v), want paid-top flagged paid", got, paid)
 	}
 	// With nothing else registered there is no second opinion to be had, and the
@@ -51,7 +51,7 @@ func TestJudgeGraderPrefersFree(t *testing.T) {
 	// is what made maybeJudge's guard look like a sampling decision when it was
 	// really "this worker is never judged".
 	reg.remove("paid-top")
-	if got, paid := r.judgeGrader(reg.get("free-mid")); got != nil || paid {
+	if got, paid := r.judgeGrader(reg.get("free-mid"), nil); got != nil || paid {
 		t.Errorf("one-worker fleet: got %v (paid=%v), want no grader", got, paid)
 	}
 	// An embeddings-only worker is never a grader, whatever its quality.
@@ -59,7 +59,7 @@ func TestJudgeGraderPrefersFree(t *testing.T) {
 	reg.upsert(BackendRegistration{ID: "emb", URL: "http://emb", Model: "e", Quality: 100,
 		TTLSeconds: 3600, Features: []string{"embeddings"}})
 	reg.finishCertification("emb", true, map[string]Check{}, 0, 0, "")
-	if got, _ := r.judgeGrader(reg.get("free-mid")); got == nil || got.ID != "cheapie" {
+	if got, _ := r.judgeGrader(reg.get("free-mid"), nil); got == nil || got.ID != "cheapie" {
 		t.Errorf("embeddings worker used as a grader: %v", got)
 	}
 }
@@ -86,7 +86,7 @@ func TestJudgeGradesTheFleetsBestWorker(t *testing.T) {
 	top := registerPriced(t, reg, "flagship", 95, 4, 0, 0)
 	r := &Router{registry: reg}
 
-	got, paid := r.judgeGrader(top)
+	got, paid := r.judgeGrader(top, nil)
 	if got == nil {
 		t.Fatal("no grader for the fleet's best worker: its traffic is never judged, so the " +
 			"matrix learns nothing about the worker serving most of it")
@@ -145,7 +145,7 @@ func TestJudgeRecordsAnOutcomeForTheBestWorker(t *testing.T) {
 
 	r.maybeJudge([]Message{{Role: "user", Content: "what is the capital of France?"}}, false,
 		reg.get("flagship"), "route:outcome:p=0.90,n=8",
-		`{"choices":[{"message":{"content":"Berlin."}}]}`, false, 1200)
+		`{"choices":[{"message":{"content":"Berlin."}}]}`, false, 1200, nil)
 
 	waitFor(t, func() bool {
 		for _, id := range r.outcomes.backendsWithEvidence() {

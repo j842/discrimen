@@ -23,8 +23,8 @@ package router
 // Two supporting diagnostics, both cheap and both worth knowing before trusting
 // any routing decision:
 //
-//	Degenerate fraction — questions every worker passes or every worker fails.
-//	They cannot discriminate between workers no matter how good the predictor is.
+//	Degenerate fraction — questions every model passes or every model fails.
+//	They cannot discriminate between models no matter how good the predictor is.
 //	One published pool was 52.5% all-correct, which capped the achievable gain at
 //	+1.2pp regardless of method.
 //

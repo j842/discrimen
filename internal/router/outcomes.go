@@ -180,7 +180,10 @@ const outcomeMinObservations = 2
 // ever exclude it.
 const outcomeEvidencePenalty = 0.3
 
-// prediction is what the matrix says about one worker in one mode.
+// prediction is what the matrix says about one MODEL in one mode. Two workers
+// serving the same weights get the same prediction — that is the point of
+// filing evidence under the model — and are separated afterwards on Seconds,
+// which is the term that is genuinely per-box.
 type prediction struct {
 	// Correct is the similarity-weighted hit rate on nearby questions: an
 	// estimate of how often this worker answers this KIND of prompt correctly.
@@ -272,11 +275,12 @@ type outcomeMatrix struct {
 	// failure retries rather than disabling judged-vector persistence for the
 	// process lifetime.
 	vecTableReady atomic.Bool
-	// fullScans counts walks of the WHOLE observation map, and vecScans counts
-	// walks of the whole VECTOR map. They exist for tests, because this exact
-	// shape has now regressed twice: predict once rescanned every vector per
-	// candidate (13ms per routed request on a 7-worker fleet, all of it added
-	// latency and growing with the judged cache), and the fallback below then did
+	// fullScans counts walks of the WHOLE observation map on the ROUTING path,
+	// and vecScans counts walks of the whole VECTOR map. They exist for tests,
+	// because this exact shape has now regressed twice: predict once rescanned
+	// every vector per candidate (13ms per routed request on a 7-worker fleet,
+	// all of it added latency and growing with the judged cache), and the
+	// fallback below then did
 	// the same thing by calling summary() per candidate. A comment asking the next
 	// author to remember did not hold; a counter a test can assert on does.
 	//
@@ -285,6 +289,13 @@ type outcomeMatrix struct {
 	// scan that cost 13ms was in neighboursOf, over m.vecs, and it never touched
 	// the observation map at all. A future predict()-per-candidate would have
 	// reinstated the measured fault while the existing counter read 1.
+	//
+	// The DISPLAY and diagnostic walkers deliberately do not count — summarise,
+	// String, validate and pruneJudged all walk the observation map and none of
+	// them increments. They are not what the counter is protecting: a dashboard
+	// poll or an admin request that scans the map is doing what it is for, and a
+	// test that counted those would go red for a poll rather than for a routing
+	// regression, which is how a guard stops being believed.
 	fullScans atomic.Uint64
 	vecScans  atomic.Uint64
 }
@@ -1326,7 +1337,7 @@ func backendsOf(cs []outcomeChoice) []*Backend {
 // pruneJudged bounds how many production questions the matrix carries.
 //
 // Bank questions are never pruned: they are the fixed instrument, and dropping
-// one would silently change what every worker's summary is computed over.
+// one would silently change what every model's summary is computed over.
 // Judged questions are unbounded in principle — production traffic never stops —
 // and the matrix is scanned linearly per routed request, so both memory and
 // request latency depend on this cap. Oldest first, which is also right on the
@@ -1402,7 +1413,11 @@ type TopicSummary struct {
 	Correct int     `json:"correct"`
 }
 
-// OutcomeSummary is the display-only view of one worker in one mode.
+// OutcomeSummary is the display-only view of one MODEL in one mode, which is
+// what an operator sees against each worker serving it. Two workers running the
+// same weights therefore show identical numbers, and that is not a bug to fix
+// later: the evidence is about the weights, so attributing half of it to each
+// box would be the fiction, not the shared figure.
 //
 // Explicitly NOT a routing input: routing queries neighbours of the actual
 // prompt, and compressing that into a headline is exactly the mistake the

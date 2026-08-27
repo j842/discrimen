@@ -257,8 +257,14 @@ func (r *Router) bankTopicOf(qid string) string {
 	return r.bankTopics[qid]
 }
 
-// outcomeSummaryFor is the display view of one worker, in the mode routing would
-// use for a request with no thinking preference.
+// outcomeSummaryFor is the display view shown against one worker, in the mode
+// routing would use for a request with no thinking preference.
+//
+// It is the record of the worker's MODEL, looked up by modelHash(b) like every
+// other read. So two workers serving the same weights show the same numbers —
+// which is the honest rendering, since the evidence is about the weights — and
+// a worker deployed today against a model already profiled elsewhere shows a
+// full record immediately rather than an empty one.
 func (r *Router) outcomeSummaryFor(b *Backend, thinking bool) *OutcomeSummary {
 	if r.outcomes == nil {
 		return nil

@@ -18,8 +18,24 @@ import (
 	"unicode/utf8"
 )
 
-// benchmarkVersion is bumped whenever the question set or profiling changes, so a
-// cached profile measured against an older version is re-profiled, not reused.
+// benchmarkVersion marks a change to how PROFILING ITSELF works, so a cached
+// profile measured by an older method is re-profiled rather than reused.
+//
+// Its old job — "bumped whenever the question set or the grading changes" — is
+// gone, and with it the reason it was a cliff. A question's identity now carries
+// its text, its expected answer, its match mode and the version of the grader
+// that scores it (see identity.go), so changing a question or fixing one grader
+// invalidates exactly the answers it affects and nothing else. Bumping this to
+// fix the numeric grader used to discard every mcq, exact-list and contains
+// result on every worker in both modes — about 5,600 gradings, hours of GPU time
+// — to re-derive verdicts that had not changed.
+//
+// A bump is still cheap to recover from BECAUSE of that: re-profiling now re-runs
+// the capability, speed, capacity and context probes, which are seconds, while
+// every question the model has already answered is served from the permacache.
+//
+// So bump it for a change to the METHOD (a different probe, a different way of
+// asking), not for a change to the QUESTIONS.
 // v24: a question the worker can't answer within benchAnswerDeadline is scored a
 // speed fail (counted wrong, not retried) instead of a retried transport error.
 // v25: length-truncation now counts as a FAILURE (was excluded from the
@@ -520,13 +536,18 @@ type benchOutcome struct {
 	// one; it exists so the results slice can stay index-aligned with
 	// benchmarkQuestions, which runNoThinkQualityBenchmark consumes positionally.
 	skipped bool
-	tier    int
-	pass    bool
-	errd    bool
-	slow    bool
-	trunc   bool
-	loose   bool
-	got     string
+	// cached means the verdict came from the permacache rather than a generation:
+	// this model has answered this exact question, graded this exact way, before.
+	// Reported so a profile that finished in seconds is legible as a cache hit
+	// rather than mistaken for a worker that answered impossibly fast.
+	cached bool
+	tier   int
+	pass   bool
+	errd   bool
+	slow   bool
+	trunc  bool
+	loose  bool
+	got    string
 }
 
 // benchOne asks the worker one benchmark question in the given thinking mode and
@@ -535,6 +556,29 @@ type benchOutcome struct {
 // main benchmark does — a second copy of the request/grading logic would drift.
 func (r *Router) benchOne(b *Backend, q benchmarkQ, think bool, busy *benchBusyTracker) benchOutcome {
 	res := benchOutcome{tier: q.Tier}
+	// THE PERMACACHE. Has this model already answered this question, graded this
+	// way? If so the answer cannot have changed — the qid pins the prompt, the
+	// expected answer, the match mode and the grader's version, and the model hash
+	// pins the weights, quantisation and engine — so asking again would spend a
+	// generation to re-derive a verdict already held.
+	//
+	// This is what makes a grader fix cheap. Only the questions whose grading
+	// actually changed get new qids and miss; every other question in the bank
+	// hits, on every worker, in both modes.
+	if r.outcomes != nil {
+		if hit, sameWorker, ok := r.outcomes.cachedVerdict(benchQuestionQID(q), modelHash(b), b.ID, think); ok {
+			res.pass, res.cached, res.got = hit.Correct, true, "(cached)"
+			// Latency only from the worker that measured it. A hit from another
+			// deployment of the same weights is a real verdict and a meaningless
+			// duration — different box, different load — and the matrix already
+			// reads a zero here as "not measured" and falls back to the generic
+			// estimate rather than believing somebody else's hardware.
+			if sameWorker {
+				res.latencyMS = hit.LatencyMS
+			}
+			return res
+		}
+	}
 	prompt, maxTokens := benchRequestFor(q, think, usableContextTokens(b))
 	// A prompt that does not fit the worker's window is a MISS, not an outage.
 	//

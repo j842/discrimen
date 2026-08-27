@@ -148,8 +148,9 @@ func TestJudgeRecordsAnOutcomeForTheBestWorker(t *testing.T) {
 		`{"choices":[{"message":{"content":"Berlin."}}]}`, false, 1200, nil)
 
 	waitFor(t, func() bool {
+		// backendsWithEvidence lists MODEL hashes now, not worker ids.
 		for _, id := range r.outcomes.backendsWithEvidence() {
-			if id == "flagship" {
+			if id == modelHash(reg.get("flagship")) {
 				return true
 			}
 		}

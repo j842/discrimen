@@ -13,9 +13,15 @@ import (
 func vec(xs ...float64) []float64 { return xs }
 
 func obs(qid, backend string, thinking, correct bool, ms int64, source string) Observation {
-	return Observation{QID: qid, Backend: backend, Thinking: thinking, Correct: correct,
-		LatencyMS: ms, Source: source, At: time.Unix(0, 0)}
+	return Observation{QID: qid, ModelHash: mh(backend), Backend: backend, Thinking: thinking,
+		Correct: correct, LatencyMS: ms, Source: source, At: time.Unix(0, 0)}
 }
+
+// mh is the model hash of a bare testBackend with this id — the identity routing
+// will look these observations up under. Fixtures and candidates have to agree on
+// it, and deriving both from the same function is what stops a test passing
+// because nothing matched.
+func mh(id string) string { return unfingerprintedModelHash(id, "") }
 
 func newTestMatrix(t *testing.T) *outcomeMatrix {
 	t.Helper()
@@ -57,19 +63,19 @@ func TestPredictUsesNearbyQuestions(t *testing.T) {
 	})
 
 	mathsPrompt, codePrompt := vec(1, 0.05), vec(0.05, 1)
-	if p := m.predict(mathsPrompt, "mathsbot", true); p.Correct < 0.9 {
+	if p := m.predict(mathsPrompt, mh("mathsbot"), true); p.Correct < 0.9 {
 		t.Errorf("mathsbot on a maths prompt = %.2f, want ~1.0", p.Correct)
 	}
-	if p := m.predict(mathsPrompt, "codebot", true); p.Correct > 0.1 {
+	if p := m.predict(mathsPrompt, mh("codebot"), true); p.Correct > 0.1 {
 		t.Errorf("codebot on a maths prompt = %.2f, want ~0.0", p.Correct)
 	}
-	if p := m.predict(codePrompt, "codebot", true); p.Correct < 0.9 {
+	if p := m.predict(codePrompt, mh("codebot"), true); p.Correct < 0.9 {
 		t.Errorf("codebot on a code prompt = %.2f, want ~1.0", p.Correct)
 	}
 	// Both have an identical OVERALL hit rate of 50%, so a scalar would rank
 	// them equal on every prompt. This is the improvement being claimed.
-	rm, _ := m.summary("mathsbot", true)
-	rc, _ := m.summary("codebot", true)
+	rm, _ := m.summary(mh("mathsbot"), true)
+	rc, _ := m.summary(mh("codebot"), true)
 	if math.Abs(rm-rc) > 0.001 {
 		t.Fatalf("test setup: overall rates should be equal, got %.2f and %.2f", rm, rc)
 	}
@@ -86,8 +92,8 @@ func TestPredictSeparatesThinkingModes(t *testing.T) {
 		obs("q1", "w", false, false, 100, obsSourceBench),
 		obs("q2", "w", false, false, 100, obsSourceBench),
 	})
-	on := m.predict(vec(1, 0.05), "w", true)
-	off := m.predict(vec(1, 0.05), "w", false)
+	on := m.predict(vec(1, 0.05), mh("w"), true)
+	off := m.predict(vec(1, 0.05), mh("w"), false)
 	if on.Correct < 0.9 {
 		t.Errorf("thinking-on = %.2f, want ~1.0", on.Correct)
 	}
@@ -106,12 +112,12 @@ func TestPredictReportsLowConfidenceForUnfamiliarPrompts(t *testing.T) {
 		obs("q1", "w", true, true, 100, obsSourceBench),
 		obs("q2", "w", true, true, 100, obsSourceBench),
 	})
-	far := m.predict(vec(0, 0, 1), "w", true)
+	far := m.predict(vec(0, 0, 1), mh("w"), true)
 	if far.known() {
 		t.Errorf("an orthogonal prompt produced a usable prediction (conf=%.2f support=%.1f)",
 			far.Confidence, far.Support)
 	}
-	near := m.predict(vec(1, 0.05, 0), "w", true)
+	near := m.predict(vec(1, 0.05, 0), mh("w"), true)
 	if !near.known() {
 		t.Errorf("a close prompt produced no usable prediction (conf=%.2f support=%.1f)",
 			near.Confidence, near.Support)
@@ -124,7 +130,7 @@ func TestPredictUnknownWorkerIsNotZero(t *testing.T) {
 	m := newTestMatrix(t)
 	m.setVector("q1", vec(1, 0))
 	_ = m.record(context.Background(), []Observation{obs("q1", "known", true, true, 100, obsSourceBench)})
-	p := m.predict(vec(1, 0), "never-profiled", true)
+	p := m.predict(vec(1, 0), mh("never-profiled"), true)
 	if p.known() {
 		t.Error("an unprofiled worker produced a usable prediction")
 	}
@@ -144,7 +150,7 @@ func TestJudgedEvidenceIsDiscounted(t *testing.T) {
 		obs("q1", "w", true, false, 100, obsSourceBench),
 		obs("q2", "w", true, true, 100, obsSourceJudge),
 	})
-	p := m.predict(vec(1, 0.05), "w", true)
+	p := m.predict(vec(1, 0.05), mh("w"), true)
 	if p.Correct >= 0.5 {
 		t.Errorf("hit rate %.2f — judged evidence was not discounted against bench evidence", p.Correct)
 	}
@@ -158,33 +164,76 @@ func TestReprofileSupersedes(t *testing.T) {
 	ctx := context.Background()
 	_ = m.record(ctx, []Observation{obs("q1", "w", true, false, 100, obsSourceBench)})
 	_ = m.record(ctx, []Observation{obs("q1", "w", true, true, 100, obsSourceBench)})
-	if p := m.predict(vec(1, 0), "w", true); p.Correct != 1 {
+	if p := m.predict(vec(1, 0), mh("w"), true); p.Correct != 1 {
 		t.Errorf("hit rate %.2f after a corrected re-profile, want 1.0 — the old result survived", p.Correct)
 	}
 	// ...but bench and judge evidence coexist: different evidence about
 	// different traffic.
 	_ = m.record(ctx, []Observation{obs("q1", "w", true, false, 100, obsSourceJudge)})
-	if p := m.predict(vec(1, 0), "w", true); p.Correct == 1 {
+	if p := m.predict(vec(1, 0), mh("w"), true); p.Correct == 1 {
 		t.Error("judged evidence replaced bench evidence instead of joining it")
 	}
 }
 
-// forget must remove a worker entirely, so a delete or a grader change does not
-// leave stale evidence behind.
-func TestForgetRemovesAWorker(t *testing.T) {
+// Evidence is about the MODEL, so it survives the worker that produced it and is
+// found again by any other deployment of the same weights.
+//
+// This is the property the old forget() denied: it dropped every row for a worker
+// on delete, so decommissioning a box destroyed hours of grading about weights
+// that had not changed, and standing the same model up elsewhere re-earned all of
+// it. The fear it was guarding — a returning worker inheriting stale results —
+// is handled by the hash instead: come back with a different model and the hash
+// differs, so nothing matches.
+func TestEvidenceIsAboutTheModelNotTheWorker(t *testing.T) {
 	m := newTestMatrix(t)
 	m.setVector("q1", vec(1, 0))
 	ctx := context.Background()
-	_ = m.record(ctx, []Observation{
-		obs("q1", "gone", true, true, 100, obsSourceBench),
-		obs("q1", "kept", true, true, 100, obsSourceBench),
-	})
-	_ = m.forget(ctx, "gone")
-	if p := m.predict(vec(1, 0), "gone", true); p.Observations != 0 {
-		t.Error("a forgotten worker still has evidence")
+
+	// One model, measured on the host it happened to be running on that day.
+	weights := &Backend{}
+	weights.ID, weights.Model = "epyc-slot-3", "gemma-26b"
+	weights.ServedID, weights.ModelParams, weights.ModelSizeBytes = "gemma", 26_000_000_000, 17_000_000_000
+	weights.Engine = engineLlamaCPP
+
+	if err := m.record(ctx, []Observation{{
+		QID: "q1", ModelHash: modelHash(weights), Backend: weights.ID,
+		Thinking: true, Correct: true, LatencyMS: 100, Source: obsSourceBench, At: time.Unix(0, 0),
+	}}); err != nil {
+		t.Fatalf("record: %v", err)
 	}
-	if p := m.predict(vec(1, 0), "kept", true); p.Observations == 0 {
-		t.Error("forget removed the wrong worker")
+
+	// That host is decommissioned and the same weights come up somewhere else,
+	// under a different worker id.
+	moved := &Backend{}
+	moved.ID, moved.Model = "silver-slot-1", "gemma-26b"
+	moved.ServedID, moved.ModelParams, moved.ModelSizeBytes = "gemma", 26_000_000_000, 17_000_000_000
+	moved.Engine = engineLlamaCPP
+
+	if modelHash(moved) != modelHash(weights) {
+		t.Fatalf("the same weights on another host hashed differently:\n  %s\n  %s",
+			modelHash(weights), modelHash(moved))
+	}
+	if p := m.predict(vec(1, 0), modelHash(moved), true); p.Observations == 0 {
+		t.Error("the redeployed model found none of its own evidence")
+	}
+
+	// A genuinely different model on the very same worker id must NOT inherit it.
+	swapped := &Backend{}
+	swapped.ID, swapped.Model = "epyc-slot-3", "qwen-32b"
+	swapped.ServedID, swapped.ModelParams, swapped.ModelSizeBytes = "qwen", 32_000_000_000, 20_000_000_000
+	swapped.Engine = engineLlamaCPP
+	if p := m.predict(vec(1, 0), modelHash(swapped), true); p.Observations != 0 {
+		t.Error("a different model inherited the previous one's results because the worker id matched")
+	}
+
+	// And the same weights under a different ENGINE are treated as different, since
+	// samplers and kernels differ and the two can disagree on a near-tie.
+	vllm := &Backend{}
+	vllm.ID, vllm.Model = "gpu-1", "gemma-26b"
+	vllm.ServedID, vllm.ModelParams, vllm.ModelSizeBytes = "gemma", 26_000_000_000, 17_000_000_000
+	vllm.Engine = engineOpenAI
+	if modelHash(vllm) == modelHash(weights) {
+		t.Error("llama.cpp and an OpenAI-shaped server share one identity")
 	}
 }
 
@@ -277,8 +326,8 @@ func TestFallbackPrefersSpeedAmongComparableWorkers(t *testing.T) {
 	}
 	_ = m.record(ctx, recs)
 
-	slowRate, _ := m.summary("slow", true)
-	quickRate, _ := m.summary("quick", true)
+	slowRate, _ := m.summary(mh("slow"), true)
+	quickRate, _ := m.summary(mh("quick"), true)
 	if slowRate-quickRate > outcomeSpeedMargin {
 		t.Fatalf("test setup: gap %.3f exceeds the margin %.2f", slowRate-quickRate, outcomeSpeedMargin)
 	}
@@ -340,14 +389,14 @@ func TestSummariseSeparatesModesAndSources(t *testing.T) {
 		}
 		return "coding"
 	}
-	on := m.summarise("w", true, topics)
+	on := m.summarise(mh("w"), true, topics)
 	if on.Total != 2 || on.Correct != 1 {
 		t.Errorf("thinking summary = %d/%d, want 1/2 — judged rows leaked into the bank score", on.Correct, on.Total)
 	}
 	if on.Judged != 1 {
 		t.Errorf("judged count = %d, want 1", on.Judged)
 	}
-	off := m.summarise("w", false, topics)
+	off := m.summarise(mh("w"), false, topics)
 	if off.Correct != 0 || off.Total != 2 {
 		t.Errorf("no-think summary = %d/%d, want 0/2 — the modes leaked", off.Correct, off.Total)
 	}
@@ -369,7 +418,7 @@ func TestSummariseSeparatesModesAndSources(t *testing.T) {
 	}
 	// A worker with no evidence must read as INSUFFICIENT, not as a zero rate —
 	// zero means "answered and was wrong".
-	none := m.summarise("never-seen", true, topics)
+	none := m.summarise(mh("never-seen"), true, topics)
 	if !none.Insufficient {
 		t.Error("a worker with no observations does not report insufficient")
 	}
@@ -390,7 +439,7 @@ func TestPruneJudgedKeepsBankQuestions(t *testing.T) {
 		_ = m.record(ctx, []Observation{o})
 	}
 	m.pruneJudged(ctx, 5)
-	if p := m.predict(vec(1, 0), "w", true); p.Observations == 0 {
+	if p := m.predict(vec(1, 0), mh("w"), true); p.Observations == 0 {
 		t.Error("pruning removed the bank question")
 	}
 	m.mu.RLock()
@@ -468,7 +517,7 @@ func TestConfidenceGateCanActuallyFail(t *testing.T) {
 		obs("far1", "w", true, true, 10, obsSourceBench),
 		obs("far2", "w", true, true, 10, obsSourceBench),
 	})
-	p := m.predict([]float64{1, 0}, "w", true)
+	p := m.predict([]float64{1, 0}, mh("w"), true)
 	if p.Observations >= outcomeMinObservations && p.known() {
 		t.Errorf("barely-admitted neighbours produced a KNOWN prediction (conf=%.3f) — "+
 			"the gate still cannot distinguish close evidence from distant evidence", p.Confidence)
@@ -481,7 +530,7 @@ func TestConfidenceGateCanActuallyFail(t *testing.T) {
 		obs("near1", "w", true, true, 10, obsSourceBench),
 		obs("near2", "w", true, true, 10, obsSourceBench),
 	})
-	if near := m2.predict([]float64{1, 0}, "w", true); !near.known() {
+	if near := m2.predict([]float64{1, 0}, mh("w"), true); !near.known() {
 		t.Errorf("close neighbours produced an unusable prediction (conf=%.3f)", near.Confidence)
 	}
 }
@@ -501,11 +550,11 @@ func TestPredictRejectsAForeignEmbeddingSpace(t *testing.T) {
 		obs("q1", "w", true, true, 10, obsSourceBench),
 		obs("q2", "w", true, true, 10, obsSourceBench),
 	})
-	if p := m.predict([]float64{1, 0, 0, 0}, "w", true); !p.known() {
+	if p := m.predict([]float64{1, 0, 0, 0}, mh("w"), true); !p.known() {
 		t.Fatal("test premise wrong: a same-space query should predict")
 	}
 	wrongDim := []float64{1, 0, 0, 0, 0, 0, 0, 0}
-	if p := m.predict(wrongDim, "w", true); p.Observations != 0 {
+	if p := m.predict(wrongDim, mh("w"), true); p.Observations != 0 {
 		t.Errorf("a %d-dim query against %d-dim vectors produced a prediction (correct=%.2f conf=%.2f)",
 			len(wrongDim), 4, p.Correct, p.Confidence)
 	}
@@ -524,6 +573,17 @@ func TestBackfillRecoversObservationsFromStoredProfiles(t *testing.T) {
 	ctx := context.Background()
 	logs := newTestLogStore(t)
 	r := &Router{logs: logs, outcomes: newOutcomeMatrix(logs.db)}
+
+	// Stored results carry the prompt but not the match mode, so their qids are
+	// resolved against the live bank — the fixture has to be the bank.
+	saved := benchmarkQuestions
+	defer func() { benchmarkQuestions = saved }()
+	benchmarkQuestions = []benchmarkQ{
+		{Tier: 1, Prompt: "2+2?", Expect: "4", Match: "numeric"},
+		{Tier: benchHardTier, Prompt: "prove it", Expect: "qed", Match: "contains"},
+		{Tier: 1, Prompt: "skipped one", Expect: "x", Match: "contains"},
+		{Tier: 1, Prompt: "errored one", Expect: "y", Match: "contains"},
+	}
 
 	// A profile of the shape profileBackend writes: the mixed pass (easy tiers
 	// asked thinking-off, hard tiers thinking-on) plus a no-think pass.
@@ -562,21 +622,22 @@ func TestBackfillRecoversObservationsFromStoredProfiles(t *testing.T) {
 	// Thinking-on: only the hard-tier question was asked in that mode. The
 	// skipped and errored ones say nothing about the model and must not be
 	// reconstructed as misses.
-	rate, on := r.outcomes.summary("w1", true)
+	legacy := func(id, model string) string { return unfingerprintedModelHash(id, model) }
+	rate, on := r.outcomes.summary(legacy("w1", "m"), true)
 	if on != 1 || rate != 0 {
 		t.Errorf("thinking evidence = %d rows at %.2f, want 1 at 0.00 — the mixed pass was not split "+
 			"by tier, or a skipped question was recorded as a miss", on, rate)
 	}
 	// Thinking-off: the two distinct questions of the no-think pass, one of which
 	// the mixed pass also asked thinking-off.
-	if _, off := r.outcomes.summary("w1", false); off != 2 {
+	if _, off := r.outcomes.summary(legacy("w1", "m"), false); off != 2 {
 		t.Errorf("no-think evidence = %d rows, want 2 — the no-think pass was not recorded, or the "+
 			"mixed pass's easy tier was filed as thinking evidence", off)
 	}
-	// A profile graded under a different question set is not evidence about this one.
-	if _, n := r.outcomes.summary("w2", false); n != 0 {
-		t.Errorf("a BenchVersion %d profile contributed %d rows to a v%d matrix",
-			stale.BenchVersion, n, benchmarkVersion)
+	// A question that left the bank contributes nothing — not because of a version
+	// gate (there is none any more) but because its prompt resolves to no qid.
+	if _, n := r.outcomes.summary(legacy("w2", "m"), false); n != 0 {
+		t.Errorf("a profile whose questions are no longer in the bank contributed %d rows", n)
 	}
 
 	// Idempotent: a second run files nothing, because recordIfNewer refuses to
@@ -595,7 +656,7 @@ func TestBackfillRecoversObservationsFromStoredProfiles(t *testing.T) {
 	if err := restarted.load(ctx); err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if _, n := restarted.summary("w1", false); n != 2 {
+	if _, n := restarted.summary(legacy("w1", "m"), false); n != 2 {
 		t.Errorf("after a restart the backfilled rows number %d, want 2 — the backfill did not persist", n)
 	}
 }
@@ -608,6 +669,10 @@ func TestBackfillDoesNotClobberFresherEvidence(t *testing.T) {
 	logs := newTestLogStore(t)
 	r := &Router{logs: logs, outcomes: newOutcomeMatrix(logs.db)}
 
+	saved := benchmarkQuestions
+	defer func() { benchmarkQuestions = saved }()
+	benchmarkQuestions = []benchmarkQ{{Tier: 1, Prompt: "2+2?", Expect: "4", Match: "numeric"}}
+
 	// The stored profile says the worker got it wrong, and is dated long ago.
 	prof := &WorkerProfile{Model: "m", BenchVersion: benchmarkVersion, MeasuredAt: time.Unix(1000, 0).UTC(),
 		BenchResultsNoThink: []BenchResult{{Tier: 1, Prompt: "2+2?", Expect: "4", Pass: false, LatencyMS: 100}}}
@@ -615,7 +680,8 @@ func TestBackfillDoesNotClobberFresherEvidence(t *testing.T) {
 		t.Fatalf("SaveWorkerProfile: %v", err)
 	}
 	// A newer observation says otherwise.
-	fresh := obs(benchQuestionQID("2+2?", "4"), "w", false, true, 100, obsSourceBench)
+	fresh := obs(benchQuestionQID(benchmarkQuestions[0]), "w", false, true, 100, obsSourceBench)
+	fresh.ModelHash = unfingerprintedModelHash("w", "m") // the identity the backfill will use
 	fresh.At = time.Unix(99999, 0).UTC()
 	if err := r.outcomes.record(ctx, []Observation{fresh}); err != nil {
 		t.Fatalf("record: %v", err)
@@ -624,7 +690,7 @@ func TestBackfillDoesNotClobberFresherEvidence(t *testing.T) {
 	if err := r.backfillOutcomesFromProfiles(ctx); err != nil {
 		t.Fatalf("backfill: %v", err)
 	}
-	rate, n := r.outcomes.summary("w", false)
+	rate, n := r.outcomes.summary(unfingerprintedModelHash("w", "m"), false)
 	if n != 1 || rate != 1 {
 		t.Errorf("after backfill = %d rows at %.2f, want 1 at 1.00 — a stale profile overwrote fresher evidence", n, rate)
 	}
@@ -644,11 +710,11 @@ func TestJudgedVectorsSurviveARestart(t *testing.T) {
 	logs := newTestLogStore(t)
 	m := newOutcomeMatrix(logs.db)
 
-	jq := judgedQID("how do I rotate a wireguard key?")
+	jq := judgedQuestionQID("how do I rotate a wireguard key?")
 	if err := m.setJudgedVector(ctx, jq, vec(1, 0, 0)); err != nil {
 		t.Fatalf("setJudgedVector: %v", err)
 	}
-	j2 := judgedQID("how do I rotate a tls certificate?")
+	j2 := judgedQuestionQID("how do I rotate a tls certificate?")
 	if err := m.setJudgedVector(ctx, j2, vec(0.999, 0.02, 0)); err != nil {
 		t.Fatalf("setJudgedVector: %v", err)
 	}
@@ -658,7 +724,7 @@ func TestJudgedVectorsSurviveARestart(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("record: %v", err)
 	}
-	if p := m.predict(vec(1, 0.01, 0), "w", true); p.Observations == 0 {
+	if p := m.predict(vec(1, 0.01, 0), mh("w"), true); p.Observations == 0 {
 		t.Fatal("test premise wrong: the judged rows are unreachable even before a restart")
 	}
 
@@ -669,7 +735,7 @@ func TestJudgedVectorsSurviveARestart(t *testing.T) {
 	if !restarted.hasVector(jq) {
 		t.Error("the judged question has no vector after a restart — its observations are unqueryable ballast")
 	}
-	if p := restarted.predict(vec(1, 0.01, 0), "w", true); p.Observations != 2 {
+	if p := restarted.predict(vec(1, 0.01, 0), mh("w"), true); p.Observations != 2 {
 		t.Errorf("a prompt like a judged one found %d observations after a restart, want 2", p.Observations)
 	}
 }
@@ -683,7 +749,7 @@ func TestRestoredVectorsFromAForeignSpaceAreDropped(t *testing.T) {
 	logs := newTestLogStore(t)
 	m := newOutcomeMatrix(logs.db)
 
-	old := judgedQID("asked under the old embedder")
+	old := judgedQuestionQID("asked under the old embedder")
 	if err := m.setJudgedVector(ctx, old, vec(1, 0, 0, 0)); err != nil {
 		t.Fatalf("setJudgedVector: %v", err)
 	}
@@ -719,7 +785,7 @@ func TestPruneJudgedDropsStoredVectors(t *testing.T) {
 	logs := newTestLogStore(t)
 	m := newOutcomeMatrix(logs.db)
 	for i := 0; i < 6; i++ {
-		qid := judgedQID("question " + string(rune('a'+i)))
+		qid := judgedQuestionQID("question " + string(rune('a'+i)))
 		if err := m.setJudgedVector(ctx, qid, vec(1, float64(i)/100)); err != nil {
 			t.Fatalf("setJudgedVector: %v", err)
 		}
@@ -810,7 +876,7 @@ func TestThinEvidenceCannotClaimTheCorrectnessFloor(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("record: %v", err)
 	}
-	p := m.predict(vec(1, 0.01), "thin", true)
+	p := m.predict(vec(1, 0.01), mh("thin"), true)
 	if !p.known() {
 		t.Fatal("test premise wrong: two close bench observations should be a known prediction")
 	}
@@ -830,7 +896,7 @@ func TestThinEvidenceCannotClaimTheCorrectnessFloor(t *testing.T) {
 	if err := m2.record(ctx, many); err != nil {
 		t.Fatalf("record: %v", err)
 	}
-	if p := m2.predict(vec(1, 0.01), "solid", true); p.supportedCorrect() <= outcomeCorrectFloor {
+	if p := m2.predict(vec(1, 0.01), mh("solid"), true); p.supportedCorrect() <= outcomeCorrectFloor {
 		t.Errorf("twelve nearby correct answers scored %.3f — the discount is punishing evidence, not thinness",
 			p.supportedCorrect())
 	}
@@ -930,7 +996,7 @@ func TestJudgedEvidenceAloneCannotSatisfyTheObservationFloor(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("record: %v", err)
 		}
-		return m.predict(vec(1, 0.01), "w", true)
+		return m.predict(vec(1, 0.01), mh("w"), true)
 	}
 	bench, judged := build(obsSourceBench), build(obsSourceJudge)
 	if !bench.known() {
@@ -957,7 +1023,7 @@ func TestJudgedEvidenceAloneCannotSatisfyTheObservationFloor(t *testing.T) {
 	if err := m.record(ctx, four); err != nil {
 		t.Fatalf("record: %v", err)
 	}
-	if p := m.predict(vec(1, 0.01), "w", true); !p.known() {
+	if p := m.predict(vec(1, 0.01), mh("w"), true); !p.known() {
 		t.Errorf("four judged rows (evidence %.2f) still do not gate routing — judged evidence is "+
 			"being discarded rather than discounted", p.evidence())
 	}

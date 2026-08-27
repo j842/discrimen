@@ -1097,8 +1097,8 @@ func (r *Router) handleBackends(w http.ResponseWriter, req *http.Request) {
 		// with the rows routing actually queries.
 		if r.outcomes != nil {
 			b.Outcomes = &BackendOutcomes{
-				Thinking: r.outcomeSummaryFor(b.ID, true),
-				NoThink:  r.outcomeSummaryFor(b.ID, false),
+				Thinking: r.outcomeSummaryFor(b, true),
+				NoThink:  r.outcomeSummaryFor(b, false),
 			}
 		}
 	}
@@ -1225,15 +1225,18 @@ func (r *Router) handleBackendByID(w http.ResponseWriter, req *http.Request) {
 		if err := r.logs.DeleteWorkerProfile(req.Context(), id); err != nil {
 			log.Printf("delete worker profile for %q: %v", id, err)
 		}
-		// The matrix rows go with the profile. A deleted worker that comes back is
-		// re-profiled from scratch — usually because something about it changed —
-		// and stale rows would let the OLD worker's results decide routes for the
-		// new one until every question had been re-answered.
-		if r.outcomes != nil {
-			if err := r.outcomes.forget(req.Context(), id); err != nil {
-				log.Printf("delete outcome rows for %q: %v", id, err)
-			}
-		}
+		// The matrix rows deliberately DO NOT go with the profile.
+		//
+		// They are filed under the model, not the worker, so deleting a worker is
+		// not evidence about the weights it was running. If it comes back with a
+		// different model the new hash simply does not match the old rows; if it
+		// comes back with the SAME model, those rows are still true and the
+		// benchmark reuses them instead of spending hours re-deriving answers it
+		// already has. Deleting a worker to force a hardware re-probe used to cost
+		// a full re-grade; now it costs a speed, capacity and context probe.
+		//
+		// This is what "decommission a worker and keep the results" means, and it
+		// is the reason the rows are keyed by model hash at all.
 		writeJSON(w, http.StatusOK, map[string]any{"status": "removed", "id": id})
 	case http.MethodGet:
 		// Admin scope, same reasoning as the /backends list it is a row of.
@@ -5531,6 +5534,9 @@ func (r *Registry) setModelMeta(id string, m ModelMeta) {
 	if m.ModelCtxTrain > 0 {
 		b.ModelCtxTrain = m.ModelCtxTrain
 	}
+	if m.Engine != "" {
+		b.Engine = m.Engine
+	}
 	if m.ServedID != "" {
 		b.ServedID = m.ServedID
 	}
@@ -6204,18 +6210,37 @@ func (s *LogStore) init(ctx context.Context) error {
 		// on that key, so a re-profile supersedes its predecessor rather than
 		// accumulating beside it — a worker's history would otherwise drag its
 		// current estimate. See outcomes.go.
+		// Keyed by MODEL, not by worker. A graded answer is evidence about the
+		// weights that produced it, so it outlives the box: decommission a worker
+		// and its results stay, deploy the same model elsewhere and the profile is
+		// already there. backend_id rides along as provenance — it is what tells a
+		// latency this worker measured from one another deployment measured on
+		// different hardware.
+		//
+		// The old table was keyed (qid, backend_id, thinking, source) and its qids
+		// were an FNV of prompt+expect with no match mode and no grader version.
+		// Every row in it is unreachable under the new identity, so it is dropped
+		// rather than migrated: carrying a second, dead key format forever to
+		// preserve rows nothing can look up is worse than re-earning them, and the
+		// bench half is re-earned by the profile run that follows this deploy.
+		`DROP TABLE IF EXISTS observations`,
+		// The vectors go with them. observation_vectors is keyed by qid and holds
+		// only judged rows, whose ids move to the same hash the bank uses — so
+		// every row in it belongs to an observation that no longer exists.
+		`DROP TABLE IF EXISTS observation_vectors`,
 		`CREATE TABLE IF NOT EXISTS observations (
 			qid TEXT NOT NULL,
-			backend_id TEXT NOT NULL,
+			model_hash TEXT NOT NULL,
+			backend_id TEXT NOT NULL DEFAULT '',
 			thinking INTEGER NOT NULL,
 			correct INTEGER NOT NULL,
 			latency_ms INTEGER NOT NULL DEFAULT 0,
 			output_tokens INTEGER NOT NULL DEFAULT 0,
 			source TEXT NOT NULL,
 			created_at TEXT NOT NULL,
-			PRIMARY KEY (qid, backend_id, thinking, source)
+			PRIMARY KEY (qid, model_hash, thinking, source)
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_observations_backend ON observations (backend_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_observations_model ON observations (model_hash)`,
 		`CREATE TABLE IF NOT EXISTS router_relays (
 			name TEXT PRIMARY KEY,
 			url TEXT NOT NULL,

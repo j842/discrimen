@@ -168,7 +168,7 @@ func (r *Router) maybeJudge(messages []Message, stream bool, served *Backend, ro
 		// ones — it is a correction signal — but the matrix is an estimate of a
 		// hit rate, and throwing away every success would make every judged
 		// worker look uniformly terrible on real traffic.
-		r.recordJudgedOutcome(served.ID, question, thinking, !bad, latencyMS)
+		r.recordJudgedOutcome(served, question, thinking, !bad, latencyMS)
 	}()
 }
 
@@ -348,11 +348,11 @@ func (r *Router) betterGrader(candidate, best *Backend, vec []float64) bool {
 func (r *Router) graderStrength(b *Backend, vec []float64) float64 {
 	if r.outcomes != nil {
 		if len(vec) > 0 {
-			if p := r.outcomes.predict(vec, b.ID, false); p.known() {
+			if p := r.outcomes.predict(vec, modelHash(b), false); p.known() {
 				return p.Correct
 			}
 		}
-		if rate, n := r.outcomes.summary(b.ID, false); n > 0 {
+		if rate, n := r.outcomes.summary(modelHash(b), false); n > 0 {
 			return rate
 		}
 	}

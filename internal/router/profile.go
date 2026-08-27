@@ -20,8 +20,12 @@ import (
 // persisted per (id, model) and reused on warm restarts — see the /llm skill and
 // the README.
 type WorkerProfile struct {
-	Model   string `json:"model"`
-	Quality int    `json:"quality"`
+	Model string `json:"model"`
+	// ModelHash is WHICH MODEL this profile measured, recorded so the results
+	// outlive the worker: a decommissioned box leaves its evidence behind, and
+	// the same weights deployed elsewhere inherit it. See modelHash.
+	ModelHash string `json:"model_hash,omitempty"`
+	Quality   int    `json:"quality"`
 	// QualityNoThink is the same weighted benchmark scored with thinking
 	// DISABLED on every question — the model a requirements.thinking="off"
 	// client actually talks to. The headline Quality grades hard tiers
@@ -474,7 +478,11 @@ func (r *Router) profileQuick(b *Backend, model string) (*WorkerProfile, error) 
 		quality = provisionalQuality
 	}
 	return &WorkerProfile{
-		Model: model, Quality: quality, ContextK: r.queryContext(b), MaxConcurrency: 1,
+		// Recorded here, at the end of the quick half, because queryModelInfo has
+		// run by now and the fingerprint is complete. It is what lets these results
+		// be found again after the worker is gone.
+		ModelHash: modelHash(b),
+		Model:     model, Quality: quality, ContextK: r.queryContext(b), MaxConcurrency: 1,
 		BaselineTPS: tps, TTFTMillis: ttft, SpeedVersion: speedProbeVersion,
 		Features: features, Thinking: thinking, ThinkingDialect: dialect,
 		Checks: checks, MeasuredAt: time.Now(), Incomplete: incomplete,
@@ -642,8 +650,8 @@ func (r *Router) profileBackend(b *Backend, model string) (*WorkerProfile, error
 		// (benchOne gates on benchHardTier), so publishing all of it as
 		// Thinking=true files a dozen no-think answers as thinking evidence. Each
 		// result is recorded in the mode it was actually asked in.
-		rows := observationsFromMixed(b.ID, p.BenchResults, at)
-		rows = append(rows, observationsFrom(b.ID, p.BenchResultsNoThink, false, at)...)
+		rows := observationsFromMixed(p.ModelHash, b.ID, p.BenchResults, at)
+		rows = append(rows, observationsFrom(p.ModelHash, b.ID, p.BenchResultsNoThink, false, at)...)
 		if err := r.outcomes.record(context.Background(), rows); err != nil {
 			log.Printf("outcome matrix: recording %s failed: %v", b.ID, err)
 		} else if err := r.ensureBankVectors(context.Background()); err != nil {
@@ -1032,6 +1040,11 @@ type ModelMeta struct {
 	ModelQuant     string `json:"model_quant,omitempty"`      // ftype, e.g. "Q4_K - Medium", "MXFP4 MoE"
 	ModelSizeBytes int64  `json:"model_size_bytes,omitempty"` // size of the loaded weights
 	ModelCtxTrain  int    `json:"model_ctx_train,omitempty"`  // context length the model was trained at
+	// Engine is the serving runtime, measured rather than declared: llama.cpp
+	// answers /props and vLLM does not. It is part of the model hash because the
+	// two disagree on samplers and kernels, so the same weights can grade
+	// differently under each — the one sharing case worth refusing.
+	Engine string `json:"engine,omitempty"`
 	// The id the worker's own /v1/models advertises, "default" included — the
 	// one spelling the runtime is guaranteed to accept in a request's "model"
 	// field. llama.cpp ignores that field, but vLLM 404s anything else, so
@@ -1122,7 +1135,12 @@ func (r *Router) queryModelInfo(b *Backend) (string, ModelMeta) {
 	}
 	// llama.cpp only (vLLM has no /props). Recent builds put the weights path at
 	// the top level, older ones under default_generation_settings.model.
+	// Answering /props at all is the llama.cpp signal — vLLM and every OpenAI-
+	// shaped provider 404 it. That makes the engine a MEASUREMENT like everything
+	// else in this struct rather than something a worker declares about itself.
+	meta.Engine = engineOpenAI
 	if raw, err := r.backendGET(b, "/props"); err == nil {
+		meta.Engine = engineLlamaCPP
 		if p, _ := raw["model_path"].(string); p != "" {
 			meta.ModelPath = p
 		} else if dg, ok := raw["default_generation_settings"].(map[string]any); ok {

@@ -20,24 +20,6 @@ import (
 	"time"
 )
 
-// benchQuestionQID is the stable identity of a bank question. Content-derived,
-// so a question keeps its identity across a re-fetch and its observations
-// survive; a positional id would silently re-point every stored row when a
-// question is inserted.
-func benchQuestionQID(prompt, expect string) string {
-	return uint64Hex(benchQuestionHash(benchmarkQ{Prompt: prompt, Expect: expect}))
-}
-
-func uint64Hex(v uint64) string {
-	const hexDigits = "0123456789abcdef"
-	out := make([]byte, 16)
-	for i := 15; i >= 0; i-- {
-		out[i] = hexDigits[v&0xf]
-		v >>= 4
-	}
-	return string(out)
-}
-
 // observationsFrom converts one profiling pass into matrix rows.
 //
 // A SKIPPED question contributes nothing — the profile budget never asked it, so
@@ -49,14 +31,20 @@ func uint64Hex(v uint64) string {
 // statement about this worker on this kind of prompt, and it is exactly what the
 // routing decision needs to know — the matrix predicts "will be correct AND will
 // complete", and a worker that cannot finish has failed the second half.
-func observationsFrom(backendID string, results []BenchResult, thinking bool, at time.Time) []Observation {
+func observationsFrom(hash, backendID string, results []BenchResult, thinking bool, at time.Time) []Observation {
+	byPrompt := bankQIDByPrompt()
 	out := make([]Observation, 0, len(results))
 	for _, r := range results {
 		if r.Skipped || r.Errored {
 			continue
 		}
+		qid, ok := byPrompt[strings.TrimSpace(r.Prompt)]
+		if !ok {
+			continue // the question left the bank, or its grading changed
+		}
 		out = append(out, Observation{
-			QID:       benchQuestionQID(r.Prompt, r.Expect),
+			QID:       qid,
+			ModelHash: hash,
 			Backend:   backendID,
 			Thinking:  thinking,
 			Correct:   r.Pass,
@@ -82,7 +70,7 @@ func (r *Router) ensureBankVectors(ctx context.Context) error {
 	}
 	var missing []benchmarkQ
 	for _, q := range benchmarkQuestions {
-		if !r.outcomes.hasVector(benchQuestionQID(q.Prompt, q.Expect)) {
+		if !r.outcomes.hasVector(benchQuestionQID(q)) {
 			missing = append(missing, q)
 		}
 	}
@@ -110,7 +98,7 @@ func (r *Router) ensureBankVectors(ctx context.Context) error {
 			return errEmbedCountMismatch
 		}
 		for i, q := range batch {
-			r.outcomes.setVector(benchQuestionQID(q.Prompt, q.Expect), vecs[i])
+			r.outcomes.setVector(benchQuestionQID(q), vecs[i])
 		}
 	}
 	log.Printf("outcome matrix: embedded %d bank questions (%s)", len(missing), r.outcomes)
@@ -151,11 +139,12 @@ var errEmbedCountMismatch = errors.New("embeddings worker returned a different n
 // similar prompt has evidence to draw on. That is the mechanism by which
 // coverage improves on its own, and it is also why it needs a bound: production
 // questions arrive forever.
-func (r *Router) recordJudgedOutcome(backendID, question string, thinking, correct bool, latencyMS int64) {
-	if r.outcomes == nil || strings.TrimSpace(question) == "" {
+func (r *Router) recordJudgedOutcome(served *Backend, question string, thinking, correct bool, latencyMS int64) {
+	if r.outcomes == nil || served == nil || strings.TrimSpace(question) == "" {
 		return
 	}
-	qid := judgedQID(question)
+	backendID := served.ID
+	qid := judgedQuestionQID(question)
 	ctx, cancel := context.WithTimeout(context.Background(), judgedEmbedTimeout)
 	defer cancel()
 	if !r.outcomes.hasVector(qid) {
@@ -177,7 +166,11 @@ func (r *Router) recordJudgedOutcome(backendID, question string, thinking, corre
 		}
 	}
 	obs := []Observation{{
-		QID: qid, Backend: backendID, Thinking: thinking, Correct: correct,
+		// Filed under the MODEL, like every other observation. Keyed by worker id
+		// it would be unreachable: routing looks a candidate up by its model hash,
+		// so a judged row with none is stored, counted, and never consulted.
+		QID: qid, ModelHash: modelHash(served), Backend: backendID,
+		Thinking: thinking, Correct: correct,
 		LatencyMS: latencyMS, Source: obsSourceJudge, At: time.Now().UTC(),
 	}}
 	if err := r.outcomes.record(ctx, obs); err != nil {
@@ -185,12 +178,6 @@ func (r *Router) recordJudgedOutcome(backendID, question string, thinking, corre
 		return
 	}
 	r.outcomes.pruneJudged(ctx, maxJudgedQuestions)
-}
-
-// judgedQID identifies a production question by content, so repeated asks of the
-// same thing accumulate evidence on one row instead of spreading across many.
-func judgedQID(question string) string {
-	return "j" + uint64Hex(benchQuestionHash(benchmarkQ{Prompt: truncateForEmbed(question)}))
 }
 
 func truncateForEmbed(s string) string {
@@ -222,7 +209,7 @@ func (r *Router) bankTopicOf(qid string) string {
 	r.bankTopicOnce.Do(func() {
 		r.bankTopics = make(map[string]string, len(benchmarkQuestions))
 		for _, q := range benchmarkQuestions {
-			r.bankTopics[benchQuestionQID(q.Prompt, q.Expect)] = benchCategoryOf(q.Tier, q.Prompt)
+			r.bankTopics[benchQuestionQID(q)] = benchCategoryOf(q.Tier, q.Prompt)
 		}
 	})
 	return r.bankTopics[qid]
@@ -230,11 +217,11 @@ func (r *Router) bankTopicOf(qid string) string {
 
 // outcomeSummaryFor is the display view of one worker, in the mode routing would
 // use for a request with no thinking preference.
-func (r *Router) outcomeSummaryFor(backendID string, thinking bool) *OutcomeSummary {
+func (r *Router) outcomeSummaryFor(b *Backend, thinking bool) *OutcomeSummary {
 	if r.outcomes == nil {
 		return nil
 	}
-	s := r.outcomes.summarise(backendID, thinking, r.bankTopicOf)
+	s := r.outcomes.summarise(modelHash(b), thinking, r.bankTopicOf)
 	return &s
 }
 
@@ -287,14 +274,20 @@ const bankVectorFillTimeout = 2 * time.Minute
 // BenchResult rather than by indexing back into benchmarkQuestions, because
 // observationsFrom drops skipped and errored entries and the two slices are not
 // aligned.
-func observationsFromMixed(backendID string, results []BenchResult, at time.Time) []Observation {
+func observationsFromMixed(hash, backendID string, results []BenchResult, at time.Time) []Observation {
+	byPrompt := bankQIDByPrompt()
 	out := make([]Observation, 0, len(results))
 	for _, r := range results {
 		if r.Skipped || r.Errored {
 			continue
 		}
+		qid, ok := byPrompt[strings.TrimSpace(r.Prompt)]
+		if !ok {
+			continue // the question left the bank, or its grading changed
+		}
 		out = append(out, Observation{
-			QID:       benchQuestionQID(r.Prompt, r.Expect),
+			QID:       qid,
+			ModelHash: hash,
 			Backend:   backendID,
 			Thinking:  r.Tier >= benchHardTier,
 			Correct:   r.Pass,
@@ -327,11 +320,13 @@ func observationsFromMixed(backendID string, results []BenchResult, at time.Time
 //
 // Idempotent, and safe beside the live writers:
 //
-//	A profile whose BenchVersion is not the current one is SKIPPED. Its answers
-//	were graded against a different question set or a different grader, which is
-//	the one thing that genuinely invalidates an observation — and record()'s key
-//	does not include the version, so filing them would corrupt the current set
-//	rather than sit beside it.
+//	EVERY profile is read, whatever bench version wrote it. There is no version
+//	gate any more and there does not need to be one: a result's validity lives in
+//	its qid, which carries the question text, its match mode and the version of
+//	the grader — so an answer graded by a superseded grader resolves to a qid
+//	nothing looks up, and one graded by an unchanged grader is still good. The old
+//	gate discarded both alike, which threw away every mcq result to fix the
+//	numeric grader.
 //
 //	Rows are filed at the profile's MeasuredAt, and recordIfNewer refuses to
 //	replace an observation already at least as fresh. So a backfill that races a
@@ -378,11 +373,17 @@ func (r *Router) backfillOutcomesFromProfiles(ctx context.Context) error {
 	}
 	rows.Close()
 
-	var recovered, stale, workers int
+	var recovered, workers int
 	for _, s := range profiles {
-		if s.prof.BenchVersion != benchmarkVersion {
-			stale++
-			continue
+		// Identity from the STORED profile, never from the live registry: the
+		// worker may be long gone, and keeping its results is the point.
+		hash := s.prof.ModelHash
+		if hash == "" {
+			// Written before the fingerprint was recorded. Falls back to a
+			// per-worker identity rather than guessing which model it was — the
+			// non-sharing direction, so an old profile can never be attributed to
+			// the wrong model.
+			hash = unfingerprintedModelHash(s.id, s.prof.Model)
 		}
 		// The profile's own timestamp, not now(): these observations describe what
 		// happened when the profile ran, and dating them now would let a
@@ -390,8 +391,8 @@ func (r *Router) backfillOutcomesFromProfiles(ctx context.Context) error {
 		// before MeasuredAt existed carries the zero time, which reads as the
 		// oldest possible evidence — exactly what an undated profile is.
 		at := s.prof.MeasuredAt.UTC()
-		obs := observationsFromMixed(s.id, s.prof.BenchResults, at)
-		obs = append(obs, observationsFrom(s.id, s.prof.BenchResultsNoThink, false, at)...)
+		obs := observationsFromMixed(hash, s.id, s.prof.BenchResults, at)
+		obs = append(obs, observationsFrom(hash, s.id, s.prof.BenchResultsNoThink, false, at)...)
 		if len(obs) == 0 {
 			continue
 		}
@@ -404,9 +405,9 @@ func (r *Router) backfillOutcomesFromProfiles(ctx context.Context) error {
 			workers++
 		}
 	}
-	if recovered > 0 || stale > 0 || unreadable > 0 {
-		log.Printf("outcome matrix: recovered %d observations from %d stored profiles (%d at an older bench version, %d unreadable) — %s",
-			recovered, workers, stale, unreadable, r.outcomes)
+	if recovered > 0 || unreadable > 0 {
+		log.Printf("outcome matrix: recovered %d observations from %d stored profiles (%d unreadable) — %s",
+			recovered, workers, unreadable, r.outcomes)
 	}
 	return nil
 }

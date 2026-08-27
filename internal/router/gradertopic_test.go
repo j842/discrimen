@@ -30,8 +30,8 @@ func TestGraderSelectionUsesThePerPromptPrediction(t *testing.T) {
 		m.setVector(qid, vec)
 		for i := 0; i < n; i++ {
 			obs = append(obs, Observation{
-				QID: qid, Backend: backend, Thinking: false, Correct: correct,
-				LatencyMS: 1000, Source: obsSourceBench, At: at,
+				QID: qid, ModelHash: unfingerprintedModelHash(backend, "m"), Backend: backend,
+				Thinking: false, Correct: correct, LatencyMS: 1000, Source: obsSourceBench, At: at,
 			})
 		}
 	}
@@ -61,10 +61,10 @@ func TestGraderSelectionUsesThePerPromptPrediction(t *testing.T) {
 	served := reg.get("served")
 
 	// Sanity: the two questions really do have opposite answers in the matrix.
-	if p := m.predict(topic, "specialist", false); !p.known() || p.Correct <= 0.5 {
+	if p := m.predict(topic, unfingerprintedModelHash("specialist", "m"), false); !p.known() || p.Correct <= 0.5 {
 		t.Fatalf("fixture wrong: specialist on-topic prediction = %+v", p)
 	}
-	if p := m.predict(topic, "generalist", false); !p.known() || p.Correct >= 0.5 {
+	if p := m.predict(topic, unfingerprintedModelHash("generalist", "m"), false); !p.known() || p.Correct >= 0.5 {
 		t.Fatalf("fixture wrong: generalist on-topic prediction = %+v", p)
 	}
 

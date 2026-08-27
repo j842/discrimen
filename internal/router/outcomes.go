@@ -56,7 +56,15 @@ import (
 // Observation is one graded answer: a worker, in one thinking mode, on one
 // question. The unit of everything in this file.
 type Observation struct {
-	QID      string // stable content hash of the question — see benchQuestionHash
+	QID string // identity of the question AND its grading — see benchQuestionQID
+	// ModelHash identifies the MODEL this is evidence about, and is what the row
+	// is keyed on. Results therefore outlive the worker that produced them: a
+	// decommissioned box takes nothing with it, and the same weights deployed
+	// elsewhere inherit the whole profile instead of re-earning it.
+	ModelHash string
+	// Backend is provenance, not identity. It is what distinguishes a latency
+	// this worker measured from one another deployment of the same model
+	// measured on different hardware — see cachedVerdict.
 	Backend  string
 	Thinking bool
 	Correct  bool
@@ -343,7 +351,7 @@ func (m *outcomeMatrix) record(ctx context.Context, obs []Observation) error {
 	for _, o := range obs {
 		kept := m.obs[o.QID][:0]
 		for _, prev := range m.obs[o.QID] {
-			if prev.Backend == o.Backend && prev.Thinking == o.Thinking && prev.Source == o.Source {
+			if prev.ModelHash == o.ModelHash && prev.Thinking == o.Thinking && prev.Source == o.Source {
 				continue // superseded
 			}
 			kept = append(kept, prev)
@@ -374,7 +382,7 @@ func (m *outcomeMatrix) recordIfNewer(ctx context.Context, obs []Observation) (i
 		superseded := false
 		kept := m.obs[o.QID][:0]
 		for _, prev := range m.obs[o.QID] {
-			if prev.Backend == o.Backend && prev.Thinking == o.Thinking && prev.Source == o.Source {
+			if prev.ModelHash == o.ModelHash && prev.Thinking == o.Thinking && prev.Source == o.Source {
 				if !prev.At.Before(o.At) {
 					superseded = true
 					kept = append(kept, prev) // the incumbent is at least as fresh
@@ -401,14 +409,14 @@ func (m *outcomeMatrix) recordIfNewer(ctx context.Context, obs []Observation) (i
 //
 // vec is the prompt's embedding — the same vector the difficulty classifier
 // already computes for every request, so this costs no extra embedding call.
-func (m *outcomeMatrix) predict(vec []float64, backend string, thinking bool) prediction {
+func (m *outcomeMatrix) predict(vec []float64, model string, thinking bool) prediction {
 	nb, ok := m.neighboursOf(vec)
 	if !ok {
 		return prediction{}
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.predictFromLocked(nb, backend, thinking)
+	return m.predictFromLocked(nb, model, thinking)
 }
 
 // neighbour is one profiled question near the query, with its similarity.
@@ -462,13 +470,13 @@ func (m *outcomeMatrix) neighboursOf(vec []float64) ([]neighbour, bool) {
 
 // predictFromLocked scores one worker against already-found neighbours. The
 // caller holds the read lock.
-func (m *outcomeMatrix) predictFromLocked(neighbours []neighbour, backend string, thinking bool) prediction {
+func (m *outcomeMatrix) predictFromLocked(neighbours []neighbour, model string, thinking bool) prediction {
 	var weighted, total, simSum float64
 	used, judged := 0, 0
 	var latencies []int64
 	for _, n := range neighbours {
 		for _, o := range m.obs[n.qid] {
-			if o.Backend != backend || o.Thinking != thinking {
+			if o.ModelHash != model || o.Thinking != thinking {
 				continue
 			}
 			w := n.sim
@@ -513,14 +521,14 @@ func (m *outcomeMatrix) predictFromLocked(neighbours []neighbour, backend string
 // across the whole bank. Explicitly NOT a routing input — routing queries
 // neighbours — but a number an operator can eyeball, and the thing `ask -l` and
 // the dashboard show in place of the retired quality score.
-func (m *outcomeMatrix) summary(backend string, thinking bool) (rate float64, n int) {
+func (m *outcomeMatrix) summary(model string, thinking bool) (rate float64, n int) {
 	m.fullScans.Add(1)
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	correct := 0
 	for _, list := range m.obs {
 		for _, o := range list {
-			if o.Backend != backend || o.Thinking != thinking || o.Source != obsSourceBench {
+			if o.ModelHash != model || o.Thinking != thinking || o.Source != obsSourceBench {
 				continue
 			}
 			n++
@@ -570,36 +578,15 @@ func (m *outcomeMatrix) bankRates(thinking bool) map[string]bankTally {
 			if o.Thinking != thinking || o.Source != obsSourceBench {
 				continue
 			}
-			t := out[o.Backend]
+			t := out[o.ModelHash]
 			t.total++
 			if o.Correct {
 				t.correct++
 			}
-			out[o.Backend] = t
+			out[o.ModelHash] = t
 		}
 	}
 	return out
-}
-
-// forget drops every observation for a worker, for a delete or a re-profile
-// under a changed grader.
-func (m *outcomeMatrix) forget(ctx context.Context, backend string) error {
-	m.mu.Lock()
-	for qid, list := range m.obs {
-		kept := list[:0]
-		for _, o := range list {
-			if o.Backend != backend {
-				kept = append(kept, o)
-			}
-		}
-		m.obs[qid] = kept
-	}
-	m.mu.Unlock()
-	if m.db == nil {
-		return nil
-	}
-	_, err := m.db.ExecContext(ctx, `DELETE FROM observations WHERE backend_id = ?`, backend)
-	return err
 }
 
 // ── persistence ────────────────────────────────────────────────────────────
@@ -614,14 +601,14 @@ func (m *outcomeMatrix) persist(ctx context.Context, obs []Observation) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 	stmt, err := tx.PrepareContext(ctx, `INSERT OR REPLACE INTO observations
-		(qid, backend_id, thinking, correct, latency_ms, output_tokens, source, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+		(qid, model_hash, backend_id, thinking, correct, latency_ms, output_tokens, source, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 	for _, o := range obs {
-		if _, err := stmt.ExecContext(ctx, o.QID, o.Backend, boolInt(o.Thinking), boolInt(o.Correct),
+		if _, err := stmt.ExecContext(ctx, o.QID, o.ModelHash, o.Backend, boolInt(o.Thinking), boolInt(o.Correct),
 			o.LatencyMS, o.OutputTokens, o.Source, o.At.UTC().Format(time.RFC3339Nano)); err != nil {
 			return err
 		}
@@ -777,7 +764,7 @@ func (m *outcomeMatrix) load(ctx context.Context) error {
 	if m.db == nil {
 		return nil
 	}
-	rows, err := m.db.QueryContext(ctx, `SELECT qid, backend_id, thinking, correct, latency_ms,
+	rows, err := m.db.QueryContext(ctx, `SELECT qid, model_hash, backend_id, thinking, correct, latency_ms,
 		output_tokens, source, created_at FROM observations`)
 	if err != nil {
 		return err
@@ -788,7 +775,7 @@ func (m *outcomeMatrix) load(ctx context.Context) error {
 		var o Observation
 		var thinking, correct int
 		var at string
-		if err := rows.Scan(&o.QID, &o.Backend, &thinking, &correct, &o.LatencyMS,
+		if err := rows.Scan(&o.QID, &o.ModelHash, &o.Backend, &thinking, &correct, &o.LatencyMS,
 			&o.OutputTokens, &o.Source, &at); err != nil {
 			return err
 		}
@@ -850,7 +837,7 @@ func (m *outcomeMatrix) backendsWithEvidence() []string {
 	seen := map[string]bool{}
 	for _, list := range m.obs {
 		for _, o := range list {
-			seen[o.Backend] = true
+			seen[o.ModelHash] = true
 		}
 	}
 	out := make([]string, 0, len(seen))
@@ -951,7 +938,7 @@ func (m *outcomeMatrix) chooseByOutcome(cands []*Backend, vec []float64, thinkin
 	for _, b := range cands {
 		var p prediction
 		if haveNeighbours {
-			p = m.predictFromLocked(nb, b.ID, thinking)
+			p = m.predictFromLocked(nb, modelHash(b), thinking)
 		}
 		if p.known() {
 			known++
@@ -1059,7 +1046,9 @@ func (m *outcomeMatrix) chooseByOutcome(cands []*Backend, vec []float64, thinkin
 		// A worker never profiled in this mode reads as the fleet-neutral 0.5
 		// rather than as zero, which would exclude a newly registered worker from
 		// everything. See bankTally.rate.
-		rate := tallies[b.ID].rate()
+		// Keyed by MODEL in the tally (that is what the evidence is about) and by
+		// worker in `rates` (that is what the ordering below indexes).
+		rate := tallies[modelHash(b)].rate()
 		rates[b.ID] = rate
 		if rate > best {
 			best = rate
@@ -1331,7 +1320,7 @@ type OutcomeSummary struct {
 
 // summarise builds the display view, grouping bank questions by the topic label
 // attached to them.
-func (m *outcomeMatrix) summarise(backend string, thinking bool, topicOf func(qid string) string) OutcomeSummary {
+func (m *outcomeMatrix) summarise(model string, thinking bool, topicOf func(qid string) string) OutcomeSummary {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	out := OutcomeSummary{Thinking: thinking}
@@ -1339,7 +1328,7 @@ func (m *outcomeMatrix) summarise(backend string, thinking bool, topicOf func(qi
 	var latencies []int64
 	for qid, list := range m.obs {
 		for _, o := range list {
-			if o.Backend != backend || o.Thinking != thinking {
+			if o.ModelHash != model || o.Thinking != thinking {
 				continue
 			}
 			if o.Source == obsSourceJudge {
@@ -1403,4 +1392,33 @@ func (m *outcomeMatrix) dimensionMatchesLocked(n int) bool {
 		return len(v) == n
 	}
 	return true
+}
+
+// cachedVerdict is the permacache: has this MODEL already answered this exact
+// question, graded this exact way?
+//
+// A hit means the generation does not have to happen. That is the expensive part
+// of profiling by a wide margin — the capacity ramp and the speed probe are
+// seconds, the question bank is hours — so this is what turns a re-profile from
+// a fleet-wide outage into a few probes.
+//
+// Bench evidence only. A judged production answer was graded by another model on
+// a prompt that merely resembles this one; it is fine as routing evidence and is
+// not a substitute for asking the question.
+//
+// sameWorker reports whether the row was measured on the worker now asking. It is
+// the caller's signal about the LATENCY, which unlike the verdict does not travel:
+// correctness is a property of the weights, the engine and the mode, all of which
+// the model hash pins, while latency is all of that plus the box and its load. A
+// hit from another deployment of the same model carries a real verdict and a
+// meaningless duration.
+func (m *outcomeMatrix) cachedVerdict(qid, model, backendID string, thinking bool) (o Observation, sameWorker bool, ok bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, prev := range m.obs[qid] {
+		if prev.ModelHash == model && prev.Thinking == thinking && prev.Source == obsSourceBench {
+			return prev, prev.Backend == backendID && backendID != "", true
+		}
+	}
+	return Observation{}, false, false
 }

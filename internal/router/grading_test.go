@@ -433,13 +433,23 @@ func TestBenchmarkUsesTheMeasuredThinkingDialect(t *testing.T) {
 // no-think bucket, found nothing, and reported it unmeasured in the only mode it
 // has.
 func TestMixedPassRecordsEachResultInItsOwnMode(t *testing.T) {
+	// A stored result carries the prompt but not the match mode, so its qid is
+	// resolved against the live bank — which means the fixture has to BE the bank.
+	saved := benchmarkQuestions
+	defer func() { benchmarkQuestions = saved }()
+	benchmarkQuestions = []benchmarkQ{
+		{Tier: 1, Prompt: "easy", Expect: "a", Match: "contains"},
+		{Tier: benchHardTier, Prompt: "hard", Expect: "b", Match: "contains"},
+		{Tier: 12, Prompt: "harder", Expect: "c", Match: "contains"},
+		{Tier: 2, Prompt: "skipped", Expect: "d", Match: "contains"},
+	}
 	results := []BenchResult{
 		{Tier: 1, Prompt: "easy", Expect: "a", Pass: true},             // asked thinking-OFF
 		{Tier: benchHardTier, Prompt: "hard", Expect: "b", Pass: true}, // asked thinking-ON
 		{Tier: 12, Prompt: "harder", Expect: "c", Pass: false},         // asked thinking-ON
 		{Tier: 2, Prompt: "skipped", Expect: "d", Skipped: true},       // never asked
 	}
-	rows := observationsFromMixed("w", results, time.Unix(0, 0))
+	rows := observationsFromMixed("model-hash", "w", results, time.Unix(0, 0))
 	if len(rows) != 3 {
 		t.Fatalf("got %d observations, want 3 (the skipped one contributes nothing)", len(rows))
 	}
@@ -460,10 +470,10 @@ func TestMixedPassRecordsEachResultInItsOwnMode(t *testing.T) {
 	}
 }
 
-func promptOfQID(results []BenchResult, qid string) string {
-	for _, r := range results {
-		if benchQuestionQID(r.Prompt, r.Expect) == qid {
-			return r.Prompt
+func promptOfQID(_ []BenchResult, qid string) string {
+	for _, q := range benchmarkQuestions {
+		if benchQuestionQID(q) == qid {
+			return q.Prompt
 		}
 	}
 	return ""

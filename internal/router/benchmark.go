@@ -620,7 +620,19 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 			})
 			continue
 		}
-		count[res.tier]++
+		// An errored question stays OUT of the denominator. It is one we could not
+		// GRADE — sandbox unreachable, transport failed, worker abandoned — and
+		// counting it left a zero in the numerator and a one in the denominator,
+		// which is arithmetically identical to a wrong answer. codeexec.go
+		// promises the opposite in prose ("an outage is not a wrong answer") and
+		// the promise was false the moment the result reached this tally.
+		// Measured: sandbox down, worker answering everything else correctly,
+		// score=75 with ok=true — and ok=true is what persists the profile and
+		// routes on it. Contrast res.slow, which IS counted, deliberately: too
+		// slow to be usable is a real verdict about the worker.
+		if !res.errd {
+			count[res.tier]++
+		}
 		switch {
 		case res.errd:
 			errored++
@@ -661,7 +673,12 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 	// If many requests failed to even respond, the worker went unreachable mid-run
 	// — it isn't "bad", we just can't grade it. Signal not-ok so the caller
 	// discards this run instead of persisting an under-rating.
-	if errored*2 > len(benchmarkQuestions) {
+	// Judged over the questions this pass actually ASKED. Against the full set the
+	// guard could never trip on a truncated run — a budget-limited pass that asked
+	// 48 of 392 and errored on all 48 scored 0 with ok=true, and the caller
+	// persisted it. Slow workers are both the ones that truncate and the ones this
+	// guard most protects.
+	if dispatched > 0 && errored*2 > dispatched {
 		return 0, false, "", nil, nil
 	}
 	// v34/v35: quality is a WEIGHTED three-bucket score — base 60 / insight 20 / coding 20

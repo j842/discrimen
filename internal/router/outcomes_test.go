@@ -474,3 +474,28 @@ func TestConfidenceGateCanActuallyFail(t *testing.T) {
 		t.Errorf("close neighbours produced an unusable prediction (conf=%.3f)", near.Confidence)
 	}
 }
+
+// A vector from a DIFFERENT embedding space must not produce a prediction. dot()
+// truncates to the shorter slice, so a 768-dim query against 384-dim bank
+// vectors still scores a plausible cosine — measured at 0.866, clearing the
+// admission floor and yielding a fully confident routing decision from garbage.
+// Bank vectors are embedded once and never re-derived, so an embedding-model
+// swap puts the matrix and the classifier in different spaces.
+func TestPredictRejectsAForeignEmbeddingSpace(t *testing.T) {
+	m := newTestMatrix(t)
+	ctx := context.Background()
+	m.setVector("q1", []float64{1, 0, 0, 0})
+	m.setVector("q2", []float64{0.99, 0.14, 0, 0})
+	_ = m.record(ctx, []Observation{
+		obs("q1", "w", true, true, 10, obsSourceBench),
+		obs("q2", "w", true, true, 10, obsSourceBench),
+	})
+	if p := m.predict([]float64{1, 0, 0, 0}, "w", true); !p.known() {
+		t.Fatal("test premise wrong: a same-space query should predict")
+	}
+	wrongDim := []float64{1, 0, 0, 0, 0, 0, 0, 0}
+	if p := m.predict(wrongDim, "w", true); p.Observations != 0 {
+		t.Errorf("a %d-dim query against %d-dim vectors produced a prediction (correct=%.2f conf=%.2f)",
+			len(wrongDim), 4, p.Correct, p.Confidence)
+	}
+}

@@ -233,6 +233,17 @@ func (m *outcomeMatrix) predict(vec []float64, backend string, thinking bool) pr
 	q := normalize(vec)
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	// dot() truncates to the shorter slice, so a vector from a DIFFERENT
+	// embedding space still produces a plausible cosine. classify() guards
+	// against this and predict did not: bank vectors are embedded once and never
+	// re-derived on a model change, so swapping bge-small (384) for bge-base
+	// (768) left the matrix in the old space while the classifier re-bootstrapped
+	// into the new one. Measured: a cross-dimension pair scored 0.866, cleared
+	// the admission floor, and produced a fully confident routing decision from
+	// garbage.
+	if len(m.vecs) > 0 && !m.dimensionMatches(len(q)) {
+		return prediction{}
+	}
 
 	type near struct {
 		qid string
@@ -757,4 +768,15 @@ func (m *outcomeMatrix) summarise(backend string, thinking bool, topicOf func(qi
 type BackendOutcomes struct {
 	Thinking *OutcomeSummary `json:"thinking,omitempty"`
 	NoThink  *OutcomeSummary `json:"nothink,omitempty"`
+}
+
+// dimensionMatches reports whether a query vector is in the same space as the
+// stored ones. Sampled rather than checked exhaustively: every vector is written
+// by the same embedder in one pass, so one is representative, and this runs on
+// the routing path.
+func (m *outcomeMatrix) dimensionMatches(n int) bool {
+	for _, v := range m.vecs {
+		return len(v) == n
+	}
+	return true
 }

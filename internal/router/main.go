@@ -2233,6 +2233,7 @@ func (r *Router) proxyPassthrough(w http.ResponseWriter, req *http.Request, iden
 	w.Header().Set("X-LLM-Backend-URL", backend.URL)
 	w.Header().Set("X-LLM-Route", route)
 	copyHeaders(w.Header(), resp.Header)
+	r.backfillRetryAfter(w.Header(), resp.StatusCode) // see dispatchStreaming
 	w.WriteHeader(resp.StatusCode)
 	logEntry.StatusCode = resp.StatusCode
 	// Taken from the reply the upstream actually sent rather than from what the
@@ -3029,6 +3030,10 @@ func (r *Router) dispatchStreaming(w http.ResponseWriter, req *http.Request, d *
 	// content-sniffs the first chunk to text/plain and strict SSE clients
 	// (EventSource, OpenAI SDKs) refuse the stream.
 	copyHeaders(w.Header(), resp.Header)
+	// Same invariant as the buffered path: a 503 from this router always says
+	// when to come back. writeUnavailable's comment claims every northbound 503
+	// goes through it; two relayed ones do not, and this was one of them.
+	r.backfillRetryAfter(w.Header(), resp.StatusCode)
 	w.WriteHeader(resp.StatusCode)
 	logEntry.StatusCode = resp.StatusCode
 	progress() // headers arrived — the idle window now measures body silence
@@ -5295,12 +5300,25 @@ func (r *Registry) setModelMeta(id string, m ModelMeta) {
 	}
 }
 
+// setHealth records a health-probe verdict. A SUCCESSFUL probe deliberately does
+// not clear LastError: /health only says the process is listening, while
+// LastError records what generation actually did, and wiping it every interval
+// erased exactly the diagnostic the proxy path had just written. Measured: "HTTP
+// 503: CUDA out of memory" became "" after one probe, so a worker that answers
+// /health and fails every request showed a blank error field — which reads as
+// healthy, and is the symptom upstreamErrorSnippet was added to remove.
 func (r *Registry) setHealth(id string, healthy bool, lastError string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if b := r.backends[id]; b != nil {
 		b.Healthy = healthy
-		b.LastError = lastError
+		// Only a FAILED probe writes the error. A successful one leaves whatever
+		// the proxy path recorded, because the two measure different things: the
+		// probe says the process is listening, LastError says what a generation
+		// did.
+		if !healthy {
+			b.LastError = lastError
+		}
 		if healthy {
 			b.LastHealthy = time.Now()
 			if b.Certification.Ready {

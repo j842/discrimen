@@ -360,7 +360,12 @@ func auroc(scores, labels []float64) float64 {
 	sort.Slice(idx, func(a, b int) bool { return scores[idx[a]] < scores[idx[b]] })
 	ranks := make([]float64, len(scores))
 	for i := 0; i < len(idx); {
-		j := i
+		// j starts one past i, not at i. NaN == NaN is false, so a NaN score left
+		// the inner loop unable to advance and the outer loop pinned a core for
+		// the life of the process — reachable from one authenticated
+		// /admin/outcomes?validate=1. The equivalent loop in benchgen_emit.go
+		// already advances unconditionally.
+		j := i + 1
 		for j < len(idx) && scores[idx[j]] == scores[idx[i]] {
 			j++
 		}

@@ -5,6 +5,7 @@ import (
 	"math"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The statistics have to be right before any verdict built on them means
@@ -153,5 +154,20 @@ func TestValidateOnThinEvidence(t *testing.T) {
 	}
 	if v := rep.verdict(); !strings.Contains(v, "not enough evidence") {
 		t.Errorf("empty matrix verdict does not say so: %q", v)
+	}
+}
+
+// auroc must terminate on a NaN score. NaN == NaN is false, so the tie-scan
+// could not advance and the outer loop pinned a core for the life of the
+// process — reachable from one authenticated /admin/outcomes?validate=1.
+func TestAUROCTerminatesOnNaN(t *testing.T) {
+	done := make(chan float64, 1)
+	go func() {
+		done <- auroc([]float64{math.NaN(), 0.5, math.NaN(), 0.1}, []float64{1, 1, 0, 0})
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("auroc did not terminate on NaN input — one admin request pins a core forever")
 	}
 }

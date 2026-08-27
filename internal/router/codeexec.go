@@ -181,9 +181,20 @@ var codeSandboxFaults = []struct {
 	{marker: "the sandbox reported a failure with no detail"},
 	{marker: "the sandbox process was killed by signal "},
 	{marker: "the sandbox process exited with status "},
-	// A fault in the QUESTION's own data rather than in the answer: the private
-	// test cases decoded to something the grader cannot use. No worker can ever
-	// be scored on it.
+	// A fault in the QUESTION's own data rather than in the answer: the test
+	// cases decoded to something the grader cannot use. No worker can ever be
+	// scored on it, which is what permanent means here.
+	//
+	// The two come from opposite sides of the isolation boundary and both had to
+	// be listed. runner.py raises the first while parsing a case's INPUT, inside
+	// the jail, and emits it as a fatal record. main.py raises the second while
+	// parsing the case's expected OUTPUT — which only the parent ever sees, since
+	// the answer key is stripped before the request crosses — so it is a per-case
+	// message that _assemble lifts to the run-level error field. It reached that
+	// field for the first time in the same change that made this comment true: it
+	// had been set on the case and nowhere else, so this entry matched nothing
+	// and a row with an unparseable answer key was scored as every worker getting
+	// it wrong.
 	{marker: "malformed test case ", permanent: true},
 	{marker: "malformed expected output", permanent: true},
 	// Nothing in the answer reached the entry point: the graded function is still
@@ -413,11 +424,15 @@ const benchSandboxBodyLimit = 32 << 20
 // from the pool; the second must be retried, and recording it as a wrong answer
 // is how a whole task silently calibrates to zero.
 //
-// Carried but not yet acted on: benchgen_calibrate.go's caller treats every
-// error alike and reports benchGradeUngraded, which is the SAFE half of the
-// distinction (the pair goes unrecorded and a later run retries) and not the
-// whole of it — a question with unusable test data is retried forever instead of
-// being dropped. Wrapping it here is what makes the drop an errors.Is away.
+// Wrapped rather than returned bare so the distinction survives the layers
+// between here and the decision. benchGradeCodeStandalone re-wraps with the
+// question id, and benchgen_calibrate.go's caller asks errors.Is — which is what
+// turns the sentinel into a behaviour: benchGradeUngradeable, recorded, and
+// never asked again. Until that errors.Is was written the sentinel carried no
+// consequence at all — the caller treated every error alike and reported
+// benchGradeUngraded, which is the SAFE half of the distinction (the pair goes
+// unrecorded and a later run retries) and not the whole of it — so a question
+// with unusable test data was retried on every run, on every backend, forever.
 var errBenchUngradeable = errors.New("ungradeable question")
 
 // benchCodeTests assembles a question's cases: the public ones, which are plain

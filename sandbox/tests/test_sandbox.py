@@ -1337,6 +1337,109 @@ class TestCompletionGrading(SandboxCase):
         self.assertIn("stub", result["error"])
 
 
+# ── faults in the question, not the answer ──────────────────────────────────
+
+
+class TestATestDataFaultReachesTheRouter(SandboxCase):
+    """A row the grader cannot read must not be reported as a wrong answer.
+
+    This is the same argument as _run_error's, one level down. The router splits
+    a 200 into "the model got it wrong" and "we could not grade this" on ONE
+    field — ``error`` — and lists the messages that mean the second in
+    codeexec.go's codeSandboxFaults. Two of those entries are permanent: they say
+    no worker can ever be scored on this question, so drop it from the pool.
+
+    "malformed expected output" was one of them and it could never match. _decide
+    set it on the CASE and nothing lifted it to the run, so a LiveBench row whose
+    expected output is not JSON came back error:null, pass:false — byte for byte
+    the wire shape of a model that got it wrong. Every worker scored zero on it,
+    calibration measured p=0 "nobody can pass this", and it shipped in the
+    ceiling band as headroom nobody can reach.
+
+    THE MARKER STRINGS BELOW ARE PINNED ON THE GO SIDE.
+    codeexec_test.go's TestCodeRunFaultMatchesTheSandbox greps this package's
+    sources for every entry in codeSandboxFaults, so rewording a message here
+    fails that test — which is the point, because the alternative is a rewording
+    that silently sends every run that hits it back to being scored as a wrong
+    answer. Change one, change both.
+    """
+
+    # Exactly as codeexec.go's codeSandboxFaults spells it.
+    MARKER = "malformed expected output"
+
+    def test_an_unparseable_answer_key_is_reported_as_a_fault(self):
+        result = grade(
+            "class Solution:\n    def f(self, n):\n        return n * 2\n",
+            [case("2", "4"), case("3", "not json at all"), case("4", "8")],
+        )
+        self.assertFalse(result["pass"], result)
+        self.assertIsNotNone(
+            result["error"],
+            "a question whose expected output will not parse came back error:null — which is the wire "
+            "shape of a wrong answer, and is how a broken row scores zero for the whole fleet",
+        )
+        self.assertIn(self.MARKER, result["error"], result)
+        # The other cases are still graded, so cases_passed stays a real
+        # fraction rather than collapsing at the first unusable row.
+        self.assertEqual(result["cases_run"], 3, result)
+        self.assertEqual(result["cases_passed"], 2, result)
+        # And the case itself still carries its own copy for the failure report.
+        self.assertEqual(result["first_failure"]["index"], 1, result)
+        self.assertIn(self.MARKER, result["first_failure"]["error"], result)
+
+    def test_a_stdin_case_has_no_answer_key_to_break(self):
+        """A stdin case's expected output is compared as TEXT, so there is no
+        JSON to fail to parse and no fault to report. Pinned because the fix
+        would be easy to write as "any comparison failure is a data fault",
+        which would excuse every wrong answer this grader has."""
+        result = grade(
+            "import sys\nprint(int(sys.stdin.read()) * 2)\n",
+            [case("2", "not json at all", "stdin")],
+            func="",
+            cls="",
+        )
+        self.assertIsNone(result["error"], result)
+        self.assertFalse(result["pass"], result)
+
+    def test_an_ordinary_wrong_answer_still_reports_no_fault(self):
+        """The control. A guard that fires on everything is not a guard: if a
+        plain wrong answer started carrying an error, the router would stop
+        counting any failure against any model."""
+        result = grade(
+            "class Solution:\n    def f(self, n):\n        return n * 2\n",
+            [case("2", "4"), case("3", "9")],
+        )
+        self.assertFalse(result["pass"], result)
+        self.assertIsNone(result["error"], result)
+
+    def test_a_run_level_failure_still_outranks_the_data_fault(self):
+        """Ordering, asserted directly on _assemble because it needs a run that
+        both produced a case AND died.
+
+        _run_error's ranking is deliberate and this change sits BELOW all of it:
+        a spawn failure, the child's own fatal record, a timeout and a signal all
+        describe a run that did not finish, and a retry of one may yet reach the
+        data fault. Only the runs that were returning None change.
+        """
+        tests = [{"input": "1", "output": "not json at all"}, {"input": "2", "output": "4"}]
+
+        died = supervisor.Outcome()
+        died.records = [{"t": "case", "index": 0, "got": "2", "value": json.dumps(2)}]
+        died.timed_out = True
+        result = main._assemble(died, len(tests), 20000, tests)
+        self.assertIn("timed out after 20000 ms", result["error"] or "", result)
+
+        finished = supervisor.Outcome()
+        finished.records = [
+            {"t": "case", "index": 0, "got": "2", "value": json.dumps(2)},
+            {"t": "case", "index": 1, "got": "4", "value": json.dumps(4)},
+            {"t": "done"},
+        ]
+        result = main._assemble(finished, len(tests), 20000, tests)
+        self.assertIn(self.MARKER, result["error"] or "", result)
+        self.assertFalse(result["pass"], result)
+
+
 # ── the suite itself ────────────────────────────────────────────────────────
 
 

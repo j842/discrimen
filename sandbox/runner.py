@@ -25,7 +25,9 @@ FD LAYOUT, and why it is not simply stdout:
       inject records into the grading stream. The real pipe is dup'd away first
       and fd 1 is pointed at the bit bucket, so a gigabyte of print() output
       costs the CPU to produce it and nothing else.
-  2   /dev/null, or the service's stderr when SANDBOX_DEBUG is set.
+  2   /dev/null, or the service's stderr when SANDBOX_DEBUG is set. The only
+      one of the four this file does not arrange for itself: the parent picks it
+      at spawn time (supervisor._spawn) and nothing below touches fd 2.
   n   the dup of the original stdout, private to this module. Every record
       carries a per-run nonce so a submission that goes looking for the
       descriptor and sprays JSON at it still cannot forge a passing case.

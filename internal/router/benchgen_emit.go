@@ -37,18 +37,25 @@ import (
 	"time"
 )
 
-// benchTierTargets is how many questions to emit per tier, and the measured
-// pass-rate band each tier draws from. The defaults mirror the shape of the
-// hand-authored arithmetic tiers being replaced (4:25, 5:7, 7:5, 8:13 = 50), so
-// the total question count — and therefore the profiling budget, which is the
-// real constraint at 8–30 min per worker for 97 questions — stays put.
-var benchTierTargets = []struct {
+// benchTierTarget is one band. A named type rather than the anonymous struct
+// this used to be: the anonymous form had to be spelled out in full at every
+// place a band was returned rather than ranged over — benchBandFor here and
+// benchBandForExact in the tests — which is three verbatim copies of a five
+// field list that a `go vet` cannot check against each other.
+type benchTierTarget struct {
 	Tier    int
 	Target  int
 	MinRate float64 // inclusive
 	MaxRate float64 // exclusive; p==1 is handled by the reserve bands instead
 	Reserve int     // reserveNone | reserveFloor | reserveCeiling
-}{
+}
+
+// benchTierTargets is how many questions to emit per tier, and the measured
+// pass-rate band each tier draws from. The defaults mirror the shape of the
+// hand-authored arithmetic tiers being replaced (4:25, 5:7, 7:5, 8:13 = 50), so
+// the total question count — and therefore the profiling budget, which is the
+// real constraint at 8–30 min per worker for 97 questions — stays put.
+var benchTierTargets = []benchTierTarget{
 	// Tier 3, not 2: benchHardTier is 3, so anything below it is graded
 	// thinking-OFF at the short budget in production while calibration grades
 	// every candidate thinking-ON at the long one. A floor item measured under
@@ -83,8 +90,9 @@ var benchTierTargets = []struct {
 //
 // So a bounded number of each is kept. They cost profiling budget and tell us
 // nothing now; they are what lets a new worker be placed correctly WITHOUT a
-// re-fetch, a re-calibration and a benchmarkVersion bump that re-profiles the
-// whole fleet.
+// re-fetch and a re-calibration — hours of fleet time, and a bank refresh that
+// every already-profiled worker would then be holding an old-bank score against
+// until it next re-profiles.
 //
 // Selection cannot rank by discrimination — D is 0 for a constant item by
 // definition — so it stratifies round-robin across source tasks and breaks ties
@@ -177,8 +185,18 @@ func benchEmit(sandboxURL string) error {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "\nwrote %s (%d questions)\n", path, len(selected))
-	fmt.Fprint(os.Stderr, "\nNEXT: bump benchmarkVersion, delete tiers 4/5/7/8 from benchmark_data.go,\n"+
-		"and commit both in the SAME commit — the question set is part of the profile cache key.\n")
+	// This used to print "bump benchmarkVersion ... the question set is part of
+	// the profile cache key", and it was the loudest copy of a claim that stopped
+	// being true when question identity became content-addressed (identity.go).
+	// An instruction a tool prints is the one an operator follows, so it is the
+	// one that most needed correcting.
+	fmt.Fprint(os.Stderr, "\nNEXT: delete tiers 4/5/7/8 from benchmark_data.go and commit both files in the\n"+
+		"SAME commit.\n\n"+
+		"Do NOT bump benchmarkVersion to publish this. Each question is identified by its\n"+
+		"own content hash, so the ones this run changed are asked afresh and the ones it\n"+
+		"kept are served from the permacache — nothing needs invalidating. Bump it only if\n"+
+		"you want the whole fleet re-scored on the new set now, since a worker with a\n"+
+		"current cached profile otherwise keeps the score it earned on the old one.\n")
 	return nil
 }
 
@@ -196,6 +214,26 @@ func benchEmit(sandboxURL string) error {
 func benchSelect(pool *benchPool, calib *calibration) ([]scoredQuestion, float64, error) {
 	if calib == nil || len(calib.Results) == 0 {
 		return nil, 0, fmt.Errorf("no calibration data (run `bench calibrate` first)")
+	}
+
+	// Questions calibration found it could never grade, collected from EVERY
+	// calibrated backend before any of them is excluded as an observer.
+	//
+	// One report is enough, and that is not a shortcut. "The answer key is not
+	// JSON" is a fact about the QUESTION, so a second backend confirming it
+	// learns nothing — and only a backend whose submission actually ran gets far
+	// enough to find out, so the one that reported it may well be the only one
+	// that could. Reading it off the observer list instead would lose exactly the
+	// backends most likely to have been the reporter: a worker excluded for
+	// answering nothing is excluded from voting on DIFFICULTY, which is a
+	// judgement about it, and this is not a judgement about it.
+	broken := map[string]bool{}
+	for _, r := range calib.Results {
+		for id, yes := range r.Ungradeable {
+			if yes {
+				broken[id] = true
+			}
+		}
 	}
 
 	// Rank backends by the score they got on THIS pool, not by the router's q:
@@ -270,7 +308,7 @@ func benchSelect(pool *benchPool, calib *calibration) ([]scoredQuestion, float64
 	// The correlation check: do the two instruments RANK the fleet the same way?
 	// A high value means the hand-authored set is tracking real capability and
 	// this is a refresh; a low one means something is wrong with one of them and
-	// bumping benchmarkVersion would bake it in.
+	// committing the emitted file would bake it in.
 	rho := benchSpearman(poolScores, routerScores)
 	fmt.Fprintf(os.Stderr, "\nSpearman(pool, router q) = %+.2f  ", rho)
 	switch {
@@ -279,7 +317,7 @@ func benchSelect(pool *benchPool, calib *calibration) ([]scoredQuestion, float64
 	case rho >= 0.4:
 		fmt.Fprintln(os.Stderr, "— partial agreement; read the disagreements before adopting.")
 	default:
-		fmt.Fprintln(os.Stderr, "— the instruments disagree. Investigate BEFORE bumping benchmarkVersion.")
+		fmt.Fprintln(os.Stderr, "— the instruments disagree. Investigate BEFORE committing this file.")
 	}
 
 	// An odd-sized fleet drops its median worker rather than assigning it to a
@@ -298,6 +336,17 @@ func benchSelect(pool *benchPool, calib *calibration) ([]scoredQuestion, float64
 		// property for tier >= 9; checking it here keeps a broken item out of
 		// every band rather than failing the build after emit.
 		if !benchSelfGrades(q) {
+			ungradeable++
+			continue
+		}
+		// The same verdict, reached the other way round. benchSelfGrades reads what
+		// is visible in pool.json; this reads what calibration DISCOVERED by trying
+		// to run the question — a private test case that decodes to something the
+		// grader cannot use is invisible from here, because the blob is opaque
+		// base64 until the sidecar unpickles it. Both drop the question outright
+		// rather than letting it reach a band: it fails for every worker, so
+		// unfiltered it lands in the p==0 pool and masquerades as headroom.
+		if broken[q.ID] {
 			ungradeable++
 			continue
 		}
@@ -354,14 +403,18 @@ func benchSelect(pool *benchPool, calib *calibration) ([]scoredQuestion, float64
 			// It used to read `if band.Tier >= benchCodingTier`. When the ceiling
 			// band moved from tier 12 to tier 10 (see benchTierTargets above)
 			// benchCodingTier stayed 12, so the test became 10 >= 12 and the guard
-			// has been dead ever since — the committed tier-10 band went out
-			// unfiltered. Lowering the constant is NOT the fix: benchCodingTier is
-			// what benchWeightedScore uses to decide which questions land in the
-			// 20-point coding bucket (and what benchmark_test.go's
-			// TestCodingTierShape walks), so setting it to 10 would sweep all 40
-			// ceiling questions into the coding bucket and restore the exact fault
-			// that moved the band off tier 12. The guard has to key on the thing it
-			// is actually about, which is "this is the headroom band".
+			// was dead from that day until this line was rewritten — which is why
+			// the committed tier-10 band went out unfiltered, and why
+			// TestCeilingBandShapeGuardFires drives selection rather than reading
+			// the source: the condition compiled, read plausibly, and matched
+			// nothing. Lowering the constant would NOT have been the fix.
+			// benchCodingTier is what benchWeightedScore uses to decide which
+			// questions land in the 20-point coding bucket (and what
+			// benchmark_test.go's TestCodingTierShape walks), so setting it to 10
+			// would sweep all 40 ceiling questions into the coding bucket and
+			// restore the exact fault that moved the band off tier 12. The guard
+			// has to key on the thing it is actually about, which is "this is the
+			// headroom band".
 			//
 			// A MULTIPLE-CHOICE ITEM CANNOT BE HEADROOM. This band is selected FOR
 			// p == 0, and on a five-option question p == 0 across a five-worker
@@ -500,9 +553,11 @@ func benchRenderFile(selected []scoredQuestion, pool *benchPool, rho float64, sa
 // LiveBench label. Spearman correlation between this pool and the hand-authored
 // benchmark's q at calibration time: %+.2f.
 //
-// To refresh: bench fetch && bench calibrate && bench emit, then bump
-// benchmarkVersion in the same commit — the question set is part of the profile
-// cache key and must not change without it.
+// To refresh: bench fetch && bench calibrate && bench emit, and commit the
+// result. No benchmarkVersion bump goes with it — each question is identified by
+// its own content hash (identity.go), so the ones a refresh changes are re-asked
+// and the ones it keeps are served from the permacache. Bump only to force the
+// already-profiled fleet onto the new set at once.
 //
 // Regenerated %s.
 
@@ -528,10 +583,15 @@ var benchmarkQuestionsLive = []benchmarkQ{
 		if s.q.Match == benchMatchCodeExec {
 			// A coding question ships its TEST CASES instead of an Expect. They
 			// have to be embedded rather than fetched at runtime for the same
-			// reason the whole generated file is committed: the question set is
-			// part of the profile cache key, so anything that could change under
-			// a fixed benchmarkVersion would let two workers be graded on
-			// different sets and then compared on one absolute scale.
+			// reason the whole generated file is committed: a quality score is a
+			// percentage over the exam that was sat, and two workers are only
+			// comparable on one absolute scale if they sat the same one. Test
+			// cases fetched at grading time are an exam that can differ between
+			// two workers, or between one worker and itself a week later, with
+			// nothing in the diff to show for it. Embedding them also puts them
+			// in the qid — benchQuestionQID hashes Code.Tests — so a case list
+			// that DOES change makes a new question rather than silently
+			// re-grading an old one.
 			cases, err := benchEmitCases(sandboxURL, s.q)
 			if err != nil {
 				return nil, fmt.Errorf("tests for %s: %w", s.q.ID, err)
@@ -557,13 +617,7 @@ var benchmarkQuestionsLive = []benchmarkQ{
 	return format.Source([]byte(b.String()))
 }
 
-func benchBandFor(tier int) struct {
-	Tier    int
-	Target  int
-	MinRate float64
-	MaxRate float64
-	Reserve int
-} {
+func benchBandFor(tier int) benchTierTarget {
 	for _, b := range benchTierTargets {
 		if b.Tier == tier {
 			return b

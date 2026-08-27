@@ -78,15 +78,147 @@ type codeEntry struct {
 }
 
 type codeGradeResult struct {
-	Pass        bool   `json:"pass"`
-	CasesRun    int    `json:"cases_run"`
-	CasesPassed int    `json:"cases_passed"`
-	Error       string `json:"error"`
+	Pass        bool `json:"pass"`
+	CasesRun    int  `json:"cases_run"`
+	CasesPassed int  `json:"cases_passed"`
+	// Error is the ONE thing that went wrong with the RUN, as against with a
+	// case: see main.py's _run_error. A submission that simply computed the wrong
+	// answer leaves it empty and sets pass:false, so a non-empty Error always
+	// means the run did not finish normally — and who is at fault for that is
+	// what codeRunFault decides.
+	Error string `json:"error"`
 	// PrefixApplied is the sidecar confirming it understood Prefix. A POINTER
 	// because the three states differ: true (applied), false (none was sent) and
 	// ABSENT (a sidecar too old to know about prefixes at all). Only the last is
 	// a problem, and a plain bool could not express it.
 	PrefixApplied *bool `json:"prefix_applied"`
+}
+
+// codeVerdict is what one graded submission actually did, as opposed to whether
+// it passed.
+//
+// The boolean alone throws away the measurement the sidecar already made: 9 of
+// 10 cases and 0 of 10 are the same false, and they are not the same fact about
+// a model. One is an edge case missed, the other is a program that does not
+// work — the exact distinction a strengths-and-weaknesses map exists to draw.
+// The sidecar has sent cases_passed all along; nothing read it.
+type codeVerdict struct {
+	Pass        bool
+	CasesRun    int
+	CasesPassed int
+}
+
+func codeVerdictOf(out codeGradeResult) codeVerdict {
+	return codeVerdict{Pass: out.Pass, CasesRun: out.CasesRun, CasesPassed: out.CasesPassed}
+}
+
+// Detail is the one-line account of the run, for the report stored against the
+// question ("(sandbox: …)" in benchOne's BenchResult.Got, stderr in
+// calibration). Cheap to read in a failure list and the difference between
+// re-reading a model's answer and not bothering.
+func (v codeVerdict) Detail() string {
+	switch {
+	case v.CasesRun == 0:
+		return "no test cases ran"
+	case v.Pass:
+		return fmt.Sprintf("passed %d/%d cases", v.CasesPassed, v.CasesRun)
+	default:
+		return fmt.Sprintf("%d/%d cases passed", v.CasesPassed, v.CasesRun)
+	}
+}
+
+// codeSandboxFaults are the run-level failures the sidecar authored about
+// ITSELF, or about the QUESTION — never about the submission. Matching them is
+// how an infrastructure fault stops being recorded as a capability fact.
+//
+// WHY THIS TABLE LISTS THE SIDECAR'S FAULTS AND NOT THE SUBMISSION'S, which is
+// the direction that looks more natural: the submission's side is not
+// enumerable. A program that fails to import is reported by whatever exception
+// Python raised — "SyntaxError: …", "NameError while loading the submission: …"
+// — which is unbounded free text. The sidecar's own messages are fixed strings
+// in supervisor.py, runner.py and main.py, so they can be listed, and anything
+// not on the list is the program. That also fixes the direction of the residual
+// risk the right way round: a message a future sidecar adds grades as a wrong
+// answer, which is what it does today, rather than silently excusing every
+// model that writes broken Python.
+//
+// Kept in sync by hand, like benchSandboxBodyLimit. TestCodeRunFaultMatchesTheSandbox
+// pins the strings against the sidecar's source so a rewording there is a test
+// failure rather than a fleet quietly re-tiering itself.
+var codeSandboxFaults = []struct {
+	marker string
+	// permanent distinguishes a question no worker can EVER be graded on from a
+	// sidecar having a bad minute. The first should be dropped from the pool, the
+	// second retried — see errBenchUngradeable.
+	permanent bool
+}{
+	// supervisor.py, Outcome.spawn_error. The first of these is why this table
+	// exists: /scratch is a 256 MB tmpfs shared by four concurrent runs under an
+	// 8 MB RLIMIT_FSIZE, so ONE submission writing large files fails mkdtemp for
+	// a DIFFERENT run — and that run recorded a wrong answer, for a different
+	// worker, on a question whose program was fine.
+	{marker: "could not create a scratch directory"},
+	{marker: "could not open the scratch directory to"},
+	{marker: "could not start the sandbox process"},
+	{marker: "the sandbox process did not die after SIGKILL"},
+	// runner.py: the grader's own crash, a request the sidecar could not parse,
+	// and a mode it has never heard of (a router newer than its sandbox).
+	{marker: "grader crashed: "},
+	{marker: "unreadable request: "},
+	{marker: "unknown runner mode "},
+	// jail.py aborting rather than executing a submission as root — a deployment
+	// fault (`docker run --user root`, a runtime that ignores USER), and one that
+	// would otherwise fail every code question on that host.
+	{marker: "refusing to execute as root"},
+	// main.py's fallbacks for a child that died with nothing to say. Every death
+	// a SUBMISSION can cause is converted into a fatal record carrying a message
+	// first — its own SIGALRM/SIGXCPU handler, MemoryError under RLIMIT_AS, the
+	// load-error path — and a fatal record outranks all three of these in
+	// _run_error. So a death with no message is the host or the container rather
+	// than the program: the cgroup OOM killer picking a victim, the pid limit, a
+	// kill from outside. Ambiguous, and resolved towards "we could not tell",
+	// because being unable to tell is not evidence against the model.
+	{marker: "the sandbox reported a failure with no detail"},
+	{marker: "the sandbox process was killed by signal "},
+	{marker: "the sandbox process exited with status "},
+	// A fault in the QUESTION's own data rather than in the answer: the private
+	// test cases decoded to something the grader cannot use. No worker can ever
+	// be scored on it.
+	{marker: "malformed test case ", permanent: true},
+}
+
+// codeRunFault reports why a graded run cannot be scored, or nil when the
+// sidecar's error is the submission's own doing and pass:false is the truth.
+//
+// The failures it catches are all real and all distinguishable, and every one of
+// them used to arrive at the caller as a wrong answer: a jail that would not
+// start, a scratch directory that could not be made, test data that will never
+// parse. Scoring those as wrong answers is how a fleet re-tiers itself around a
+// broken dependency — the model that happened to be profiled while the sidecar
+// was unwell is the model that gets routed less traffic afterwards.
+//
+// What it deliberately does NOT catch is the submission failing on its own
+// terms: "time limit exceeded", "cpu limit exceeded", "memory limit exceeded",
+// the result-size cap, and any exception the program raised while loading. Those
+// are the sidecar answering the question it was asked — this program does not
+// work — and excusing them would inflate the coding score of every model that
+// writes a loop that never terminates.
+func codeRunFault(out codeGradeResult) error {
+	msg := strings.TrimSpace(out.Error)
+	if msg == "" {
+		return nil
+	}
+	v := codeVerdictOf(out)
+	for _, f := range codeSandboxFaults {
+		if !strings.Contains(msg, f.marker) {
+			continue
+		}
+		if f.permanent {
+			return fmt.Errorf("%w: %s (%s)", errBenchUngradeable, msg, v.Detail())
+		}
+		return fmt.Errorf("sandbox could not run the submission: %s (%s)", msg, v.Detail())
+	}
+	return nil
 }
 
 // checkPrefixHonoured fails a grade whose prefix the sidecar ignored.
@@ -114,21 +246,39 @@ const (
 	codeExecHTTPGrace = 30 * time.Second // sidecar wall-clock + slack, never less than the run budget
 )
 
-// gradeCode runs one submission against one question's test cases and reports
-// whether it passed ALL of them.
-//
-// A sidecar that is unreachable returns an error rather than false. The
-// distinction matters: false means "the model got it wrong" and lowers its
-// quality score, while an error means "we could not tell", which benchOne
-// records as errored — the same treatment a worker that failed to answer gets,
-// and the same reason. Scoring an outage as a wrong answer is how a fleet
-// quietly re-tiers itself around a broken dependency.
+// gradeCode is the boolean-only form of gradeCodeVerdict, kept for the benchOne
+// call site in benchmark.go. Callers that want the case fraction — which is the
+// only thing separating "missed one edge case" from "wrote nothing that runs" —
+// should take the verdict instead.
 func (r *Router) gradeCode(ctx context.Context, code string, q benchmarkQ) (bool, error) {
+	v, err := r.gradeCodeVerdict(ctx, code, q)
+	return v.Pass, err
+}
+
+// gradeCodeVerdict runs one submission against one question's test cases and
+// reports what happened to it.
+//
+// A run we could not grade returns an ERROR rather than false, and the
+// distinction is the whole point: false means "the model got it wrong" and
+// lowers its quality score, while an error means "we could not tell", which
+// benchOne records as errored — the same treatment a worker that failed to
+// answer gets, and the same reason. Scoring an outage as a wrong answer is how a
+// fleet quietly re-tiers itself around a broken dependency.
+//
+// Three things reach that error path, not one. A sidecar that could not be
+// reached or replied with a non-200; a sidecar too old to honour the completion
+// prefix (checkPrefixHonoured); and — the one that was missing — a 200 whose
+// body says the RUN failed rather than the submission (codeRunFault). The third
+// is the most damaging of the three, because it is per-question and intermittent
+// rather than obvious: a spawn failure caused by a neighbouring run filling
+// /scratch looks exactly like a model that cannot code.
+func (r *Router) gradeCodeVerdict(ctx context.Context, code string, q benchmarkQ) (codeVerdict, error) {
+	var none codeVerdict
 	if r.cfg == nil || strings.TrimSpace(r.cfg.SandboxURL) == "" {
-		return false, fmt.Errorf("code-exec question but no sandbox configured (SANDBOX_URL)")
+		return none, fmt.Errorf("code-exec question but no sandbox configured (SANDBOX_URL)")
 	}
 	if q.Code == nil || len(q.Code.Tests) == 0 {
-		return false, fmt.Errorf("code-exec question carries no test cases")
+		return none, fmt.Errorf("code-exec question carries no test cases")
 	}
 	body, err := json.Marshal(codeGradeRequest{
 		Language: "python", Code: code, Prefix: q.Code.Prefix,
@@ -137,12 +287,12 @@ func (r *Router) gradeCode(ctx context.Context, code string, q benchmarkQ) (bool
 		TimeoutMS: codeExecTimeoutMS, MemoryMB: codeExecMemoryMB,
 	})
 	if err != nil {
-		return false, err
+		return none, err
 	}
 	url := strings.TrimSuffix(strings.TrimSpace(r.cfg.SandboxURL), "/") + "/grade"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return false, err
+		return none, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if tok := strings.TrimSpace(r.cfg.SandboxToken); tok != "" {
@@ -150,25 +300,29 @@ func (r *Router) gradeCode(ctx context.Context, code string, q benchmarkQ) (bool
 	}
 	resp, err := r.benchClient.Do(req)
 	if err != nil {
-		return false, err
+		return none, err
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("sandbox returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		return none, fmt.Errorf("sandbox returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
 	var out codeGradeResult
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return false, err
+		return none, err
 	}
 	if err := checkPrefixHonoured(q.Code.Prefix, out); err != nil {
-		return false, err
+		return none, err
 	}
-	// A submission that crashed or timed out is a WRONG ANSWER, not an outage —
-	// the sidecar answered, and its answer is "this program does not work". Only
-	// a sidecar that could not be reached or could not reply reaches the error
-	// path above.
-	return out.Pass, nil
+	// A submission that crashed, hung or ran out of memory is a WRONG ANSWER, not
+	// an outage — the sidecar answered, and its answer is "this program does not
+	// work". A sidecar that could not START the program is the opposite, and used
+	// to be indistinguishable from it: same 200, same pass:false, the only
+	// difference being an error field nothing read. codeRunFault is what reads it.
+	if err := codeRunFault(out); err != nil {
+		return none, err
+	}
+	return codeVerdictOf(out), nil
 }
 
 // benchGradeCodeStandalone is the calibration-time twin of gradeCode: same
@@ -224,6 +378,15 @@ func benchGradeCodeStandalone(sandboxURL string, q poolQuestion, code string) (b
 	if err := checkPrefixHonoured(benchCodePrefixFor(q), out); err != nil {
 		return false, err
 	}
+	// The same read of the same field as gradeCodeVerdict, and it matters MORE
+	// here: calibration is what assigns a question its tier, so a run of spawn
+	// failures does not merely mis-score one worker, it bakes an infrastructure
+	// blip into the difficulty of the question for every worker afterwards. A
+	// question every worker "failed" calibrates as maximally hard and promotes
+	// straight into the top tier.
+	if err := codeRunFault(out); err != nil {
+		return false, fmt.Errorf("%s: %w", q.ID, err)
+	}
 	return out.Pass, nil
 }
 
@@ -236,6 +399,12 @@ const benchSandboxBodyLimit = 32 << 20
 // as distinct from a sidecar that happens to be down. The first must be dropped
 // from the pool; the second must be retried, and recording it as a wrong answer
 // is how a whole task silently calibrates to zero.
+//
+// Carried but not yet acted on: benchgen_calibrate.go's caller treats every
+// error alike and reports benchGradeUngraded, which is the SAFE half of the
+// distinction (the pair goes unrecorded and a later run retries) and not the
+// whole of it — a question with unusable test data is retried forever instead of
+// being dropped. Wrapping it here is what makes the drop an errors.Is away.
 var errBenchUngradeable = errors.New("ungradeable question")
 
 // benchCodeTests assembles a question's cases: the public ones, which are plain

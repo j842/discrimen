@@ -182,21 +182,49 @@ func benchCategoryOf(tier int, prompt string) string {
 // the thing the loose tally was added to expose: a worker whose category score
 // is really a formatting cost rather than a knowledge one.
 type benchCatScore struct {
-	Strict  int     `json:"strict"`  // graded correct outright
-	Loose   int     `json:"loose"`   // right answer, ignored the requested format — half credit
-	Total   int     `json:"total"`   // every question in the category, failures and errors included
-	Passed  float64 `json:"passed"`  // Strict + Loose/2, the arithmetic benchWeightedScore uses
-	Percent int     `json:"percent"` // 100*Passed/Total, rounded
+	Strict int `json:"strict"` // graded correct outright
+	Loose  int `json:"loose"`  // right answer, ignored the requested format — half credit
+	// Total is what the score was MEASURED ON, not how many questions the
+	// category holds — see add for the two ways a question leaves it. Skipped and
+	// Errored carry the difference, so an operator reading "coding 50%" can tell
+	// 1-of-2 from 7-of-14. Without them a category the run barely touched renders
+	// identically to one it worked through.
+	Total   int     `json:"total"`
+	Skipped int     `json:"skipped,omitempty"` // never asked — the profile budget stopped first
+	Errored int     `json:"errored,omitempty"` // asked and ungradeable — an outage, not a miss
+	Passed  float64 `json:"passed"`            // Strict + Loose/2, the arithmetic benchWeightedScore uses
+	Percent int     `json:"percent"`           // 100*Passed/Total, rounded
 }
 
 func (s *benchCatScore) add(r BenchResult) {
-	// A question the profile budget never asked is not a category weakness. It
-	// has to stay out of the DENOMINATOR as well as the numerator: counting it in
-	// Total alone reads as a miss, so a truncated profile would report a model as
-	// bad at whichever categories it ran out of time in — the exact opposite of a
-	// strengths-and-weaknesses map, and worst on the slow workers that get
-	// truncated most.
-	if r.Skipped {
+	// A question this run did not MEASURE is not a category weakness, and there
+	// are two ways not to measure one. Both have to stay out of the DENOMINATOR
+	// as well as the numerator, because counting one in Total alone is
+	// arithmetically identical to grading it wrong.
+	//
+	// SKIPPED — the profile budget stopped before the question was asked.
+	// Counting those would report a model as bad at whichever categories it ran
+	// out of time in, the exact opposite of a strengths-and-weaknesses map, and
+	// worst on the slow workers that get truncated most.
+	//
+	// ERRORED — the question was asked and could not be graded: transport failed
+	// after every retry, the worker was abandoned as busy, or the code-exec
+	// sidecar could not run the submission (codeexec.go). This one was missing,
+	// and the consequence was two numbers derived from the same run by opposite
+	// rules sitting side by side: the headline Quality score has excluded errored
+	// questions since the identical fault was fixed there (benchmark.go's
+	// `if !res.errd { count[res.tier]++ }`), so a sandbox outage read as
+	// "coding 0%" beside a Quality of 75. An outage is a fact about the
+	// infrastructure and never a fact about the model.
+	//
+	// r.Slow is deliberately NOT here, matching benchmark.go: too slow to be
+	// usable is a real verdict about the worker, so it stays in the denominator.
+	switch {
+	case r.Skipped:
+		s.Skipped++
+		return
+	case r.Errored:
+		s.Errored++
 		return
 	}
 	s.Total++
@@ -210,6 +238,16 @@ func (s *benchCatScore) add(r BenchResult) {
 	}
 }
 
+// asked is how many questions of this category the run knew about — the ones it
+// measured plus the ones it could not. It is the context Percent is meaningless
+// without: 50% is a different claim on two questions than on fifteen.
+func (s benchCatScore) asked() int { return s.Total + s.Skipped + s.Errored }
+
+// finish leaves Percent at zero when Total is zero, and that is NOT a score: a
+// category whose every question was skipped or errored has no measurement at
+// all. Renderers must check Total before showing Percent — benchCategorySummary
+// does, and printing the bare 0 instead would be the outage-as-weakness bug back
+// in its worst form.
 func (s *benchCatScore) finish() {
 	if s.Total > 0 {
 		s.Percent = int(math.Round(100 * s.Passed / float64(s.Total)))
@@ -347,6 +385,19 @@ func benchCategoryRank(cat string) int {
 // worker really can score zero with thinking off, so "not measured" and
 // "measured as nothing" must not render alike.
 //
+// THE COVERAGE SUFFIX, "(9/15 measured)", is the same distinction applied to the
+// percentage itself, and it appears only when the run did not measure the whole
+// category. A percentage with no denominator invites the reader to supply one,
+// and the one they supply is the category's full size — so a truncated profile
+// or a sandbox outage that left coding measured on two questions rendered
+// exactly like a worker that had been through all fifteen. It reports the
+// THINKING-ON run's coverage, which is the run the percentage in front of it
+// came from; the full per-mode split is on GET /backends/{id}/benchmark.
+//
+// "n/a" and not "0%" when nothing in the category was measured at all, for the
+// reason on finish: zero is a score a worker can earn, and this is the absence
+// of one.
+//
 // Computed ONCE when a profile is applied and carried on the row, not derived
 // per request: the inputs only change when the worker is re-profiled.
 func benchCategorySummary(think, nothink []BenchResult) string {
@@ -359,9 +410,23 @@ func benchCategorySummary(think, nothink []BenchResult) string {
 		if b.Len() > 0 {
 			b.WriteString("  ")
 		}
+		asked := c.Think.asked()
+		if c.Think.Total == 0 {
+			fmt.Fprintf(&b, "%s n/a (0/%d measured)", c.Category, asked)
+			continue
+		}
 		fmt.Fprintf(&b, "%s %d%%", c.Category, c.Think.Percent)
 		if c.NoThink != nil {
-			fmt.Fprintf(&b, "→%d%%", c.NoThink.Percent)
+			// Non-nil means the no-think run was stored; Total still says whether
+			// this category survived it. All-errored there is an outage, not a zero.
+			if c.NoThink.Total > 0 {
+				fmt.Fprintf(&b, "→%d%%", c.NoThink.Percent)
+			} else {
+				b.WriteString("→n/a")
+			}
+		}
+		if c.Think.Total < asked {
+			fmt.Fprintf(&b, " (%d/%d measured)", c.Think.Total, asked)
 		}
 	}
 	return b.String()

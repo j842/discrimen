@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"strings"
 	"time"
 )
 
@@ -135,3 +136,94 @@ func benchEmbedText(q benchmarkQ) string {
 const benchEmbedMaxChars = 2000
 
 var errEmbedCountMismatch = errors.New("embeddings worker returned a different number of vectors than requested")
+
+// recordJudgedOutcome files a graded PRODUCTION answer in the matrix.
+//
+// This is what makes the matrix converge on the traffic actually being served.
+// A fixed question bank is drawn from someone else's distribution — LiveBench
+// maths and code, where this fleet mostly sees agent tool loops and chat — so
+// without this the matrix would predict confidently about questions nobody asks
+// and fall back on everything real.
+//
+// The question is embedded and kept as a neighbour in its own right, so the NEXT
+// similar prompt has evidence to draw on. That is the mechanism by which
+// coverage improves on its own, and it is also why it needs a bound: production
+// questions arrive forever.
+func (r *Router) recordJudgedOutcome(backendID, question string, thinking, correct bool, latencyMS int64) {
+	if r.outcomes == nil || strings.TrimSpace(question) == "" {
+		return
+	}
+	qid := judgedQID(question)
+	ctx, cancel := context.WithTimeout(context.Background(), judgedEmbedTimeout)
+	defer cancel()
+	if !r.outcomes.hasVector(qid) {
+		vecs, err := r.embedTexts(ctx, []string{truncateForEmbed(question)})
+		if err != nil || len(vecs) == 0 {
+			// No vector means the row is unreachable by any query, so there is no
+			// point storing it. Silent: the embeddings worker being briefly down
+			// must not fill the log with one line per sampled request.
+			return
+		}
+		r.outcomes.setVector(qid, vecs[0])
+	}
+	obs := []Observation{{
+		QID: qid, Backend: backendID, Thinking: thinking, Correct: correct,
+		LatencyMS: latencyMS, Source: obsSourceJudge, At: time.Now().UTC(),
+	}}
+	if err := r.outcomes.record(ctx, obs); err != nil {
+		log.Printf("outcome matrix: recording a judged answer for %s failed: %v", backendID, err)
+		return
+	}
+	r.outcomes.pruneJudged(ctx, maxJudgedQuestions)
+}
+
+// judgedQID identifies a production question by content, so repeated asks of the
+// same thing accumulate evidence on one row instead of spreading across many.
+func judgedQID(question string) string {
+	return "j" + uint64Hex(benchQuestionHash(benchmarkQ{Prompt: truncateForEmbed(question)}))
+}
+
+func truncateForEmbed(s string) string {
+	if len(s) > benchEmbedMaxChars {
+		return s[:benchEmbedMaxChars]
+	}
+	return s
+}
+
+const (
+	// judgedEmbedTimeout bounds the extra embedding call. Short: this runs on a
+	// background sample, and a slow embeddings worker must not pile up goroutines.
+	judgedEmbedTimeout = 10 * time.Second
+	// maxJudgedQuestions bounds how many production questions the matrix keeps.
+	// Production traffic is unbounded and the matrix is scanned linearly on every
+	// routed request, so without a cap both memory and per-request latency grow
+	// forever. Oldest go first, which is also the right policy on the merits: a
+	// judged result from six months ago describes a fleet that has since changed.
+	maxJudgedQuestions = 4000
+)
+
+// bankTopicOf labels a bank question for the strengths-and-weaknesses display.
+//
+// Reuses the existing category labelling rather than inventing a second one, so
+// the summary and the older per-category breakdown cannot disagree about what
+// counts as coding. Judged production questions have no label — they are not
+// part of the bank — and are counted separately.
+func (r *Router) bankTopicOf(qid string) string {
+	r.bankTopicOnce.Do(func() {
+		r.bankTopics = make(map[string]string, len(benchmarkQuestions))
+		for _, q := range benchmarkQuestions {
+			r.bankTopics[benchQuestionQID(q.Prompt, q.Expect)] = benchCategoryOf(q.Tier, q.Prompt)
+		}
+	})
+	return r.bankTopics[qid]
+}
+
+// outcomeSummaryFor is the display view of one worker, in the mode routing would
+// use for a request with no thinking preference.
+func (r *Router) outcomeSummaryFor(backendID string, thinking bool) *OutcomeSummary {
+	if r.outcomes == nil {
+		return nil
+	}
+	s := r.outcomes.summarise(backendID, thinking, r.bankTopicOf)
+	return &s
+}

@@ -156,7 +156,12 @@ type Backend struct {
 	// a registration content change as a re-registration, which resets
 	// certification and rebuilds the slot channel.
 	ContextProbe *ContextProbe `json:"context_probe,omitempty"`
-	ObservedTPS  float64       `json:"observed_tps,omitempty"` // live EWMA of DECODE throughput (TTFT excluded), BOTH modes pooled
+	// Outcomes is the measured hit rate and per-topic breakdown, attached for
+	// display only. Never persisted and never read by routing: routing queries
+	// the matrix for neighbours of the actual prompt, and compressing that into
+	// a headline is precisely the mistake the quality scalar made.
+	Outcomes    *BackendOutcomes `json:"outcomes,omitempty"`
+	ObservedTPS float64          `json:"observed_tps,omitempty"` // live EWMA of DECODE throughput (TTFT excluded), BOTH modes pooled
 	// Per-thinking-mode measurements. A model with thinking on and the same model
 	// with it off are treated as two models here rather than assumed equivalent:
 	// decode rate ought to be mode-independent and the generated LENGTH certainly
@@ -688,13 +693,18 @@ type Router struct {
 	// correctly, and how fast — the thing routing queries instead of comparing a
 	// quality percentage against a difficulty score. Nil disables it, in which
 	// case routing falls back to the older quality-target path. See outcomes.go.
-	outcomes    *outcomeMatrix
-	judgeSem    chan struct{}   // bounds concurrent background judge calls; nil unless judging enabled
-	judgeCount  atomic.Uint64   // sample counter for background answer judging
-	judgePaid   judgeBudget     // rolling token allowance for grading with a PAID model (see judge.go)
-	profiling   sync.Map        // worker ids with a cold-start profile in flight (de-dups overlapping profiles)
-	gateAudited atomic.Bool     // set once the thinking-gate-vs-tier audit has logged (model-independent)
-	sessions    *sessionTracker // conversation → worker affinity; nil disables stickiness (see session.go)
+	outcomes *outcomeMatrix
+	// bankTopics maps a bank question id to its display category, built once and
+	// reusing benchCategoryOf so the summary and the older per-category
+	// breakdown cannot disagree about what counts as coding.
+	bankTopics    map[string]string
+	bankTopicOnce sync.Once
+	judgeSem      chan struct{}   // bounds concurrent background judge calls; nil unless judging enabled
+	judgeCount    atomic.Uint64   // sample counter for background answer judging
+	judgePaid     judgeBudget     // rolling token allowance for grading with a PAID model (see judge.go)
+	profiling     sync.Map        // worker ids with a cold-start profile in flight (de-dups overlapping profiles)
+	gateAudited   atomic.Bool     // set once the thinking-gate-vs-tier audit has logged (model-independent)
+	sessions      *sessionTracker // conversation → worker affinity; nil disables stickiness (see session.go)
 
 	// profileMeters holds a *profileMeter per worker id for the span of that
 	// worker's profiling run, so what the run consumed can be totalled onto the
@@ -1028,6 +1038,17 @@ func (r *Router) handleBackends(w http.ResponseWriter, req *http.Request) {
 	for _, b := range pub {
 		if _, ok := r.profiling.Load(b.ID); ok {
 			b.Profiling = true // background cold-start profile still running → values provisional
+		}
+		// The measured hit rate and its per-topic breakdown, which is what
+		// replaces the quality score on every display surface. Attached here
+		// rather than stored on the Backend because it is derived from the matrix
+		// on demand — storing it would create a second copy that could disagree
+		// with the rows routing actually queries.
+		if r.outcomes != nil {
+			b.Outcomes = &BackendOutcomes{
+				Thinking: r.outcomeSummaryFor(b.ID, true),
+				NoThink:  r.outcomeSummaryFor(b.ID, false),
+			}
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"backends": pub})
@@ -2836,7 +2857,7 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 					// Judging parses the answer text back out of the capture — skip when
 					// truncation removed part of it (a half answer grades as garbage).
 					if capture.truncated() <= 0 {
-						r.maybeJudge(chatReq.Messages, chatReq.Stream, served, score, entry.Output)
+						r.maybeJudge(chatReq.Messages, chatReq.Stream, served, score, entry.Output, entry.Thinking == thinkingOn, entry.DurationMillis)
 					}
 				}
 			}

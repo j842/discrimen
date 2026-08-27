@@ -97,7 +97,11 @@ func (b *judgeBudget) charge(tokens int) {
 // with the best model, feeding the verdict into the tier adapter. Non-blocking;
 // a no-op unless judging is enabled and a better model than the one that served
 // the request exists.
-func (r *Router) maybeJudge(messages []Message, stream bool, served *Backend, score float64, output string) {
+// thinking and latencyMS describe the request being graded, and exist so the
+// verdict can be recorded in the outcome matrix against the right (worker, mode)
+// pair. Without the mode a judged result would be filed against whichever mode
+// the matrix happened to be queried for, which is the one thing goal 3 forbids.
+func (r *Router) maybeJudge(messages []Message, stream bool, served *Backend, score float64, output string, thinking bool, latencyMS int64) {
 	if r.adapter == nil || r.judgeSem == nil || r.cfg.JudgeSampleRate <= 0 {
 		return
 	}
@@ -127,10 +131,19 @@ func (r *Router) maybeJudge(messages []Message, stream bool, served *Backend, sc
 	}
 	go func() {
 		defer func() { <-r.judgeSem }()
-		if bad, ok := r.askJudge(best, question, answer); ok && bad {
+		bad, ok := r.askJudge(best, question, answer)
+		if !ok {
+			return
+		}
+		if bad {
 			r.adapter.observe(score, true)
 			log.Printf("judge: %s answer for d=%.2f graded BAD by %s → raised tier bias", served.ID, score, best.ID)
 		}
+		// BOTH verdicts are recorded. The tier adapter only ever cared about bad
+		// ones — it is a correction signal — but the matrix is an estimate of a
+		// hit rate, and throwing away every success would make every judged
+		// worker look uniformly terrible on real traffic.
+		r.recordJudgedOutcome(served.ID, question, thinking, !bad, latencyMS)
 	}()
 }
 

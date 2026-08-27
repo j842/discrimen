@@ -301,3 +301,104 @@ func TestNoCandidateClearsTheFloor(t *testing.T) {
 		t.Errorf("picked %q, want the more accurate 'a' (reason %q)", got[0].ID, reason)
 	}
 }
+
+// The display summary must separate the two modes and must not fold judged
+// production answers into the bank score — the bank is the fixed instrument, and
+// mixing a moving sample of real traffic into it would make the headline drift
+// for reasons unrelated to the worker.
+func TestSummariseSeparatesModesAndSources(t *testing.T) {
+	m := newTestMatrix(t)
+	ctx := context.Background()
+	m.setVector("q1", vec(1, 0))
+	m.setVector("q2", vec(0.99, 0.14))
+	_ = m.record(ctx, []Observation{
+		obs("q1", "w", true, true, 100, obsSourceBench),
+		obs("q2", "w", true, false, 100, obsSourceBench),
+		obs("q1", "w", false, false, 100, obsSourceBench),
+		obs("q2", "w", false, false, 100, obsSourceBench),
+		obs("jq", "w", true, true, 100, obsSourceJudge),
+	})
+	topics := func(qid string) string {
+		if qid == "q1" {
+			return "maths"
+		}
+		return "coding"
+	}
+	on := m.summarise("w", true, topics)
+	if on.Total != 2 || on.Correct != 1 {
+		t.Errorf("thinking summary = %d/%d, want 1/2 — judged rows leaked into the bank score", on.Correct, on.Total)
+	}
+	if on.Judged != 1 {
+		t.Errorf("judged count = %d, want 1", on.Judged)
+	}
+	off := m.summarise("w", false, topics)
+	if off.Correct != 0 || off.Total != 2 {
+		t.Errorf("no-think summary = %d/%d, want 0/2 — the modes leaked", off.Correct, off.Total)
+	}
+	// The per-topic breakdown is the strengths-and-weaknesses map.
+	if len(on.ByTopic) != 2 {
+		t.Fatalf("expected two topics, got %d", len(on.ByTopic))
+	}
+	for _, ts := range on.ByTopic {
+		switch ts.Topic {
+		case "maths":
+			if ts.Rate != 1 {
+				t.Errorf("maths rate %.2f, want 1.0", ts.Rate)
+			}
+		case "coding":
+			if ts.Rate != 0 {
+				t.Errorf("coding rate %.2f, want 0.0", ts.Rate)
+			}
+		}
+	}
+	// A worker with no evidence must read as INSUFFICIENT, not as a zero rate —
+	// zero means "answered and was wrong".
+	none := m.summarise("never-seen", true, topics)
+	if !none.Insufficient {
+		t.Error("a worker with no observations does not report insufficient")
+	}
+}
+
+// Judged production questions are bounded; bank questions never are. Without
+// that the matrix grows without limit and every routed request scans it.
+func TestPruneJudgedKeepsBankQuestions(t *testing.T) {
+	m := newTestMatrix(t)
+	ctx := context.Background()
+	m.setVector("bank1", vec(1, 0))
+	_ = m.record(ctx, []Observation{obs("bank1", "w", true, true, 10, obsSourceBench)})
+	for i := 0; i < 20; i++ {
+		qid := "j" + string(rune('a'+i))
+		m.setVector(qid, vec(1, float64(i)/100))
+		o := obs(qid, "w", true, true, 10, obsSourceJudge)
+		o.At = time.Unix(int64(i), 0)
+		_ = m.record(ctx, []Observation{o})
+	}
+	m.pruneJudged(ctx, 5)
+	if p := m.predict(vec(1, 0), "w", true); p.Observations == 0 {
+		t.Error("pruning removed the bank question")
+	}
+	m.mu.RLock()
+	judged := 0
+	for _, list := range m.obs {
+		for _, o := range list {
+			if o.Source == obsSourceJudge {
+				judged++
+			}
+		}
+	}
+	m.mu.RUnlock()
+	if judged > 5 {
+		t.Errorf("%d judged questions survived a cap of 5", judged)
+	}
+	// The oldest went first.
+	m.mu.RLock()
+	_, keptNewest := m.obs["j"+string(rune('a'+19))]
+	_, keptOldest := m.obs["j"+string(rune('a'+0))]
+	m.mu.RUnlock()
+	if !keptNewest {
+		t.Error("the newest judged question was pruned")
+	}
+	if keptOldest {
+		t.Error("the oldest judged question survived")
+	}
+}

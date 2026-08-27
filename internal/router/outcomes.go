@@ -555,3 +555,159 @@ func backendsOf(cs []outcomeChoice) []*Backend {
 	}
 	return out
 }
+
+// pruneJudged bounds how many production questions the matrix carries.
+//
+// Bank questions are never pruned: they are the fixed instrument, and dropping
+// one would silently change what every worker's summary is computed over.
+// Judged questions are unbounded in principle — production traffic never stops —
+// and the matrix is scanned linearly per routed request, so both memory and
+// request latency depend on this cap. Oldest first, which is also right on the
+// merits: a verdict from months ago describes a fleet that has since changed.
+func (m *outcomeMatrix) pruneJudged(ctx context.Context, max int) {
+	if max <= 0 {
+		return
+	}
+	type aged struct {
+		qid string
+		at  time.Time
+	}
+	m.mu.Lock()
+	var judged []aged
+	for qid, list := range m.obs {
+		newest := time.Time{}
+		onlyJudged := true
+		for _, o := range list {
+			if o.Source != obsSourceJudge {
+				onlyJudged = false
+				break
+			}
+			if o.At.After(newest) {
+				newest = o.At
+			}
+		}
+		// A question with ANY bench evidence is a bank question and stays.
+		if onlyJudged && len(list) > 0 {
+			judged = append(judged, aged{qid, newest})
+		}
+	}
+	if len(judged) <= max {
+		m.mu.Unlock()
+		return
+	}
+	sort.Slice(judged, func(i, j int) bool { return judged[i].at.Before(judged[j].at) })
+	drop := judged[:len(judged)-max]
+	ids := make([]string, 0, len(drop))
+	for _, d := range drop {
+		delete(m.obs, d.qid)
+		delete(m.vecs, d.qid)
+		ids = append(ids, d.qid)
+	}
+	m.mu.Unlock()
+
+	if m.db == nil {
+		return
+	}
+	for _, qid := range ids {
+		if _, err := m.db.ExecContext(ctx, `DELETE FROM observations WHERE qid = ? AND source = ?`,
+			qid, obsSourceJudge); err != nil {
+			return // best effort: the in-memory prune is what bounds the hot path
+		}
+	}
+}
+
+// TopicSummary is one cluster of the bank and how a worker did on it — the
+// strengths-and-weaknesses map, computed from the same rows routing queries
+// rather than from a separate per-category tally that could disagree with them.
+type TopicSummary struct {
+	Topic   string  `json:"topic"`
+	Rate    float64 `json:"rate"`
+	Total   int     `json:"total"`
+	Correct int     `json:"correct"`
+}
+
+// OutcomeSummary is the display-only view of one worker in one mode.
+//
+// Explicitly NOT a routing input: routing queries neighbours of the actual
+// prompt, and compressing that into a headline is exactly the mistake the
+// quality scalar made. It exists so an operator has something to read, and so
+// the fallback path (which has no neighbours to consult) has an overall ordering
+// to work from.
+type OutcomeSummary struct {
+	Rate     float64        `json:"rate"`
+	Total    int            `json:"total"`
+	Correct  int            `json:"correct"`
+	Judged   int            `json:"judged"`
+	MedianMS int64          `json:"median_ms"`
+	ByTopic  []TopicSummary `json:"by_topic,omitempty"`
+	Thinking bool           `json:"thinking"`
+	// Insufficient marks a worker with no bank evidence in this mode — a fresh
+	// registration, or one profiled only in the other mode. Distinct from a rate
+	// of zero, which means it answered and was wrong.
+	Insufficient bool `json:"insufficient,omitempty"`
+}
+
+// summarise builds the display view, grouping bank questions by the topic label
+// attached to them.
+func (m *outcomeMatrix) summarise(backend string, thinking bool, topicOf func(qid string) string) OutcomeSummary {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := OutcomeSummary{Thinking: thinking}
+	byTopic := map[string]*TopicSummary{}
+	var latencies []int64
+	for qid, list := range m.obs {
+		for _, o := range list {
+			if o.Backend != backend || o.Thinking != thinking {
+				continue
+			}
+			if o.Source == obsSourceJudge {
+				out.Judged++
+				continue // real traffic has no topic label and is not part of the bank score
+			}
+			out.Total++
+			if o.Correct {
+				out.Correct++
+			}
+			if o.LatencyMS > 0 {
+				latencies = append(latencies, o.LatencyMS)
+			}
+			topic := "other"
+			if topicOf != nil {
+				if t := topicOf(qid); t != "" {
+					topic = t
+				}
+			}
+			ts := byTopic[topic]
+			if ts == nil {
+				ts = &TopicSummary{Topic: topic}
+				byTopic[topic] = ts
+			}
+			ts.Total++
+			if o.Correct {
+				ts.Correct++
+			}
+		}
+	}
+	if out.Total > 0 {
+		out.Rate = float64(out.Correct) / float64(out.Total)
+	}
+	out.Insufficient = out.Total == 0
+	out.MedianMS = medianInt64(latencies)
+	for _, ts := range byTopic {
+		if ts.Total > 0 {
+			ts.Rate = float64(ts.Correct) / float64(ts.Total)
+		}
+		out.ByTopic = append(out.ByTopic, *ts)
+	}
+	sort.Slice(out.ByTopic, func(i, j int) bool { return out.ByTopic[i].Topic < out.ByTopic[j].Topic })
+	return out
+}
+
+// BackendOutcomes is a worker's measured record in both thinking modes. The two
+// are reported side by side and never merged: they are separate models, and a
+// single headline would hide the case this fleet actually exhibits — a worker
+// materially better in one mode than the other.
+type BackendOutcomes struct {
+	Thinking *OutcomeSummary `json:"thinking,omitempty"`
+	NoThink  *OutcomeSummary `json:"nothink,omitempty"`
+}

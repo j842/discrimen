@@ -50,3 +50,6 @@ __pycache__/
 # pool.json. Reproducible from `discrimen bench fetch`, so not a source artefact.
 internal/router/benchdata/private/
 internal/router/zz*_test.go
+
+# Agent worktrees (transient; live checkouts, never content of this repo)
+.claude/worktrees/

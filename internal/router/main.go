@@ -2418,11 +2418,22 @@ func (r *Router) pickAndAcquire(ctx context.Context, candidates []*Backend) (*Ba
 	}
 	// Every candidate is momentarily saturated; wait, re-scanning each tick
 	// until one frees, the caller gives up, or slotMaxWait elapses.
+	//
+	// "Saturated" and "gone" are different waits. Waiting is only ever right for a
+	// worker that is busy, because a slot will free; a worker that has gone
+	// unhealthy, expired or deregistered will never hand one back, so once no
+	// candidate is routable at all there is nothing left to wait for. Without this
+	// a request pinned to a worker that just went down would sit for the full
+	// slotMaxWait — ten minutes — before reporting a timeout, when the answer was
+	// already known on the first scan.
 	deadline := time.NewTimer(slotMaxWait)
 	defer deadline.Stop()
 	poll := time.NewTicker(slotPollInterval)
 	defer poll.Stop()
 	for {
+		if !r.anyRoutable(candidates) {
+			return nil, nil, fmt.Errorf("no routable backend remains among %d candidate(s)", len(candidates))
+		}
 		select {
 		case <-ctx.Done():
 			return nil, nil, ctx.Err()
@@ -2436,15 +2447,51 @@ func (r *Router) pickAndAcquire(ctx context.Context, candidates []*Backend) (*Ba
 	}
 }
 
+// anyRoutable reports whether at least one candidate is still worth waiting for.
+func (r *Router) anyRoutable(candidates []*Backend) bool {
+	for _, b := range candidates {
+		if r.registry.stillRoutable(b.ID) {
+			return true
+		}
+	}
+	return false
+}
+
 // scanForSlot tries each candidate best-first and returns the first that has a
 // free concurrency slot (acquiring it), or ok=false if all are full.
+//
+// The candidate list was snapshotted when the request was planned, and
+// pickAndAcquire re-scans it every slotPollInterval for up to slotMaxWait — ten
+// minutes, during which a worker can go unhealthy, expire, or be taken down for
+// maintenance. Re-checking routability here is what stops a queue of waiting
+// requests from being handed to a worker that stopped being a candidate several
+// minutes ago; the ranking is still the plan's, only liveness is re-read.
 func (r *Router) scanForSlot(candidates []*Backend) (*Backend, chan struct{}, bool) {
 	for _, b := range candidates {
+		if !r.registry.stillRoutable(b.ID) {
+			continue
+		}
 		if slot, ok := r.registry.tryAcquireSlot(b.ID); ok {
 			return b, slot, true
 		}
 	}
 	return nil, nil, false
+}
+
+// stillRoutable reports whether a backend the router already chose still exists.
+//
+// Deliberately just existence, not the full eligible() predicate. The planner
+// applied health, readiness and expiry when it built the candidate list, and
+// re-applying them here would let a worker that merely blipped unhealthy for one
+// health tick drop a request that was already waiting patiently for it — the
+// candidate list is a decision, not a subscription. What must be re-read is
+// existence, because deregistration also deletes the slot channel, and an absent
+// slot channel reads as "uncapped" (see tryAcquireSlot).
+func (r *Registry) stillRoutable(id string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, ok := r.backends[id]
+	return ok
 }
 
 // acquirePreference is a BOUNDED first-choice set for slot acquisition: try to
@@ -4506,34 +4553,43 @@ func (r *Router) rawCompletion(backend *Backend, payload map[string]any) (map[st
 // timeout, so that deadline alone governs whether an answer arrived in time — the
 // usability bound is a benchmark criterion, independent of the live-proxy
 // BACKEND_TIMEOUT_SECONDS.
-// benchCompletion is one profiling generation.
-//
-// It counts against ActiveRequests like any other. It did not, and the omission
-// showed up two ways: `ask -l` reported s=0/8 on a worker the benchmark was
-// hammering at four concurrent generations, and — the part that actually
-// misroutes — expectedLatency, relayOccupancy and the Concurrency log column all
-// read that same counter, so the fleet's load was understated exactly while a
-// profile was saturating a GPU. Live traffic was then priced as if the worker
-// were idle and sent to it.
-//
-// It does NOT take a slot. Slots are the router's promise about how many
-// requests a worker can serve at once, and the benchmark deliberately runs
-// beside live traffic at a capped concurrency of its own; taking slots would
-// have profiling starve the traffic it is supposed to be improving. Counting
-// without reserving is the honest reading: the worker really is this busy, and
-// the router really has not set that work aside.
 func (r *Router) benchCompletion(ctx context.Context, backend *Backend, payload map[string]any) (map[string]any, error) {
-	if r.registry != nil { // nil only in tests that drive the benchmark directly
-		r.registry.incActive(backend.ID, 1)
-		defer r.registry.incActive(backend.ID, -1)
-	}
 	return r.doCompletion(ctx, r.benchClient, backend, payload)
 }
 
 // doCompletion POSTs a non-streamed chat completion and returns the decoded body.
 // The error string for a non-2xx response ("completion returned <code>: …") is parsed
 // by vision.go (completionStatusCode/isClientReject) — keep that prefix stable.
+//
+// EVERY router-originated generation lands here — the quality benchmark, the
+// capacity ramp, the chat/thinking/vision probes and the background judge all
+// funnel through doCompletion, rawCompletion or simpleCompletion — so this is
+// where they are counted against ActiveRequests.
+//
+// They were not counted, and the omission was not cosmetic. `ask -l` read s=0/8
+// on a worker the benchmark was driving at four concurrent generations; worse,
+// expectedLatency, relayOccupancy and the Concurrency request-log column all read
+// that same counter, so the fleet's load was understated exactly while a profile
+// saturated a GPU, and live traffic was priced as if the worker were idle and
+// routed onto it. The capacity ramp is the sharpest case: it fires up to
+// CapacityProbeMax concurrent generations (deployed at 16) at a worker that reads
+// as completely idle.
+//
+// The counter belongs HERE rather than around one caller. It was first added
+// around benchCompletion alone, which left the judge, the probes and the capacity
+// ramp still invisible — the same bug, one call site further out.
+//
+// None of this takes a SLOT. Slots are the router's promise about how many
+// requests a worker will be asked to serve at once, and this background work
+// deliberately runs beside live traffic under its own concurrency cap; reserving
+// slots would have profiling starve the traffic it exists to improve. Counting
+// without reserving is the honest reading: the worker really is this busy, and
+// the router really has not set that work aside.
 func (r *Router) doCompletion(ctx context.Context, client *http.Client, backend *Backend, payload map[string]any) (map[string]any, error) {
+	if r.registry != nil { // nil only in tests that drive a probe or the benchmark directly
+		r.registry.incActive(backend.ID, 1)
+		defer r.registry.incActive(backend.ID, -1)
+	}
 	body, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamChatURL(backend), bytes.NewReader(body))
 	if err != nil {
@@ -5162,9 +5218,26 @@ func (r *Registry) upsert(reg BackendRegistration) (*Backend, bool) {
 	// with a different cap we replace it. Any in-flight requests still hold
 	// a reference to the old channel and release into it harmlessly when
 	// they finish — the orphaned tokens are GC'd with the old channel.
-	if reg.MaxConcurrency > 0 {
+	//
+	// A registration that declares NO cap does not retract a cap the router
+	// measured for itself. Workers beacon with max_concurrency: 0 — they do not
+	// know their own capacity, which is the whole reason capacityProbe exists — so
+	// deleting the channel here handed a re-registering worker UNBOUNDED admission
+	// while the ranker still believed its measured cap. A worker restarting with a
+	// changed model would take the entire queue waiting on it at once, mid-reload.
+	// Only an explicit operator-declared zero should clear a measured cap, and that
+	// arrives through the provider path, not a beacon.
+	// r.slotCap, not existing.MaxConcurrency: `existing.BackendRegistration = reg`
+	// above has already overwritten the latter with the incoming zero. slotCap is
+	// the channel's own record of its capacity and survives the copy.
+	switch {
+	case reg.MaxConcurrency > 0:
 		r.syncSlotsLocked(reg.ID, reg.MaxConcurrency)
-	} else {
+	case r.slotCap[reg.ID] > 0:
+		// Keep the existing channel as-is. Recreating it here would hand out a
+		// fresh full set of tokens while in-flight requests still hold tokens from
+		// the old one, briefly over-admitting by exactly the in-flight count.
+	default:
 		delete(r.slots, reg.ID)
 		delete(r.slotCap, reg.ID)
 	}
@@ -5213,12 +5286,26 @@ func (r *Registry) remove(id string) bool {
 // tryAcquireSlot attempts a non-blocking slot acquisition for the named
 // backend. Returns (slot, true) on success — including the unbounded case,
 // where the slot is nil and releaseSlot is a no-op. Returns (nil, false) when
-// the backend has a declared cap and is currently full. Blocking/spilling
-// across backends is handled by pickAndAcquire.
+// the backend has a declared cap and is currently full, or when it is no longer
+// registered. Blocking/spilling across backends is handled by pickAndAcquire.
+//
+// A MISSING slot channel means "uncapped", and that is only the truth while the
+// backend still exists. Both remove() and upsert()'s uncapped branch delete the
+// entry, so an absent-backend check has to come first: without it, deregistering
+// a worker — or a worker re-registering with a changed model — made it look like
+// INFINITE free capacity to every request already queued in pickAndAcquire, which
+// polls a candidate list snapshotted at request start for up to slotMaxWait. Eight
+// requests waiting behind a full single-slot GPU would all dispatch at once into
+// the worker that had just dropped out, get 503s while its model reloaded, and
+// trip its circuit breaker. Decommissioning a worker made it maximally attractive.
 func (r *Registry) tryAcquireSlot(id string) (chan struct{}, bool) {
 	r.mu.RLock()
 	ch := r.slots[id]
+	_, registered := r.backends[id]
 	r.mu.RUnlock()
+	if !registered {
+		return nil, false
+	}
 	if ch == nil {
 		return nil, true
 	}

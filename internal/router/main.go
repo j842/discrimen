@@ -2915,11 +2915,11 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 	// can't rewind. Fall through to the single-shot path. ttftBase (slot
 	// acquisition), not start (request arrival), is the TTFT/decode measurement
 	// base so router-side queue wait doesn't pollute the latency EWMAs.
-	if chatReq.Stream {
-		r.dispatchStreaming(w, req, backend, body, route, &logEntry, capture, stats, ttftBase, job, thinking)
-		return
-	}
-	r.dispatchBuffered(w, req, &dispatch{
+	// ONE dispatch for both paths. The streaming path needs the plan and the slot
+	// to fail over before its first byte, which is exactly what the buffered path
+	// already had — building it here rather than only for the buffered branch is
+	// what lets both share redispatch's slot-swap.
+	d := &dispatch{
 		backend:   &backend,
 		slot:      &slot,
 		body:      body,
@@ -2934,7 +2934,15 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 		log:       &logEntry,
 		output:    capture,
 		escalated: &escalated,
-	})
+	}
+	// ttftBase (slot acquisition), not start (request arrival), is the TTFT and
+	// decode measurement base, so router-side queue wait does not pollute the
+	// latency EWMAs.
+	if chatReq.Stream {
+		r.dispatchStreaming(w, req, d, route, capture, stats, ttftBase, thinking)
+		return
+	}
+	r.dispatchBuffered(w, req, d)
 }
 
 // dispatchStreaming forwards a single SSE-style response from backend to
@@ -2943,7 +2951,8 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 // ttftBase is when the worker slot was acquired (NOT request arrival); the
 // first chunk's arrival minus ttftBase is the worker's true first-token latency,
 // excluding any router-side queue wait (see proxyToBackend / fix #4).
-func (r *Router) dispatchStreaming(w http.ResponseWriter, req *http.Request, backend *Backend, body []byte, route string, logEntry *RequestLog, capture io.Writer, stats *sseStats, ttftBase time.Time, job jobCost, thinking bool) {
+func (r *Router) dispatchStreaming(w http.ResponseWriter, req *http.Request, d *dispatch, route string, capture io.Writer, stats *sseStats, ttftBase time.Time, thinking bool) {
+	backend, body, logEntry, job := *d.backend, d.body, d.log, d.job
 	// Idle watchdog instead of a wall-clock cap: the old client-level
 	// BACKEND_TIMEOUT_SECONDS bounded the WHOLE stream, killing legitimate
 	// long generations mid-flow while still letting a silently hung backend
@@ -2976,6 +2985,31 @@ func (r *Router) dispatchStreaming(w http.ResponseWriter, req *http.Request, bac
 	}
 
 	resp, err := r.streamClient.Do(proxyReq)
+	// PRE-FIRST-BYTE FAILOVER. "SSE bytes cannot be recalled" is true from the
+	// first byte WRITTEN TO THE CLIENT, not from the dial — and nothing has been
+	// written yet. A worker that answers the dial with a 503 has told us it
+	// cannot serve this request, which is a routing failure exactly as it is on
+	// the buffered path, and the client is none the wiser if we ask someone else.
+	if other, newResp, moved := r.streamFailover(req, d, resp, err); moved {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		backend, resp, err = other, newResp, nil
+		body = d.body
+		upstreamURL = upstreamChatURL(backend)
+		_ = upstreamURL // re-derived for clarity; the dial has already happened
+		w.Header().Set("X-LLM-Failover", fmt.Sprintf("%s->%s", logEntry.BackendID, backend.ID))
+		logEntry.BackendID = backend.ID
+		logEntry.BackendModel = backend.Model
+		logEntry.ObservedTPS = backend.ObservedTPS
+		logEntry.CertifiedTPS = backend.Certification.TokensPerSec
+		logEntry.BaselineTPS = backend.BaselineTPS
+		logEntry.SpeedScore = speedScore(backend)
+		if s := d.plan.session.outcome(backend.ID); s != "" {
+			w.Header().Set("X-LLM-Session", s)
+		}
+		defer resp.Body.Close()
+	}
 	if err != nil {
 		// A client hangup surfaces here as context-canceled (ctx inherits
 		// req.Context()). That says nothing about the backend — with long prefills

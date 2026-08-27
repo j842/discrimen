@@ -1043,8 +1043,16 @@ func runStream(t *testing.T, srv *httptest.Server) (*httptest.ResponseRecorder, 
 	logEntry := &RequestLog{}
 	rec := httptest.NewRecorder()
 	req := post("/v1/chat/completions", `{"messages":[{"role":"user","content":"hi"}],"stream":true}`, "")
-	r.dispatchStreaming(rec, req, reg.get("w"), []byte(`{"stream":true}`), "route",
-		logEntry, io.Discard, &sseStats{}, time.Now(), nominalJob(), false)
+	backend := reg.get("w")
+	slot := make(chan struct{}, 1)
+	// plan.auto is false here on purpose: this test exercises the PUMP, and
+	// failover is a property of the dial. A plan with no candidates would decline
+	// anyway, but saying so explicitly keeps the two concerns separate.
+	r.dispatchStreaming(rec, req, &dispatch{
+		backend: &backend, slot: &slot,
+		body: []byte(`{"stream":true}`), raw: []byte(`{"stream":true}`),
+		plan: &routePlan{}, job: nominalJob(), log: logEntry, output: io.Discard,
+	}, "route", io.Discard, &sseStats{}, time.Now(), false)
 	return rec, logEntry
 }
 

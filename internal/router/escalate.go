@@ -39,6 +39,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -89,7 +90,43 @@ func (res bufferedResult) ok() bool {
 // better worker before replying.
 func (r *Router) dispatchBuffered(w http.ResponseWriter, req *http.Request, d *dispatch) {
 	backend := *d.backend
-	res := r.stripAndRetry(req, backend, d, r.requestBuffered(req, backend, d.body))
+	// FIRST attempt with no delay ladder. The ladder exists for a worker that is
+	// briefly loading or saturated, and sleeping is only the right answer when
+	// there is nowhere else to go — while it sleeps, the caller's slot on the
+	// FAILING worker stays held (releaseSlot is deferred in proxyToBackend), so
+	// 17 seconds of ladder pins a slot on a broken worker while healthy ones sit
+	// idle. Try somewhere else first; the ladder is the fallback, not the reflex.
+	res := r.stripAndRetry(req, backend, d, r.requestBufferedWithDelays(req, backend, d.body, nil))
+
+	// A 5xx with nothing written to the client is a ROUTING failure, not an
+	// answer: the caller asked the router to pick a worker, and the one it picked
+	// could not respond. Moving to the next candidate is the same decision the
+	// router already made once, with better information. Nothing has been written
+	// yet on this path, so it is invisible to the caller.
+	tried := map[string]bool{backend.ID: true}
+	if !res.ok() && retryableFailure(res) {
+		if other, next, ok := r.failover(req, d, res, tried); ok {
+			backend = other
+			res = next
+			w.Header().Set("X-LLM-Failover", fmt.Sprintf("%s->%s", d.log.BackendID, other.ID))
+			if s := d.plan.session.outcome(other.ID); s != "" {
+				w.Header().Set("X-LLM-Session", s)
+			}
+			d.log.BackendID = other.ID
+			d.log.BackendModel = other.Model
+			d.log.ObservedTPS = other.ObservedTPS
+			d.log.CertifiedTPS = other.Certification.TokensPerSec
+			d.log.BaselineTPS = other.BaselineTPS
+			d.log.SpeedScore = speedScore(other)
+		}
+	}
+
+	// Only now, with every alternative exhausted, is waiting the best available
+	// move: the worker may simply be loading, and a slot held on it is no longer
+	// denying the request a better home.
+	if !res.ok() && retryableFailure(res) && len(nextCandidates(d.plan, tried)) == 0 {
+		res = r.stripAndRetry(req, backend, d, r.requestBufferedWithDelays(req, backend, d.body, proxyRetryDelays))
+	}
 
 	if res.ok() && classifyResponse(res.body, false) == responseEmpty {
 		if better, betterRes, ok := r.escalate(req, d, res); ok {
@@ -151,40 +188,73 @@ func (r *Router) escalate(req *http.Request, d *dispatch, orig bufferedResult) (
 	// budget on the failed generation. Only escalate onto a worker that can still
 	// finish inside what's left — otherwise the repair turns a bad answer into no
 	// answer, which is the trade deadlineFilter exists to refuse.
-	if d.budget > 0 {
-		remaining := (d.budget - time.Since(d.start)).Seconds() * deadlineSafetyFactor
-		fits := filterCandidates(better, func(b *Backend) bool {
-			return expectedLatency(b, d.job) <= remaining
-		})
-		if len(fits) == 0 {
-			log.Printf("escalation: %s answered empty but only %.1fs of the caller's budget is left — keeping it",
-				from.ID, remaining)
-			return nil, orig, false
-		}
+	if fits, ok := r.affordable(d, better, from); ok {
 		better = fits
+	} else {
+		return nil, orig, false
 	}
+	// An escalation is only worth a second generation if the replacement is
+	// BETTER, so a result that is merely non-empty does not commit.
+	return r.redispatch(req, d, orig, better, func(res bufferedResult) bool {
+		return res.ok() && classifyResponse(res.body, false) != responseEmpty
+	})
+}
 
-	// Take the better worker's slot before giving up the current one, so a
-	// saturated fleet can't leave this request holding nothing. Bounded: past the
-	// grace, keep the original answer rather than queue the caller indefinitely.
+// affordable narrows candidates to those that can still finish inside whatever
+// remains of the caller's declared budget.
+func (r *Router) affordable(d *dispatch, cands []*Backend, from *Backend) ([]*Backend, bool) {
+	if d.budget <= 0 {
+		return cands, true
+	}
+	remaining := (d.budget - time.Since(d.start)).Seconds() * deadlineSafetyFactor
+	fits := filterCandidates(cands, func(b *Backend) bool {
+		return expectedLatency(b, d.job) <= remaining
+	})
+	if len(fits) == 0 {
+		log.Printf("redispatch: only %.1fs of the caller's budget is left after %s — not moving",
+			remaining, from.ID)
+		return nil, false
+	}
+	return fits, true
+}
+
+// redispatch is the MECHANICS of moving a request to another worker, with the
+// policy left to the caller.
+//
+// Two callers with different policies share it: escalate() moves a request whose
+// answer came back empty and only commits to something better, while failover()
+// moves one whose worker returned a 5xx and commits to any worker that answers
+// at all. The mechanics are identical and were fiddly enough to be worth having
+// in exactly one place — the ordering below is load-bearing.
+//
+// On success the caller's slot and active-request accounting have ALREADY been
+// moved to the returned worker.
+func (r *Router) redispatch(req *http.Request, d *dispatch, orig bufferedResult,
+	candidates []*Backend, accept func(bufferedResult) bool) (*Backend, bufferedResult, bool) {
+	from := *d.backend
+	// Take the new worker's slot BEFORE giving up the current one, so a saturated
+	// fleet cannot leave this request holding nothing. Bounded: past the grace,
+	// keep what we have rather than queue the caller indefinitely.
 	ctx, cancel := context.WithTimeout(req.Context(), escalateSlotWait)
 	defer cancel()
-	target, slot, _, err := r.pickAndAcquirePreferred(ctx, better, acquirePreference{})
+	target, slot, _, err := r.pickAndAcquirePreferred(ctx, candidates, acquirePreference{})
 	if err != nil {
-		log.Printf("escalation: no slot on a better worker within %s — keeping %s's empty answer", escalateSlotWait, from.ID)
+		log.Printf("redispatch: no slot on an alternative within %s — keeping %s", escalateSlotWait, from.ID)
 		return nil, orig, false
 	}
 
 	// Re-patch from the CLIENT's body, not the already-patched one: the previous
 	// worker's context ceiling may have clamped max_tokens, and inheriting that
-	// clamp would hand the better worker a budget shaped by a worker it is
-	// replacing. The served-model rewrite differs per worker too.
+	// clamp would hand the new worker a budget shaped by a worker it is replacing.
+	// The served-model rewrite differs per worker too.
 	body := patchForwardedBody(d.raw, d.inject, budgetCeiling(target, d.job), d.tr.forBackend(target), target.ServedID)
 	body = r.stripLearned(body, d.raw, target.ID)
 
 	r.registry.incActive(target.ID, 1)
-	res := r.requestBuffered(req, target, body)
-	if !res.ok() || classifyResponse(res.body, false) == responseEmpty {
+	// No delay ladder on the first attempt against a fresh worker: the point of
+	// moving is that this one has not just failed.
+	res := r.requestBufferedWithDelays(req, target, body, nil)
+	if !accept(res) {
 		// No better off. Give the slot back and leave everything as it was.
 		r.registry.incActive(target.ID, -1)
 		r.registry.releaseSlot(slot)
@@ -199,6 +269,21 @@ func (r *Router) escalate(req *http.Request, d *dispatch, orig bufferedResult) (
 	*d.slot = slot
 	d.body = body
 	return target, res, true
+}
+
+// nextCandidates is the request's candidates minus the workers already tried,
+// order preserved.
+//
+// Order is the whole value: plan.candidates arrives from the outcome matrix as
+// "workers expected to answer this prompt correctly, fastest first", so the next
+// one is already the right next one. Under the quality scalar this needed a
+// predicate to find something BETTER; it no longer does, and betterCandidates'
+// strict `Quality >` is now inconsistent with how routing actually ranks.
+func nextCandidates(plan *routePlan, tried map[string]bool) []*Backend {
+	if plan == nil {
+		return nil
+	}
+	return filterCandidates(plan.candidates, func(b *Backend) bool { return !tried[b.ID] })
 }
 
 // betterCandidates returns the request's candidates that are strictly higher
@@ -222,13 +307,42 @@ func betterCandidates(candidates []*Backend, from *Backend, job jobCost) []*Back
 // requestBuffered runs one buffered exchange against a worker, including the
 // 5xx/429 retry ladder, and returns the result WITHOUT writing to the client.
 func (r *Router) requestBuffered(req *http.Request, backend *Backend, body []byte) bufferedResult {
+	return r.requestBufferedWithDelays(req, backend, body, proxyRetryDelays)
+}
+
+// requestBufferedWithDelays is requestBuffered with the retry ladder supplied by
+// the caller, so a first attempt against a FRESH worker can skip it entirely.
+//
+// The ladder exists for a worker that is briefly loading or briefly saturated,
+// and sleeping is the right answer only when there is nowhere else to go. It
+// costs more than it looks: the caller's slot stays held for the whole ladder
+// (releaseSlot is deferred in proxyToBackend), so 17 seconds of sleep pins a slot
+// on a worker that is failing while other workers sit idle. Failover tries the
+// next candidate first with nil delays, and falls back to the ladder only once
+// candidates are exhausted.
+func (r *Router) requestBufferedWithDelays(req *http.Request, backend *Backend, body []byte, delays []time.Duration) bufferedResult {
 	upstreamURL := upstreamChatURL(backend)
 	var last bufferedResult
-	totalAttempts := len(proxyRetryDelays) + 1
+	totalAttempts := len(delays) + 1
 
 	for attempt := 0; attempt < totalAttempts; attempt++ {
 		if attempt > 0 {
-			delay := proxyRetryDelays[attempt-1]
+			delay := delays[attempt-1]
+			// An upstream that said WHEN to come back knows better than the ladder.
+			// This matters for relay rows and paid providers, where 503 means "busy,
+			// try again in N" rather than "broken".
+			if hint := retryAfterHint(last.header); hint > 0 && hint > delay {
+				delay = hint
+			}
+			// Never sleep past the caller's own deadline: waiting out a budget the
+			// router just worked to honour converts a slow answer into no answer.
+			if d, ok := req.Context().Deadline(); ok {
+				if left := time.Until(d); left <= 0 {
+					return last
+				} else if delay > left {
+					delay = left
+				}
+			}
 			log.Printf("backend=%s attempt %d/%d retrying after %s (prev status=%d err=%v)",
 				backend.ID, attempt+1, totalAttempts, delay, last.statusCode, last.netErr)
 			select {
@@ -299,8 +413,16 @@ func (r *Router) writeBuffered(w http.ResponseWriter, req *http.Request, backend
 		return
 	}
 	r.registry.noteProxyResult(backend.ID, res.statusCode < 500)
+	// A 5xx that reaches the client has survived failover, so record WHY on the
+	// worker: /backends otherwise shows a failing worker with an empty LastError,
+	// which reads as healthy. The body's first line is usually the whole story
+	// ("Loading model", "CUDA out of memory").
+	if res.statusCode >= 500 {
+		r.registry.setError(backend.ID, upstreamErrorSnippet(res.statusCode, res.body))
+	}
 	copyHeaders(w.Header(), res.header)
 	setRouteHeaders(w, backend, d.plan.route, d.log)
+	r.backfillRetryAfter(w.Header(), res.statusCode)
 	w.WriteHeader(res.statusCode)
 	d.log.StatusCode = res.statusCode
 	if _, err := w.Write(res.body); err != nil {
@@ -559,4 +681,224 @@ func strippableField(request, client map[string]json.RawMessage, field string) b
 	}
 	_, fromClient := client[field]
 	return !fromClient
+}
+
+// ── failover: a 5xx with nothing written is a routing failure ──────────────
+
+// retryableFailure reports whether a buffered result is worth trying elsewhere.
+//
+// A 4xx is NOT: the request itself is wrong, and every worker will say the same.
+// stripAndRetry owns the one 4xx worth retrying — an endpoint refusing a field
+// it does not recognise — and it retries on the SAME worker, which is correct
+// because the field, not the worker, is the problem.
+func retryableFailure(res bufferedResult) bool {
+	if res.netErr != nil {
+		return true
+	}
+	return res.statusCode >= 500 || res.statusCode == http.StatusTooManyRequests
+}
+
+// maxFailoverHops bounds how many workers one request may be moved across.
+// Two: enough to survive a worker that is down or loading, few enough that a
+// fleet-wide outage fails fast rather than walking every worker in turn while
+// the caller waits.
+const maxFailoverHops = 2
+
+// failover moves a request whose worker could not answer at all.
+//
+// The policy differs from escalate() in one way that matters: it accepts an
+// EQUAL worker. Escalation exists because an answer was bad, so only a better
+// worker justifies the second generation; here there was no answer, so any
+// worker that responds is an improvement. plan.candidates is already ordered
+// "expected to be correct, fastest first", so the next one is the right one.
+// tried is shared with the caller and MUTATED: it is what tells dispatchBuffered
+// whether every candidate has been exhausted, and therefore whether waiting on
+// the ladder is the last remaining move or merely the laziest one.
+func (r *Router) failover(req *http.Request, d *dispatch, res bufferedResult, tried map[string]bool) (*Backend, bufferedResult, bool) {
+	// Only where the ROUTER chose the worker. A pin or a named model is an
+	// instruction, and silently answering from somewhere else would break the
+	// guarantee the caller asked for — they would rather have the error.
+	if !d.plan.auto {
+		return nil, res, false
+	}
+	// Never inside an open tool loop, for the same reason escalation is not: the
+	// receiving model gets a tool result whose matching call it never emitted.
+	if d.plan.session.locked() {
+		return nil, res, false
+	}
+	current := res
+	for hop := 0; hop < maxFailoverHops; hop++ {
+		cands := nextCandidates(d.plan, tried)
+		if len(cands) == 0 {
+			break
+		}
+		if fits, ok := r.affordable(d, cands, *d.backend); ok {
+			cands = fits
+		} else {
+			break
+		}
+		from := (*d.backend).ID
+		// Accept anything that ANSWERS. An empty reply is escalate()'s business
+		// and is handled after this returns; here the bar is simply "responded".
+		// Marked BEFORE the attempt, not after: redispatch picks one of these
+		// internally, and a candidate that has been offered has had its chance
+		// whether or not a slot was free for it.
+		for _, b := range cands {
+			tried[b.ID] = true
+		}
+		target, next, ok := r.redispatch(req, d, current, cands, func(rr bufferedResult) bool {
+			return rr.ok()
+		})
+		if !ok {
+			continue
+		}
+		log.Printf("failover: %s returned %s for %s → re-served by %s (hop %d)",
+			from, describeFailure(current), d.plan.route, target.ID, hop+1)
+		return target, next, true
+	}
+	return nil, current, false
+}
+
+func describeFailure(res bufferedResult) string {
+	if res.netErr != nil {
+		return res.netErr.Error()
+	}
+	return fmt.Sprintf("HTTP %d", res.statusCode)
+}
+
+// retryAfterHint reads an upstream's own Retry-After, in seconds or as an HTTP
+// date. Zero when absent or unparseable.
+func retryAfterHint(h http.Header) time.Duration {
+	if h == nil {
+		return 0
+	}
+	v := strings.TrimSpace(h.Get("Retry-After"))
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
+// backfillRetryAfter restores the invariant that a 503 from this router always
+// tells the caller when to come back. An upstream 503 relayed verbatim often
+// carries no hint, and a client that cannot tell "retry shortly" from "give up"
+// retries immediately and makes the saturation worse.
+func (r *Router) backfillRetryAfter(dst http.Header, status int) {
+	if status != http.StatusServiceUnavailable || dst.Get("Retry-After") != "" {
+		return
+	}
+	if after := r.retryAfterUnavailable(); after > 0 {
+		dst.Set("Retry-After", strconv.Itoa(int(after.Seconds())))
+	}
+}
+
+// upstreamErrorSnippet renders a failed upstream response for the worker's
+// LastError, which is what an operator reads on /backends.
+//
+// Bounded and single-line: the body may be an HTML error page or a megabyte of
+// JSON, and the useful part is almost always at the front — "Loading model",
+// "CUDA out of memory", "model not found".
+func upstreamErrorSnippet(status int, body []byte) string {
+	msg := strings.TrimSpace(string(body))
+	if len(msg) > upstreamSnippetMax {
+		msg = msg[:upstreamSnippetMax] + "…"
+	}
+	msg = strings.Join(strings.Fields(msg), " ")
+	if msg == "" {
+		return fmt.Sprintf("HTTP %d", status)
+	}
+	return fmt.Sprintf("HTTP %d: %s", status, msg)
+}
+
+const upstreamSnippetMax = 200
+
+// streamFailover moves a STREAMING request that failed at the dial.
+//
+// The constraint everyone remembers about streaming — that bytes cannot be
+// recalled — is true from the first byte written TO THE CLIENT, not from the
+// dial. Between the two there is a window in which a 503 is just a routing
+// failure, indistinguishable to the caller from having picked the other worker
+// first. This is that window.
+//
+// Returns moved=false and leaves the caller's response untouched in every case
+// where it does not apply, so the ordinary path is unchanged.
+func (r *Router) streamFailover(req *http.Request, d *dispatch, resp *http.Response, dialErr error) (*Backend, *http.Response, bool) {
+	if !d.plan.auto || d.plan.session.locked() {
+		return nil, nil, false
+	}
+	// A dial error or a retryable status. Anything else — including every 4xx —
+	// is the request's own problem and will fail identically everywhere.
+	if dialErr == nil {
+		if resp == nil || (resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests) {
+			return nil, nil, false
+		}
+	} else if req.Context().Err() != nil {
+		return nil, nil, false // the CLIENT went away; not the worker's fault
+	}
+
+	tried := map[string]bool{(*d.backend).ID: true}
+	for hop := 0; hop < maxFailoverHops; hop++ {
+		cands := nextCandidates(d.plan, tried)
+		if len(cands) == 0 {
+			return nil, nil, false
+		}
+		fits, ok := r.affordable(d, cands, *d.backend)
+		if !ok {
+			return nil, nil, false
+		}
+		for _, b := range fits {
+			tried[b.ID] = true
+		}
+		from := *d.backend
+		ctx, cancel := context.WithTimeout(req.Context(), escalateSlotWait)
+		target, slot, _, err := r.pickAndAcquirePreferred(ctx, fits, acquirePreference{})
+		cancel()
+		if err != nil {
+			continue
+		}
+		body := patchForwardedBody(d.raw, d.inject, budgetCeiling(target, d.job), d.tr.forBackend(target), target.ServedID)
+		body = r.stripLearned(body, d.raw, target.ID)
+
+		newResp, dialErr2 := r.dialStream(req, target, body)
+		if dialErr2 != nil || newResp.StatusCode >= 500 || newResp.StatusCode == http.StatusTooManyRequests {
+			if newResp != nil {
+				newResp.Body.Close()
+			}
+			r.registry.releaseSlot(slot)
+			continue
+		}
+		// Commit, in the same order redispatch uses: the new slot is already held,
+		// so releasing the old one cannot leave this request holding nothing.
+		r.registry.incActive(target.ID, 1)
+		r.registry.incActive(from.ID, -1)
+		r.registry.releaseSlot(*d.slot)
+		*d.backend = target
+		*d.slot = slot
+		d.body = body
+		log.Printf("failover(stream): %s failed at the dial for %s → re-dialled on %s (hop %d)",
+			from.ID, d.plan.route, target.ID, hop+1)
+		return target, newResp, true
+	}
+	return nil, nil, false
+}
+
+// dialStream opens one upstream streaming request without pumping it, so the
+// status can be inspected before anything is committed to the client.
+func (r *Router) dialStream(req *http.Request, backend *Backend, body []byte) (*http.Response, error) {
+	proxyReq, err := http.NewRequestWithContext(req.Context(), http.MethodPost, upstreamChatURL(backend), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	proxyReq.Header.Set("Content-Type", "application/json")
+	setBackendCredential(proxyReq, backend)
+	r.stampRelayChain(proxyReq, req, backend)
+	return r.streamClient.Do(proxyReq)
 }

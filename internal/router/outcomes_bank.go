@@ -60,7 +60,13 @@ func observationsWith(hash, backendID string, results []BenchResult, at time.Tim
 	byPrompt := bankQIDByPrompt()
 	out := make([]Observation, 0, len(results))
 	for _, r := range results {
-		if r.Skipped || r.Errored {
+		// Skipped: never asked, so no evidence either way. Errored: a transport
+		// failure says nothing about the model. Unsupported: the prompt did not fit
+		// THIS deployment's context window, which is a fact about the box the
+		// weights are running on and not about the weights — filing it here would
+		// let one small-window deployment poison every other deployment of the same
+		// model, which would then read a genuine wrong answer and stop asking.
+		if r.Skipped || r.Errored || r.Unsupported {
 			continue
 		}
 		qid, ok := byPrompt[strings.TrimSpace(r.Prompt)]
@@ -73,6 +79,7 @@ func observationsWith(hash, backendID string, results []BenchResult, at time.Tim
 			Backend:   backendID,
 			Thinking:  thinkingOf(r),
 			Correct:   r.Pass,
+			Loose:     r.Loose,
 			LatencyMS: r.LatencyMS,
 			Source:    obsSourceBench,
 			At:        at,

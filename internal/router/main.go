@@ -6292,8 +6292,8 @@ func (s *LogStore) init(ctx context.Context) error {
 			backend_id TEXT NOT NULL DEFAULT '',
 			thinking INTEGER NOT NULL,
 			correct INTEGER NOT NULL,
+			loose INTEGER NOT NULL DEFAULT 0,
 			latency_ms INTEGER NOT NULL DEFAULT 0,
-			output_tokens INTEGER NOT NULL DEFAULT 0,
 			source TEXT NOT NULL,
 			created_at TEXT NOT NULL,
 			PRIMARY KEY (qid, model_hash, thinking, source)

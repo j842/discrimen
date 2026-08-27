@@ -74,6 +74,13 @@ type Observation struct {
 	Backend  string
 	Thinking bool
 	Correct  bool
+	// Loose records a HALF credit: the answer asserts the expected value but
+	// failed strict extraction (see checkAnswerLoose). Stored because Correct
+	// alone cannot carry it, and a cache hit that dropped it would re-score the
+	// same answers lower on every re-profile — the same worker, the same replies,
+	// a worse number, which is exactly the "two scores that no longer mean the
+	// same thing" failure the grading rules exist to prevent.
+	Loose bool
 	// LatencyMS is what the answer COST. Kept beside correctness rather than in a
 	// separate table because the routing decision needs both together — the
 	// fastest worker that will be right — and joining them later would mean
@@ -708,15 +715,15 @@ func (m *outcomeMatrix) persist(ctx context.Context, obs []Observation) error {
 	// set it, the column defaults to 0, and naming it here would only restate the
 	// default. See Observation.LatencyMS.
 	stmt, err := tx.PrepareContext(ctx, `INSERT OR REPLACE INTO observations
-		(qid, model_hash, backend_id, thinking, correct, latency_ms, source, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+		(qid, model_hash, backend_id, thinking, correct, loose, latency_ms, source, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 	for _, o := range obs {
 		if _, err := stmt.ExecContext(ctx, o.QID, o.ModelHash, o.Backend, boolInt(o.Thinking), boolInt(o.Correct),
-			o.LatencyMS, o.Source, o.At.UTC().Format(time.RFC3339Nano)); err != nil {
+			boolInt(o.Loose), o.LatencyMS, o.Source, o.At.UTC().Format(time.RFC3339Nano)); err != nil {
 			return err
 		}
 	}
@@ -871,8 +878,8 @@ func (m *outcomeMatrix) load(ctx context.Context) error {
 	if m.db == nil {
 		return nil
 	}
-	rows, err := m.db.QueryContext(ctx, `SELECT qid, model_hash, backend_id, thinking, correct, latency_ms,
-		source, created_at FROM observations`)
+	rows, err := m.db.QueryContext(ctx, `SELECT qid, model_hash, backend_id, thinking, correct, loose,
+		latency_ms, source, created_at FROM observations`)
 	if err != nil {
 		return err
 	}
@@ -880,13 +887,13 @@ func (m *outcomeMatrix) load(ctx context.Context) error {
 	loaded := map[string][]Observation{}
 	for rows.Next() {
 		var o Observation
-		var thinking, correct int
+		var thinking, correct, loose int
 		var at string
-		if err := rows.Scan(&o.QID, &o.ModelHash, &o.Backend, &thinking, &correct, &o.LatencyMS,
-			&o.Source, &at); err != nil {
+		if err := rows.Scan(&o.QID, &o.ModelHash, &o.Backend, &thinking, &correct, &loose,
+			&o.LatencyMS, &o.Source, &at); err != nil {
 			return err
 		}
-		o.Thinking, o.Correct = thinking == 1, correct == 1
+		o.Thinking, o.Correct, o.Loose = thinking == 1, correct == 1, loose == 1
 		o.At, _ = time.Parse(time.RFC3339Nano, at)
 		loaded[o.QID] = append(loaded[o.QID], o)
 	}

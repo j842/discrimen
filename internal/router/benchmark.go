@@ -287,6 +287,10 @@ type BenchResult struct {
 	Errored   bool   `json:"errored,omitempty"`
 	Slow      bool   `json:"slow,omitempty"`  // exceeded benchAnswerDeadline — too slow to be usable, scored a fail (not a transport error)
 	Loose     bool   `json:"loose,omitempty"` // failed strict extraction but asserts the expected answer — half credit (see checkAnswerLoose)
+	// Unsupported means the prompt exceeded this worker's context window. A miss
+	// for this worker, and deliberately NOT evidence about the model: the window
+	// is a property of the deployment, not the weights.
+	Unsupported bool `json:"unsupported,omitempty"`
 	// LatencyMS is how long this answer took, for the outcome matrix.
 	LatencyMS int64 `json:"latency_ms,omitempty"`
 	// Skipped means the profile budget stopped before this question was asked.
@@ -558,6 +562,9 @@ type benchOutcome struct {
 	// one; it exists so the results slice can stay index-aligned with
 	// benchmarkQuestions, which runNoThinkQualityBenchmark consumes positionally.
 	skipped bool
+	// unsupported means the prompt does not fit this worker's context window. A
+	// miss for this worker and NOT evidence about the model — see benchOne.
+	unsupported bool
 	// cached means the verdict came from the permacache rather than a generation:
 	// this model has answered this exact question, graded this exact way, before.
 	// Counted into the "cached=N" term of the per-run log line so a profile that
@@ -614,9 +621,17 @@ func (r *Router) benchOne(b *Backend, q benchmarkQ, think bool, busy *benchBusyT
 	// window answers the 48K rung, and a 32K deployment of the same weights would
 	// inherit that pass and be recorded as able to reason over 48K of context it
 	// cannot even accept. Its own window is the better answer and it is free.
+	//
+	// Marked `unsupported` as well as failed, because the two audiences differ.
+	// THIS worker's score should carry the miss — it genuinely cannot answer. The
+	// MODEL's shared record must not, because the window is not a property of the
+	// weights: recording it there would let one 32K deployment poison every other
+	// deployment of the same model, which would then read a real wrong answer and
+	// never ask. See observationsWith, which drops these.
 	if wanted := benchPromptTokenEstimate(prompt) + benchMinAnswerTokens; ctxTokens > 0 && wanted > ctxTokens {
 		res.got = fmt.Sprintf("(prompt needs ~%d tokens, worker window is %d)", wanted, ctxTokens)
-		return res // pass=false, errd=false: counted, and counted as a miss
+		res.unsupported = true
+		return res // pass=false, errd=false: counted for this worker, not for the model
 	}
 	// THE PERMACACHE. Has this model already answered this question, graded this
 	// way? If so the answer cannot have changed — the qid pins the prompt, the
@@ -629,7 +644,7 @@ func (r *Router) benchOne(b *Backend, q benchmarkQ, think bool, busy *benchBusyT
 	// hits, on every worker, in both modes.
 	if r.outcomes != nil {
 		if hit, sameWorker, ok := r.outcomes.cachedVerdict(benchQuestionQID(q), modelHash(b), b.ID, think); ok {
-			res.pass, res.cached, res.got = hit.Correct, true, "(cached)"
+			res.pass, res.loose, res.cached, res.got = hit.Correct, hit.Loose, true, "(cached)"
 			// Latency only from the worker that measured it. A hit from another
 			// deployment of the same weights is a real verdict and a meaningless
 			// duration — different box, different load — and the matrix already
@@ -915,7 +930,7 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 		details = append(details, BenchResult{
 			Tier: q.Tier, Prompt: q.Prompt, Expect: q.Expect,
 			Got: res.got, Pass: res.pass, Truncated: res.trunc, Errored: res.errd, Slow: res.slow,
-			Loose: res.loose, LatencyMS: res.latencyMS,
+			Loose: res.loose, LatencyMS: res.latencyMS, Unsupported: res.unsupported,
 		})
 		if !res.pass {
 			reason := " (wrong)"
@@ -1149,7 +1164,7 @@ func (r *Router) runNoThinkQualityBenchmark(b *Backend, concurrency int, mixed [
 		details = append(details, BenchResult{
 			Tier: q.Tier, Prompt: q.Prompt, Expect: q.Expect,
 			Got: res.got, Pass: res.pass, Truncated: res.trunc, Errored: res.errd, Slow: res.slow,
-			Loose: res.loose, LatencyMS: res.latencyMS,
+			Loose: res.loose, LatencyMS: res.latencyMS, Unsupported: res.unsupported,
 		})
 		switch {
 		case res.errd:

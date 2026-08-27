@@ -100,6 +100,19 @@ const outcomeNeighbours = 12
 // report low confidence rather than average over irrelevant questions.
 const outcomeMinSimilarity = 0.55
 
+// outcomeMinConfidence is the MEAN neighbour similarity a prediction needs
+// before it may gate routing, and it is deliberately above the admission floor.
+//
+// It used to equal outcomeMinSimilarity, which made the gate vacuous: a
+// neighbour is only admitted at all when its similarity clears that floor, and
+// the mean of values each >= X is >= X. The check could never be false, so
+// known() reduced to "at least two observations" while the file's comments
+// rested their honesty on a confidence figure that gated nothing.
+//
+// Set so a prediction built from barely-admitted neighbours is treated as
+// unknown, while one built from genuinely close ones is not.
+const outcomeMinConfidence = 0.68
+
 // outcomeMinObservations is the floor on how many nearby answers a prediction
 // must rest on before it may gate routing. Below it the answer is "I do not
 // know", which the caller handles explicitly.
@@ -137,7 +150,7 @@ type prediction struct {
 // known reports whether a prediction rests on enough nearby evidence to gate a
 // routing decision.
 func (p prediction) known() bool {
-	return p.Observations >= outcomeMinObservations && p.Confidence >= outcomeMinSimilarity
+	return p.Observations >= outcomeMinObservations && p.Confidence >= outcomeMinConfidence
 }
 
 // outcomeMatrix holds the observations and the question vectors they refer to.

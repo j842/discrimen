@@ -97,7 +97,7 @@ func (r *Router) dispatchBuffered(w http.ResponseWriter, req *http.Request, d *d
 	// FAILING worker stays held (releaseSlot is deferred in proxyToBackend), so
 	// 17 seconds of ladder pins a slot on a broken worker while healthy ones sit
 	// idle. Try somewhere else first; the ladder is the fallback, not the reflex.
-	res := r.stripAndRetry(req, backend, d, r.requestBufferedWithDelays(req, backend, d.body, nil))
+	res := r.stripAndRetry(req, backend, d, r.requestBufferedWithDelays(req, backend, d.body, nil, d.remainingBudget()))
 
 	// A 5xx with nothing written to the client is a ROUTING failure, not an
 	// answer: the caller asked the router to pick a worker, and the one it picked
@@ -126,7 +126,7 @@ func (r *Router) dispatchBuffered(w http.ResponseWriter, req *http.Request, d *d
 	// move: the worker may simply be loading, and a slot held on it is no longer
 	// denying the request a better home.
 	if !res.ok() && retryableFailure(res) && len(nextCandidates(d.plan, tried)) == 0 {
-		res = r.stripAndRetry(req, backend, d, r.requestBufferedWithDelays(req, backend, d.body, proxyRetryDelays))
+		res = r.stripAndRetry(req, backend, d, r.requestBufferedWithDelays(req, backend, d.body, proxyRetryDelays, d.remainingBudget()))
 	}
 
 	if res.ok() && classifyResponse(res.body, false) == responseEmpty {
@@ -260,7 +260,7 @@ func (r *Router) redispatch(req *http.Request, d *dispatch, orig bufferedResult,
 	r.registry.incActive(target.ID, 1)
 	// No delay ladder on the first attempt against a fresh worker: the point of
 	// moving is that this one has not just failed.
-	res := r.requestBufferedWithDelays(req, target, body, nil)
+	res := r.requestBufferedWithDelays(req, target, body, nil, d.remainingBudget())
 	if !accept(res) {
 		// No better off. Give the slot back and leave everything as it was.
 		r.registry.incActive(target.ID, -1)
@@ -314,7 +314,7 @@ func betterCandidates(candidates []*Backend, from *Backend, job jobCost) []*Back
 // requestBuffered runs one buffered exchange against a worker, including the
 // 5xx/429 retry ladder, and returns the result WITHOUT writing to the client.
 func (r *Router) requestBuffered(req *http.Request, backend *Backend, body []byte) bufferedResult {
-	return r.requestBufferedWithDelays(req, backend, body, proxyRetryDelays)
+	return r.requestBufferedWithDelays(req, backend, body, proxyRetryDelays, 0)
 }
 
 // requestBufferedWithDelays is requestBuffered with the retry ladder supplied by
@@ -327,7 +327,17 @@ func (r *Router) requestBuffered(req *http.Request, backend *Backend, body []byt
 // on a worker that is failing while other workers sit idle. Failover tries the
 // next candidate first with nil delays, and falls back to the ladder only once
 // candidates are exhausted.
-func (r *Router) requestBufferedWithDelays(req *http.Request, backend *Backend, body []byte, delays []time.Duration) bufferedResult {
+// budgetLeft is what remains of the CALLER's declared deadline, or 0 when they
+// declared none. Passed explicitly because req.Context() has no deadline —
+// net/http never sets one, there is no TimeoutHandler in the serving path, and
+// the real budget arrives in a header — so the context check this replaced could
+// never fire. With a 100ms declared deadline and a three-rung ladder it slept
+// 1.2s; in production, 17s against any shorter budget.
+func (r *Router) requestBufferedWithDelays(req *http.Request, backend *Backend, body []byte, delays []time.Duration, budgetLeft time.Duration) bufferedResult {
+	deadline := time.Time{}
+	if budgetLeft > 0 {
+		deadline = time.Now().Add(budgetLeft)
+	}
 	upstreamURL := upstreamChatURL(backend)
 	var last bufferedResult
 	totalAttempts := len(delays) + 1
@@ -339,14 +349,23 @@ func (r *Router) requestBufferedWithDelays(req *http.Request, backend *Backend, 
 			// This matters for relay rows and paid providers, where 503 means "busy,
 			// try again in N" rather than "broken".
 			if hint := retryAfterHint(last.header); hint > 0 && hint > delay {
+				// Capped. A rate-limited provider answering "Retry-After: 60" would
+				// otherwise make the router sleep a minute per rung, twice, holding
+				// the caller's slot throughout — the hint is advice about the
+				// upstream, not permission to abandon the caller.
+				if hint > maxRetryAfterWait {
+					hint = maxRetryAfterWait
+				}
 				delay = hint
 			}
 			// Never sleep past the caller's own deadline: waiting out a budget the
 			// router just worked to honour converts a slow answer into no answer.
-			if d, ok := req.Context().Deadline(); ok {
-				if left := time.Until(d); left <= 0 {
+			if !deadline.IsZero() {
+				left := time.Until(deadline)
+				if left <= 0 {
 					return last
-				} else if delay > left {
+				}
+				if delay > left {
 					delay = left
 				}
 			}
@@ -951,4 +970,23 @@ func (r *Router) noteFailedAttempt(backendID string, res bufferedResult) {
 		r.registry.setError(backendID, upstreamErrorSnippet(res.statusCode, res.body))
 	}
 	r.registry.noteProxyResult(backendID, res.statusCode < 500)
+}
+
+// maxRetryAfterWait caps how long an upstream's own Retry-After may make this
+// router sleep on one rung. Long enough to honour a real "busy, come back
+// shortly"; short enough that a provider answering in minutes cannot hold a
+// caller's slot for them.
+const maxRetryAfterWait = 5 * time.Second
+
+// remainingBudget is what is left of the caller's declared deadline, or 0 when
+// they declared none. Zero means "unbounded" to every consumer, which matches
+// the meaning of an absent X-LLM-Deadline-MS.
+func (d *dispatch) remainingBudget() time.Duration {
+	if d == nil || d.budget <= 0 {
+		return 0
+	}
+	if left := d.budget - time.Since(d.start); left > 0 {
+		return left
+	}
+	return time.Nanosecond // expired: let the caller see it rather than sleeping
 }

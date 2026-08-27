@@ -435,3 +435,42 @@ func TestChooseNeverNarrowsTheCandidateList(t *testing.T) {
 		t.Errorf("fallback returned %d of 3 candidates", len(all))
 	}
 }
+
+// The confidence gate must be able to BIND. It used to be compared against the
+// same constant that admits a neighbour in the first place — and the mean of
+// values each >= X is >= X — so the check could never be false and known()
+// silently reduced to "at least two observations", while the file's comments
+// rested their honesty on a figure that gated nothing.
+func TestConfidenceGateCanActuallyFail(t *testing.T) {
+	if outcomeMinConfidence <= outcomeMinSimilarity {
+		t.Fatalf("outcomeMinConfidence (%.2f) must exceed outcomeMinSimilarity (%.2f), or "+
+			"the gate is vacuous by construction", outcomeMinConfidence, outcomeMinSimilarity)
+	}
+	m := newTestMatrix(t)
+	ctx := context.Background()
+	// Two neighbours that only just clear the admission floor.
+	far1 := normalize([]float64{1, 1.2})
+	far2 := normalize([]float64{1, 1.25})
+	m.setVector("far1", far1)
+	m.setVector("far2", far2)
+	_ = m.record(ctx, []Observation{
+		obs("far1", "w", true, true, 10, obsSourceBench),
+		obs("far2", "w", true, true, 10, obsSourceBench),
+	})
+	p := m.predict([]float64{1, 0}, "w", true)
+	if p.Observations >= outcomeMinObservations && p.known() {
+		t.Errorf("barely-admitted neighbours produced a KNOWN prediction (conf=%.3f) — "+
+			"the gate still cannot distinguish close evidence from distant evidence", p.Confidence)
+	}
+	// ...while genuinely close neighbours still qualify.
+	m2 := newTestMatrix(t)
+	m2.setVector("near1", normalize([]float64{1, 0.02}))
+	m2.setVector("near2", normalize([]float64{1, 0.05}))
+	_ = m2.record(ctx, []Observation{
+		obs("near1", "w", true, true, 10, obsSourceBench),
+		obs("near2", "w", true, true, 10, obsSourceBench),
+	})
+	if near := m2.predict([]float64{1, 0}, "w", true); !near.known() {
+		t.Errorf("close neighbours produced an unusable prediction (conf=%.3f)", near.Confidence)
+	}
+}

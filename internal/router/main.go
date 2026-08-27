@@ -3448,14 +3448,20 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 	// (everyone is above-bar), so the acquire step behaves exactly as before.
 	return &routePlan{
 		candidates: rankBackends(filtered, job, tr.noThink),
-		route:      routeKind(wantModel),
-		cl:         cl,
-		job:        job,
-		tr:         tr,
-		session:    sess,
-		group:      gr,
-		expert:     expert,
-		rejected:   rejected,
+		// The ROUTER still chose this worker — the classifier being unavailable
+		// does not make it the caller's pick. Omitting this switched off
+		// escalation, both failover paths and the judge in exactly the degraded
+		// mode where they matter most, which is the same four-feature silent
+		// disable dace4c9 was written to prevent.
+		auto:     wantModel == "",
+		route:    routeKind(wantModel),
+		cl:       cl,
+		job:      job,
+		tr:       tr,
+		session:  sess,
+		group:    gr,
+		expert:   expert,
+		rejected: rejected,
 	}, nil
 }
 

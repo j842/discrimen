@@ -243,3 +243,63 @@ func TestAutoRouteIsStructuralNotStringSniffed(t *testing.T) {
 		t.Error("parseRouteScore accepted a named-model route")
 	}
 }
+
+// Every branch that lets the ROUTER choose the worker must mark the plan auto.
+// The classifier being unavailable does not make the pick the caller's — and
+// omitting it switched off escalation, both failover paths and the judge in
+// exactly the degraded mode where they matter most.
+func TestEveryRouterChosenBranchIsAuto(t *testing.T) {
+	reg := newTestRegistry()
+	readyBackend(reg, "tiny", 20, 200, 2)
+	req := &ChatRequest{Messages: []Message{{Role: "user", Content: "hi"}}}
+
+	// No classifier at all — the degraded mode, which reaches the third branch.
+	bare := &Router{cfg: &Config{DefaultMaxTokens: 4096}, registry: reg,
+		sessions: newSessionTracker(time.Hour, 16)}
+	plan, err := bare.planRoute(req, 0, false)
+	if err != nil {
+		t.Fatalf("planRoute: %v", err)
+	}
+	if !plan.auto {
+		t.Errorf("route %q from the no-classifier branch is not marked auto, so escalation, "+
+			"both failover paths and the judge are all switched off", plan.route)
+	}
+
+	// And a client-named model is NOT auto on that same branch: the caller chose.
+	named := &ChatRequest{Model: "tiny", Messages: req.Messages}
+	if p, err := bare.planRoute(named, 0, false); err == nil && p.auto {
+		t.Errorf("route %q for a client-named model is marked auto", p.route)
+	}
+}
+
+// An upstream's Retry-After is advice about the upstream, not permission to
+// abandon the caller.
+func TestRetryAfterIsCapped(t *testing.T) {
+	if maxRetryAfterWait > 10*time.Second {
+		t.Errorf("maxRetryAfterWait is %s — long enough to hold a caller's slot hostage", maxRetryAfterWait)
+	}
+	h := http.Header{}
+	h.Set("Retry-After", "600")
+	if hint := retryAfterHint(h); hint <= maxRetryAfterWait {
+		t.Fatalf("test premise wrong: hint %s already under the cap", hint)
+	}
+}
+
+// The retry ladder must honour the caller's declared budget. It read
+// req.Context().Deadline(), which net/http never sets, so the check could never
+// fire and the ladder slept its full length against any budget.
+func TestRemainingBudget(t *testing.T) {
+	none := &dispatch{}
+	if none.remainingBudget() != 0 {
+		t.Error("no declared budget should read as unbounded (0)")
+	}
+	live := &dispatch{budget: time.Second, start: time.Now()}
+	if b := live.remainingBudget(); b <= 0 || b > time.Second {
+		t.Errorf("remaining = %v, want just under 1s", b)
+	}
+	expired := &dispatch{budget: time.Millisecond, start: time.Now().Add(-time.Hour)}
+	if b := expired.remainingBudget(); b <= 0 {
+		t.Errorf("an expired budget returned %v; it must stay positive-but-tiny so the "+
+			"ladder returns immediately rather than reading as unbounded", b)
+	}
+}

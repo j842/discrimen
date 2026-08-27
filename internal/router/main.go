@@ -588,6 +588,18 @@ func Main() {
 	defer logs.Close()
 
 	router := &Router{cfg: cfg, registry: registry, client: &http.Client{Timeout: cfg.BackendHTTPTimeout}, streamClient: &http.Client{}, benchClient: &http.Client{}, logs: logs}
+	// The outcome matrix shares the request log's database — same file, same
+	// single connection — so a profile's results and the requests that produced
+	// them are backed up and restored together. Loading is best effort: an
+	// unreadable matrix means predictions fall back to "unknown", which routes
+	// on overall hit rate and speed, whereas refusing to start would take the
+	// fleet down over a cache.
+	router.outcomes = newOutcomeMatrix(logs.db)
+	if err := router.outcomes.load(context.Background()); err != nil {
+		log.Printf("outcome matrix: load failed, starting empty: %v", err)
+	} else {
+		log.Printf("outcome matrix: %s", router.outcomes)
+	}
 	// Before anything is served: generate the credentials the operator did not
 	// supply and print them once. An empty ROUTER_CLIENT_TOKENS used to mean no
 	// client authentication at all, which is right on a trusted LAN and wrong for
@@ -672,12 +684,17 @@ type Router struct {
 	logs         *LogStore
 	classifier   *difficultyClassifier // nil unless auto difficulty routing is enabled
 	adapter      *tierAdapter          // nil unless online tier adaptation is enabled
-	judgeSem     chan struct{}         // bounds concurrent background judge calls; nil unless judging enabled
-	judgeCount   atomic.Uint64         // sample counter for background answer judging
-	judgePaid    judgeBudget           // rolling token allowance for grading with a PAID model (see judge.go)
-	profiling    sync.Map              // worker ids with a cold-start profile in flight (de-dups overlapping profiles)
-	gateAudited  atomic.Bool           // set once the thinking-gate-vs-tier audit has logged (model-independent)
-	sessions     *sessionTracker       // conversation → worker affinity; nil disables stickiness (see session.go)
+	// outcomes is the measured record of which worker answered which question
+	// correctly, and how fast — the thing routing queries instead of comparing a
+	// quality percentage against a difficulty score. Nil disables it, in which
+	// case routing falls back to the older quality-target path. See outcomes.go.
+	outcomes    *outcomeMatrix
+	judgeSem    chan struct{}   // bounds concurrent background judge calls; nil unless judging enabled
+	judgeCount  atomic.Uint64   // sample counter for background answer judging
+	judgePaid   judgeBudget     // rolling token allowance for grading with a PAID model (see judge.go)
+	profiling   sync.Map        // worker ids with a cold-start profile in flight (de-dups overlapping profiles)
+	gateAudited atomic.Bool     // set once the thinking-gate-vs-tier audit has logged (model-independent)
+	sessions    *sessionTracker // conversation → worker affinity; nil disables stickiness (see session.go)
 
 	// profileMeters holds a *profileMeter per worker id for the span of that
 	// worker's profiling run, so what the run consumed can be totalled onto the
@@ -1135,6 +1152,15 @@ func (r *Router) handleBackendByID(w http.ResponseWriter, req *http.Request) {
 		}
 		if err := r.logs.DeleteWorkerProfile(req.Context(), id); err != nil {
 			log.Printf("delete worker profile for %q: %v", id, err)
+		}
+		// The matrix rows go with the profile. A deleted worker that comes back is
+		// re-profiled from scratch — usually because something about it changed —
+		// and stale rows would let the OLD worker's results decide routes for the
+		// new one until every question had been re-answered.
+		if r.outcomes != nil {
+			if err := r.outcomes.forget(req.Context(), id); err != nil {
+				log.Printf("delete outcome rows for %q: %v", id, err)
+			}
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"status": "removed", "id": id})
 	case http.MethodGet:
@@ -3277,6 +3303,28 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 	// quality/speed levers. Best-effort: if the classifier is unavailable (no
 	// embeddings worker) or the request carries no messages (a bare /v1/completions
 	// call), fall through to the quality-ranked fallback below.
+	// FIRST: the outcome matrix, which answers the routing question directly —
+	// which of these workers got questions like this one right, and which of
+	// those is fastest. No quality score, no difficulty target, nothing compared
+	// against anything. It supersedes the tier path below wherever it has
+	// evidence, and declines (leaving the tier path in place) where it does not,
+	// so the two can run side by side until the tier machinery is removed.
+	if cl != nil && r.outcomes != nil && len(cl.vec) > 0 {
+		if ordered, reason := r.outcomes.chooseByOutcome(filtered, cl.vec, !tr.noThink, job); len(ordered) > 0 {
+			return &routePlan{
+				candidates: ordered,
+				route:      fmt.Sprintf("%s:%s", routeKind(wantModel), reason),
+				cl:         cl,
+				job:        job,
+				tr:         tr,
+				session:    sess,
+				group:      gr,
+				expert:     expert,
+				rejected:   rejected,
+			}, nil
+		}
+	}
+
 	if cl != nil && r.cfg.AutoDifficulty {
 		target := r.classifier.targetForFleet(filtered, r.adapter.adjust(cl.difficulty), tr.noThink)
 		// target is surfaced as the quality floor so the acquire step prefers to

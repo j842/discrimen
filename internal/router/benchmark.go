@@ -189,6 +189,8 @@ type BenchResult struct {
 	Errored   bool   `json:"errored,omitempty"`
 	Slow      bool   `json:"slow,omitempty"`  // exceeded benchAnswerDeadline — too slow to be usable, scored a fail (not a transport error)
 	Loose     bool   `json:"loose,omitempty"` // failed strict extraction but asserts the expected answer — half credit (see checkAnswerLoose)
+	// LatencyMS is how long this answer took, for the outcome matrix.
+	LatencyMS int64 `json:"latency_ms,omitempty"`
 	// Skipped means the profile budget stopped before this question was asked.
 	// Deliberately phrased as "skipped" rather than "ran": false is the zero
 	// value, so a result recorded before this field existed reads as HAVING run,
@@ -391,6 +393,10 @@ const (
 
 // benchOutcome is the graded result of one benchmark question against one worker.
 type benchOutcome struct {
+	// latencyMS is how long the answer took. Recorded per question because the
+	// outcome matrix predicts "how long does this KIND of prompt take this
+	// worker", which a fleet-wide throughput average cannot answer.
+	latencyMS int64
 	// skipped means the question was never asked, because the profile budget ran
 	// out before it was dispatched. It is NOT a miss and must not be scored as
 	// one; it exists so the results slice can stay index-aligned with
@@ -442,6 +448,10 @@ func (r *Router) benchOne(b *Backend, q benchmarkQ, think bool, busy *benchBusyT
 	var slow bool
 	deadline := benchAnswerDeadline
 	abandoned := false
+	// Timed across the whole call including retries, because that is the wall
+	// clock a caller would have experienced. A busy-retry is time the request
+	// really spent waiting.
+	started := time.Now()
 	for attempt := 1; ; attempt++ {
 		if busy != nil && busy.abandoned() {
 			abandoned = true
@@ -475,6 +485,7 @@ func (r *Router) benchOne(b *Backend, q benchmarkQ, think bool, busy *benchBusyT
 		}
 		time.Sleep(benchRetryBackoff * time.Duration(attempt))
 	}
+	res.latencyMS = time.Since(started).Milliseconds()
 	switch {
 	case abandoned:
 		// Not a wrong answer and not this question's fault: the worker stopped
@@ -631,7 +642,7 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 		details = append(details, BenchResult{
 			Tier: q.Tier, Prompt: q.Prompt, Expect: q.Expect,
 			Got: res.got, Pass: res.pass, Truncated: res.trunc, Errored: res.errd, Slow: res.slow,
-			Loose: res.loose,
+			Loose: res.loose, LatencyMS: res.latencyMS,
 		})
 		if !res.pass {
 			reason := " (wrong)"
@@ -796,7 +807,7 @@ func (r *Router) runNoThinkQualityBenchmark(b *Backend, concurrency int, mixed [
 		details = append(details, BenchResult{
 			Tier: q.Tier, Prompt: q.Prompt, Expect: q.Expect,
 			Got: res.got, Pass: res.pass, Truncated: res.trunc, Errored: res.errd, Slow: res.slow,
-			Loose: res.loose,
+			Loose: res.loose, LatencyMS: res.latencyMS,
 		})
 		switch {
 		case res.errd:

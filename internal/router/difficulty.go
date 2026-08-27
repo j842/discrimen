@@ -358,6 +358,13 @@ type difficultyBand struct {
 type classification struct {
 	difficulty float64 // 0 = trivial, 1 = hard → model tier
 	reasoning  float64 // 0 = direct, 1 = needs reasoning → thinking mode
+	// vec is the prompt's normalised embedding, kept rather than discarded so
+	// the outcome matrix can find similar profiled questions without a second
+	// embedding call. It rides in the classification (and therefore in the
+	// cache) because it is derived from exactly the same text: computing it
+	// separately would double the embedding cost of every request and could
+	// disagree with the difficulty score it sits beside.
+	vec []float64
 }
 
 // centroids are the four normalised seed-group centroids.
@@ -509,6 +516,7 @@ func (c *difficultyClassifier) classify(req *ChatRequest) (classification, bool)
 	cl := classification{
 		difficulty: clamp01(0.5 + 0.5*math.Tanh((dot(v, cents.hard)-dot(v, cents.simple))/c.temp)),
 		reasoning:  clamp01(0.5 + 0.5*math.Tanh((dot(v, cents.reasoning)-dot(v, cents.direct))/c.temp)),
+		vec:        v,
 	}
 	c.cache.put(text, cl)
 	return cl, true

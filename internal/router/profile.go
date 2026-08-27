@@ -456,6 +456,27 @@ func (r *Router) profileBackend(b *Backend, model string) (*WorkerProfile, error
 		p.QualityNoThink = quality
 		p.QualityNoThinkDetail = qBreakdown
 	}
+	// Feed the outcome matrix. This is what routing will query — per question,
+	// not per worker — so it is recorded from the SAME results the score above
+	// was computed from, rather than re-derived later from a stored profile that
+	// might have been written by a different grader.
+	//
+	// Best effort: a matrix write that fails costs prediction quality, and
+	// failing the profile over it would throw away a run that has just cost
+	// hours. The rows are re-created by the next profile.
+	if r.outcomes != nil {
+		at := time.Now().UTC()
+		rows := observationsFrom(b.ID, p.BenchResults, true, at)
+		rows = append(rows, observationsFrom(b.ID, p.BenchResultsNoThink, false, at)...)
+		if err := r.outcomes.record(context.Background(), rows); err != nil {
+			log.Printf("outcome matrix: recording %s failed: %v", b.ID, err)
+		} else if err := r.ensureBankVectors(context.Background()); err != nil {
+			// Without vectors the rows are unreachable — every prediction falls
+			// back — so this is worth a line even though it is not fatal.
+			log.Printf("outcome matrix: embedding the bank failed, predictions will fall back: %v", err)
+		}
+	}
+
 	// Usable context, measured rather than believed. Last because it is the one
 	// probe whose cost scales with the worker's own claim — a model advertising
 	// 256K spends real minutes in prefill proving it — and because a failure here

@@ -675,28 +675,31 @@ func TestExpertRestrictsThePanelToTheKeysModels(t *testing.T) {
 
 // ── The router must not learn from an ensemble ──────────────────────────────
 
-// TestExpertTeachesTheAdapterNothing: the adapter and the judge key off
-// "route:d=", and an ensemble is not a tier the router chose — N models' work
-// says nothing about where one request should have gone.
-func TestExpertTeachesTheAdapterNothing(t *testing.T) {
-	if _, ok := parseRouteScore(routeExpert); ok {
-		t.Fatal("the expert route parses as a router-chosen tier")
-	}
+// An ensemble is not a routing decision the router can learn from: N models'
+// work says nothing about where ONE request should have gone. The judge is the
+// only learner left, and it is gated on plan.auto — which an expert plan never
+// sets, so the ensemble is excluded structurally rather than by the shape of its
+// route string.
+//
+// It used to be excluded because "expert" does not parse as "route:d=", which
+// held only while every learner sniffed that prefix. The tier adapter that read
+// it has since been removed and the judge moved to plan.auto; this pins the
+// property that outlived both.
+func TestAnEnsembleIsNotARouterChoice(t *testing.T) {
 	alpha, beta, gamma := threeModels()
 	r := expertFleet(t, alpha, beta, gamma)
-	cfg := *r.cfg
-	cfg.AdaptBins, cfg.AdaptMaxBias, cfg.AdaptLRUp, cfg.AdaptLRDown = 10, 0.3, 0.04, 0.01
-	r.cfg = &cfg
-	r.adapter = newTierAdapter(&cfg, t.TempDir()+"/tier_adapter.json")
 
-	if rec := askExpert(t, r, ""); rec.Code != http.StatusOK {
-		t.Fatalf("status = %d", rec.Code)
+	req := &ChatRequest{Model: expertModel, Messages: []Message{{Role: "user", Content: "say hello"}}}
+	plan, err := r.planRoute(req, 0, false)
+	if err != nil {
+		t.Fatalf("planRoute: %v", err)
 	}
-	time.Sleep(50 * time.Millisecond) // the proxy path's bookkeeping is a goroutine
-	for i, bias := range r.adapter.snapshot() {
-		if bias != 0 {
-			t.Fatalf("the adapter learned from an ensemble (bin %d = %v)", i, bias)
-		}
+	if plan.route != routeExpert {
+		t.Fatalf("test premise wrong: route = %q, want %q", plan.route, routeExpert)
+	}
+	if plan.auto {
+		t.Error("an expert plan is marked auto, so the judge would record an ensemble's " +
+			"answer as evidence about the one worker that happened to synthesise it")
 	}
 }
 

@@ -69,14 +69,6 @@ type Config struct {
 	AutoThinking       bool
 	ReasoningThreshold float64 // reasoning score ≥ this → enable thinking
 
-	// Online tier adapter (self-improving). Learns an upward score bias per
-	// difficulty region from inadequate (empty/truncated) responses.
-	AdaptOnline  bool
-	AdaptMaxBias float64
-	AdaptLRUp    float64
-	AdaptLRDown  float64
-	AdaptBins    int
-
 	// JudgeSampleRate is the fraction of served answers graded in the background
 	// by another worker; the verdict is recorded in the outcome matrix, which is
 	// the only evidence the router ever gets about the traffic it actually serves
@@ -672,11 +664,6 @@ func Main() {
 			cfg.AutoDifficulty, cfg.DifficultyBands, cfg.AutoThinking, cfg.ReasoningThreshold)
 		go router.warnIfNoEmbeddings()
 	}
-	if cfg.AdaptOnline {
-		router.adapter = newTierAdapter(cfg, filepath.Join(filepath.Dir(cfg.LogDBPath), "tier_adapter.json"))
-		go router.adapter.persistLoop()
-		log.Printf("online tier adaptation enabled (max_bias=%.2f bins=%d)", cfg.AdaptMaxBias, cfg.AdaptBins)
-	}
 	if cfg.JudgeSampleRate > 0 {
 		router.judgeSem = make(chan struct{}, judgeMaxConcurrent)
 		log.Printf("background answer judging enabled (sample rate=%.2f, %d concurrent)", cfg.JudgeSampleRate, judgeMaxConcurrent)
@@ -732,7 +719,6 @@ type Router struct {
 	benchClient  *http.Client // no client-level timeout — the cold-start benchmark bounds each request by benchAnswerDeadline via context instead
 	logs         *LogStore
 	classifier   *difficultyClassifier // nil unless auto difficulty routing is enabled
-	adapter      *tierAdapter          // nil unless online tier adaptation is enabled
 	// outcomes is the measured record of which worker answered which question
 	// correctly, and how fast — the thing routing queries instead of comparing a
 	// quality percentage against a difficulty score. Nil disables it, in which
@@ -811,14 +797,6 @@ const (
 	// reasoningThreshold is the reasoning score at or above which thinking is
 	// enabled.
 	reasoningThreshold = 0.35
-
-	// The adapter's learning rates. Up is four times down because the signal it
-	// learns from is asymmetric: an inadequate answer is direct evidence the tier
-	// was too low, while an adequate one is only weak evidence it was too high.
-	adaptMaxBias = 0.30
-	adaptLRUp    = 0.04
-	adaptLRDown  = 0.01
-	adaptBins    = 10
 
 	// judgeSampleRate is the fraction of SERVED answers graded in the background
 	// by another worker in the fleet. This is the signal that makes a fast-but-dim
@@ -925,12 +903,6 @@ func loadConfig() *Config {
 		AutoThinking:       auto,
 		ReasoningThreshold: reasoningThreshold,
 
-		AdaptOnline:  auto,
-		AdaptMaxBias: adaptMaxBias,
-		AdaptLRUp:    adaptLRUp,
-		AdaptLRDown:  adaptLRDown,
-		AdaptBins:    adaptBins,
-
 		JudgeSampleRate: judge,
 
 		ProfileWorkers:   true,
@@ -996,8 +968,6 @@ func (r *Router) routes() *http.ServeMux {
 	// froze it there, and anything new is admin-scoped under /admin.
 	mux.HandleFunc("/admin/usage", r.handleUsage)
 	mux.HandleFunc("/admin/outcomes", r.handleOutcomes)
-	mux.HandleFunc("/v1/route-feedback", r.handleRouteFeedback)
-	mux.HandleFunc("/route-feedback", r.handleRouteFeedback)
 	mux.HandleFunc("/v1/route-preview", r.handleRoutePreview)
 	mux.HandleFunc("/route-preview", r.handleRoutePreview)
 	mux.HandleFunc("/debug/backends/", r.handleDebugBackends)
@@ -1451,53 +1421,6 @@ func (r *Router) handleRegisterBackend(w http.ResponseWriter, req *http.Request)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"status": "registered", "id": backend.ID})
-}
-
-// handleRouteFeedback records an explicit outcome for a previously auto-routed
-// request, feeding the online tier adapter a stronger signal than the passive
-// empty/truncated detection. A client (e.g. the agent on escalation) POSTs the
-// X-LLM-Route of the response it's grading plus a verdict. No-op when online
-// adaptation is disabled.
-// handleRouteFeedback stays CLIENT scope: a caller grading its own answer feeds
-// the adapter a signal only that caller has, and the payload names no worker,
-// no other client and nothing about the fleet.
-func (r *Router) handleRouteFeedback(w http.ResponseWriter, req *http.Request) {
-	if req.Method != http.MethodPost {
-		methodNotAllowed(w)
-		return
-	}
-	if _, ok := r.requireClient(w, req); !ok {
-		return
-	}
-	var fb struct {
-		Route   string   `json:"route"`   // X-LLM-Route being graded, e.g. "route:d=0.42,q>=2"
-		Score   *float64 `json:"score"`   // alternative: the raw difficulty score directly
-		Verdict string   `json:"verdict"` // "inadequate"/"escalate"/"bad" → needs higher; else clean
-	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, req.Body, 1<<20)).Decode(&fb); err != nil {
-		writeJSON(w, http.StatusBadRequest, validationError{Message: fmt.Sprintf("invalid json: %s", err)})
-		return
-	}
-	if r.adapter == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"status": "ignored", "reason": "online adaptation disabled"})
-		return
-	}
-	var score float64
-	if fb.Score != nil {
-		score = *fb.Score
-	} else if s, ok := parseRouteScore(fb.Route); ok {
-		score = s
-	} else {
-		writeJSON(w, http.StatusBadRequest, validationError{Message: "feedback needs a difficulty `route` (route:d=…) or a `score`"})
-		return
-	}
-	needHigher := false
-	switch strings.ToLower(strings.TrimSpace(fb.Verdict)) {
-	case "inadequate", "escalate", "bad", "retry", "higher":
-		needHigher = true
-	}
-	r.adapter.observe(score, needHigher)
-	writeJSON(w, http.StatusOK, map[string]any{"status": "recorded"})
 }
 
 // handleModels stays CLIENT scope, and has to: a client cannot use an OpenAI
@@ -2896,9 +2819,9 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 	// clone, so an aged-out verdict is re-tested rather than believed for ever.
 	// Usually empty, and then free.
 	body = r.stripLearned(body, rawBody, backend.ID)
-	// Make a missed preference observable WITHOUT touching X-LLM-Route (its
-	// route:d=…,q>=… form is parsed by parseRouteScore): a dedicated response
-	// header plus a log line. The route header still records the target the prompt
+	// Make a missed preference observable WITHOUT touching X-LLM-Route, which
+	// clients and the arena both parse: a dedicated response header plus a log
+	// line. The route header still records the target the prompt
 	// was classified to need; this records that we couldn't honour it within the
 	// grace and served elsewhere.
 	if missedPref {
@@ -2965,9 +2888,8 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 	if chatReq.Stream {
 		stats = &sseStats{}
 	}
-	// escalated records that an inline escalation happened, so the adapter still
-	// learns the region needed a better model even though the answer it finally
-	// returned was fine.
+	// escalated records that an inline escalation happened, so X-Llm-Escalated can
+	// report the repair even though the answer finally returned was fine.
 	escalated := false
 	defer func() {
 		logEntry.DurationMillis = time.Since(start).Milliseconds()
@@ -3011,44 +2933,19 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 		}
 		entry := redactForRelay(logEntry, ident)
 		served := backend
-		didEscalate := escalated
 		caller := ident
 		autoRoute := plan.auto
 		go func() {
 			r.recordKeyUse(caller, charged)
-			// Self-improvement: feed this auto-routed request's outcome back to the
-			// online tier adapter (no-op unless enabled and this was a "route:d=" pick).
-			// A failed/aborted transfer (client hung up mid-stream, worker died) says
-			// nothing about answer quality — feeding it as "inadequate" ratcheted
-			// bins toward expensive workers on exactly the slow-prefill prompts
-			// clients abort most.
-			// A relayed request was classified by the router that sent it, which is
-			// already learning from this same outcome — see learnFromRelay.
+			// A failed or aborted transfer (client hung up mid-stream, worker died)
+			// says nothing about answer quality, so it teaches nothing. A relayed
+			// request was classified by the router that sent it, which is already
+			// learning from this same outcome — see learnFromRelay.
 			clean := entry.Error == "" && entry.StatusCode >= 200 && entry.StatusCode < 300
-			// The ADAPTER needs the numeric difficulty score, so it still keys on
-			// the "route:d=" form — that is the tier machinery learning about tiers,
-			// and a matrix route has no tier for it to learn about.
-			if r.adapter != nil && learnFromRelay(caller) && clean {
-				if score, ok := parseRouteScore(route); ok {
-					// Streamed inadequacy comes from the full-stream stats; the capture
-					// may have truncated the middle away.
-					inadequate := false
-					if stats != nil {
-						inadequate = stats.inadequate()
-					} else {
-						inadequate = responseInadequate(capture.Bytes(), false)
-					}
-					// An escalation REPAIRED the answer, so the body now looks clean —
-					// but the tier the router originally picked was the wrong one, which
-					// is exactly what the adapter exists to learn. Without this the
-					// repair would teach it the opposite.
-					r.adapter.observe(score, inadequate || didEscalate)
-				}
-			}
-			// The JUDGE is gated separately, on whether the router chose the worker
-			// — NOT on the adapter's score format. It feeds the outcome matrix, and
-			// keying it on "route:d=" meant it never ran on a matrix-routed request:
-			// the matrix's own feedback loop was open, closing only when the
+			// The judge is gated on whether THE ROUTER chose this worker, structurally
+			// (plan.auto), not by sniffing the route string. It used to key on a
+			// literal "route:d=" prefix, which meant it never ran on a matrix-routed
+			// request: the matrix's own feedback loop was open, closing only when the
 			// embeddings worker was down and the tier path took over.
 			//
 			// Judging parses the answer text back out of the capture, so it is
@@ -3586,9 +3483,27 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 	// FIRST: the outcome matrix, which answers the routing question directly —
 	// which of these workers got questions like this one right, and which of
 	// those is fastest. No quality score, no difficulty target, nothing compared
-	// against anything. It supersedes the tier path below wherever it has
-	// evidence, and declines (leaving the tier path in place) where it does not,
-	// so the two can run side by side until the tier machinery is removed.
+	// against anything.
+	//
+	// IT NEVER DECLINES, and this comment used to say it did — "supersedes the
+	// tier path wherever it has evidence, and declines where it does not, so the
+	// two can run side by side". That sentence was wrong and expensive. It is the
+	// reason the tier branch below LOOKS reachable, and three separate audits had
+	// to re-derive from the code that it is not.
+	//
+	// chooseByOutcome RANKS; it does not filter. With no evidence it falls through
+	// to its own bank-rate fallback and still returns every candidate in some
+	// order. Its only empty return needs len(cands) == 0, which is already
+	// excluded above. r.outcomes is assigned unconditionally at startup, and
+	// classify() cannot report ok without having written a vector. So whenever
+	// cl != nil this branch returns, and NOTHING BELOW IT RUNS.
+	//
+	// What is left below is therefore dead: targetForFleet, autoTargetQuality and
+	// rankByDifficulty are reachable only from tests. They are kept for now
+	// because deleting them touches difficulty.go's band tables and the arena's
+	// target_quality field, and that is a separate change from removing the
+	// adapter that used to feed them. Do not read their presence as evidence that
+	// a tier path still exists.
 	if cl != nil && r.outcomes != nil && len(cl.vec) > 0 {
 		// Self-healing: cheap when already filled (one atomic load), and the only
 		// thing that fills the bank after a warm restart.
@@ -3614,15 +3529,16 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 	}
 
 	if cl != nil && r.cfg.AutoDifficulty {
-		target := r.classifier.targetForFleet(filtered, r.adapter.adjust(cl.difficulty), tr.noThink)
+		target := r.classifier.targetForFleet(filtered, cl.difficulty, tr.noThink)
 		// target is surfaced as the quality floor so the acquire step prefers to
 		// wait BRIEFLY for an above-target worker before spilling below it (fix #2);
 		// routing too cheap is the quality-risky direction.
 		//
-		// A client-named model reports as "model:…" rather than "route:…" on
-		// purpose: parseRouteScore only reads the "route:d=" form, so the online
-		// tier adapter and the background judge learn from tiers the ROUTER chose
-		// and not from ones a harness chose for it.
+		// A client-named model reports as "model:…" rather than "route:…" so an
+		// operator reading a log or a header can tell a decision the ROUTER made
+		// from one a harness made for it. Nothing branches on the spelling any
+		// more — the judge is gated on plan.auto — but the distinction is still
+		// the first thing you want when a route looks wrong.
 		return &routePlan{
 			candidates: rankByDifficulty(filtered, target, job, tr.noThink),
 			auto:       wantModel == "",

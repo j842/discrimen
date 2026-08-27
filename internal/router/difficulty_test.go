@@ -1192,8 +1192,8 @@ func TestSelectBackendsHonoursNamedModel(t *testing.T) {
 			t.Fatalf("candidate %s serves %q, not the named model", b.ID, b.Model)
 		}
 	}
-	// Reported as "model:…" so parseRouteScore ignores it and the online tier
-	// adapter never learns from a tier the client picked.
+	// Reported as "model:…" so an operator can tell a client's choice from the
+	// router's. plan.auto is what actually gates the judge.
 	if strings.HasPrefix(route, "route") {
 		t.Fatalf("a client-named model must not report as an auto route, got %q", route)
 	}

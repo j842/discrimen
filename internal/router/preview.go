@@ -25,7 +25,7 @@ package router
 // like working answers.
 //
 // It is strictly read-only. It does not acquire a slot, record a session turn,
-// feed the adapter, or contact a worker. Two side effects it can have, both of
+// or contact a worker. Two side effects it can have, both of
 // them reads: populating the classifier's prompt→score cache, which is exactly
 // what the next real request would have done anyway, and querying the outcome
 // matrix, which is a read under its own lock and changes nothing in it.
@@ -82,10 +82,9 @@ type previewCandidate struct {
 //
 // It exists because the preview described a router that no longer runs. The
 // decision half was three fields from the difficulty-tier ranker — target_quality,
-// above_bar and adapter_bias — and the matrix path sets none of them. On every
+// above_bar — and the matrix path sets neither. On every
 // live request target_quality was 0, so above_bar was true for every candidate
-// forever, and adapter_bias reported a correction from a table nothing consults
-// (see adapter.go). The endpoint whose entire job is "explain this route" was
+// forever. The endpoint whose entire job is "explain this route" was
 // explaining the route the router stopped taking, with three fields that never
 // varied, which is a harder failure to notice than an absent field.
 //
@@ -161,20 +160,13 @@ type previewResponse struct {
 	// and ranks rather than declines. It is kept, and kept unconditional, because
 	// `discrimen arena` reads it off this struct; read a 0 as "no quality floor
 	// was in play", not as "the floor was zero".
-	TargetQuality int `json:"target_quality"`
-	// AdapterBias is the upward score correction the online tier adapter would
-	// contribute, and it is reported ONLY when a quality target exists — which
-	// is the only branch of planRoute that ever calls adapter.adjust. On the
-	// matrix path the adapter is not consulted at all, and publishing a non-zero
-	// bias there described a correction that was never applied to anything. See
-	// the reachability note at the top of adapter.go.
-	AdapterBias float64         `json:"adapter_bias,omitempty"`
-	Classified  bool            `json:"classified"`
-	Thinking    previewThinking `json:"thinking"`
-	Job         previewJob      `json:"job"`
-	Session     previewSession  `json:"session"`
-	Group       *previewGroup   `json:"group,omitempty"`
-	Expert      *previewExpert  `json:"expert,omitempty"`
+	TargetQuality int             `json:"target_quality"`
+	Classified    bool            `json:"classified"`
+	Thinking      previewThinking `json:"thinking"`
+	Job           previewJob      `json:"job"`
+	Session       previewSession  `json:"session"`
+	Group         *previewGroup   `json:"group,omitempty"`
+	Expert        *previewExpert  `json:"expert,omitempty"`
 	// Able is how many of the leading Candidates the matrix judged
 	// interchangeable on correctness. Acquisition may reorder within that prefix
 	// — preferring a free local worker over a paid remote one — and must not
@@ -377,14 +369,7 @@ func (r *Router) renderPreview(chatReq *ChatRequest, plan *routePlan, budget tim
 	if plan.cl != nil {
 		d, rs := plan.cl.difficulty, plan.cl.reasoning
 		resp.Difficulty, resp.Reasoning, resp.Classified = &d, &rs, true
-		// Only where the adapter was actually consulted. planRoute calls
-		// adapter.adjust in exactly one place — the branch that also sets
-		// plan.target — so a target means the bias was applied to the score this
-		// route was derived from, and no target means it was not. Reporting it
-		// unconditionally attributed a correction to a decision that never saw it.
-		if plan.target > 0 {
-			resp.AdapterBias = round3(r.adapter.adjust(d) - d)
-		} else if r.outcomes != nil && len(plan.cl.vec) > 0 {
+		if r.outcomes != nil && len(plan.cl.vec) > 0 {
 			resp.Notes = append(resp.Notes,
 				"ranked by the outcome matrix: predicted correctness on graded questions like this one, then speed. "+
 					"target_quality is 0 and above_bar is absent because no quality bar is involved — the candidates carry "+

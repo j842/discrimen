@@ -99,7 +99,7 @@ exists to solve.
 | `ROUTER_JUDGE_SAMPLE_RATE` | `judgeSampleRate` = 0.2 (`main.go`), gated on `ROUTER_AUTO_ROUTING` |
 | `ROUTER_LATENCY_EST_THINK_TOKENS` | `latencyEstThinkTokens` = 1500 (`difficulty.go`) |
 | `ROUTER_LATENCY_EST_TOKENS` | `latencyEstTokens` = 256 (`difficulty.go`) |
-| `ROUTER_ONLINE_ADAPT` | `AdaptOnline` now follows `ROUTER_AUTO_ROUTING`. The adapter it switches on is no longer consulted by routing — see `adapter.go` |
+| `ROUTER_ONLINE_ADAPT` | Removed with the online tier adapter itself, along with `tier_adapter.json` and `POST /v1/route-feedback`. Nothing consulted its learned bias: it fed only the difficulty-tier branch, which the outcome matrix supersedes on every classified request |
 | `ROUTER_PROFILE_WORKERS` | `ProfileWorkers: true` in `loadConfig` |
 | `ROUTER_QUALITY_FLOOR_WAIT_SECONDS` | `qualityFloorWait` = 10s (`main.go`) |
 | `ROUTER_REASONING_THRESHOLD` | `reasoningThreshold` = 0.35 (`main.go`) |
@@ -168,7 +168,7 @@ Three more variables changed rather than disappearing.
 
 - `ROUTER_AUTO_DIFFICULTY` and `ROUTER_AUTO_THINKING` are replaced by the single
   `ROUTER_AUTO_ROUTING`, which also governs background judging (and the online
-  adapter, which no longer affects routing). It defaults to **true**. The old
+  adapter, now removed). It defaults to **true**. The old
   pair defaulted to false in the binary and true in the deployment template.
 - `ROUTER_CLIENT_TOKEN` (singular) was the default for the `-token` flag on the
   `arena` and `bench` subcommands. It is now `ROUTER_ADMIN_KEY`, because both

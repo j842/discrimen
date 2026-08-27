@@ -35,15 +35,11 @@ package router
 //     reasoning field removed from what it produces.
 //
 // What an ensemble must NOT do is teach the router anything, and it is kept out
-// of both learners three times over. serveExpert owns the whole response and
-// never goes through proxyToBackend, so the deferred goroutine that feeds the
-// adapter and the judge is not on this path at all. An expert plan carries
-// auto=false, which is the flag the JUDGE is gated on since it stopped sniffing
-// the route string. And the route string is "expert", which parseRouteScore does
-// not recognise, so the ADAPTER — which still needs a numeric difficulty score
-// and therefore still parses it — has nothing to observe against. All three say
-// the same thing: an ensemble is not a tier the router chose, and a bin biased by
-// an ensemble's outcome would be biased by N models' work for a decision about
+// of the judge twice over. serveExpert owns the whole response and never goes
+// through proxyToBackend, so the deferred goroutine that feeds the judge is not
+// on this path at all; and an expert plan carries auto=false, which is the flag
+// the judge is gated on. Both say the same thing: an ensemble is not a decision
+// the router made, and learning from one would credit N models' work to
 // one.
 //
 // The name is the router's, held the same way "default" and a group name are:

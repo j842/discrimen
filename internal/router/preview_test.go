@@ -477,9 +477,6 @@ func TestRoutePreviewOmitsAboveBarWithoutATarget(t *testing.T) {
 	if pv.TargetQuality != 0 {
 		t.Fatalf("the outcome matrix path must carry no quality target, got %d", pv.TargetQuality)
 	}
-	if pv.AdapterBias != 0 {
-		t.Errorf("adapter_bias=%v on a route the adapter was never consulted for", pv.AdapterBias)
-	}
 	if len(pv.Candidates) == 0 {
 		t.Fatalf("admin preview lost its candidates")
 	}

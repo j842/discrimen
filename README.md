@@ -356,9 +356,9 @@ completion-time estimates and the reason each excluded endpoint was excluded. It
 contacts no endpoint and changes no state.
 
 Note what it does *not* return on a matrix-routed request: `target_quality` is 0
-and `above_bar` is absent, because there is no quality bar involved. Those two
-fields, plus `adapter_bias`, belong to the difficulty-tier ranker described under
-"What is left of the tier system" below.
+and `above_bar` is absent, because there is no quality bar involved. Both belong
+to the difficulty-tier ranker described under "What is left of the tier system"
+below.
 
 ## Session affinity
 
@@ -413,11 +413,9 @@ Four deliberate boundaries:
 - **One hop.** If the better endpoint is also empty, the original response is
   returned.
 
-The escalation itself is fed only to the online tier adapter, as "this
-difficulty bin needed a better model" — and that adapter is no longer consulted
-(see below), so at present an escalation repairs the request in front of it and
-teaches routing nothing. What the outcome matrix *does* learn from the same
-exchange arrives by the other route: the background judge grades the answer that
+An escalation repairs the request in front of it and teaches routing nothing
+directly. What the outcome matrix learns from the same exchange arrives by the
+other route: the background judge grades the answer that
 was finally returned and attributes it to the worker that produced it, which is
 the escalated one. The worker that returned nothing is not currently credited
 with having done so.
@@ -476,13 +474,14 @@ they now do:
   no outcome matrix, which in practice means the test suite. On a deployed
   router the matrix ranks rather than declining, so the tier branch is not
   reached.
-- **The online tier adapter** — a per-difficulty-bin upward bias, learned from
-  inadequate answers — is **not consulted**. It still loads and saves
-  `tier_adapter.json`, and `ROUTER_AUTO_ROUTING` still logs "online tier
-  adaptation enabled" at startup, but the only code that reads its bias is the
-  tier branch above. `POST /v1/route-feedback` still moves it and nothing acts
-  on the result. The banner at the top of `internal/router/adapter.go` sets out
-  the reachability argument, and a test pins it.
+- **The online tier adapter is gone.** It learned a per-difficulty-bin upward
+  bias from inadequate answers and fed the tier branch above, which nothing
+  reaches. Removed outright rather than left switched on and inert: its config
+  knobs, its `tier_adapter.json` persistence, its "online tier adaptation
+  enabled" boot line and the `POST /v1/route-feedback` endpoint that was its
+  only remaining writer have all gone with it. Its response-adequacy classifier
+  was never really the adapter's and lives on in
+  `internal/router/inadequacy.go`, where escalation and the expert panel use it.
 
 ## Client guidance
 
@@ -513,9 +512,11 @@ Levels are passed through verbatim rather than validated: the meaningful set
 belongs to the endpoint's chat template, not to the router. DeepSeek branches on
 `high` and `max`, other templates on other words.
 
-A named model reports as `X-LLM-Route: model:d=…` instead of `route:d=…`, which
-is also how the adapter and the judge know to learn only from tiers the *router*
-chose.
+A named model reports as `X-LLM-Route: model:…` instead of `route:…`, so an
+operator can tell a client's choice from the router's at a glance. Nothing
+branches on the spelling — the judge is gated on a structural flag set where the
+plan is built — but it is the first thing worth knowing when a route looks
+wrong.
 
 `max_tokens` is a ceiling, not a reservation. The context filter charges a
 nominal answer rather than the client's declared cap, and the cap is trimmed to
@@ -576,7 +577,6 @@ synthesiser would record a hit rate for a model that did not earn it alone.
 | GET | `/v1/models` | client | The model menu, aliases included |
 | GET | `/v1/models/{id}` | client | One model |
 | POST | `/v1/route-preview` | client | What this request *would* do. No generation, no state change. An admin caller additionally gets the per-worker outcome predictions and time estimates, and the reason each worker was excluded |
-| POST | `/v1/route-feedback` | client | Report a route outcome. Feeds the online tier adapter, which is **not consulted** — see "What is left of the tier system". Accepted and recorded; it changes no routing |
 | GET | `/health` | none | Health and `auto_routing` status |
 | POST | `/backends/register` | worker | Endpoint self-registration. Frozen interface |
 | DELETE | `/backends/{id}` | worker or admin | Remove an entry, its persisted row and its cached profile. **Its graded answers stay**: they are evidence about the model, not about the box |
@@ -640,7 +640,7 @@ exists to solve. They are constants in the binary.
 | Variable | Default | |
 |---|---|---|
 | `ROUTER_PORT` | `8585` | |
-| `LOG_DB_PATH` | `/data/llm-router/logs.sqlite` | The request log, and in the same file the outcome matrix — so a profile's graded results and the requests that produced them are backed up and restored together. Its directory is also where the adapter state and the persistence keyfile land |
+| `LOG_DB_PATH` | `/data/llm-router/logs.sqlite` | The request log, and in the same file the outcome matrix — so a profile's graded results and the requests that produced them are backed up and restored together. Its directory is also where the persistence keyfile lands |
 | `ROUTER_ADMIN_PASSWORD` | *(empty)* | Seeds the admin password, and resets it on any start where it is set. Unset leaves a stored password alone |
 | `ROUTER_WORKER_TOKEN` | *(empty)* | Bearer token an endpoint presents to register |
 | `ROUTER_CLIENT_TOKENS` | *(empty)* | Comma-separated client bearer tokens |
@@ -890,7 +890,7 @@ standard library.
 | `session.go` | conversation identity, tool-loop detection, affinity tracker |
 | `escalate.go` | buffered dispatch, inline escalation, strip-and-retry |
 | `relay.go` | routing through another discrimen: the relay key, `/relay/fleet`, the loop guard, and the fleet import |
-| `adapter.go` | the online tier adapter (**not consulted** — see the banner at the top of the file), plus the response-adequacy classifier that several live paths depend on |
+| `inadequacy.go` | the response-adequacy classifier — is a 2xx body actually an answer, and is it empty (the worker's failure, escalated) or truncated (the caller's ceiling, not escalated). Split out when the online tier adapter that used to share the file was removed |
 | `judge.go` | background LLM-as-judge |
 | `preview.go` | `/v1/route-preview` |
 | `arena.go` | the router-level regression gate |

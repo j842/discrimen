@@ -240,10 +240,15 @@ func TestPrefillSecondsScalesWithPrompt(t *testing.T) {
 	if got := prefillSeconds(slow, 4116); got < 150 || got > 210 {
 		t.Errorf("4116 tokens at 23 tok/s = %.0fs, want ~179s", got)
 	}
-	// Without a measured rate it still falls back to the flat average as before.
+	// Without a measured rate the flat average is the OVERHEAD FLOOR and no longer
+	// the whole answer: the same 4116 tokens still have to be paid for at the fleet
+	// constant. Returning 0.978s here — the flat average, whatever the prompt — was
+	// the defect, not the fallback.
 	noRate := &Backend{ObservedTTFTMillis: 978}
-	if got := prefillSeconds(noRate, 4116); got < 0.9 || got > 1.1 {
-		t.Errorf("fallback = %.3fs, want ~0.978s", got)
+	want := 0.978 + 4116/fallbackPrefillTPS
+	if got := prefillSeconds(noRate, 4116); got < want*0.99 || got > want*1.01 {
+		t.Errorf("fallback = %.3fs, want ~%.3fs (%.3fs overhead + 4116 tokens at %.0f tok/s)",
+			got, want, 0.978, fallbackPrefillTPS)
 	}
 }
 

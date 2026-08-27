@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"path"
 	"regexp"
@@ -41,8 +42,22 @@ type WorkerProfile struct {
 	// the quality score, so changing the ladder does not re-profile the fleet.
 	ContextProbe   *ContextProbe `json:"context_probe,omitempty"`
 	MaxConcurrency int           `json:"max_concurrency"`
-	BaselineTPS    float64       `json:"baseline_tps"`
-	TTFTMillis     int64         `json:"ttft_millis"`
+	// CapacityCurve is what the ramp measured on the way to MaxConcurrency, one
+	// entry per concurrency level it accepted. The ramp collected it all along and
+	// threw it away, keeping only the integer it inferred: see concurrencyAlpha for
+	// the question the integer cannot answer and the curve can.
+	//
+	// A profile CACHED before this field existed carries none, and nothing
+	// backfills it — the clause belongs in backfillCachedProfile, whose own comment
+	// says every new WorkerProfile field needs one or it inherits the prefill
+	// probe's silent staleness (shipped, cached over, never measured). The
+	// consequence here is bounded rather than silent: an absent curve prices as
+	// α = 1, the neutral default, so an already-profiled fleet keeps exactly the
+	// load model it has today until each worker's next cold profile. It still wants
+	// that clause.
+	CapacityCurve []CapacityLevel `json:"capacity_curve,omitempty"`
+	BaselineTPS   float64         `json:"baseline_tps"`
+	TTFTMillis    int64           `json:"ttft_millis"`
 	// PrefillTPS is prompt tokens per second, measured on a prompt of known length.
 	// Unlike TTFTMillis it scales with the request, which is what routing needs: the
 	// spread across the fleet is far wider for prefill than for decode (0.67s vs 37.2s
@@ -130,6 +145,101 @@ type WorkerProfile struct {
 // profile and the background quality benchmark — low enough (on the 0–100 quality
 // percentage scale) that an unproven worker only draws easy traffic until it earns more.
 const provisionalQuality = 30
+
+// CapacityLevel is one rung of the capacity ramp: the aggregate throughput a
+// worker sustained with N requests running at once.
+//
+// The ramp measured every rung and used each only to compare against the last
+// one (`agg < prev*1.15`), then dropped it. What survived was the integer — how
+// many at once — which cannot answer the question routing actually asks, namely
+// how much slower EACH of them is while the worker is doing that.
+type CapacityLevel struct {
+	N   int     `json:"n"`   // concurrent requests in flight
+	TPS float64 `json:"tps"` // aggregate tokens/sec summed across all N
+}
+
+// concurrencyAlpha fits the exponent α in agg(n) ≈ agg(1)·n^α to a measured
+// capacity ramp. It is the whole reason the curve is now kept.
+//
+// Per-request throughput at batch n is agg(n)/n = agg(1)·n^(α-1), so one
+// request's service time inside a batch of n is n^(1-α) times what it costs
+// alone — a continuous, monotonic load term, which is what expectedLatency needs
+// and what a step function could not give it (see loadPenalty). α = 1 is perfect
+// batching, α = 0 a worker that serialises.
+//
+// Least squares in log-log space, forced through (1, agg(1)) because that point
+// is the definition of the axis rather than an observation on it. Clamped to
+// [0,1]: above 1 is super-linear scaling, which is sampling noise and not a
+// property of any batching engine, and below 0 is throughput that FELL, which
+// the ramp reads as a plateau and stops climbing at anyway.
+//
+// Returns 1 — no penalty at all — for a curve too short to fit. An unmeasured
+// slowdown has to cost nothing, or every worker profiled before this existed
+// silently acquires an invented one.
+func concurrencyAlpha(curve []CapacityLevel) float64 {
+	base := 0.0
+	for _, lv := range curve {
+		if lv.N == 1 && lv.TPS > 0 {
+			base = lv.TPS
+		}
+	}
+	if base <= 0 {
+		return 1
+	}
+	var sxx, sxy float64
+	for _, lv := range curve {
+		if lv.N <= 1 || lv.TPS <= 0 {
+			continue
+		}
+		x := math.Log(float64(lv.N))
+		y := math.Log(lv.TPS / base)
+		sxx += x * x
+		sxy += x * y
+	}
+	if sxx <= 0 {
+		return 1
+	}
+	return math.Max(0, math.Min(1, sxy/sxx))
+}
+
+// concurrencyAlphas carries a worker's measured batching exponent from
+// profiling, where it is measured, to routing, where it is priced.
+//
+// It is a package-level side table rather than a field on Backend, and that is a
+// constraint on this change rather than a design: Backend is declared in main.go.
+// The one-line fix is `ConcurrencyAlpha float64` on Backend, assigned beside
+// MaxConcurrency in applyProfileIfGen and publishCapacity; when it lands,
+// loadPenalty should read b.ConcurrencyAlpha and this table should go with it.
+//
+// Keyed by backend id and written once per profile, so it holds one float per
+// worker the router has ever profiled — bounded by the fleet, and a removed
+// worker leaves a float behind. Read for every ranked candidate of every request,
+// hence a sync.Map rather than a mutex.
+var concurrencyAlphas sync.Map // backend id -> float64
+
+// publishConcurrencyAlpha records what a capacity ramp measured about how a
+// worker degrades under load. A curve with nothing to fit publishes nothing,
+// which leaves the worker priced with no load penalty — see concurrencyAlpha.
+func publishConcurrencyAlpha(id string, curve []CapacityLevel) {
+	if id == "" || len(curve) < 2 {
+		return
+	}
+	concurrencyAlphas.Store(id, concurrencyAlpha(curve))
+}
+
+// concurrencyAlphaFor is the exponent routing prices a backend's load with. The
+// default of 1 (perfect batching, no penalty) covers a worker whose ramp predates
+// the curve, one still on its provisional profile, and a relay row whose upstream
+// sends a capacity but no curve behind it.
+func concurrencyAlphaFor(b *Backend) float64 {
+	if b == nil {
+		return 1
+	}
+	if v, ok := concurrencyAlphas.Load(b.ID); ok {
+		return v.(float64)
+	}
+	return 1
+}
 
 // A capacity-probe level is only believed to be the ceiling after this many
 // consecutive failures, spaced by the delay below. Cheap insurance: the measured
@@ -402,7 +512,7 @@ func (r *Router) profileBackend(b *Backend, model string) (*WorkerProfile, error
 	}
 	prog := r.progressFor(b.ID)
 	prog.enter(phaseCapacity, 0)
-	capN, capOK := r.capacityProbe(b)
+	capN, capCurve, capOK := r.capacityProbe(b)
 	// Abort BEFORE the benchmark when the capacity probe already failed: a hung
 	// worker otherwise burns 28 questions × attempts × the request timeout
 	// (many hours) holding the profiling guard, only for the results to be
@@ -412,6 +522,27 @@ func (r *Router) profileBackend(b *Backend, model string) (*WorkerProfile, error
 		return nil, r.abort(b, meter, "worker unreachable during capacity probe")
 	}
 	capN = r.resolveCapacity(b, capN)
+	// PUBLISH the measurement now, not at the end of the run.
+	//
+	// It used to sit in this local until after the quality benchmark, which is
+	// 25+ minutes on a typical worker and has run to five hours on a slow one. For
+	// all of it the router priced the worker off profileQuick's provisional
+	// MaxConcurrency=1: expectedLatency's queue term reads that field, isFull reads
+	// it, and the `ask -l` slots column reads it — so live traffic was spilled off
+	// the worker as though it were serial, while THIS function drove the same
+	// worker at up to 4-way concurrency for the whole benchmark.
+	//
+	// Cleanly separable from the atomic quality commit at the end. capOK is
+	// validated immediately above, so what goes out here is a COMPLETED
+	// measurement, not half of one. An abort further down discards the QUALITY the
+	// run was after and leaves the worker on its provisional profile by design; it
+	// does not un-measure the capacity, and should not — the ramp succeeded, and
+	// the retry would only measure the same thing again.
+	//
+	// The applyProfileIfGen at the end writes this same number, and syncSlotsLocked
+	// no-ops on an unchanged cap, so the commit stays a commit rather than becoming
+	// a conflict that rebuilds the slot channel under live traffic.
+	r.registry.publishCapacity(b.ID, b.profileGen, capN, capCurve)
 	// Prefill rate is measured here rather than left to the live EWMA, which only
 	// samples non-thinking requests and so never fills in for a thinking-heavy worker.
 	// A failure is not fatal: routing falls back to the flat TTFT average as before.
@@ -442,7 +573,8 @@ func (r *Router) profileBackend(b *Backend, model string) (*WorkerProfile, error
 		return nil, r.abort(b, meter, "worker unreachable during quality benchmark")
 	}
 	p.MaxConcurrency = capN
-	p.Checks["capacity"] = Check{OK: true, Message: fmt.Sprintf("%d concurrent", capN)}
+	p.CapacityCurve = capCurve
+	p.Checks["capacity"] = Check{OK: true, Message: capacityMessage(capN, capCurve)}
 	p.Quality = quality
 	p.BenchVersion = benchmarkVersion
 	p.QualityDetail = qBreakdown
@@ -676,7 +808,18 @@ func (r *Router) capabilityProbe(probe func() error) (err error, inconclusive bo
 
 // capacityProbe estimates how many concurrent requests the worker handles before
 // aggregate throughput stops scaling (the saturation knee) or it starts failing.
-func (r *Router) capacityProbe(b *Backend) (capacity int, ok bool) {
+//
+// It also returns the CURVE it climbed — one CapacityLevel per rung it accepted.
+// That was always measured and always discarded, and it is the only thing in the
+// router that describes how much a request slows down while sharing a worker
+// rather than merely whether it fits; see concurrencyAlpha.
+//
+// The curve holds only the ACCEPTED rungs, not the plateau the ramp stopped on.
+// A plateau point sits outside the concurrency the worker will ever be dispatched
+// at, so fitting through it would flatten the exponent inside the range that IS
+// used: a worker that scales perfectly to 2 and then flattens at 4 would come out
+// at α≈0.63 and be charged a slowdown at a batch of 2 it does not have.
+func (r *Router) capacityProbe(b *Backend) (capacity int, curve []CapacityLevel, ok bool) {
 	maxN := r.cfg.CapacityProbeMax
 	if maxN < 1 {
 		maxN = 16
@@ -716,7 +859,7 @@ func (r *Router) capacityProbe(b *Backend) (capacity int, ok bool) {
 		}
 		if !good {
 			if n == 1 {
-				return 1, false // can't serve even one request → worker unreachable
+				return 1, nil, false // can't serve even one request → worker unreachable
 			}
 			log.Printf("capacity probe: %s failed n=%d after %d attempts; capacity=%d", b.ID, n, capacityProbeAttempts, best)
 			break // repeatable errors at a higher level → that's the capacity ceiling
@@ -742,8 +885,56 @@ func (r *Router) capacityProbe(b *Backend) (capacity int, ok bool) {
 			break // plateau held across every re-sample → saturation knee
 		}
 		best, prev = n, agg
+		curve = append(curve, CapacityLevel{N: n, TPS: agg})
 	}
-	return best, true
+	return best, curve, true
+}
+
+// publishCapacity applies a measured concurrency ceiling — and the throughput
+// curve behind it — to a LIVE backend the moment the ramp settles them, instead
+// of waiting for the profile the ramp is only the first step of.
+//
+// The guards are applyProfileIfGen's, for its reasons: a result from a stale
+// registration generation is dropped (the worker re-registered or was deleted
+// mid-measurement), and an operator's declared ceiling on a manual row is never
+// overwritten by a probe. The slot channel is synced to the EFFECTIVE cap rather
+// than the measured one, or that declared ceiling would be advisory only —
+// again the same rule, and the same reason.
+//
+// Returns false when the row has gone or re-registered underneath the run.
+func (r *Registry) publishCapacity(id string, gen int64, n int, curve []CapacityLevel) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	b := r.backends[id]
+	if b == nil || (gen != 0 && b.profileGen != gen) {
+		return false
+	}
+	if n > 0 && operatorDeclared(b).MaxConcurrency == 0 {
+		b.MaxConcurrency = n
+	}
+	r.syncSlotsLocked(id, b.MaxConcurrency)
+	publishConcurrencyAlpha(id, curve)
+	return true
+}
+
+// capacityMessage renders the ramp for the per-probe check list. The curve goes
+// in beside the verdict because the verdict alone cannot say what it cost:
+// "4 concurrent" says the worker takes four, and "1:900 2:1500 4:1900" says each
+// of those four runs at 475 tok/s against 900 alone, so a request that lands in a
+// full batch takes about twice as long as one that lands on an idle worker. That
+// is the difference between a worker to send a burst to and one to spread away
+// from, and nothing else in /backends shows it.
+func capacityMessage(n int, curve []CapacityLevel) string {
+	msg := fmt.Sprintf("%d concurrent", n)
+	if len(curve) < 2 {
+		return msg
+	}
+	parts := make([]string, 0, len(curve))
+	for _, lv := range curve {
+		parts = append(parts, fmt.Sprintf("%d:%.0f", lv.N, lv.TPS))
+	}
+	return fmt.Sprintf("%s (aggregate tok/s %s; scaling exponent %.2f)",
+		msg, strings.Join(parts, " "), concurrencyAlpha(curve))
 }
 
 // resolveCapacity settles a worker's concurrency from the ramp's inference and
@@ -1147,6 +1338,13 @@ func (r *Registry) applyProfileIfGen(id string, gen int64, p *WorkerProfile) boo
 	if p.BenchVersion > 0 {
 		r.syncSlotsLocked(id, b.MaxConcurrency)
 	}
+	// The load curve rides with the capacity it was measured beside, so a WARM
+	// restart from a cached profile prices load the way the run that measured it
+	// did — otherwise the exponent would exist only for the minutes between a cold
+	// ramp and the next restart. Unconditional: a profile with no curve (cached
+	// before this existed, imported from a relay, provisional) publishes nothing
+	// and the worker keeps the neutral default. See publishConcurrencyAlpha.
+	publishConcurrencyAlpha(id, p.CapacityCurve)
 	return true
 }
 

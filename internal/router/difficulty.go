@@ -67,9 +67,34 @@ var latencyEstTokens = 256
 // decode dominates the wall clock.
 var latencyEstThinkTokens = 1500
 
-// uncappedNominalSlots is the concurrency assumed for a backend that registered
-// max_concurrency=0 (unbounded), so its queue occupancy can still be estimated.
+// uncappedNominalSlots is the concurrency assumed for a backend whose capacity
+// is UNKNOWN — a beacon the capacity ramp has not reached yet, or a relay row
+// whose upstream reported none. It is a stand-in for a measurement, not a
+// measurement, so it is deliberately NOT applied to a row that has told us it has
+// no ceiling at all: see queueSlots for the difference and why it matters.
 var uncappedNominalSlots = 4
+
+// fallbackPrefillTPS is the prompt tokens per second assumed for a worker that
+// nothing has measured at length: no live prefill EWMA, and no context ladder to
+// read a rate off either. Units are PROMPT tokens per second — prefill work, not
+// decode; on one box the two differ by more than two orders of magnitude.
+//
+// A constant rate is a poor estimate of any particular worker and a far better
+// one than the constant TIME it replaced. 200 tok/s is wrong for everything, but
+// it is wrong by a bounded factor, and it prices 15k tokens of prefill three
+// thousand times above five tokens of it — which "liveTTFT, whatever the prompt"
+// did not (see prefillSeconds).
+//
+// The value sits just above the CPU end of every prefill rate this fleet has
+// actually measured: 23 tok/s on llm-naples-deepseek-284B-q4 (4116 prompt tokens
+// in 178 real seconds), ~108 on the CPU worker in the 55x comparison below,
+// 125-143 on the 284B CPU+GPU box — against 643 on llm-a750-Granite4.1-8B, 4,665
+// on llm-6000pro, ~5,970 on the GPU in that same comparison. Erring toward the
+// slow end is the safe direction for a latency estimate, the same call speedProbe
+// and prefillProbe both make: an unmeasured worker loses long prompts to one
+// measured fast, which is the right answer more often than not, and deadlineFilter
+// never returns an empty set, so no worker can be priced out of existence by it.
+var fallbackPrefillTPS = 200.0
 
 // deadlineSafetyFactor is the fraction of the caller's remaining budget a job's
 // estimate must fit inside to count as placeable. Below 1 because the estimate is
@@ -813,20 +838,81 @@ func expectedLatency(b *Backend, job jobCost) float64 {
 	if job.incumbent != "" && b.ID == job.incumbent {
 		first *= 1 - sessionPrefillDiscount
 	}
-	slots := b.MaxConcurrency
+	// One request's service time is first-token latency plus decode; what the
+	// worker is already doing stretches it.
+	return (first + gen) * loadPenalty(b)
+}
+
+// loadPenalty is how much longer this request takes because of what the backend
+// is ALREADY running. One multiplier over the whole service time, never below 1.
+//
+// It used to be a pure step — `over := occupancy + 1 - slots`, then ceil()'d —
+// which is wrong at both ends. Below saturation `over` is ≤ 0, so on an 8-slot
+// worker SEVEN busy slots predicted identically to idle; then the eighth doubled
+// the estimate in one jump. Real continuous batching does neither: a request that
+// fits in the batch does not queue, but it does share the GPU with everything
+// else in it, and per-request throughput falls smoothly as the batch grows.
+//
+// Two continuous terms, and the second is only the first one's overflow:
+//
+//	share  batch^(1-α), from the worker's own MEASURED throughput ramp — the
+//	       curve capacityProbe collects at n = 1, 2, 4, 8 and used to discard
+//	       (see concurrencyAlpha). α = 1 is perfect batching and no penalty at
+//	       all, which is what an unmeasured worker gets: an invented slowdown is
+//	       worse than none.
+//	queue  the requests that do not fit, spread over the slots that will free up:
+//	       (n-slots)/slots rather than ceil() of it. One request past the last
+//	       slot waits for the FIRST of `slots` in-flight generations to finish,
+//	       not for a whole one. On a 1-slot worker — the commonest row in the
+//	       fleet, and the case the ceil() was right for — the two forms are
+//	       arithmetically identical, so nothing there changes.
+func loadPenalty(b *Backend) float64 {
+	slots := queueSlots(b)
 	if slots <= 0 {
-		slots = uncappedNominalSlots
+		return 1 // no ceiling declared and none to assume — see queueSlots
 	}
-	if slots <= 0 {
-		slots = 1
+	n := float64(occupancy(b) + 1) // this request's own place in the line
+	batch := math.Min(n, float64(slots))
+	share := math.Pow(batch, 1-concurrencyAlphaFor(b))
+	queue := 0.0
+	if over := n - float64(slots); over > 0 {
+		queue = over / float64(slots)
 	}
-	wait := 0.0
-	if over := float64(occupancy(b) + 1 - slots); over > 0 {
-		wait = math.Ceil(over / float64(slots))
+	return share * (1 + queue)
+}
+
+// queueSlots is how many requests a backend runs at once for the purpose of
+// pricing a queue — or 0 for one that has told us it has no ceiling worth
+// modelling, which is not the same thing as a ceiling of zero.
+//
+// MaxConcurrency == 0 used to mean "assume uncappedNominalSlots" everywhere, and
+// that conflates two different rows. On a beacon the capacity ramp has not
+// reached yet, or a relay row whose upstream published no capacity, four is a
+// stand-in for a number nobody has measured, and pricing some queue beats
+// pricing none.
+//
+// On a hosted API row it is a stand-in for nothing. The operator entered the row
+// and left the ceiling blank because the provider has no per-customer
+// concurrency limit worth modelling, and charging it a queue penalty off THIS
+// router's dispatch count doubled a paid endpoint's estimate at four concurrent
+// requests — a number that says nothing whatever about a provider fronting
+// thousands. The effect was to push traffic off a genuinely fast paid endpoint
+// under mild local load, which is the opposite of what it was bought for.
+//
+// A local row is excluded from that even when an operator typed it: a vLLM
+// somebody entered by hand is still one box with one real ceiling. "manual" says
+// who wrote the row down, not what is behind it.
+func queueSlots(b *Backend) int {
+	if b.MaxConcurrency > 0 {
+		return b.MaxConcurrency
 	}
-	// One request's service time is first-token latency plus decode; queueing past
-	// the slot count multiplies it.
-	return (first + gen) * (1 + wait)
+	if isManualRow(b) && !isLocalProvider(b.Provider) {
+		return 0
+	}
+	if uncappedNominalSlots > 0 {
+		return uncappedNominalSlots
+	}
+	return 1
 }
 
 // prefillSeconds estimates time-to-first-token for THIS request's prompt.
@@ -835,8 +921,39 @@ func expectedLatency(b *Backend, job jobCost) float64 {
 // ~4k-token prompt: 0.67s on the GPU worker vs 37.2s on a CPU worker, a 55x gap —
 // so scaling a measured tok/s by the actual prompt beats reusing a raw TTFT
 // average. The raw EWMA is also not comparable across workers, because each one's
-// average reflects whatever prompt sizes it happens to receive. Falls back to the
-// TTFT EWMA (previous behaviour) until a prefill rate has been measured.
+// average reflects whatever prompt sizes it happens to receive.
+//
+// EVERY branch now scales with promptTokens, including the one for a worker
+// nothing has measured. That branch used to return liveTTFT alone, described as a
+// fallback "until a prefill rate has been measured", and that description
+// understated it: it was not degraded accuracy on the dominant term of a
+// long-context request, it was total blindness to it. Measured against the live
+// fleet 2026-08-27 through /v1/route-preview, a 45-character prompt and a
+// 61,000-character one produced BYTE-IDENTICAL expected_seconds on every worker
+// (16.553 / 52.051 / 144.455 / 205.287) bar the single one carrying a measured
+// rate. Six of seven had ObservedPrefillTPS == 0, and not by accident: it is only
+// ever set from a completed FULL profile or from live STREAMING samples over
+// minPrefillTokens, so a worker serving non-streaming traffic, or one that has
+// only finished the quick half of profiling, never acquires one at all.
+//
+// The rates are tried in order of how much each knows about THIS worker:
+//
+//  1. ObservedPrefillTPS — the live EWMA, seeded from the prefill probe.
+//  2. The context ladder's own per-rung rate, measured on this worker at 4K
+//     tokens and up, which is exactly the range at issue (contextProbePrefillTPS).
+//  3. fallbackPrefillTPS, a fleet constant, when nothing has measured it at
+//     length at all.
+//
+// Only (3) adds liveTTFT, and the asymmetry is the point. The two measured rates
+// are prompt tokens ÷ first-token latency, so fixed per-request overhead is
+// already inside them and adding it again would bill for it twice. The constant is
+// a pure rate and needs an overhead floor — and on a worker in case (3) that is
+// precisely what liveTTFT is: observe() feeds the TTFT EWMA only from
+// non-thinking requests and feeds the prefill EWMA from those SAME requests once
+// the prompt clears minPrefillTokens, so a worker holding a TTFT average but no
+// rate has been measured on nothing longer than 256 tokens. Failing that the
+// figure is the certification one, taken on the speed probe's ~30-token prompt.
+// Either way it is overhead, not prefill work.
 //
 // A relay row adds its round trip on top, and this is the only place it is
 // added. Every latency term on such a row describes the far ENDPOINT with the
@@ -848,10 +965,55 @@ func expectedLatency(b *Backend, job jobCost) float64 {
 // directly.
 func prefillSeconds(b *Backend, promptTokens int) float64 {
 	wire := b.RelayRTTMillis / 1000
-	if rate := b.ObservedPrefillTPS; rate > 0 && promptTokens > 0 {
+	if promptTokens <= 0 {
+		// No request in hand (the pinned/debug paths, and nominalJob). There is no
+		// prompt to scale by, so the flat average is all there is.
+		return liveTTFT(b) + wire
+	}
+	if rate := b.ObservedPrefillTPS; rate > 0 {
 		return float64(promptTokens)/rate + wire
 	}
-	return liveTTFT(b) + wire
+	if rate := contextProbePrefillTPS(b, promptTokens); rate > 0 {
+		return float64(promptTokens)/rate + wire
+	}
+	return liveTTFT(b) + float64(promptTokens)/fallbackPrefillTPS + wire
+}
+
+// contextProbePrefillTPS reads a provisional prefill rate off the context ladder,
+// for a worker whose own EWMA is still empty.
+//
+// It costs nothing to have: the ladder plants a needle in a haystack of KNOWN
+// length and times the answer, so each rung already carries tokens ÷ TTFT for
+// this worker (see contextprobe.go), and it runs at the end of every full profile
+// and is persisted with it. That makes it a measured prefill curve at 4K, 8K, 16K
+// and up — the sizes the flat-TTFT fallback was most wrong about, and the ones
+// the founding goal cares about most.
+//
+// The rung NEAREST this request is used rather than one summary figure, because
+// prefill rate falls with length (attention is not linear in it) and a 4K reading
+// over-rates a 128K prompt. Nearest means nearest by RATIO, since the ladder
+// doubles: for a 60K prompt, 64K is one rung away and 4K is four, though by
+// absolute difference 4K would look the closer of the two on any worker that
+// climbed past 120K.
+//
+// It reads LOW, deliberately. A rung's timing is a whole non-streamed call, so
+// the ≤64 generated tokens sit inside the number — a real share of the call at
+// 4K, noise at 64K. Erring pessimistic is the same call every other latency
+// measurement here makes.
+func contextProbePrefillTPS(b *Backend, promptTokens int) float64 {
+	if b == nil || b.ContextProbe == nil || promptTokens <= 0 {
+		return 0
+	}
+	best, nearest := 0.0, math.Inf(1)
+	for _, lv := range b.ContextProbe.Levels {
+		if lv.Errored || lv.PrefillTPS <= 0 || lv.Tokens <= 0 {
+			continue
+		}
+		if d := math.Abs(math.Log(float64(lv.Tokens) / float64(promptTokens))); d < nearest {
+			best, nearest = lv.PrefillTPS, d
+		}
+	}
+	return best
 }
 
 // liveTTFT returns the backend's first-token latency in seconds — the live EWMA

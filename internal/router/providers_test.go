@@ -259,7 +259,7 @@ func TestDeclaredConcurrencyOutranksRamp(t *testing.T) {
 	}
 	b := reg.get("provider")
 
-	ramp, ok := r.capacityProbe(b)
+	ramp, _, ok := r.capacityProbe(b)
 	if !ok {
 		t.Fatal("capacity probe reported the worker unreachable")
 	}
@@ -1001,7 +1001,7 @@ func TestPlateauVerdictIsRetried(t *testing.T) {
 		client:   &http.Client{Timeout: 5 * time.Second},
 	}
 
-	ramp, ok := r.capacityProbe(reg.get("noisy"))
+	ramp, _, ok := r.capacityProbe(reg.get("noisy"))
 	if !ok {
 		t.Fatal("capacity probe reported the worker unreachable")
 	}

@@ -8,43 +8,119 @@ is a number you have to take on faith, and this one decides where requests go.
 
 When a worker joins the fleet the router knows nothing about it except what its
 configuration claims. Cold-start profiling replaces that claim with a
-measurement: the router asks the worker all 130 questions below, grades the
-answers, and stores a score from 0 to 100 on the worker's profile. Difficulty
-routing then maps a request's estimated difficulty onto that measured scale, so
-a hard prompt goes to a worker that has actually demonstrated it can handle hard
-prompts rather than to one that declared itself capable.
+measurement: the router asks the worker the 401 questions in the bank, grades
+each answer, and keeps **every individual verdict** — which question, which
+model, which thinking mode, right or wrong, how long it took.
 
-That is also why the questions are chosen to **spread** the fleet rather than to
-be uniformly hard. If every worker scores the same, the score stops
-distinguishing them and routing collapses to pure speed. Tiers 9, 10 and 11 — 29
-of the 130 questions — exist only because the tier below each of them saturated,
-and two further tiers were built, measured and deleted along the way. Tier 12 is
-there for a different reason: it is the only tier that asks whether a worker can
-read code rather than solve a puzzle.
+Those per-question verdicts are the routing evidence. When a request arrives, the
+router embeds it, finds the graded questions nearest it in that space, and asks
+which of the candidate workers got *those* questions right. A hard prompt goes to
+a worker that has demonstrated it can answer questions like that one, rather than
+to one that declared itself capable — or to one with a good average.
+
+The 0-100 quality score is still computed and still published, and it is a
+perfectly good summary for a person reading `/backends`. It is not what routing
+reads. That change is the reason for most of what follows.
+
+### What that means for choosing questions
+
+Under the old scalar, a question every worker passed carried no information: if
+every worker scores the same, the score stops distinguishing them and routing
+collapses to pure speed. Tiers 9, 10 and 11 exist because the tier below each of
+them saturated, and two further tiers were built, measured and deleted getting
+there.
+
+**That rule no longer holds, and the section "What actually spreads the fleet"
+below should be read with this in mind.** A question every worker passes is
+useful now: it says the fleet is uniformly able on that kind of prompt, which is
+exactly what the router wants to know when a prompt like it arrives — it means
+"route this one on speed". A question every worker fails is useful for the same
+reason in reverse. What the matrix cannot use is a question nobody has been
+*asked*, and coverage of subject matter now matters more than spread within it.
+
+Tier 12 was already there for a different reason: it is the only tier that asks
+whether a worker can read code rather than solve a puzzle. The nine long-context
+questions were added on the same logic — they measure something no other question
+in the bank measures, whether a model uses the whole of a large prompt.
 
 ## Versioning
 
-`benchmarkVersion` (in `internal/router/benchmark.go`) is currently **36**. It is
+There are **two** version numbers now, and mixing them up is the thing this
+section exists to prevent. They were one number until recently, and this page
+described that one number, so if you have read it before: the rule has changed.
+
+### `graderVersions` — one number per grading mode
+
+`graderVersions` (in `internal/router/identity.go`) holds a version per match
+mode:
+
+```go
+var graderVersions = map[string]int{
+    "numeric": 2, "mcq": 2, "mcq-repeat": 2, "exact-list": 1,
+    "contains": 2, "final-contains": 2, "code-exec": 1,
+}
+```
+
+**This is the one you bump when grading behaviour changes.** A question's
+identity is a hash of its prompt, its expected answer, its match mode, and that
+mode's grader version (plus the test cases, for a code question — those are part
+of the question the way `Expect` is for a string-matched one). Bump `numeric` and
+every numeric question in the bank gets a new identity, so every worker's numeric
+verdicts stop being addressable and are re-asked. **Nothing else moves.** The mcq
+results, the exact-list results and the code results are untouched, on every
+worker, in both modes.
+
+They are bumped by hand, deliberately. Deriving them from the source — hashing
+the grader functions, say — would churn on a comment edit and silently re-profile
+the fleet for nothing, which is the over-firing the whole scheme exists to stop.
+
+### Editing a question needs no version bump at all
+
+Change a prompt, change an expected answer, add a question, remove one: the
+identity is a hash of the content, so the changed question is simply a *different
+question*. It has no cached verdicts and is asked. The unchanged ones around it
+keep theirs. A removed question's rows are not deleted and not stale — nothing
+ever asks for that identity again.
+
+The same applies on the model side. A model's identity is a hash of its served
+id, parameter count, quantisation, file size, trained context and serving engine
+— **not** its file path, and not the worker id. So results follow the weights:
+decommission a worker and its graded answers stay, run the same model on another
+host and it inherits them. Deleting a backend deletes its registration and its
+stored profile, and deliberately leaves its graded answers alone.
+
+Only the *verdict* travels that way. A latency measured on one box says nothing
+about another, so a cross-host cache hit carries the pass/fail and re-measures
+the timing.
+
+### `benchmarkVersion` — the profiling method
+
+`benchmarkVersion` (in `internal/router/benchmark.go`) is currently **43**. It is
 part of the profile cache key: a stored profile is reused only if its
-`BenchVersion` matches the running binary's. Changing a question, adding a tier,
-or altering how answers are graded means bumping that constant, which invalidates
-every cached profile in the fleet and re-measures every worker against the new
-set.
+`BenchVersion` matches the running binary's.
 
-That coupling is the reason the question set is committed to the repository
-rather than fetched at install time. If the questions could change without the
-version changing, a worker profiled on Tuesday and one profiled on Thursday
-would be graded on different sets and then compared on the same 0-100 scale,
-silently, with every number still looking plausible.
+**Bump it for a change to the METHOD — a different probe, a different way of
+asking — not for a change to the questions.** Its old job was "bumped whenever
+the question set or the grading changes", and that made it a cliff: bumping it to
+fix the numeric grader discarded every mcq, exact-list and contains result on
+every worker in both modes, about 5,600 gradings and hours of GPU time, to
+re-derive verdicts that had not changed.
 
-> Source of truth: `internal/router/benchmark_data.go` (the questions) and
+A bump is now cheap to recover from, and that is the point of the split. It
+re-runs the capability, speed, capacity and context probes — seconds — while
+every question the model has already answered is served from the permanent cache.
+
+> Source of truth: `internal/router/identity.go` (what a question and a model
+> are), `internal/router/benchmark_data*.go` (the questions) and
 > `internal/router/benchmark.go` (the grading). This document is a derived
-> snapshot. If the two disagree, the Go files win.
+> snapshot. If they disagree, the Go files win.
 
 ### Version history
 
-Every entry below is a change that made an older score mean something different,
-which is the only kind of change that belongs in this list.
+Every entry below is a change that made an older *profile* mean something
+different. Note that most entries predate the split above and were bumps under
+the old rule, where a question or grader change had to be recorded here; under
+the current rule several of them would not have needed a bump at all.
 
 | Version | Change |
 |---------|--------|
@@ -61,34 +137,58 @@ which is the only kind of change that belongs in this list.
 | v34 | Quality became a weighted two-bucket score instead of a flat percentage. |
 | v35 | Tier 12 added and the weighted score grew a third bucket for it. The numeric grader now keeps the sign (`benchNumberRe`). |
 | v36 | Question 89 (tier 10, the lift) revised. It never stated that the lift beats a man running up 30 flights while offering "it depends on the lift's speed" as an option, so that option was defensible and three of four workers spent their whole budget on the one item instead of answering it. Both journey times are now stated, and the escape hatch is replaced by an age decoy. |
+| v37 | Loose half-credit grading. A reply that fails strict extraction but visibly *asserts* the expected answer — emphasised, as its final stated equation, an emphasised option pick, or the expected option's own text — scores half a point, tallied separately. Motivated by a 35B A3B whose 8 of 12 misses were semantically correct answers that ignored "Give the number only", so its q=89 measured formatting rather than knowledge. Strict grading is unchanged; loose only adds credit. |
+| v38 | The per-question answer deadline goes 2 min to **6 min**, and the per-tier split is removed — every question now gets the long deadline. At 2 minutes, 75% of the strongest home worker's recorded misses were answers it was cut off part-way through, so its score was that much a measure of throughput. Also: `coding_completion` answers are graded as prefix + answer, since they are fragments continuing a partial solution shown in the prompt; that had scored the two strongest workers 0% on the task while the weakest scored highest. |
+| v39 | Four grading defects, each of which changed scores silently. `exact-list` (31% of the set) failed a correct answer whose lead-in contained a comma. A single-element `exact-list` passed a *wrong* answer, because almost any prose line parses as a one-element list. `contains` was a bare substring, so a reply that mentioned the expected token while ruling it out passed. And magnitude words multiplied — "two hundred" read as 100. |
+| v40 | The token ceiling stops being a binding constraint: 16384 to **32768**, clamped per worker to what its context window holds. Time is already bounded by the answer deadline, and at 16384 the two were nearly the same constraint (~6 min at ~45 tok/s) while still failing questions on workers fast enough to reach it — one worker recorded 29 truncations. |
+| v41 | An **errored** question no longer counts in the denominator. It used to be a zero over a one, arithmetically identical to a wrong answer, so an unreachable sandbox scored a perfect worker at 75 with `ok=true`. The thinking gate is now written in each endpoint's measured dialect rather than a hardcoded `chat_template_kwargs`, which on every relay row and strict provider meant neither pass switched anything and both scores were the same mode measured twice. |
+| v42 | The generated set is re-tiered to match the emit rules: 40 unpassable headroom items move off tier 12, which they were filling with maths, so the 20-point coding bucket is 28 coding questions rather than 28 real ones diluted by 40 impossible non-code ones. Max achievable quality goes from ~88 back to 100. The no-think pass now asks only the questions the mixed pass actually asked. |
+| v43 | Eight grading and profiling corrections, all reproduced against the real graders. The numeric grader treated "and" as a clause break, so the **tier-1 control** "The sum of 8 and 5 is 13." graded wrong — 137 of 392 questions are numeric, and any model that explains its working was understated. The mcq last-standalone-letter fallback passed a pick the model never made. `contains` and `final-contains` read only the final clause, failing a correct answer followed by an explanation. The no-think pass counted errored questions in its denominator and divided its give-up guard by intended rather than dispatched questions. Carried-over easy tiers lost their latency and answer text and overwrote measured matrix rows. The busy-retry loop could hang a profile forever. And `benchRequestFor` appended "Give the number only." to 21 items whose own text demanded bold. |
 
-v33 and v34 both landed **without** bumping the constant, which is exactly the
-failure the constant exists to prevent. Profiles measured under the flat
-percentage stayed in `worker_profiles` marked current, and `autoTargetQuality`
-reads every cached score as one absolute 0-100 scale, so pre-v33 and post-v34
-workers were being compared on scales that no longer meant the same thing.
-`TestBenchmarkVersionCoversScoringChanges` fails CI if it happens again: it
-finds the highest `vNN:` marker in `benchmark.go` and `benchmark_data.go` and
-requires `benchmarkVersion` to be at least that.
+v33 and v34 both landed **without** bumping the constant, which was exactly the
+failure the constant existed to prevent under the old rule: profiles measured
+under the flat percentage stayed in `worker_profiles` marked current, and every
+cached score was read as one absolute 0-100 scale, so pre-v33 and post-v34
+workers were compared on scales that no longer meant the same thing.
+`TestBenchmarkVersionCoversScoringChanges` still fails CI if a `vNN:` marker
+appears in the source above the constant's value.
+
+That guard is now about the *method*. The equivalent mistake for a grader fix is
+forgetting to bump its `graderVersions` entry, which leaves the old verdicts
+addressable and quietly keeps grading everything with the fixed grader's
+questions still filed under the broken grader's hash.
 
 ## Grading
 
-**Size.** 130 questions across 12 tiers.
+**Size.** 401 questions across 12 tiers, from three sources: 130 hand-authored,
+262 generated from LiveBench, and 9 long-context (see below).
 
-| Tier | Questions | Mode | Deadline |
-|------|-----------|------|----------|
-| 1 — controls | 4 | thinking-off | 2 min |
-| 2 — floor | 4 | thinking-off | 2 min |
-| 3 — mid | 7 | thinking-on | 2 min |
-| 4 — upper-mid | 25 | thinking-on | 2 min |
-| 5 — hard | 7 | thinking-on | 2 min |
-| 6 — traps | 8 | thinking-on | 2 min |
-| 7 — harder | 5 | thinking-on | 2 min |
-| 8 — frontier | 13 | thinking-on | 2 min |
-| 9 — unrecallable | 12 | thinking-on | 6 min |
-| 10 — ceiling | 12 | thinking-on | 6 min |
-| 11 — insight | 5 | thinking-on | 6 min |
-| 12 — programming | 28 | thinking-on | 6 min |
+| Tier | Total | Hand-written | LiveBench | Long-context | Mode |
+|------|------:|-------------:|----------:|-------------:|------|
+| 1 — controls | 4 | 4 | | | thinking-off |
+| 2 — floor | 4 | 4 | | | thinking-off |
+| 3 — mid | 11 | 7 | 4 | | thinking-on |
+| 4 — upper-mid | 43 | 25 | 18 | | thinking-on |
+| 5 — hard | 67 | 7 | 60 | | thinking-on |
+| 6 — traps | 11 | 8 | | 3 | thinking-on |
+| 7 — harder | 75 | 5 | 70 | | thinking-on |
+| 8 — frontier | 83 | 13 | 70 | | thinking-on |
+| 9 — unrecallable | 15 | 12 | | 3 | thinking-on |
+| 10 — ceiling | 55 | 12 | 40 | 3 | thinking-on |
+| 11 — insight | 5 | 5 | | | thinking-on |
+| 12 — programming | 28 | 28 | | | thinking-on |
+
+**Deadline.** `benchAnswerDeadline` is **6 minutes**, the same for every tier
+since v38. There is no per-tier split. A question a worker cannot answer inside
+it is a speed fail: counted wrong, not retried.
+
+**Budget.** A thinking-on pass also stops dispatching after 90 minutes of wall
+clock, once at least 48 questions have gone out. A worker slow enough to hit that
+is scored on what it managed, and its progress line ends with `done` short of
+`total`.
+
+By category rather than by tier — which is how `/backends/{id}/benchmark`
+reports it — the bank is 199 maths, 156 reasoning, 38 coding and 8 general.
 
 **Thinking mode.** Every question is graded in the mode the router would serve
 it in. `benchHardTier` is **3**: tiers below it are graded thinking-off, tiers at
@@ -101,8 +201,13 @@ honour: `chat_template_kwargs: {"enable_thinking": …}` in the request body, an
 for thinking-off, ` /no_think` appended to the prompt text.
 
 **Token ceilings.** Thinking-off answers get **1024** tokens (`benchMaxTokens`);
-they are short trap and recall replies. Thinking-on answers get **16384**
-(`benchThinkMaxTokens`) — 8192 truncated some tier-7 and tier-8 questions.
+they are short trap and recall replies. Thinking-on answers get **32768**
+(`benchThinkMaxTokens`), clamped per worker to what its context window can
+actually hold. It was 16384 until v40, where it stopped doing independent work:
+time is already bounded by the 6-minute answer deadline, and 16384 tokens is
+about six minutes at the ~45 tok/s most of this fleet runs at, so the ceiling
+only bit on the workers fast enough to reach it — one recorded 29 truncations
+that were a token cap rather than a failure to reason.
 
 **Temperature.** 0, for every question. A graded benchmark has to be
 deterministic: the same model must return the same answer on every re-profile,
@@ -122,15 +227,16 @@ through a long reply and are sent unchanged.
 one:
 
 - **Base**, tiers 1 to 10 (below `benchInsightTier` = **11**), shares
-  `benchBaseWeight` = **60** points pro rata. With the current set that is 97
-  questions, so each is worth about 0.62 points.
+  `benchBaseWeight` = **60** points pro rata. With the current set that is 368
+  questions, so each is worth about 0.16 points.
 - **Insight**, tier 11, shares `benchInsightWeight` = **20** points pro rata.
   With the current set that is 5 questions, so each is worth 4 points.
 - **Coding**, tier 12 and above (`benchCodingTier` = **12**), shares
   `benchCodingWeight` = **20** points pro rata. With the current set that is 28
   questions, so each is worth about 0.71 points.
 
-So `score = round(60 × base/97 + 20 × insight/5 + 20 × coding/28)`.
+So `score = round(60 × base/368 + 20 × insight/5 + 20 × coding/28)`, over
+whichever of those questions were actually asked and graded.
 
 A model that sweeps tiers 1 to 10 and can touch neither hard band caps at **60**;
 one that can also read code but not find the insight shortcut reads **80**. Under
@@ -167,31 +273,34 @@ stays in the denominator:
   problem stays visible rather than showing up as fake low quality.
 - **Too slow.** A question the worker cannot answer within its deadline is a
   usability failure, counted wrong and **not retried** — a retry would only burn
-  another deadline for the same verdict. The bound is `benchAnswerDeadline` = **2
-  minutes** for tiers 1 to 8, and `benchAnswerDeadlineFrontier` = **6 minutes**
-  for tiers at or above `benchFrontierTier` = **9**. The frontier tiers get the
-  longer bound because at that difficulty the question is whether the model can
-  reason at all, and production already prices patience separately: the router
-  ranks candidates by expected completion time, so a slow-but-right worker loses
-  the race for quick prompts without having its quality falsified first. Tiers 3
-  to 8 keep the tight bound on purpose, because that spread of slow mid-tier
-  reasoners is real and wanted.
+  another deadline for the same verdict. The bound is `benchAnswerDeadline` = **6
+  minutes**, for every tier.
 
-  The test is `q.Tier >= benchFrontierTier`, so **tier 12 inherits the 6-minute
-  deadline** even though nothing about it was considered when the bound was
-  chosen. That rationale was written in v33 for long-form frontier reasoning,
-  where a 284B MoE running at 18 tok/s was scoring below a saturated 27B on
-  nothing but tier-10 speed fails. Tier 12 is 28 short code traces whose answers
-  are single numbers or single words. Six minutes each is far more patience than
-  those questions need, and the effect is that a worker slow enough to be
-  unusable on code tracing is not caught by the deadline on this tier. If a
-  narrower bound is wanted for tier 12, it needs its own constant rather than a
-  change to `benchFrontierTier`, which would also move tiers 9 to 11.
+  It used to be 2 minutes below tier 9 and 6 at or above it, on the reasoning
+  that at frontier difficulty the question is whether the model can reason at
+  all, while a slow mid-tier reasoner is a real and wanted part of the spread.
+  v38 removed the split, because the tight bound turned out to be measuring
+  throughput rather than capability: at 2 minutes, **75% of the strongest home
+  worker's recorded misses were answers it was cut off part-way through**.
+  Production already prices patience separately — routing ranks candidates by
+  expected completion time, so a slow-but-right worker loses the race for quick
+  prompts without having its quality falsified first.
+- **Prompt too long for the worker.** Judged before the request is dispatched, so
+  nothing is spent: if the estimated prompt plus a minimum answer exceeds the
+  worker's measured window, the question is a **miss**. It is only applied when
+  the window is actually known; a worker still being profiled is asked. This
+  matters for the long-context questions below, where it used to be an error
+  instead — and an errored question stays out of the denominator, so a 32K worker
+  read as *unmeasured* at the 48K rung rather than as unable to do it, which is
+  the opposite of what a weakness map should say.
 - **Errored.** Any other request failure is treated as transient — a dropped
   request under concurrent profiling load — and retried up to
   `benchMaxAttempts` = **3** times with a backoff of 1 second times the attempt
-  number. Only a request that fails every attempt is recorded as errored, and it
-  counts as a failure.
+  number. Only a request that fails every attempt is recorded as errored, and
+  since v41 an errored question is excluded from the denominator rather than
+  counted wrong. It used to be a zero over a one, arithmetically identical to a
+  wrong answer, so an unreachable grading sandbox scored a perfect worker at 75
+  and reported success.
 
 **Discarded runs.** If more than half the questions error, the worker went
 unreachable mid-run. It is not bad, it just cannot be graded, so the run is
@@ -208,6 +317,20 @@ served from `GET /backends/{id}/benchmark`. The per-tier breakdown is logged as
 `t1=4/4 t2=4/4 …`, with `trunc=`, `slow=` and `err=` counts appended when
 non-zero.
 
+An answer served from the permanent cache — the model has already answered this
+exact question under this exact grader — is recorded as a pass or a fail with the
+answer text shown as `(cached)`, and no generation is spent on it. Its **latency**
+is only carried across when the cached row was measured on the *same worker*:
+correctness is a property of the weights and travels, a duration is a property of
+the box and does not. That is what makes a re-profile cheap and a grader fix
+cheaper.
+
+**Progress.** While the run is going, `GET /backends` carries a
+`profile_progress` object for that worker — the phase, questions done out of
+questions intended, how many are in flight, elapsed time, and an ETA once eight
+have finished. `ask -l` renders it as a progress bar. On a budget-truncated run
+`done` ends below `total`, which is the honest reading rather than a bug.
+
 **Categories.** The same run, grouped by what each question measures rather than
 by how hard it is: `coding`, `maths`, `reasoning`, and `general` for the control
 and floor tiers. It ships in the same response, under `categories`, with the tier
@@ -217,9 +340,13 @@ and one the tier line cannot be read for — tier 4 mixes compiler gotchas in wi
 arithmetic, and the generated half lands maths and reasoning items in the same
 tiers.
 
-The category is DERIVED, not stored (`internal/router/benchcategory.go`), so it
-changes no bytes of the question set and cannot invalidate a cached profile.
-Three rules in order: the answer-format boilerplate LiveBench pastes onto every
+The category is DERIVED, not stored (`internal/router/benchcategory.go`), so
+re-categorising a question changes no bytes of the question and therefore does
+not change its identity or orphan its cached verdicts. (Under the old scheme the
+same property was stated as "cannot invalidate a cached profile", which was the
+sharper constraint — a question's bytes could not be touched without re-measuring
+the whole fleet. That is no longer true of the bytes, but it is still true, and
+still worth keeping, of the categorisation.) Three rules in order: the answer-format boilerplate LiveBench pastes onto every
 generated item identifies its task and therefore its category; a language name
 identifies a hand-authored code trace; anything left is hand-authored and takes
 its tier's charter. A figure is a flat pass rate within the category — strict
@@ -354,11 +481,33 @@ actually it was K2.") does not count.
 **`contains`** — case-insensitive substring. The default, used where the expected
 answer is a distinctive word or token that cannot plausibly appear by accident.
 
-Across the 130 questions: 90 `numeric`, 24 `mcq`, 13 `contains`, 3
-`final-contains`. Tier 12 is deliberately all `numeric` and `contains` — see
+Across the whole 401-question bank: 143 `numeric`, 120 `exact-list`, 95
+`mcq-repeat`, 27 `mcq`, 13 `contains`, 3 `final-contains`. The generated half
+supplies nearly all the `exact-list` and `mcq-repeat` items — LiveBench's own
+answer-format boilerplate asks for a duplicated letter, which is what
+`mcq-repeat` reads. Tier 12 is deliberately all `numeric` and `contains` — see
 that tier's comment block for why multiple choice was cut from it.
 
+A seventh mode, `code-exec`, is graded by running the answer against test cases
+in the sandbox. It is what `bench emit` assigns to LiveBench's `LCB_generation`
+and `coding_completion` tasks, and the currently committed bank has none of them.
+
+Each of those seven modes has its own entry in `graderVersions`, and that map is
+the blast radius of a grader fix: change `numeric` and 143 questions are re-asked
+on every worker in both modes, and the other 258 keep every verdict they have.
+A `code-exec` question's identity also folds in its test cases, which are part of
+the question the same way `Expect` is for a string-matched one.
+
 ## What actually spreads the fleet
+
+> **This section is history, and it is kept because the measurements in it are
+> real and hard to come by.** It was written when a worker's whole rating was one
+> 0-100 number, and a question that failed to *spread* the fleet was a question
+> that bought nothing. Routing does not work that way any more: it looks up
+> per-question verdicts near the prompt, so a question every worker passes says
+> "route prompts like this on speed", which is a useful thing to know. Read what
+> follows as an account of how the hand-authored tiers came to be shaped the way
+> they are, not as the rule for adding a question today.
 
 Two whole tiers have been built, measured and deleted getting to the current
 twelve. The per-tier numbers off the live fleet (Qwen3.6-27B / Granite-8B /
@@ -396,6 +545,72 @@ therefore not buying new discrimination. What it buys is a programming-specific
 measurement in a set that is otherwise entirely puzzles, so a worker's score says
 something about whether it can be handed a codebase rather than a riddle.
 
+That last paragraph is where the old rule started to break down, and it is worth
+saying why the exception became the rule. Tier 12 is exactly the kind of question
+the outcome matrix wants: it correlates with everything else and therefore adds
+nothing to a scalar, and it is the only evidence in the bank about a whole class
+of prompt. The nine long-context questions were added on that basis rather than
+on spread, and the 262 generated questions widened subject coverage rather than
+the score's range.
+
+## The long-context questions
+
+Nine questions, three input lengths by three task shapes, added because nothing
+else in the bank asks whether a model uses the whole of a large prompt.
+
+| Rung | Prompt | ~Tokens | Tier |
+|------|-------:|--------:|-----:|
+| short | 16,000 chars | 4,000 | 6 |
+| medium | 64,000 chars | 16,000 | 9 |
+| long | 192,000 chars | 48,000 | 10 |
+
+Each rung renders a synthetic machine field log — a unit-to-keeper roster header,
+then several hundred records of the form
+`[NNNN] unit=… keeper=… t=NNNNN status=… delta=±N` interleaved with prose notes —
+and asks three questions of it:
+
+- **aggregation** — sum the deltas of all eleven fault records (`numeric`);
+- **ordering** — sort the nine escalated records by timestamp and name the keeper
+  of the third-earliest (`mcq`, ten options);
+- **contradiction** — find the one record whose keeper disagrees with the header
+  roster and give its 1-based index (`numeric`).
+
+Three properties are enforced by test. The answer is settled at least halfway
+through the log, and the first half yields a *different* answer, so skimming the
+opening fails. The preamble goes before the log and the question after it, because
+a question stated only up front lets a model stream past the log looking for one
+thing — which is a retrieval test, and retrieval is what `contextprobe.go`
+already measures with a single needle. And the number of special records is held
+constant across rungs, so only the length varies.
+
+The generator is a hand-written splitmix64 rather than `math/rand`, deliberately:
+the bank is content-hashed, so the questions must be byte-identical on every run,
+on every machine, forever. Golden prompt hashes are pinned in the test.
+
+### Their tiers are provisional
+
+**Tiers 6, 9 and 10 above are not measurements.** Every other tier in this bank
+is a measured fleet pass-rate band, assigned from calibration data. These three
+are an author's ordering of three input lengths, assigned without running a single
+worker, because a calibration is hours of live GPU time. They happen to type-check.
+
+Before reading any number that depends on them:
+
+```
+go run . bench calibrate -router http://localhost:8585 -token "$ROUTER_ADMIN_KEY"
+```
+
+and re-band from the measured pass rate. Until then the only defensible claim is
+the ordering: 48K is not easier than 16K, which is not easier than 4K.
+
+They were slotted into existing tiers rather than given a tier 13 for two
+concrete reasons: tier 13 would fall in `benchWeightedScore`'s coding bucket
+(tier 12 and above) and dilute a 20-point bucket that is supposed to be about
+code, and `benchTierCategory` has no entry for 13, so they would categorise as
+unknown. They are filed under `reasoning`, and the test asserts it — a synthetic
+log full of systems vocabulary is an easy way to get a long-context reasoning
+measurement filed under "coding".
+
 All hand-authored questions here are original rather than lifted from the
 benchmarks they are modelled on. GPQA in particular is gated behind an agreement
 not to reproduce its items in plain text, precisely to keep them out of training
@@ -407,9 +622,22 @@ trap tiers are built in the spirit of.
 
 # The questions
 
-Questions are numbered 1 to 130 in the order they appear in
-`benchmark_data.go`. Multi-line prompts are shown in code blocks so the exact
-text sent to the worker is reproduced; the router sends each as a single string.
+**This is the hand-authored half of the bank: 130 of the 401 questions.** They
+are numbered 1 to 130 in the order they appear in `benchmark_data.go`, and the
+tier headings below count only them. The other 271 are not reproduced here:
+
+- **262 generated from LiveBench**, in `benchmark_data_live.go`, which is
+  generated by `discrimen bench emit` and carries its own provenance header.
+  They are somebody else's questions under their own licence — see
+  [NOTICE](../NOTICE) — and the file is the readable copy.
+- **9 long-context**, synthesised in code from frozen seeds by
+  `benchmark_data_longcontext.go`. Each prompt is tens of thousands of
+  characters, so printing them here would be most of this document. The
+  generator, the three task shapes and the answer derivation are described under
+  "The long-context questions" above.
+
+Multi-line prompts are shown in code blocks so the exact text sent to the worker
+is reproduced; the router sends each as a single string.
 
 ## Tier 1 — controls (4 questions, thinking-off)
 
@@ -1675,23 +1903,38 @@ routing.
 The mitigation is refresh, not secrecy. The router carries a three-phase
 generator (`bench fetch`, `bench calibrate`, `bench emit`) that pulls fresh
 candidate questions from LiveBench, grades them against the live fleet with the
-exact production grader, and selects the ones that actually discriminate. Each
-refresh is a commit that bumps `benchmarkVersion` alongside the new questions,
-which invalidates every cached profile and re-measures the whole fleet against
-questions the models have not seen. LiveBench replaces about a sixth of its own
-questions monthly, with a full turnover roughly every six months, for exactly
-this reason.
+exact production grader, and selects the ones that actually discriminate.
+LiveBench replaces about a sixth of its own questions monthly, with a full
+turnover roughly every six months, for exactly this reason.
 
-Two honest limits on that mitigation.
+**A refresh no longer costs a fleet-wide re-measurement.** It used to: the
+question set was part of the profile cache key, so replacing a sixth of it
+invalidated every profile and re-ran the whole bank on every worker. Since a
+question's identity is a hash of its own content, the new questions are simply
+new — they have no cached verdicts and are asked — while the questions that
+survived the refresh keep every verdict every worker has ever given them. The
+retired questions' rows are not deleted and not stale; nothing ever asks for
+those identities again.
+
+So the practical instruction has inverted. **Do not bump `benchmarkVersion` when
+you refresh the questions.** Bump it when you change how the profiling is *done*.
+(The generated file's own header still carries the older instruction; it is
+generated, and the rule above is the current one.)
+
+Two honest limits on the mitigation itself.
 
 First, it only covers the sourced arithmetic tiers. LiveBench cannot supply the
 trap, unrecallable and world-model tiers (6, 9, 10 and 11), because their whole
 value is being absent from any training corpus. Nor can it supply tier 12:
 `benchgen.go` excludes LiveBench's `coding` and `agentic_coding` categories
 because grading them needs execution, which the router does not do at profiling
-time. That is 65 of the 130 questions the generator can never refresh, and they
-are the tiers with the best measured spread, so they are the ones publication
-damages most. Refreshing them means authoring new ones by hand.
+time. That is 65 of the 130 hand-authored questions the generator can never
+refresh, and they are the tiers with the best measured spread, so they are the
+ones publication damages most. Refreshing them means authoring new ones by hand.
+The nine long-context questions are in the same position for a different reason:
+they are synthesised deterministically from frozen seeds, so refreshing them
+means changing the seeds, which is a one-line commit and re-asks exactly those
+nine.
 
 Second, saturation arrives on its own schedule regardless of contamination. Tier
 9 was added because a 27B scored 100% on the tier before it; tier 10 was added

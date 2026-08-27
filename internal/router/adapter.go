@@ -2,6 +2,59 @@ package router
 
 // Online tier adapter — self-correcting layer over auto-tier routing.
 //
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ NOT CONSULTED. THE BIAS THIS LEARNS CHANGES NO ROUTING DECISION.         │
+// └──────────────────────────────────────────────────────────────────────────┘
+//
+// Read this before believing anything below it. The tierAdapter still exists,
+// still loads and saves tier_adapter.json, and Main still logs "online tier
+// adaptation enabled" on every start with ROUTER_AUTO_ROUTING on — and none of
+// that reaches a route any more. Audited 2026-08-27; the reachability argument
+// is three steps and each one is checkable:
+//
+//  1. adjust() has exactly ONE caller outside this file's tests: planRoute's
+//     difficulty-tier branch, `if cl != nil && r.cfg.AutoDifficulty`.
+//  2. The outcome-matrix branch sits ABOVE it, gated on
+//     `cl != nil && r.outcomes != nil && len(cl.vec) > 0`, and it RETURNS. It
+//     cannot fall through on thin evidence: chooseByOutcome ranks rather than
+//     filters, so its only empty return is `len(cands) == 0`, and planRoute has
+//     already refused an empty candidate set well above this point.
+//  3. Each of those three gate terms is satisfied whenever the tier branch's own
+//     would be. r.outcomes is assigned unconditionally in Main (there is no knob
+//     that leaves it nil in a deployed router). classify() returns ok=true only
+//     after setting vec, from a live embed or from a cache entry that was itself
+//     stored with one, so `cl != nil` implies `len(cl.vec) > 0`.
+//
+//     ⇒ cl != nil ⇒ the matrix branch returns ⇒ the tier branch is unreachable
+//     ⇒ adjust() is never called on a deployed router. It survives on the tier
+//     path only in tests, which build a Router by hand with no matrix.
+//
+// observe() is in slightly better shape and no better use. Its two proxy-side
+// callers are both gated on parseRouteScore succeeding, which needs a route
+// string of the form "route:d=…" — the tier branch's format. The matrix branch
+// writes "route:outcome:…" and the unclassified fallback writes bare "route", so
+// neither parses and neither teaches. What still can is POST /v1/route-feedback,
+// where a client supplies a score directly. So the table does move; nothing reads
+// it afterwards except the adapter_bias field in /v1/route-preview, which now
+// reports it only on the tier path for exactly this reason.
+//
+// It is left in place rather than deleted because the deletion is not local to
+// this file: the constructor, the persistLoop goroutine, the boot log line, the
+// four Adapt* config fields, the /v1/route-feedback handler and the two observe
+// call sites are all in main.go, with more in judge.go, escalate.go and
+// relay.go. Whoever removes it should remove all of that in one commit, along
+// with tier_adapter.json on the data volume. Until then this banner is the
+// difference between dormant code and code that looks like it is working.
+//
+// NOTHING BELOW THIS LINE IS DEAD. classifyResponse, responseInadequate,
+// parseRouteScore and the inadequacy constants are all live: escalate.go,
+// capture.go, relay.go and main.go depend on them, and they are what tell a
+// 2xx that contains no answer from one that does. They live here for historical
+// reasons — they were written as the adapter's input — not because they belong
+// to it.
+//
+// ── What it does, when it is consulted ──────────────────────────────────────
+//
 // It learns, per difficulty-score region, a small UPWARD bias on the score when
 // the chosen tier's responses come back inadequate — empty or truncated
 // (finish_reason "length"), the same signals the clabtree agent itself retries

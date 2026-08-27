@@ -9,15 +9,26 @@ package router
 //
 // The preview runs the REAL selection pipeline (planRoute) — same classifier,
 // same hard filters, same thinking resolution, same session affinity, same
-// completion-time ranking — and renders the result instead of dispatching it. It
+// outcome-matrix ranking — and renders the result instead of dispatching it. It
 // deliberately shares planRoute rather than reimplementing the explanation: a
 // preview that derives its own answer eventually explains a route the router
 // doesn't take, which is worse than no preview at all.
 //
+// SHARING planRoute IS NOT ENOUGH ON ITS OWN, and that is the lesson of the two
+// defects this file has carried. Everything planRoute does not do — the per-key
+// allow-list, which the proxy applies on the very next line, and the per-worker
+// prediction, which the proxy never needs to render — has to be done here too,
+// or the preview is wrong in exactly the cases nobody previews until something
+// has already gone strange. A restricted key was told would_serve: a worker its
+// real request could not reach; and the decision half described the
+// difficulty-tier ranker with three fields the live path never sets. Both looked
+// like working answers.
+//
 // It is strictly read-only. It does not acquire a slot, record a session turn,
-// feed the adapter, or contact a worker. The one side effect it can have is
-// populating the classifier's prompt→score cache, which is exactly what the next
-// real request would have done anyway.
+// feed the adapter, or contact a worker. Two side effects it can have, both of
+// them reads: populating the classifier's prompt→score cache, which is exactly
+// what the next real request would have done anyway, and querying the outcome
+// matrix, which is a read under its own lock and changes nothing in it.
 
 import (
 	"errors"
@@ -237,12 +248,12 @@ func (r *Router) handleRoutePreview(w http.ResponseWriter, req *http.Request) {
 	// CLIENT scope, with the fleet detail held back to admin.
 	//
 	// The endpoint exists so a caller can understand what its OWN request would
-	// do, and that answer — the decision, the classification, the tier, the
-	// thinking mode, whether a named group fell back — tells them nothing about
-	// the estate they could not learn from the response headers of the request
-	// itself. The candidate and rejection lists are a different thing entirely:
-	// every worker id, alive or not, with its quality and its load, to anyone
-	// holding any client token. That is the inventory moving GET /backends to
+	// do, and that answer — the decision, the classification, the thinking mode,
+	// whether a named group fell back — tells them nothing about the estate they
+	// could not learn from the response headers of the request itself. The
+	// candidate and rejection lists are a different thing entirely: every worker
+	// id, alive or not, with its quality, its load and now the matrix's opinion of
+	// it, to anyone holding any client token. That is the inventory moving GET /backends to
 	// admin scope was meant to stop handing out, and X-LLM-Backend-ID was closed
 	// for the same reason (see refusePin).
 	ident, ok := r.requireClient(w, req)
@@ -373,6 +384,11 @@ func (r *Router) renderPreview(chatReq *ChatRequest, plan *routePlan, budget tim
 		// unconditionally attributed a correction to a decision that never saw it.
 		if plan.target > 0 {
 			resp.AdapterBias = round3(r.adapter.adjust(d) - d)
+		} else if r.outcomes != nil && len(plan.cl.vec) > 0 {
+			resp.Notes = append(resp.Notes,
+				"ranked by the outcome matrix: predicted correctness on graded questions like this one, then speed. "+
+					"target_quality is 0 and above_bar is absent because no quality bar is involved — the candidates carry "+
+					"the prediction that ordered them instead")
 		}
 	} else {
 		resp.Notes = append(resp.Notes,

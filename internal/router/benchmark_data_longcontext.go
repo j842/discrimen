@@ -44,23 +44,39 @@ package router
 //
 // SYNTHESISED IN CODE, NOT PASTED. A 48K-token prompt is ~192,000 characters and
 // has no business being a string literal. More importantly the bank is
-// CONTENT-HASHED — benchQuestionHash orders questions within a tier by an FNV of
-// Prompt+Expect, and the question set is part of the profile cache key — so the
-// generator must be byte-identical on every run, on every machine, forever. It
-// therefore uses its own splitmix64 rather than math/rand (whose exact stream is
-// a stdlib implementation detail this file must not depend on), takes no clock,
-// no map iteration and no environment, and is pinned by golden hashes in
-// benchmark_data_longcontext_test.go so an accidental edit to the generator
-// fails CI instead of silently re-profiling the fleet.
+// CONTENT-HASHED, in two independent places, and a generator that drifted would
+// break both:
+//
+//	benchQuestionQID (identity.go) hashes the prompt, the expected answer, the
+//	match mode and the grader version, and a graded answer is permacached under
+//	it. A prompt that differed between two runs of the same binary would MISS on
+//	every run — so these nine, the most expensive questions in the bank by two
+//	orders of magnitude, would be re-generated on every profile of every worker
+//	forever, and no two of those verdicts would be about the same question.
+//
+//	benchQuestionHash orders questions within a tier by an FNV of Prompt+Expect,
+//	and a truncated profile grades the prefix of that order. A prompt that moved
+//	would reshuffle the tier and change WHICH questions a budget-stopped run
+//	asked, so two profiles of one worker would sit on different exams.
+//
+// So the generator must be byte-identical on every run, on every machine,
+// forever. It therefore uses its own splitmix64 rather than math/rand (whose
+// exact stream is a stdlib implementation detail this file must not depend on),
+// takes no clock, no map iteration and no environment — the one map it builds is
+// a membership set that is never ranged over — and is pinned by golden prompt
+// hashes in benchmark_data_longcontext_test.go, so an accidental edit to the
+// generator fails CI instead of silently re-asking nine 48K questions.
 //
 // ─── PROVISIONAL AND UNCALIBRATED TIERS ─────────────────────────────────────
 //
-// The Tier values below are NOT measurements. Every other tier in this bank is a
-// measured fleet pass-rate band (benchgen_emit.go assigns them from calibration
-// data); these are an author's ordering of three input lengths, assigned without
-// running a single worker, because a calibration is hours of live GPU time.
-// Treat them as placeholders that happen to type-check. Before anyone reads a
-// number that depends on them:
+// The Tier values below are NOT measurements. The generated half of the bank
+// takes its tier from a measured fleet pass-rate band (benchgen_emit.go assigns
+// them from calibration data) and the hand-authored half from a charter tuned
+// against the live fleet over many revisions (benchmark_data.go); these three are
+// an author's ordering of three input lengths, assigned without running a single
+// worker, because a calibration is hours of live GPU time. Treat them as
+// placeholders that happen to type-check. Before anyone reads a number that
+// depends on them:
 //
 //	go run . bench calibrate -router http://localhost:8585 -token "$ROUTER_ADMIN_KEY"
 //
@@ -91,19 +107,32 @@ package router
 // serve a 48K prompt) but it is a fail earned on throughput, so read it with
 // the speed probe beside it.
 //
+// Two things have since taken the worst case off this bill. A worker whose window
+// cannot hold a rung is scored a miss BEFORE dispatch and never prefills it at
+// all (see below), and a rung this model has already answered is served from the
+// permacache, so the ~408K is a first-sighting cost rather than a per-profile one.
+//
 // STORAGE. BenchResult carries the full Prompt into the persisted profile, so
 // these nine add ~816KB per pass and up to ~1.6MB per worker profile. That is
 // the reason there are nine and not ninety.
 //
-// ─── ONE KNOWN GAP, WHICH NEEDS AN OWNER OF benchmark.go ────────────────────
+// ─── THE GAP THAT MADE THESE UNMEASURABLE, AND HOW IT CLOSED ────────────────
 //
-// A worker whose window is smaller than the prompt does not FAIL these — its
-// server rejects the request, benchOne records res.errd, and an errored question
-// stays out of the denominator (runQualityBenchmark). So a 32K worker is
-// silently unmeasured at the 48K rung rather than scored as unable to do it,
-// which is the opposite of what a weakness map should say. Fixing it means
-// teaching runQualityBenchmark to score "prompt longer than the advertised
-// window" as a miss rather than an outage, which is benchmark.go's call to make.
+// A worker whose window is smaller than the prompt used not to FAIL these: its
+// server rejected the request, benchOne recorded res.errd, and an errored
+// question stays out of the denominator by design (runQualityBenchmark), so a
+// 32K worker came back silently unmeasured at the 48K rung rather than scored as
+// unable to do it — the opposite of what a weakness map should say, and about
+// precisely the finding this file exists to produce.
+//
+// benchOne now judges it before dispatch: a prompt that does not fit the
+// worker's usable window is a MISS, counted, with the shortfall in the result
+// text. It is judged only when the window is actually KNOWN (usableContextTokens
+// returns 0 mid-profile, and guessing a miss from a missing number would fail
+// questions a worker can answer), and it is judged BEFORE the permacache is
+// consulted, because the window belongs to the deployment while the cache is
+// keyed by model — otherwise a 32K deployment would inherit a 128K sibling's
+// pass at the 48K rung.
 
 import (
 	"fmt"
@@ -114,14 +143,14 @@ import (
 
 // longCtxRand is splitmix64, written out here rather than taken from math/rand.
 //
-// The bank is content-hashed and the question set is part of the profile cache
-// key, so "the same question every run" is a correctness property, not a
-// convenience. math/rand's exact stream for a given seed is a stdlib
-// implementation detail — it has been changed before, and a change would
-// silently re-generate every prompt below under an unchanged benchmarkVersion,
-// which is precisely the failure mode that makes two workers profiled a week
-// apart incomparable on one absolute 0-100 scale. Twelve lines of arithmetic
-// owned by this file cannot do that.
+// The bank is content-hashed, so "the same question every run" is a correctness
+// property, not a convenience. math/rand's exact stream for a given seed is a
+// stdlib implementation detail — it has been changed before, and a change would
+// silently re-generate every prompt below, giving each one a new qid that no
+// permacached verdict answers and a new position in its tier's asking order. Two
+// workers profiled a week apart would then be graded on different questions and
+// compared on one absolute 0-100 scale. Twelve lines of arithmetic owned by this
+// file cannot do that.
 type longCtxRand struct{ state uint64 }
 
 func (r *longCtxRand) next() uint64 {
@@ -372,7 +401,7 @@ func longCtxBuild(seed uint64, targetChars int) longCtxDoc {
 
 	doc := longCtxDoc{}
 	escalated := make([]longCtxRecord, 0, longCtxEscalations)
-	fault, esc := 0, 0
+	esc := 0
 	for i, slot := range slots {
 		switch shuffled[i] {
 		case 0:
@@ -383,7 +412,6 @@ func longCtxBuild(seed uint64, targetChars int) longCtxDoc {
 			recs[slot].Status = "fault"
 			recs[slot].Delta = 1 + r.intn(9)
 			doc.FaultSum += recs[slot].Delta
-			fault++
 		case 1:
 			entry := longCtxRoster[rosterPerm[esc]]
 			recs[slot].Status = "escalated"
@@ -405,7 +433,11 @@ func longCtxBuild(seed uint64, targetChars int) longCtxDoc {
 			doc.MismatchIndex = recs[slot].Index
 		}
 	}
-	_ = fault
+	// The fault records are not counted here on purpose. There is exactly one
+	// stamped per bucket that drew role 0, so the count is longCtxFaults by
+	// construction — and a counter checked against a constant it was derived from
+	// proves nothing. What does prove it is reading the answer back off the page,
+	// which is what TestLongContextAnswersAreInTheDocument does.
 
 	// Third-earliest by timestamp. The records were written into the log in
 	// arrival order and the timestamps are not, so this cannot be read off the
@@ -474,10 +506,15 @@ func longCtxBuild(seed uint64, targetChars int) longCtxDoc {
 // its three questions carry. See the PROVISIONAL banner at the top of the file:
 // the tiers are an author's ordering of the lengths, not a measurement.
 //
-// The seeds are arbitrary and, once shipped, FROZEN: changing one regenerates
-// every prompt and every answer at that rung, which changes benchQuestionHash
-// and so the order questions are asked in, and must therefore be treated as a
-// question-set change requiring a benchmarkVersion bump.
+// The seeds are arbitrary and, once shipped, FROZEN. Changing one regenerates
+// every prompt and every answer at that rung, and both hashes move with it: the
+// three questions get new qids, so every worker's cached verdict for them is
+// unreachable and each is re-asked at full price, and benchQuestionHash moves,
+// so the order that tier is asked in changes and two truncated profiles sample
+// different prefixes. None of that needs a benchmarkVersion bump any more —
+// that constant is for a change to the profiling METHOD (see benchmark.go) —
+// but it is not free either, and the golden hashes in the test are there to make
+// sure it is deliberate.
 var longCtxRungs = []struct {
 	Seed   uint64
 	Chars  int // ~4 chars per token, the same estimate benchPromptTokenEstimate uses

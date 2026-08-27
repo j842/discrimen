@@ -14,10 +14,13 @@ import (
 // The tiers already published by the benchmark are a difficulty ladder, and they
 // answer "how far up does this worker get". They cannot answer the question an
 // operator actually asks before handing a worker a job — "can it read code?" —
-// because difficulty and ability are orthogonal axes: tier 12 is programming,
-// but a LiveBench maths item calibrated into tier 12 sits there too, and tier 4
-// deliberately mixes compiler gotchas in with arithmetic word problems. Reading
-// t4=12/25 tells you nothing about which half was missed.
+// because difficulty and ability are orthogonal axes. Tier 4 deliberately mixes
+// compiler and shell gotchas in with arithmetic word problems; tier 5 holds AMC
+// maths beside zebra-puzzle constraint satisfaction, because the fleet happened
+// to find them equally hard and a generated question's tier is a measured pass
+// rate rather than a subject; and tiers 6, 9 and 10 now also carry the synthetic
+// long-context items. Reading t5=40/67 tells you nothing about which half was
+// missed.
 //
 // The categories are the three abilities the question set actually spans, plus
 // a bucket for the control questions that measure none of them:
@@ -28,15 +31,18 @@ import (
 //	general    tiers 1-2, the controls and the floor — deliberately not discriminators
 //
 // WHY THE CATEGORY IS DERIVED AND NOT STORED. benchmarkQ carries no Category
-// field and this file does not add one. Half the question set is generated
-// (benchmark_data_live.go, written by `bench emit` from LiveBench), so a stored
-// field would have to be threaded through the generator, and the generator's
-// output is part of the PROFILE CACHE KEY: LoadWorkerProfile keys on
-// benchmarkVersion, and anything that changes the question set without changing
-// that version silently compares workers graded on different sets against one
-// absolute 0-100 scale (see benchgen.go's "WHY THE OUTPUT IS COMMITTED"). A
-// derived category has none of that exposure — it changes no bytes, invalidates
-// no profile, and can be corrected in a patch release without re-benchmarking a
+// field and this file does not add one. Most of the question set is generated —
+// benchmark_data_live.go is written by `bench emit` from LiveBench and
+// benchmark_data_longcontext.go is synthesised at init() — so a stored field
+// would have to be threaded through both generators, and correcting a
+// misclassification would mean regenerating a committed bank (or, for the
+// long-context half, re-deriving nine 192,000-character prompts) to change a
+// label that no worker is ever asked about.
+//
+// A derived category has none of that exposure. It changes no bytes of any
+// prompt, so it moves no benchQuestionQID and no cached verdict; it leaves
+// benchQuestionHash and therefore the asking order alone; and it can be corrected
+// in a patch release, over profiles already on disk, without re-benchmarking a
 // fleet. The cost is that this file has to recognise questions from their text,
 // which is what the rest of it is about.
 
@@ -136,6 +142,15 @@ var benchCodeRe = regexp.MustCompile(`(?i)\b(bash|python|golang|kotlin|javascrip
 //	        in the prompt. Filing it by the shape of its answers rather than by
 //	        what makes it hard would make the maths column meaningless.
 //
+// The long-context questions (benchmark_data_longcontext.go) also land here —
+// they carry no LiveBench marker and no language name — and that is deliberate on
+// their side rather than an accident on this one: tiers 6, 9 and 10 were chosen
+// for them partly BECAUSE this table already files all three as reasoning, which
+// is what reasoning over a long input is. Their roster of invented keeper names
+// is likewise chosen to look nothing like a language or shell keyword, since
+// benchCodeRe is consulted first and would otherwise file a long-context
+// measurement under coding.
+//
 // A tier absent from this table yields benchCatUnknown rather than a guess. Adding
 // tier 13 should mean adding a line here, and TestBenchCategoryCoversEveryTier is
 // what says so.
@@ -157,7 +172,8 @@ var benchTierCategory = map[int]string{
 // benchCategoryOf places one question. Three rules, in the order they are
 // checked and for the reasons above: a LiveBench format marker settles the
 // generated half outright, a language name settles a hand-authored code trace,
-// and what is left is hand-authored and takes its tier's charter.
+// and what is left — the hand-authored set and the synthesised long-context
+// items — takes its tier's charter.
 func benchCategoryOf(tier int, prompt string) string {
 	for _, m := range benchLiveMarkers {
 		if strings.Contains(prompt, m.marker) {

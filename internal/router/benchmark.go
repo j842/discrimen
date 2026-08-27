@@ -35,7 +35,16 @@ import (
 // every question the model has already answered is served from the permacache.
 //
 // So bump it for a change to the METHOD (a different probe, a different way of
-// asking), not for a change to the QUESTIONS.
+// asking), not for a change to the QUESTIONS. A change to how an answer is
+// GRADED has its own knob and it is not this one: bump that mode's entry in
+// graderVersions (identity.go), which re-asks exactly the questions that mode
+// scores and leaves every other question in the bank cached.
+//
+// Everything from here down is HISTORY — an account of what each bump was for,
+// written when it was made and under whatever the rules were at the time. Several
+// of these entries say a bump invalidated the whole bank, and they are accurate
+// about the world they were written in; they are not a description of what a bump
+// does today. That is the four paragraphs above.
 // v24: a question the worker can't answer within benchAnswerDeadline is scored a
 // speed fail (counted wrong, not retried) instead of a retried transport error.
 // v25: length-truncation now counts as a FAILURE (was excluded from the
@@ -254,7 +263,11 @@ type benchmarkQ struct {
 	Tier   int    // difficulty band 1 (control) … 11 (budget-bounded insight) … 12 (programming); also sets grading mode — tiers >= benchHardTier are graded thinking-on (see benchmark_data.go)
 	Prompt string // user prompt sent to the worker
 	Expect string // expected answer token (see Match)
-	Match  string // "contains" | "numeric" | "mcq" | "final-contains" | "code-exec" (see checkAnswer)
+	// Match is the grading mode. Every value here is also a key in
+	// graderVersions (identity.go), because a question's identity carries the
+	// version of the grader that scores it — a mode missing from that map grades
+	// under version 0 and can never share a cached verdict with one that isn't.
+	Match string // "contains" | "numeric" | "mcq" | "mcq-repeat" | "exact-list" | "final-contains" | "code-exec" (see checkAnswer)
 	// Code is set only when Match == benchMatchCodeExec. Such a question has no
 	// Expect: its ground truth is its test cases, and grading means running the
 	// answer in the sandbox sidecar (codeexec.go) rather than comparing strings.
@@ -293,9 +306,13 @@ var (
 	// adjacent to the digits, so a spaced subtraction ("10 - 3 = 7") still reads its
 	// operands unsigned.
 	benchNumberRe = regexp.MustCompile(`-?[0-9]+(?:\.[0-9]+)?`)
-	// mcq pick extraction, tried in priority order by checkAnswer: an explicit
+	// mcq pick extraction, tried in priority order by matchesMCQ: an explicit
 	// declaration ("the answer is B", "Answer: C"), a letter leading the answer
-	// ("C. because…", "(B)"), then the last standalone letter. The fallback class
+	// ("C. because…", "(B)"), then benchBareLetterPick, which wants a REASON to
+	// read a bare letter as a choice — the reply ending on it, the concluding
+	// option anchor of an enumerating reply, or a single candidate letter in the
+	// whole text. (It was "the last standalone letter anywhere", which passed
+	// picks the model never made; see benchBareLetterPick.) The bare-letter class
 	// admits uppercase plus lowercase b/c only: a bare lowercase "a" or "d" is
 	// almost always the article or the "I'd" contraction, which is how a plain
 	// (?i)\b[a-d]\b misread prose answers ("…causing a syntax error" → "a").
@@ -330,12 +347,15 @@ var (
 	// bare last-letter rule read the one after "or" as its answer.
 	benchLetterOrRe = regexp.MustCompile(`(?i)\b([a-j])\s+or\s+\(?([a-j])\b`)
 	// benchEnumRe finds option anchors — an A-J letter opening the string, a line, or
-	// a clause, written "X)" / "X." — so checkAnswer can tell an answer that
+	// a clause, written "X)" / "X." — so matchesMCQ can tell an answer that
 	// ENUMERATES the options ("A) … no. B) … no. C) … yes.") from one that leads
-	// with its pick (see benchEnumerates). Widening to A-J lets "i.e."/"e.g." read as
-	// two option anchors and flag a non-enumerating answer as enumerating; the only
-	// consequence is that the leading-letter rule stands aside and the last
-	// standalone letter decides, which for those replies is the same pick.
+	// with its pick (see benchEnumerates). It is read twice: to stand the
+	// leading-letter rule aside, and then by benchBareLetterPick, which takes the
+	// LAST anchor of an enumerating reply as the option it worked its way to.
+	// Widening to A-J lets "i.e."/"e.g." read as two option anchors and flag a
+	// non-enumerating answer as enumerating; the only consequence is that the
+	// leading-letter rule stands aside and benchBareLetterPick decides, which for
+	// those replies is the same pick.
 	benchEnumRe = regexp.MustCompile(`(?i)(?:^|[.!?;:\n—–])\s*\(?([a-j])[).]`)
 
 	// Numeric mirrors mcq's tiers: an explicitly declared value ("the answer is 1",
@@ -349,18 +369,20 @@ var (
 	// inside a number is never read as a clause break by benchLeadNumber.
 	benchThousandsRe = regexp.MustCompile(`[0-9]+(?:,[0-9]{3})+`)
 	// benchLeadBreakRe ends the leading clause of a numeric answer: clause
-	// punctuation or parens. A '.'/',' between digits is part of a number and is
-	// skipped by benchLeadNumber.
+	// punctuation or parens. A '.'/',' between digits is part of a number, and a
+	// spaced hyphen between them is a subtraction; benchLeadCut skips both.
 	//
 	// v43: `\band\b` was in this set and is not any more. A conjunction joins two
 	// coordinate clauses; it does not end an assertion, and treating it as one
 	// made benchLeadNumber COMMIT to the first number of any reply that used the
 	// word. The TIER-1 CONTROL question was graded wrong by it — "The sum of 8
 	// and 5 is 13." led with "The sum of 8" — as were "There are 7 sons and 1
-	// sister, so 8." and "20 and 5 more makes 25.". 137 of 392 questions are
-	// numeric, so this understated every model that explains its working.
-	// Coordinate replies are read by benchCoordinateLeadNumber instead, which
-	// offers a candidate rather than a commitment.
+	// sister, so 8." and "20 and 5 more makes 25.". 137 of the bank's 392
+	// questions were numeric when that was measured, and 143 of 401 are today —
+	// the largest match mode either way — so this understated every model that
+	// explains its working. Coordinate replies are read by
+	// benchCoordinateLeadNumber instead, which offers a candidate rather than a
+	// commitment.
 	benchLeadBreakRe = regexp.MustCompile(`[.!?;:,\n—–()]|\s-\s`)
 	// benchCoordAndRe finds the conjunction that joins two coordinate clauses.
 	benchCoordAndRe = regexp.MustCompile(`\band\b`)
@@ -538,8 +560,11 @@ type benchOutcome struct {
 	skipped bool
 	// cached means the verdict came from the permacache rather than a generation:
 	// this model has answered this exact question, graded this exact way, before.
-	// Reported so a profile that finished in seconds is legible as a cache hit
-	// rather than mistaken for a worker that answered impossibly fast.
+	// Counted into the "cached=N" term of the per-run log line so a profile that
+	// finished in seconds is legible as a cache hit rather than mistaken for a
+	// worker that answered impossibly fast. Deliberately NOT in the persisted
+	// breakdown string: how a verdict was obtained is a fact about this run, and
+	// the breakdown is a description of the worker.
 	cached bool
 	tier   int
 	pass   bool
@@ -554,8 +579,45 @@ type benchOutcome struct {
 // grades the answer. Extracted from runQualityBenchmark's loop so the no-think
 // scoring pass (runNoThinkQualityBenchmark) asks questions EXACTLY the way the
 // main benchmark does — a second copy of the request/grading logic would drift.
+//
+// Two things can settle a question without a generation, and the ORDER of them is
+// load-bearing: the worker's own context window first, the permacache second. See
+// each in place below.
 func (r *Router) benchOne(b *Backend, q benchmarkQ, think bool, busy *benchBusyTracker) benchOutcome {
 	res := benchOutcome{tier: q.Tier}
+	ctxTokens := usableContextTokens(b)
+	prompt, maxTokens := benchRequestFor(q, think, ctxTokens)
+	// A prompt that does not fit the worker's window is a MISS, not an outage.
+	//
+	// The request would otherwise go out anyway, the worker would reject it for
+	// length, and the generic retry path would record res.errd — which leaves the
+	// question out of the denominator entirely. A 32K worker asked a 48K question
+	// would come back neither right nor wrong but UNMEASURED, reported exactly
+	// like a worker the profile budget never got to.
+	//
+	// That is backwards for the one thing these questions exist to measure. "This
+	// model cannot reason over 48K of context" is a real, useful weakness and the
+	// reason the long-context set was added; recording it as "we could not tell"
+	// hides precisely the finding. Judged before dispatch because the verdict does
+	// not need the worker's opinion — it follows from the advertised window — and
+	// asking anyway would spend a real generation to learn something already known.
+	//
+	// Only when the window is actually KNOWN. usableContextTokens returns 0 for a
+	// worker still being profiled, and guessing a miss from a missing number would
+	// fail questions for a worker that can answer them.
+	//
+	// BEFORE THE PERMACACHE, and that is not an accident. The cache is keyed by
+	// MODEL — the same weights on two hosts share every verdict — while the window
+	// is a property of the DEPLOYMENT: modelHash carries ModelCtxTrain, the context
+	// the weights were trained at, not the -c the server was started with, and the
+	// context probe measures each host separately. So one deployment given a 128K
+	// window answers the 48K rung, and a 32K deployment of the same weights would
+	// inherit that pass and be recorded as able to reason over 48K of context it
+	// cannot even accept. Its own window is the better answer and it is free.
+	if wanted := benchPromptTokenEstimate(prompt) + benchMinAnswerTokens; ctxTokens > 0 && wanted > ctxTokens {
+		res.got = fmt.Sprintf("(prompt needs ~%d tokens, worker window is %d)", wanted, ctxTokens)
+		return res // pass=false, errd=false: counted, and counted as a miss
+	}
 	// THE PERMACACHE. Has this model already answered this question, graded this
 	// way? If so the answer cannot have changed — the qid pins the prompt, the
 	// expected answer, the match mode and the grader's version, and the model hash
@@ -578,30 +640,6 @@ func (r *Router) benchOne(b *Backend, q benchmarkQ, think bool, busy *benchBusyT
 			}
 			return res
 		}
-	}
-	prompt, maxTokens := benchRequestFor(q, think, usableContextTokens(b))
-	// A prompt that does not fit the worker's window is a MISS, not an outage.
-	//
-	// The request would otherwise go out anyway, the worker would reject it for
-	// length, and the generic retry path would record res.errd — which leaves the
-	// question out of the denominator entirely. A 32K worker asked a 48K question
-	// would come back neither right nor wrong but UNMEASURED, reported exactly
-	// like a worker the profile budget never got to.
-	//
-	// That is backwards for the one thing these questions exist to measure. "This
-	// model cannot reason over 48K of context" is a real, useful weakness and the
-	// reason the long-context set was added; recording it as "we could not tell"
-	// hides precisely the finding. Judged before dispatch because the verdict does
-	// not need the worker's opinion — it follows from the advertised window — and
-	// asking anyway would spend a real generation to learn something already known.
-	//
-	// Only when the window is actually KNOWN. usableContextTokens returns 0 for a
-	// worker still being profiled, and guessing a miss from a missing number would
-	// fail questions for a worker that can answer them.
-	if ctx := usableContextTokens(b); ctx > 0 && benchPromptTokenEstimate(prompt)+benchMinAnswerTokens > ctx {
-		res.got = fmt.Sprintf("(prompt needs ~%d tokens, worker window is %d)",
-			benchPromptTokenEstimate(prompt)+benchMinAnswerTokens, ctx)
-		return res // pass=false, errd=false: counted, and counted as a miss
 	}
 	// Greedy decoding (temperature 0): a graded benchmark must be
 	// deterministic, so the same (model, question) returns the same answer on
@@ -741,13 +779,17 @@ func (r *Router) benchOne(b *Backend, q benchmarkQ, think bool, busy *benchBusyT
 	return res
 }
 
-// runQualityBenchmark grades the worker against benchmarkQuestions and scores it as the
-// PERCENTAGE of questions answered correctly (0–100): every question counts the same
-// regardless of tier, so a model holds a high score only by staying correct through the
-// hard tiers too, and the score is independent of how many questions the set has — so
-// questions can be added without rescaling anything downstream. The frontier tiers (7–8)
-// are hard enough that a perfect 100 stays out of reach, so the realistic ceiling sits
-// just below it.
+// runQualityBenchmark grades the worker against benchmarkQuestions and scores it 0–100
+// on the WEIGHTED three-bucket scale benchWeightedScore implements — general reasoning
+// 60, budget-bounded insight 20, programming 20 (see the const block for the tier
+// boundaries and why coding is not folded in with insight). It was a flat percentage
+// over every question until v34/v35, and the difference matters to anyone reading a
+// score: a model holds a high one only by staying correct through the hard bands, not by
+// sweeping a large easy tier. Each bucket is internally count-independent, so questions
+// can still be added freely within a bucket without rescaling anything downstream, and
+// an empty bucket's weight is redistributed so the scale survives a smaller set.
+// The realistic ceiling sits below 100 because tier 11 is authored so that it does —
+// it is the band the strongest worker in this fleet still loses points in.
 // A question the worker can't answer within the per-question usability deadline
 // (benchAnswerDeadline) is scored a FAIL — too slow to be usable — and is not retried.
 // Other transient request failures ARE retried; a length-truncated answer (the model
@@ -781,9 +823,12 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 	// leaves a balanced sample rather than every easy question and no hard one.
 	//
 	// The bound exists because the deadline and the question count multiply: at
-	// six minutes a question, a worker with one slot and 277 questions is a
-	// 27-hour profile, and benchmarkVersion bumps re-profile the whole fleet at
-	// once. That worker would be saturated for a day while still serving traffic.
+	// six minutes a question, a worker with one slot and the current 401 questions
+	// is a 40-hour profile, and a benchmarkVersion bump re-profiles the whole fleet
+	// at once. That worker would be saturated for two days while still serving
+	// traffic. (The permacache takes the sting out of a REPEAT profile — an answer
+	// this model has already given costs nothing — but a worker seen for the first
+	// time still pays the full bill, which is the case this bound is for.)
 	ran := make([]bool, len(benchmarkQuestions))
 	started := time.Now()
 	dispatched := 0
@@ -814,23 +859,19 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 			b.ID, dispatched, len(benchmarkQuestions), benchProfileBudget)
 	}
 
-	maxTier := 1
-	for _, q := range benchmarkQuestions {
-		if q.Tier > maxTier {
-			maxTier = q.Tier
-		}
-	}
+	maxTier := benchMaxTier()
 	pass := make([]int, maxTier+1)
 	loose := make([]int, maxTier+1)
 	count := make([]int, maxTier+1)
-	errored, slowFailed, truncated, looseTotal := 0, 0, 0, 0
+	errored, slowFailed, truncated, looseTotal, cachedHits := 0, 0, 0, 0, 0
 	for i, res := range results {
 		q := benchmarkQuestions[i]
 		// A question that was never dispatched is not a miss — excluded from every
 		// tally, but still emitted so the slice stays index-aligned with
 		// benchmarkQuestions. runNoThinkQualityBenchmark indexes into it and
-		// refuses to run at all if the lengths disagree, so dropping the entry
-		// would silently disable no-think scoring on any truncated profile.
+		// refuses to run at all unless it lines up position for position
+		// (benchResultsAlignWithBank), so dropping the entry would silently disable
+		// no-think scoring on any truncated profile.
 		if !ran[i] {
 			details = append(details, BenchResult{
 				Tier: q.Tier, Prompt: q.Prompt, Expect: q.Expect, Skipped: true,
@@ -867,6 +908,9 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 		// problem stays visible even though it's no longer excluded from the score.
 		if res.trunc {
 			truncated++
+		}
+		if res.cached {
+			cachedHits++
 		}
 		details = append(details, BenchResult{
 			Tier: q.Tier, Prompt: q.Prompt, Expect: q.Expect,
@@ -920,27 +964,53 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 	// Per-tier breakdown (+ any truncations) so the spread is visible and a
 	// truncation problem shows up explicitly rather than as fake low quality.
 	// Per-tier counts are STRICT passes; the loose tally is global, like trunc.
+	breakdown = benchBreakdownLine(pass, count, maxTier, looseTotal, truncated, slowFailed, errored)
+	// cachedHits is in the LOG and not in the breakdown: a run served entirely
+	// from the permacache finishes in seconds, and without this it reads as a
+	// worker that answered 401 questions impossibly fast.
+	log.Printf("benchmark %s: q=%d%% (errored=%d, slow=%d, cached=%d, conc=%d) %s",
+		b.ID, score, errored, slowFailed, cachedHits, concurrency, breakdown)
+	return score, true, breakdown, failed, details
+}
+
+// benchMaxTier is the highest tier the current question set carries. Never below
+// 1, so the per-tier slices the callers size from it are always indexable.
+func benchMaxTier() int {
+	maxTier := 1
+	for _, q := range benchmarkQuestions {
+		if q.Tier > maxTier {
+			maxTier = q.Tier
+		}
+	}
+	return maxTier
+}
+
+// benchBreakdownLine renders the per-tier detail string that is persisted as
+// QualityDetail / QualityNoThinkDetail and shown on /backends: "t1=4/4 t5=7/10
+// loose=2 trunc=1". Only non-empty tiers and non-zero counters appear, so an
+// unremarkable run stays short.
+//
+// Shared by both passes because the two lines are read side by side — they are
+// the same worker in two thinking modes — and a difference in FORMAT between them
+// would read as a difference in the worker. The no-think pass passes looseTotal=0:
+// its detail line has never carried a loose tally, though its loose answers do
+// earn the same half point in benchWeightedScore.
+func benchBreakdownLine(pass, count []int, maxTier, looseTotal, truncated, slowFailed, errored int) string {
 	var bd strings.Builder
-	for t := 1; t <= maxTier; t++ {
+	for t := 1; t <= maxTier && t < len(count); t++ {
 		if count[t] > 0 {
 			fmt.Fprintf(&bd, "t%d=%d/%d ", t, pass[t], count[t])
 		}
 	}
-	if looseTotal > 0 {
-		fmt.Fprintf(&bd, "loose=%d ", looseTotal)
+	for _, c := range []struct {
+		label string
+		n     int
+	}{{"loose", looseTotal}, {"trunc", truncated}, {"slow", slowFailed}, {"err", errored}} {
+		if c.n > 0 {
+			fmt.Fprintf(&bd, "%s=%d ", c.label, c.n)
+		}
 	}
-	if truncated > 0 {
-		fmt.Fprintf(&bd, "trunc=%d ", truncated)
-	}
-	if slowFailed > 0 {
-		fmt.Fprintf(&bd, "slow=%d ", slowFailed)
-	}
-	if errored > 0 {
-		fmt.Fprintf(&bd, "err=%d ", errored)
-	}
-	breakdown = strings.TrimSpace(bd.String())
-	log.Printf("benchmark %s: q=%d%% (errored=%d, slow=%d, conc=%d) %s", b.ID, score, errored, slowFailed, concurrency, breakdown)
-	return score, true, breakdown, failed, details
+	return strings.TrimSpace(bd.String())
 }
 
 // runNoThinkQualityBenchmark scores the worker as it answers with thinking
@@ -959,7 +1029,9 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 // thinking-off in the mixed run, so only the hard tiers are re-asked; their
 // outcomes are merged with the mixed run's easy-tier results and scored with the
 // same weighted arithmetic. `mixed` is the detail list runQualityBenchmark
-// returned, aligned index-for-index with benchmarkQuestions.
+// returned, aligned index-for-index with benchmarkQuestions — checked, not
+// assumed, because it also arrives from a profile read off disk that may predate
+// an edit to the bank (benchResultsAlignWithBank).
 // The fourth return is the per-question record for THIS pass. Without it the
 // no-think outcomes were tallied into per-tier counters and then discarded, so
 // the stored profile could say a worker scored 41 with thinking off but not
@@ -967,7 +1039,7 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 // category breakdown could only ever show the thinking-on half. Building it
 // costs one append per question in a loop that already visits every outcome.
 func (r *Router) runNoThinkQualityBenchmark(b *Backend, concurrency int, mixed []BenchResult) (score int, ok bool, breakdown string, details []BenchResult) {
-	if len(benchmarkQuestions) == 0 || len(mixed) != len(benchmarkQuestions) {
+	if len(benchmarkQuestions) == 0 || !benchResultsAlignWithBank(mixed) {
 		return 0, false, "", nil
 	}
 	if concurrency < 1 {
@@ -1023,19 +1095,14 @@ func (r *Router) runNoThinkQualityBenchmark(b *Backend, concurrency int, mixed [
 			b.ID, dispatched, len(hardIdx), benchProfileBudget)
 	}
 
-	maxTier := 1
-	for _, q := range benchmarkQuestions {
-		if q.Tier > maxTier {
-			maxTier = q.Tier
-		}
-	}
+	maxTier := benchMaxTier()
 	pass := make([]int, maxTier+1)
 	loose := make([]int, maxTier+1)
 	count := make([]int, maxTier+1)
 	// asked is the give-up guard's denominator: every question this pass has an
 	// answer (or an error) for. Counted here rather than taken from `dispatched`
 	// so it covers the same population as `errored` — see the guard below.
-	errored, slowFailed, truncated, asked := 0, 0, 0, 0
+	errored, slowFailed, truncated, asked, cachedHits := 0, 0, 0, 0, 0
 	outcomes := make([]benchOutcome, len(benchmarkQuestions))
 	for i, m := range mixed {
 		// Easy tiers ran thinking-off in the mixed pass; carry them over verbatim,
@@ -1097,6 +1164,9 @@ func (r *Router) runNoThinkQualityBenchmark(b *Backend, concurrency int, mixed [
 		if res.trunc {
 			truncated++
 		}
+		if res.cached {
+			cachedHits++
+		}
 	}
 	// Same give-up rule as the mixed run, judged over the questions this pass
 	// actually ASKED: a worker that went unreachable mid-run is unmeasurable, not
@@ -1118,37 +1188,56 @@ func (r *Router) runNoThinkQualityBenchmark(b *Backend, concurrency int, mixed [
 	if !ok2 {
 		return 0, false, "", nil
 	}
-	var bd strings.Builder
-	for t := 1; t <= maxTier; t++ {
-		if count[t] > 0 {
-			fmt.Fprintf(&bd, "t%d=%d/%d ", t, pass[t], count[t])
-		}
-	}
-	if truncated > 0 {
-		fmt.Fprintf(&bd, "trunc=%d ", truncated)
-	}
-	if slowFailed > 0 {
-		fmt.Fprintf(&bd, "slow=%d ", slowFailed)
-	}
-	if errored > 0 {
-		fmt.Fprintf(&bd, "err=%d ", errored)
-	}
-	log.Printf("benchmark %s (no-think): q=%d%% (errored=%d, slow=%d, conc=%d) %s",
-		b.ID, score2, errored, slowFailed, concurrency, strings.TrimSpace(bd.String()))
-	return score2, true, strings.TrimSpace(bd.String()), details
+	// looseTotal=0: this line has never carried a loose tally, though the loose
+	// answers behind it do earn the same half point in benchWeightedScore above.
+	breakdown = benchBreakdownLine(pass, count, maxTier, 0, truncated, slowFailed, errored)
+	log.Printf("benchmark %s (no-think): q=%d%% (errored=%d, slow=%d, cached=%d, conc=%d) %s",
+		b.ID, score2, errored, slowFailed, cachedHits, concurrency, breakdown)
+	return score2, true, breakdown, details
 }
 
 // needsNoThinkBackfill reports whether a cached profile is missing its no-think
 // quality score AND carries enough stored state to backfill it without a full
 // re-benchmark: the mixed run's per-question results, aligned with the CURRENT
-// question set (the caller has already gated on BenchVersion, so a length match
-// means the same questions). A non-thinking worker needs nothing — its mixed
-// score already is its no-think score, and qualityFor reads Quality for it
-// (exact) until its profile is rewritten anyway. A THINKING worker awaiting
+// question set (benchResultsAlignWithBank). A non-thinking worker needs nothing —
+// its mixed score already is its no-think score, and qualityFor reads Quality for
+// it (exact) until its profile is rewritten anyway. A THINKING worker awaiting
 // backfill ranks as unmeasured on no-think requests, which is the pressure to
 // run this promptly rather than a reason to widen the fallback.
 func needsNoThinkBackfill(p *WorkerProfile) bool {
-	return p.Thinking && p.QualityNoThink == 0 && len(p.BenchResults) == len(benchmarkQuestions)
+	return p.Thinking && p.QualityNoThink == 0 && benchResultsAlignWithBank(p.BenchResults)
+}
+
+// benchResultsAlignWithBank reports whether a stored per-question run lines up
+// with today's benchmarkQuestions position for position, so the two can be zipped
+// by index.
+//
+// The test used to be the LENGTH alone, underwritten by the caller's BenchVersion
+// gate: benchmarkVersion was bumped for any question-set change, so a stored run
+// at the current version had to be the current set. That premise is GONE. Graded
+// answers are content-addressed now (identity.go), and the whole point of that is
+// that a question can be edited, added or removed WITHOUT a version bump — so a
+// length match no longer implies the same questions, and two sets of the same size
+// would be zipped index-for-index, attaching the stored answer for question k to
+// whatever question k is today. runNoThinkQualityBenchmark would then carry a
+// stale easy-tier answer into a new question's result row, and observationsFrom
+// resolves that row by PROMPT, so the wrong verdict would be filed under the new
+// question's qid and permacached there.
+//
+// Comparing the prompts is what the length was standing in for, and it costs one
+// string compare per question on a path that runs at most once per certification.
+// Trimmed, because bankQIDByPrompt trims too, and a stored row that only differs
+// in surrounding whitespace resolves to the same question everywhere else.
+func benchResultsAlignWithBank(results []BenchResult) bool {
+	if len(results) != len(benchmarkQuestions) {
+		return false
+	}
+	for i, r := range results {
+		if strings.TrimSpace(r.Prompt) != strings.TrimSpace(benchmarkQuestions[i].Prompt) {
+			return false
+		}
+	}
+	return true
 }
 
 // benchWeightedScore turns the per-tier tallies into the 0-100 quality score, split
@@ -1345,17 +1434,27 @@ func benchDigits(a string) string {
 	return digits
 }
 
+// benchGradeInputs is the prologue both graders share: the reply with its LaTeX
+// and unicode scaffolding stripped, the trimmed expected token, and whether there
+// is anything to grade against at all.
+//
+// An empty expectation cannot be satisfied by anything, and the check belongs
+// HERE rather than in each branch: the modes that fall through to checkAnswer's
+// substring default — "contains", "final-contains", "code-exec" and any
+// unrecognised string — all returned true for arbitrary text, so one malformed
+// question graded every answer correct and lifted the entire fleet's score. A
+// per-mode guard is exactly what left those four behind, which is why the strict
+// and loose graders now take it from one place.
+func benchGradeInputs(q benchmarkQ, answer string) (a, exp string, ok bool) {
+	a = normalizeBenchAnswer(answer)
+	exp = strings.TrimSpace(q.Expect)
+	return a, exp, exp != ""
+}
+
 // checkAnswer reports whether answer satisfies q's expected result.
 func checkAnswer(q benchmarkQ, answer string) bool {
-	a := normalizeBenchAnswer(answer)
-	exp := strings.TrimSpace(q.Expect)
-	// An empty expectation cannot be satisfied by anything, and the check belongs
-	// HERE rather than in each branch: the modes that fell through to the
-	// substring default — "contains", "final-contains", "code-exec" and any
-	// unrecognised string — all returned true for arbitrary text, so one
-	// malformed question graded every answer correct and lifted the entire
-	// fleet's score. A per-mode guard is exactly what left those four behind.
-	if exp == "" {
+	a, exp, ok := benchGradeInputs(q, answer)
+	if !ok {
 		return false
 	}
 	switch q.Match {
@@ -1469,9 +1568,8 @@ func checkAnswer(q benchmarkQ, answer string) bool {
 // answer with an explanation after it deserves the whole point; see
 // containsFinalAnswer.
 func checkAnswerLoose(q benchmarkQ, answer string) bool {
-	a := normalizeBenchAnswer(answer)
-	exp := strings.TrimSpace(q.Expect)
-	if exp == "" {
+	a, exp, ok := benchGradeInputs(q, answer)
+	if !ok {
 		return false
 	}
 	switch q.Match {
@@ -1740,9 +1838,9 @@ func benchBareLetterPick(a string, enumerates bool) (string, bool) {
 //
 // Written as a scan rather than a regex because Go's RE2 has no backreferences,
 // so `([A-J])\1{2,}` doesn't compile. UPPERCASE ONLY, for the same reason
-// benchLetterRe won't read a bare lowercase letter as a pick: a lowercase run
-// is far likelier to be prose than an answer, and the mcq fallback still catches
-// a model that answered in some other form. Last rather than first, because a
+// benchLetterRe admits no lowercase letter but b and c: a lowercase run is far
+// likelier to be prose than an answer, and the mcq fallback still catches a
+// model that answered in some other form. Last rather than first, because a
 // reasoning model echoes the instruction's own example ("if the answer is F,
 // then write FFFFF") before committing to its own pick.
 func lastRepeatedLetter(s string) (string, bool) {
@@ -1850,10 +1948,7 @@ func matchesAnswerList(answer, expect string) bool {
 // list rather than surrounding prose: it parses into at least as many elements
 // as the answer has, and at least one of them is an item from the answer.
 func listLineIsCandidate(line string, want []string) bool {
-	if idx := strings.LastIndex(line, ":"); idx >= 0 && idx < len(line)-1 {
-		line = line[idx+1:]
-	}
-	got := splitAnswerList(line)
+	got := listLineElements(line)
 	if len(got) < len(want) {
 		return false
 	}
@@ -1879,12 +1974,7 @@ func listLineIsCandidate(line string, want []string) bool {
 // common things a model writes, so this was rejecting right answers across 31%
 // of the question set.
 func listLineMatches(line string, want []string) bool {
-	// Drop a leading label ("Answer:", "The final answer is:") so the list is
-	// compared, not the sentence around it.
-	if idx := strings.LastIndex(line, ":"); idx >= 0 && idx < len(line)-1 {
-		line = line[idx+1:]
-	}
-	got := splitAnswerList(line)
+	got := listLineElements(line)
 	if len(got) < len(want) {
 		return false
 	}
@@ -1925,6 +2015,19 @@ func listHeadMatches(got, want string) bool {
 	return false
 }
 
+// listLineElements parses one line into comparable list elements, dropping a
+// leading label ("Answer:", "The final answer is:") so the list is compared and
+// not the sentence around it. Shared so the line that is CHOSEN as the answer
+// (listLineIsCandidate) and the line that is GRADED (listLineMatches) can never
+// parse differently — if they did, the scan would settle on a line the grader
+// then read as something else.
+func listLineElements(line string) []string {
+	if idx := strings.LastIndex(line, ":"); idx >= 0 && idx < len(line)-1 {
+		line = line[idx+1:]
+	}
+	return splitAnswerList(line)
+}
+
 // splitAnswerList normalises one comma-separated list into comparable elements.
 func splitAnswerList(s string) []string {
 	s = strings.TrimSpace(s)
@@ -1962,8 +2065,9 @@ func lastSubmatch(re *regexp.Regexp, s string) (string, bool) {
 // benchEnumerates reports whether an mcq answer ENUMERATES the options — two or
 // more distinct A-J letters each opening the string, a line, or a clause as "X)" /
 // "X." ("A) … no. B) … no. C) … yes."). Such an answer leads with an option label,
-// not its pick, so checkAnswer skips the leading-letter rule and lets a declared
-// pick or the last standalone letter (the concluding option) decide.
+// not its pick, so matchesMCQ skips the leading-letter rule and lets a declared
+// pick or benchBareLetterPick decide — and it tells benchBareLetterPick that the
+// reply's own last option anchor is the option it worked its way to.
 func benchEnumerates(a string) bool {
 	distinct := map[string]bool{}
 	for _, m := range benchEnumRe.FindAllStringSubmatch(a, -1) {
@@ -2002,15 +2106,27 @@ func benchLeadNumber(s string) (string, bool) {
 	}
 	cut := benchLeadCut(s)
 	lead := benchNumberRe.FindAllString(s[:cut], -1)
-	if len(lead) != 1 {
+	if len(lead) != 1 || benchValueReusedIn(s[cut:], lead[0]) {
 		return "", false
 	}
-	for _, later := range benchNumberRe.FindAllString(s[cut:], -1) {
-		if numericMatches(later, lead[0]) {
-			return "", false // lead value re-used in the working below it
+	return lead[0], true
+}
+
+// benchValueReusedIn reports whether n appears again in the text FOLLOWING the
+// clause that asserted it, in which case it was an operand mid-computation rather
+// than a conclusion — "total distance 200 m, 200/100 = …" asserts 2, not 200 —
+// and the caller must fall through to the last-number rule.
+//
+// Shared by both lead-number readers because the rule is one rule: a leading
+// value that the working below picks up again was never the answer. Compared by
+// VALUE, so "4" and "4.0" are the same operand.
+func benchValueReusedIn(rest, n string) bool {
+	for _, later := range benchNumberRe.FindAllString(rest, -1) {
+		if numericMatches(later, n) {
+			return true
 		}
 	}
-	return lead[0], true
+	return false
 }
 
 // benchLeadCut returns where the leading clause of s ends.
@@ -2052,8 +2168,9 @@ func benchLeadCut(s string) int {
 // it is the direction this file normally refuses. It is accepted here because it
 // is unavoidable (see the symmetry argument above), because the model did state
 // the value in a full assertion rather than leaving it lying in the working, and
-// because the alternative was a systematic false NEGATIVE across 137 numeric
-// questions including a tier-1 control. benchAssertVerbRe keeps the widening to
+// because the alternative was a systematic false NEGATIVE across every numeric
+// question in the bank — 137 of them when this was measured, 143 today —
+// including a tier-1 control. benchAssertVerbRe keeps the widening to
 // clauses that actually state something, so an operand ("The sum of 8") is not
 // offered.
 func benchCoordinateLeadNumber(s string) (string, bool) {
@@ -2070,13 +2187,8 @@ func benchCoordinateLeadNumber(s string) (string, bool) {
 		return "", false
 	}
 	ns := benchNumberRe.FindAllString(first, -1)
-	if len(ns) != 1 {
+	if len(ns) != 1 || benchValueReusedIn(s[loc[1]:], ns[0]) {
 		return "", false
-	}
-	for _, later := range benchNumberRe.FindAllString(s[loc[1]:], -1) {
-		if numericMatches(later, ns[0]) {
-			return "", false // re-used below: an operand, not a conclusion
-		}
 	}
 	return ns[0], true
 }
@@ -2403,7 +2515,9 @@ func (t *benchBusyTracker) abandoned() bool {
 // Vars rather than consts so a test can shrink them: what a budget-stopped pass
 // does with its results is exactly where the no-think give-up guard was wrong,
 // and reproducing that against the real 90 minutes is not a test anyone runs.
-// Nothing in the router writes them; timing_log_test.go asserts their values.
+// Nothing in the router writes them; timing_log_test.go asserts bounds on both,
+// so a shrink left behind by a test edit fails CI rather than silently truncating
+// every profile.
 var (
 	benchProfileBudget       = 90 * time.Minute
 	benchMinProfileQuestions = 48
@@ -2561,9 +2675,9 @@ func benchRequestFor(q benchmarkQ, think bool, ctxTokens int) (prompt string, ma
 // appended " Give the number only." to all of them. The model was told to do two
 // contradictory things in one prompt, so whatever it did violated one of them.
 // That is a confound on the very grader the suffix exists to help, and since the
-// bank has no instruction-following category (maths 199, reasoning 147, coding
-// 38, general 8), the only place instruction-following showed up at all was as
-// noise inside the numeric score.
+// bank has no instruction-following category (today: maths 199, reasoning 156,
+// coding 38, general 8 — benchcategory.go recognises no fifth), the only place
+// instruction-following showed up at all was as noise inside the numeric score.
 //
 // Detected from the prompt TEXT rather than from a list of question ids, because
 // `bench emit` regenerates the bank and an id list would rot silently. The test

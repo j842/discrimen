@@ -24,7 +24,7 @@ package router
 // spread. If the top re-bunches at q≈9–10, that's the signal a hard-tier question has
 // gone too easy thinking-on and needs replacing.
 //
-// The eight tiers are difficulty BANDS, tuned empirically against the live fleet
+// The twelve tiers are difficulty BANDS, tuned empirically against the live fleet
 // (Qwen-27B / Gemma-26B-A4B / Gemma-4-E4B / LFM-1.2B) so each band peels off a quality
 // class:
 //
@@ -49,14 +49,37 @@ package router
 //	         is a decoy and the answer turns on physical, temporal or social common sense.
 //	         (Was the top tier until v33 — a 2026 Qwen3.6-27B now walks through it.)
 //	Tier 11 — budget-bounded insight (thinking-on): enumeration problems with a hidden
-//	         closed-form shortcut; grinding exceeds the 16k thinking budget, insight answers
-//	         in ~1k tokens. The first tier that separates a 27B from a 284B (see the tier's
-//	         own comment block for the measured spread and everything that DIDN'T work).
+//	         closed-form shortcut; grinding exceeds the budget, insight answers in ~1k
+//	         tokens. The first tier that separates a 27B from a 284B (see the tier's own
+//	         comment block for the measured spread and everything that DIDN'T work).
+//	         "The budget" was benchThinkMaxTokens at 16384 when this was measured; it is
+//	         32768 now, and benchAnswerDeadline's six minutes is what a grinder hits first
+//	         on this fleet. The tier still works because the gap it exploits is orders of
+//	         magnitude, not a factor of two — but it is the tier most exposed to a raised
+//	         ceiling, so re-measure the spread whenever either bound moves.
 //	Tier 12 — programming (thinking-on): trace a short program, give its exact output. The
 //	         only tier that measures whether a worker can be handed a codebase rather than
 //	         a puzzle; every tier above measures reasoning in the abstract. Answers are
 //	         facts about the language, so they grade exactly with no execution. Sourced by
 //	         abstracting real production bugs (see the tier's own comment block).
+//
+// THE TIERS ARE SHARED, and the charters above describe only what THIS FILE puts in them.
+// Two other files append to benchmarkQuestions at init():
+//
+//	benchmark_data_live.go   the generated LiveBench half, currently 262 questions across
+//	                         tiers 3, 4, 5, 7, 8 and 10 (this file's own 130 and the nine
+//	                         below make 401). Their tier is a MEASURED fleet
+//	                         pass-rate band with no ability meaning, so an AMC maths item
+//	                         and a zebra puzzle sit in the same tier whenever the fleet
+//	                         found them equally hard.
+//	benchmark_data_longcontext.go  nine synthesised ~4K/16K/48K reasoning-over-a-long-input
+//	                         questions, three each in tiers 6, 9 and 10. Their tiers are
+//	                         explicitly PROVISIONAL — an author's ordering of the three
+//	                         input lengths, never calibrated — and that file says so at
+//	                         length.
+//
+// So a tier's charter tells you what it was BUILT to measure, and benchcategory.go is what
+// tells you what a given question actually measures.
 //
 // WHAT ACTUALLY SPREADS THE TOP, MEASURED. Two whole tiers have been built and thrown away
 // getting to the current 9 and 10, and the per-tier numbers off the live fleet
@@ -256,10 +279,13 @@ var benchmarkQuestions = []benchmarkQ{
 	// seven times the output length of BBH, and its own results section reports models
 	// scoring below random because they "could not solve the problem in their effective
 	// output token lengths and started degenerating after a point, so no final answer could
-	// be extracted." Against benchThinkMaxTokens and a 2-minute benchAnswerDeadline that
-	// failure mode would truncate every worker alike and measure endurance instead of
-	// reasoning — no spread, all cost. So every item here is compact: hard to get right,
-	// quick to answer, with a short checkable result.
+	// be extracted." Against benchThinkMaxTokens and benchAnswerDeadline — 16384 tokens and
+	// 2 minutes when this tier was written, 32768 and 6 minutes now — that failure mode
+	// would truncate every worker alike and measure endurance instead of reasoning: no
+	// spread, all cost. The looser bounds have not made it safe, only slower to hit, and the
+	// tier-10 lift question (see v36 in benchmark.go) is the worked example of a single
+	// under-specified item eating three workers' entire budgets. So every item here is
+	// compact: hard to get right, quick to answer, with a short checkable result.
 	//
 	// Measured spread on this tier: Qwen3.6-27B 12/12, Granite-8B 8/12, Gemma-26B-A4B 5/12 —
 	// 58 points, second only to tier 6. It earns its runtime; it just doesn't reach the top. ----

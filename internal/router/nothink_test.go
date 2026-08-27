@@ -218,7 +218,17 @@ func TestNoThinkBenchmarkMergesEasyTiers(t *testing.T) {
 }
 
 func TestNeedsNoThinkBackfill(t *testing.T) {
+	// A stored run only backfills if it lines up with TODAY's bank position for
+	// position — the backfill zips the two by index. A length match used to be
+	// enough because benchmarkVersion was bumped for any question-set change;
+	// content-addressed grading ended that, so the prompts are compared.
 	aligned := make([]BenchResult, len(benchmarkQuestions))
+	for i, q := range benchmarkQuestions {
+		aligned[i] = BenchResult{Tier: q.Tier, Prompt: q.Prompt, Expect: q.Expect}
+	}
+	edited := append([]BenchResult(nil), aligned...)
+	edited[len(edited)-1].Prompt = "a question that is no longer in the bank"
+
 	cases := []struct {
 		name string
 		p    WorkerProfile
@@ -228,10 +238,68 @@ func TestNeedsNoThinkBackfill(t *testing.T) {
 		{"already has the score", WorkerProfile{Thinking: true, QualityNoThink: 40, BenchResults: aligned}, false},
 		{"non-thinking worker needs nothing", WorkerProfile{BenchResults: aligned}, false},
 		{"no stored results to merge from", WorkerProfile{Thinking: true}, false},
+		{"right length, wrong questions", WorkerProfile{Thinking: true, BenchResults: edited}, false},
 	}
 	for _, c := range cases {
 		if got := needsNoThinkBackfill(&c.p); got != c.want {
 			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
 		}
+	}
+}
+
+// THE ALIGNMENT IS CHECKED, NOT ASSUMED. runNoThinkQualityBenchmark carries the
+// mixed pass's easy-tier answers over BY INDEX, and its `mixed` argument can come
+// from a profile read off disk. Under the old rules a stored run at the current
+// benchmarkVersion had to be the current question set; graded answers are
+// content-addressed now, so a question can be edited without a version bump and a
+// same-length run is no longer the same exam. Zipping them anyway would attach one
+// question's stored verdict to another's prompt — and observationsFrom resolves a
+// row by its prompt, so the wrong verdict would be filed under the new question's
+// qid and permacached there.
+func TestNoThinkPassRefusesAMisalignedMixedRun(t *testing.T) {
+	saved := benchmarkQuestions
+	defer func() { benchmarkQuestions = saved }()
+	benchmarkQuestions = []benchmarkQ{
+		{Tier: 1, Prompt: "easy-1", Expect: "1", Match: "numeric"},
+		{Tier: 5, Prompt: "hard-1", Expect: "42", Match: "numeric"},
+	}
+
+	var asked atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		asked.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{
+				"message": map[string]any{"role": "assistant", "content": "42"}, "finish_reason": "stop",
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	r := &Router{benchClient: &http.Client{}}
+	b := &Backend{BackendRegistration: BackendRegistration{ID: "w", URL: srv.URL, Model: "m"}}
+
+	// A run of the right LENGTH whose first question is not the bank's first
+	// question any more — a question edited under an unchanged benchmarkVersion.
+	stale := []BenchResult{
+		{Tier: 1, Prompt: "easy-1-as-it-used-to-be-worded", Expect: "1", Pass: true, LatencyMS: 5},
+		{Tier: 5, Prompt: "hard-1", Expect: "42", Pass: true, LatencyMS: 9},
+	}
+	if score, ok, _, details := r.runNoThinkQualityBenchmark(b, 1, stale); ok {
+		t.Errorf("a mixed run that does not match the bank scored %d with ok=true (%d results); "+
+			"ok=true is what persists a profile and writes the observations", score, len(details))
+	}
+	if got := asked.Load(); got != 0 {
+		t.Errorf("%d questions were asked against a misaligned run, want 0", got)
+	}
+
+	// The same run, correctly aligned, still works — the guard must not be a
+	// blanket refusal.
+	good := []BenchResult{
+		{Tier: 1, Prompt: "easy-1", Expect: "1", Pass: true, LatencyMS: 5},
+		{Tier: 5, Prompt: "hard-1", Expect: "42", Pass: true, LatencyMS: 9},
+	}
+	if _, ok, _, _ := r.runNoThinkQualityBenchmark(b, 1, good); !ok {
+		t.Error("an aligned mixed run was refused")
 	}
 }

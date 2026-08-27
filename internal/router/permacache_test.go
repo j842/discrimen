@@ -130,6 +130,32 @@ func TestACachedLatencyDoesNotTravelBetweenWorkers(t *testing.T) {
 	}
 }
 
+// EVERY match mode the bank uses must be in graderVersions.
+//
+// graderVersionFor returns 0 for a mode it does not know, which is a legal
+// identity — so nothing breaks, visibly. What breaks invisibly is the repair
+// path: a mode with no entry has no version to bump, so a fix to ITS grader
+// cannot invalidate the verdicts it was written to correct, and every worker goes
+// on being scored by the old rules from the permacache. A new match mode is
+// exactly when someone would forget, so the bank is checked against the map here
+// rather than trusted to a comment on benchmarkQ.
+func TestEveryMatchModeHasAGraderVersion(t *testing.T) {
+	seen := map[string]bool{}
+	for _, q := range benchmarkQuestions {
+		if seen[q.Match] {
+			continue
+		}
+		seen[q.Match] = true
+		if _, ok := graderVersions[q.Match]; !ok {
+			t.Errorf("match mode %q is used by the bank but has no graderVersions entry — "+
+				"a fix to its grader could never invalidate the answers it re-grades", q.Match)
+		}
+	}
+	if len(seen) == 0 {
+		t.Fatal("no match modes found in the bank")
+	}
+}
+
 // A question is its text AND its grading. Same prompt, different match mode or a
 // bumped grader, means a different question — otherwise a grader fix would keep
 // serving the verdict it was written to correct.

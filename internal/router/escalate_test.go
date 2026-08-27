@@ -37,14 +37,19 @@ func TestClassifyResponse(t *testing.T) {
 		{"stream with nothing", "data: {\"choices\":[{\"delta\":{}}]}\n", true, responseEmpty},
 		{"stream tool call", "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0}]}}]}\n", true, responseOK},
 		{"stream truncated", "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"length\"}]}\n", true, responseTruncated},
+
+		// A body that does not parse into a usable completion is EMPTY, not OK.
+		// These four all classified as a good answer once: escalation never fired
+		// on them, and writeBuffered scored them a SUCCESS, resetting the
+		// consecutive-failure run so the breaker could never trip on this shape.
+		{"unparseable", `<html>502 Bad Gateway</html>`, false, responseEmpty},
+		{"truncated json", `{"choices":[{"mess`, false, responseEmpty},
+		{"no choices", `{"choices":[]}`, false, responseEmpty},
+		{"upstream error object", `{"error":{"message":"boom"}}`, false, responseEmpty},
 	}
 	for _, tc := range cases {
 		if got := classifyResponse([]byte(tc.body), tc.streamed); got != tc.want {
 			t.Errorf("%s: classifyResponse=%d want %d", tc.name, got, tc.want)
-		}
-		// The boolean the adapter consumes must be unchanged by the split.
-		if wantBool := tc.want != responseOK; responseInadequate([]byte(tc.body), tc.streamed) != wantBool {
-			t.Errorf("%s: responseInadequate disagrees with classifyResponse", tc.name)
 		}
 	}
 }
@@ -178,7 +183,7 @@ func cannedWorker(t *testing.T, body string, hits *atomic.Int64) *httptest.Serve
 	return srv
 }
 
-func escalationRouter(t *testing.T, cheapBody, goodBody string, cheapHits, goodHits *atomic.Int64) (*Router, *tierAdapter) {
+func escalationRouter(t *testing.T, cheapBody, goodBody string, cheapHits, goodHits *atomic.Int64) *Router {
 	t.Helper()
 	cheap := cannedWorker(t, cheapBody, cheapHits)
 	good := cannedWorker(t, goodBody, goodHits)
@@ -188,7 +193,13 @@ func escalationRouter(t *testing.T, cheapBody, goodBody string, cheapHits, goodH
 		id      string
 		url     string
 		quality int
-	}{{"cheap", cheap.URL, 30}, {"good", good.URL, 90}} {
+		// Scores chosen so the EMPTY-answering worker ranks first. Escalation used
+		// to find "something better" by quality; it now walks the plan's own
+		// ordering, and with no matrix in this harness that ordering comes from
+		// backendScore, which reads measured quality. The names describe each
+		// worker's ROLE here — "cheap" answers first and badly, "good" repairs it
+		// — not their scores.
+	}{{"cheap", cheap.URL, 90}, {"good", good.URL, 30}} {
 		reg.upsert(BackendRegistration{
 			ID: w.id, URL: w.url, Model: "default", Quality: w.quality,
 			BaselineTPS: 100, MaxConcurrency: 2, TTLSeconds: 3600, Features: []string{"chat"},
@@ -197,24 +208,21 @@ func escalationRouter(t *testing.T, cheapBody, goodBody string, cheapHits, goodH
 	}
 
 	cfg := &Config{
-		DefaultMaxTokens: 4096, AutoDifficulty: true, EscalateInline: true,
-		DifficultyBands: defaultDifficultyBands, DifficultyTemp: 0.10,
+		DefaultMaxTokens: 4096, AutoDifficulty: true, EscalateInline: true, DifficultyTemp: 0.10,
 		DifficultyTimeout: time.Second, DifficultyCacheSize: 16, DifficultyMaxChars: 4000,
-		AdaptBins: 10, AdaptMaxBias: 0.3, AdaptLRUp: 0.04, AdaptLRDown: 0.01,
 	}
 	dir := t.TempDir()
-	adapter := newTierAdapter(cfg, dir+"/tier_adapter.json")
 	logs, err := openLogStore(dir+"/logs.sqlite", 16384, "")
 	if err != nil {
 		t.Fatalf("open log store: %v", err)
 	}
 	t.Cleanup(func() { logs.Close() })
 	r := &Router{
-		cfg: cfg, registry: reg, classifier: testClassifier(fakeEmbed), adapter: adapter,
+		cfg: cfg, registry: reg, classifier: testClassifier(fakeEmbed),
 		client: &http.Client{Timeout: 5 * time.Second}, streamClient: &http.Client{},
 		logs: logs, sessions: newSessionTracker(time.Hour, 16),
 	}
-	return r, adapter
+	return r
 }
 
 const emptyAnswer = `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[]},"finish_reason":"stop"}]}`
@@ -222,7 +230,7 @@ const realAnswer = `{"choices":[{"message":{"role":"assistant","content":"the ca
 
 func TestEscalationRepairsAnEmptyAnswer(t *testing.T) {
 	var cheapHits, goodHits atomic.Int64
-	r, adapter := escalationRouter(t, emptyAnswer, realAnswer, &cheapHits, &goodHits)
+	r := escalationRouter(t, emptyAnswer, realAnswer, &cheapHits, &goodHits)
 
 	rec := runChat(t, r, `{"model":"default","stream":false,"messages":[{"role":"user","content":"say hello"}]}`)
 
@@ -241,15 +249,6 @@ func TestEscalationRepairsAnEmptyAnswer(t *testing.T) {
 	if got := rec.Header().Get("X-LLM-Backend-ID"); got != "good" {
 		t.Fatalf("route headers should name the worker that actually answered, got %q", got)
 	}
-	// The repair must not teach the adapter that the cheap tier was fine.
-	waitFor(t, func() bool {
-		for _, b := range adapter.snapshot() {
-			if b > 0 {
-				return true
-			}
-		}
-		return false
-	}, "adapter never learned the region needed a better model")
 }
 
 // A truncated answer is the caller's own token ceiling; a bigger model hits the
@@ -257,7 +256,7 @@ func TestEscalationRepairsAnEmptyAnswer(t *testing.T) {
 func TestEscalationSkipsTruncatedAnswers(t *testing.T) {
 	const truncated = `{"choices":[{"message":{"role":"assistant","content":"the capital is"},"finish_reason":"length"}]}`
 	var cheapHits, goodHits atomic.Int64
-	r, _ := escalationRouter(t, truncated, realAnswer, &cheapHits, &goodHits)
+	r := escalationRouter(t, truncated, realAnswer, &cheapHits, &goodHits)
 
 	rec := runChat(t, r, `{"model":"default","stream":false,"messages":[{"role":"user","content":"say hello"}]}`)
 	if goodHits.Load() != 0 {
@@ -272,7 +271,7 @@ func TestEscalationSkipsTruncatedAnswers(t *testing.T) {
 // the escalation never loops.
 func TestEscalationDoesNotLoop(t *testing.T) {
 	var cheapHits, goodHits atomic.Int64
-	r, _ := escalationRouter(t, emptyAnswer, emptyAnswer, &cheapHits, &goodHits)
+	r := escalationRouter(t, emptyAnswer, emptyAnswer, &cheapHits, &goodHits)
 
 	rec := runChat(t, r, `{"model":"default","stream":false,"messages":[{"role":"user","content":"say hello"}]}`)
 	if rec.Code != http.StatusOK {
@@ -295,7 +294,7 @@ func TestEscalationDoesNotLoop(t *testing.T) {
 
 func TestEscalationDisabled(t *testing.T) {
 	var cheapHits, goodHits atomic.Int64
-	r, _ := escalationRouter(t, emptyAnswer, realAnswer, &cheapHits, &goodHits)
+	r := escalationRouter(t, emptyAnswer, realAnswer, &cheapHits, &goodHits)
 	r.cfg.EscalateInline = false
 
 	runChat(t, r, `{"model":"default","stream":false,"messages":[{"role":"user","content":"say hello"}]}`)
@@ -308,7 +307,7 @@ func TestEscalationDisabled(t *testing.T) {
 // would be a worse surprise than the empty reply.
 func TestEscalationSkipsPinnedRequests(t *testing.T) {
 	var cheapHits, goodHits atomic.Int64
-	r, _ := escalationRouter(t, emptyAnswer, realAnswer, &cheapHits, &goodHits)
+	r := escalationRouter(t, emptyAnswer, realAnswer, &cheapHits, &goodHits)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"default","stream":false,"messages":[{"role":"user","content":"say hello"}]}`))
@@ -330,7 +329,7 @@ func TestEscalationSkipsPinnedRequests(t *testing.T) {
 // one worker; escalating would undo that in one hop.
 func TestEscalationSkipsAnOpenToolLoop(t *testing.T) {
 	var cheapHits, goodHits atomic.Int64
-	r, _ := escalationRouter(t, emptyAnswer, realAnswer, &cheapHits, &goodHits)
+	r := escalationRouter(t, emptyAnswer, realAnswer, &cheapHits, &goodHits)
 
 	// The loop's earlier turns were served by "cheap", which is what makes the
 	// session locked rather than merely sticky.
@@ -383,7 +382,7 @@ func waitFor(t *testing.T, cond func() bool, msg string) {
 // generation. Escalating past that budget turns a bad answer into no answer.
 func TestEscalationRespectsADeclaredDeadline(t *testing.T) {
 	var cheapHits, goodHits atomic.Int64
-	r, _ := escalationRouter(t, emptyAnswer, realAnswer, &cheapHits, &goodHits)
+	r := escalationRouter(t, emptyAnswer, realAnswer, &cheapHits, &goodHits)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"default","stream":false,"messages":[{"role":"user","content":"say hello"}]}`))

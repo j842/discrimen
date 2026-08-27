@@ -34,11 +34,13 @@ package router
 //     member's reasoning trace, runs with thinking forced off, and has any
 //     reasoning field removed from what it produces.
 //
-// What an ensemble must NOT do is teach the router anything. Its route string is
-// "expert", which parseRouteScore does not recognise, so neither the online tier
-// adapter nor the background judge sees it as a tier the router chose — because
-// it isn't one, and a bin biased by an ensemble's outcome would be biased by
-// N models' work for a decision about one.
+// What an ensemble must NOT do is teach the router anything, and it is kept out
+// of the judge twice over. serveExpert owns the whole response and never goes
+// through proxyToBackend, so the deferred goroutine that feeds the judge is not
+// on this path at all; and an expert plan carries auto=false, which is the flag
+// the judge is gated on. Both say the same thing: an ensemble is not a decision
+// the router made, and learning from one would credit N models' work to
+// one.
 //
 // The name is the router's, held the same way "default" and a group name are:
 // no group may be created with it, and a worker that registers a model called
@@ -52,6 +54,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -75,14 +78,14 @@ func isExpertModel(name string) bool {
 // expertSlotWait is how long ONE member waits for its own worker's slot before
 // the panel gives up on it.
 //
-// Short on purpose, and shorter than every other grace in the router
-// (qualityFloorWait 10s, sessionLockWait 5s, escalateSlotWait 15s), because it
-// is the only one where waiting costs somebody else's answer: the panel is as
-// slow as its slowest member, so a request held here delays every other member's
-// result as well as its own. A worker that has not freed a slot in five seconds
-// is mid-generation — tens of seconds on this fleet — so waiting longer means
-// waiting out a whole other request, and the ensemble has N-1 other models to
-// hear from in the meantime.
+// Short on purpose, and no longer than any other grace in the router (level with
+// sessionLockWait's 5s, against qualityFloorWait's 10s and escalateSlotWait's
+// 15s), because it is the only one where waiting costs somebody else's answer:
+// the panel is as slow as its slowest member, so a request held here delays every
+// other member's result as well as its own. A worker that has not freed a slot in
+// five seconds is mid-generation — tens of seconds on this fleet — so waiting
+// longer means waiting out a whole other request, and the ensemble has N-1 other
+// models to hear from in the meantime.
 var expertSlotWait = 5 * time.Second
 
 // expertMaxParallel caps how many members are in flight at once.
@@ -188,7 +191,7 @@ func expertEntry(fleetFeatures []string) map[string]any {
 // asked here rather than re-invented. target 0: an ensemble has no quality bar
 // to clear, since it is asking everyone.
 func expertMembers(candidates []*Backend, job jobCost) []*Backend {
-	ranked := rankByDifficulty(append([]*Backend(nil), candidates...), 0, job, false)
+	ranked := rankPanel(append([]*Backend(nil), candidates...), job)
 	seen := map[string]bool{}
 	members := make([]*Backend, 0, len(ranked))
 	for _, b := range ranked {
@@ -204,10 +207,24 @@ func expertMembers(candidates []*Backend, job jobCost) []*Backend {
 // pickSynthesiser is the highest MEASURED quality worker that can still fit the
 // synthesis prompt, or nil when none can.
 //
-// Quality is the fleet's own benchmark result, not a declared number, which is
-// the same source the background judge picks its grader from. Ties are broken by
-// the ordinary ranking, so two workers of equal measured quality are separated
-// by which will finish first rather than by map order.
+// Quality is the fleet's own benchmark result, not a declared number. It is NO
+// LONGER the same source the background judge picks its grader from: judgeGrader
+// now ranks on graderStrength, which reads the outcome matrix — the hit rate on
+// prompts LIKE THIS ONE where the request carries an embedding, the worker's
+// overall rate otherwise — and falls back to the benchmark scalar only for a
+// fleet nothing has been observed on yet.
+//
+// The divergence is not an oversight, but it is not a settled decision either.
+// The judge is choosing a grader for one specific answer and holds a vector for
+// the prompt, computed for routing and passed down. Synthesis has N answers and
+// one conversation, and no equivalent "which of these is the right question to
+// ask about" — so the fleet-wide benchmark is still the only ordering over
+// workers available here that is not a guess. Anyone wiring the matrix in should
+// know they are answering a question this function has not been asked yet, not
+// fixing an inconsistency.
+//
+// Ties are broken by the ordinary ranking, so two workers of equal measured
+// quality are separated by which will finish first rather than by map order.
 //
 // A member may be the synthesiser; that is fine. It reads its own answer beside
 // the others without knowing which was its, and the alternative — excluding it —
@@ -228,7 +245,7 @@ func pickSynthesiser(candidates []*Backend, neededContext int, job jobCost) *Bac
 		}
 	}
 	tied := filterCandidates(fits, func(b *Backend) bool { return b.Quality == best })
-	return rankByDifficulty(tied, 0, job, false)[0]
+	return rankPanel(tied, job)[0]
 }
 
 // ── Dispatch ────────────────────────────────────────────────────────────────
@@ -1102,4 +1119,49 @@ func (t *usageTally) add(b *Backend, used usageCount, job jobCost) {
 		t.paid = true
 		t.cost += tokenCost(b, charge.prompt, charge.completion)
 	}
+}
+
+// rankPanel orders workers for the ensemble: available first, then free, then
+// whichever finishes soonest.
+//
+// This was rankByDifficulty, the tier ranker, shared with a routing path that no
+// longer exists. Both surviving callers already passed target = 0, which made its
+// quality-bar steps vacuous — every worker clears a bar of zero — so what is left
+// here is what those calls were actually getting, written out. No quality score is
+// read at all now, which also settles a question the old signature raised: it took
+// a thinkOff flag and both callers hardcoded false, so a no-think ensemble was
+// ranked on mixed-mode scores.
+//
+// Sorts in place and returns the same slice, so callers that must not disturb the
+// plan's ordering copy first.
+func rankPanel(candidates []*Backend, job jobCost) []*Backend {
+	sort.SliceStable(candidates, func(i, j int) bool {
+		a, b := candidates[i], candidates[j]
+		// 1. A worker with a free slot beats one without. Spilling is still the
+		//    acquire step's job; this is only the order it tries them in.
+		if af, bf := isFull(a), isFull(b); af != bf {
+			return !af
+		}
+		// 2. Free before metered. An ensemble asks N workers for one answer, so it
+		//    is the router's most expensive route by construction — the one place
+		//    cost most deserves a say.
+		if af, bf := isFreeBackend(a), isFreeBackend(b); af != bf {
+			return af
+		}
+		// 3. Whichever will FINISH FIRST for this job, from live prefill/decode
+		//    rates and queue occupancy. A slow worker loses on latency by itself,
+		//    with no speed cutoff to tune, and a busy fast one sheds to idle ones.
+		if la, lb := expectedLatency(a, job), expectedLatency(b, job); la != lb {
+			return la < lb
+		}
+		// 4. Exact tie → keep the conversation where it is. Only reachable when the
+		//    completion-time estimate cannot separate them at all (neither has a
+		//    measured prefill rate yet), where staying is free and switching costs a
+		//    cold prefix.
+		if ai, bi := sessionIncumbent(a, job), sessionIncumbent(b, job); ai != bi {
+			return ai
+		}
+		return a.ID < b.ID
+	})
+	return candidates
 }

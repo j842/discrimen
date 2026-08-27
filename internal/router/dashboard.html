@@ -1691,7 +1691,7 @@
         if (k.relay) {
           role.push(el('span', {
             class: 'pill',
-            title: 'Another discrimen routing through this one. Reads /relay/fleet; its prompts and answers are not stored, and its outcomes do not teach the tier adapter.',
+            title: 'Another discrimen routing through this one. Reads /relay/fleet; its prompts and answers are not stored, and its outcomes are not judged — so they never reach the outcome matrix that ranks this fleet. The upstream router is already learning from the same answers.',
           }, ['relay']));
         }
         tr.appendChild(td([el('div', {class: 'features'}, role)]));

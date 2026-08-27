@@ -70,16 +70,20 @@ func longCtxRosterFrom(t *testing.T, prompt string) map[string]string {
 }
 
 // A profile is only comparable to another profile measured on the SAME
-// questions: LoadWorkerProfile keys on benchmarkVersion, autoTargetQuality reads
-// the score as one absolute 0-100 bar, and benchQuestionHash orders questions
-// within a tier by the content of the prompt. A generator that produced
+// questions: autoTargetQuality reads every score as one absolute 0-100 bar, a
+// graded answer is permacached under benchQuestionQID (which is the prompt, the
+// answer, the match mode and the grader version), and benchQuestionHash orders
+// questions within a tier by the content of the prompt. A generator that produced
 // different bytes on two runs would therefore change the question set — and the
-// order it is asked in — under an unchanged version, silently, with every number
-// still looking plausible. These hashes are the thing that says it did not.
+// order it is asked in — silently, with every number still looking plausible, and
+// would re-generate nine 48K prompts on every profile because nothing cached
+// could ever match. These hashes are the thing that says it did not.
 //
-// If this test fails after a deliberate edit to longCtxBuild, the fix is NOT to
-// paste in the new hashes: it is to bump benchmarkVersion in the same commit, so
-// every cached profile is invalidated, and then paste in the new hashes.
+// If this test fails after a deliberate edit to longCtxBuild, pasting in the new
+// hashes is the right fix — the edit gives those three questions new qids, so
+// they are re-asked on their own and the rest of the bank is untouched. What it
+// is NOT is free: each re-ask is a 48K prefill per worker per mode. Check that
+// the edit was worth that before accepting it.
 var longCtxGolden = []struct {
 	Tier   int
 	Match  string
@@ -260,14 +264,11 @@ func TestLongContextAnswersRequireTheWholeLog(t *testing.T) {
 		case strings.Contains(q.Prompt, "THIRD record in that order"):
 			// You cannot know WHICH three escalated records are earliest until you
 			// have seen all nine, so the depth is the last one of them.
-			var esc []longCtxParsed
 			for _, r := range recs {
 				if r.Status == "escalated" {
-					esc = append(esc, r)
 					depth = r.Index
 				}
 			}
-			_ = esc
 			var seen []longCtxParsed
 			for _, r := range half {
 				if r.Status == "escalated" {

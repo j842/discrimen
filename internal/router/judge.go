@@ -105,9 +105,13 @@ func (b *judgeBudget) charge(tokens int) {
 // Non-blocking; a no-op unless judging is enabled and some worker other than the
 // one that served the request is available to look at it.
 // thinking and latencyMS describe the request being graded, and exist so the
-// verdict can be recorded in the outcome matrix against the right (worker, mode)
-// pair. Without the mode a judged result would be filed against whichever mode
-// the matrix happened to be queried for, which is the one thing goal 3 forbids.
+// verdict can be recorded in the outcome matrix against the right (model, mode)
+// pair. MODEL, not worker: recordJudgedOutcome files the row under
+// modelHash(served), because that is what routing looks a candidate up by — a
+// judged row keyed on a worker id would be stored, counted, and never consulted.
+// The worker id rides along as provenance only. Without the mode a judged result
+// would be filed against whichever mode the matrix happened to be queried for,
+// which is the one thing goal 3 forbids.
 func (r *Router) maybeJudge(messages []Message, stream bool, served *Backend, route, output string, thinking bool, latencyMS int64, vec []float64) {
 	// The adapter is NO LONGER required. Judging serves two consumers now: the
 	// tier adapter, which needs a numeric difficulty score and therefore only
@@ -153,21 +157,14 @@ func (r *Router) maybeJudge(messages []Message, stream bool, served *Backend, ro
 		if !ok {
 			return
 		}
-		// The tier adapter only understands a difficulty score, which exists only
-		// on a tier route. On a matrix route the verdict still lands in the matrix
-		// below — that is the whole point of grading it.
 		if bad {
-			if score, ok := parseRouteScore(route); ok && r.adapter != nil {
-				r.adapter.observe(score, true)
-				log.Printf("judge: %s answer for d=%.2f graded BAD by %s → raised tier bias", served.ID, score, grader.ID)
-			} else {
-				log.Printf("judge: %s answer graded BAD by %s (route %q)", served.ID, grader.ID, route)
-			}
+			log.Printf("judge: %s answer graded BAD by %s (route %q)", served.ID, grader.ID, route)
 		}
-		// BOTH verdicts are recorded. The tier adapter only ever cared about bad
-		// ones — it is a correction signal — but the matrix is an estimate of a
-		// hit rate, and throwing away every success would make every judged
-		// worker look uniformly terrible on real traffic.
+		// BOTH verdicts are recorded, not just the bad ones. The matrix is an
+		// estimate of a hit rate, so throwing away every success would make every
+		// judged worker look uniformly terrible on real traffic. (The removed tier
+		// adapter wanted only the bad ones — it was a correction signal, not an
+		// estimate.)
 		r.recordJudgedOutcome(served, question, thinking, !bad, latencyMS)
 	}()
 }

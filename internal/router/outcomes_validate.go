@@ -23,16 +23,20 @@ package router
 // Two supporting diagnostics, both cheap and both worth knowing before trusting
 // any routing decision:
 //
-//	Degenerate fraction — questions every worker passes or every worker fails.
-//	They cannot discriminate between workers no matter how good the predictor is.
+//	Degenerate fraction — questions every model passes or every model fails.
+//	They cannot discriminate between models no matter how good the predictor is.
 //	One published pool was 52.5% all-correct, which capped the achievable gain at
 //	+1.2pp regardless of method.
 //
 //	Distance/agreement correlation — do embedding-near questions actually have
-//	similar per-worker outcomes? That is the assumption kNN rests on, and it is
+//	similar per-model outcomes? That is the assumption kNN rests on, and it is
 //	directly measurable. A strong negative correlation is what "kNN will work
 //	here" looks like; near zero means the neighbours are topical company rather
 //	than evidence.
+//
+// Everything here identifies an answerer by its MODEL HASH, which is what the
+// routing path predicts about — see predictExcluding for what identifying it by
+// worker instead cost this harness.
 
 import (
 	"fmt"
@@ -76,11 +80,18 @@ type ValidationReport struct {
 	AllCorrectFrac float64         `json:"all_correct_fraction"`
 	AllFailFrac    float64         `json:"all_fail_fraction"`
 	// DistanceAgreementR is the correlation between embedding distance and
-	// disagreement in per-worker outcomes, over sampled question pairs. Negative
+	// disagreement in per-model outcomes, over sampled question pairs. Negative
 	// and large is good: near questions behave alike.
 	DistanceAgreementR float64 `json:"distance_agreement_r"`
-	Questions          int     `json:"questions"`
-	Workers            int     `json:"workers"`
+	// Questions is how many question VECTORS the matrix holds — the pool the
+	// holdout draws from, since a question with no vector can never be a
+	// neighbour and so can never be predicted from or about.
+	Questions int `json:"questions"`
+	// Workers is how many distinct MODELS have evidence, not how many boxes. The
+	// json tag keeps its old name so an operator's saved command still works; the
+	// number it carries changed when results moved from being about a worker to
+	// being about the weights it serves.
+	Workers int `json:"workers"`
 }
 
 // validate runs the whole diagnostic. domainOf labels each question; questions
@@ -100,13 +111,19 @@ func (m *outcomeMatrix) validate(domainOf func(qid string) string) ValidationRep
 	m.mu.RUnlock()
 
 	rep := ValidationReport{Questions: len(vecs)}
-	workers := map[string]bool{}
+	// Counted by MODEL HASH, which is what a "worker" is to everything downstream
+	// of here — the field every write path sets and the only one predictFrom
+	// looks up by. Counting distinct Backend values instead reported the number of
+	// BOXES, which is a different and larger number whenever the same weights run
+	// on two hosts, and it made the report claim more independent evidence than
+	// the matrix holds.
+	models := map[string]bool{}
 	for _, list := range obs {
 		for _, o := range list {
-			workers[o.Backend] = true
+			models[o.ModelHash] = true
 		}
 	}
-	rep.Workers = len(workers)
+	rep.Workers = len(models)
 	if len(vecs) == 0 || rep.Workers == 0 {
 		return rep
 	}
@@ -165,9 +182,9 @@ func scoreOver(vecs map[string][]float64, obs map[string][]Observation,
 			if o.Source != obsSourceBench {
 				continue
 			}
-			// Predict this worker on this question WITHOUT using the question
+			// Predict this MODEL on this question WITHOUT using the question
 			// itself, and without anything `allowed` excludes.
-			p := predictExcluding(vecs, obs, v, o.Backend, o.Thinking, func(other string) bool {
+			p := predictExcluding(vecs, obs, v, o.ModelHash, o.Thinking, func(other string) bool {
 				return other != qid && allowed(other)
 			})
 			if !p.known() {
@@ -198,60 +215,35 @@ func scoreOver(vecs map[string][]float64, obs map[string][]Observation,
 }
 
 // predictExcluding is predict() restricted to a subset of the question pool —
-// the mechanism the holdout needs, and deliberately the same code path routing
-// uses so the validation measures the real predictor.
+// the mechanism the holdout needs.
+//
+// It is now literally the routing path's own selection and scoring, over a
+// snapshot instead of the live matrix: nearestNeighbours with the holdout's
+// filter, then predictFrom. It USED to be a second copy of both loops, and the
+// claim in this comment that it was "deliberately the same code path" was how a
+// divergence went unnoticed — the copy filtered observations on o.Backend while
+// routing filtered on o.ModelHash. Every model deployed on more than one host
+// therefore had its evidence split in the report and nowhere else, so the
+// holdout under-counted neighbours, declined predictions routing would have
+// made, and reported a coverage figure lower than the real one. The measured
+// thing was a predictor the router does not use.
+//
+// The snapshot's vectors are all in one space and already normalised, which is
+// what lets it call nearestNeighbours directly; neighboursOf's dimension guard
+// is for the live path, where a query arrives from an embedder that may have
+// changed under the stored vectors.
 func predictExcluding(vecs map[string][]float64, obs map[string][]Observation,
-	q []float64, backend string, thinking bool, include func(qid string) bool) prediction {
-	type near struct {
-		qid string
-		sim float64
-	}
-	var neighbours []near
-	for qid, v := range vecs {
-		if !include(qid) {
-			continue
-		}
-		if sim := dot(q, v); sim >= outcomeMinSimilarity {
-			neighbours = append(neighbours, near{qid, sim})
-		}
-	}
-	sort.Slice(neighbours, func(i, j int) bool { return neighbours[i].sim > neighbours[j].sim })
-	if len(neighbours) > outcomeNeighbours {
-		neighbours = neighbours[:outcomeNeighbours]
-	}
-	var weighted, total, simSum float64
-	used := 0
-	for _, n := range neighbours {
-		for _, o := range obs[n.qid] {
-			if o.Backend != backend || o.Thinking != thinking {
-				continue
-			}
-			w := n.sim
-			if o.Source == obsSourceJudge {
-				w *= obsJudgeWeight
-			}
-			total += w
-			if o.Correct {
-				weighted += w
-			}
-			simSum += n.sim
-			used++
-		}
-	}
-	if used == 0 {
-		return prediction{}
-	}
-	return prediction{
-		Correct:      weighted / total,
-		Confidence:   simSum / float64(used),
-		Support:      total,
-		Observations: used,
-	}
+	q []float64, model string, thinking bool, include func(qid string) bool) prediction {
+	return predictFrom(obs, nearestNeighbours(vecs, q, include), model, thinking)
 }
 
-// degenerateFractions is the share of questions every worker passes, and the
-// share every worker fails. Neither can distinguish workers, so together they
+// degenerateFractions is the share of questions every model passes, and the
+// share every model fails. Neither can distinguish models, so together they
 // bound how much any router can possibly gain over picking at random.
+//
+// No identity filter needed: record() supersedes on (question, model, mode), so
+// the bench rows under one qid are already one per (model, mode) and counting
+// them counts distinct answerers.
 func degenerateFractions(obs map[string][]Observation) (allCorrect, allFail float64) {
 	graded, correct, failed := 0, 0, 0
 	for _, list := range obs {
@@ -266,7 +258,7 @@ func degenerateFractions(obs map[string][]Observation) (allCorrect, allFail floa
 			}
 		}
 		if n < 2 {
-			continue // one worker cannot be unanimous
+			continue // one model cannot be unanimous
 		}
 		graded++
 		switch hits {
@@ -283,15 +275,21 @@ func degenerateFractions(obs map[string][]Observation) (allCorrect, allFail floa
 }
 
 // distanceAgreementCorrelation measures kNN's central assumption directly: do
-// questions that are close in embedding space produce similar per-worker
+// questions that are close in embedding space produce similar per-model
 // outcomes?
 //
-// For every pair of questions with shared workers, correlate cosine SIMILARITY
-// against outcome DISAGREEMENT (the fraction of shared workers that answered
+// For every pair of questions with shared models, correlate cosine SIMILARITY
+// against outcome DISAGREEMENT (the fraction of shared models that answered
 // them differently). A strong negative correlation means near questions behave
 // alike, which is what makes a neighbour informative. Near zero means the
 // neighbours are topical company rather than evidence — the matrix would then be
 // predicting from questions that share a subject and nothing else.
+//
+// Paired on the MODEL HASH, like everything else that asks "is this the same
+// answerer". On Backend it paired boxes, so a model on two hosts contributed no
+// pairs at all for the questions its two profiles happened to split between
+// them — the rows exist and describe one answerer, and the identity that says so
+// is the hash.
 func distanceAgreementCorrelation(vecs map[string][]float64, obs map[string][]Observation) float64 {
 	qids := keysOf(vecs)
 	sort.Strings(qids) // deterministic sampling
@@ -315,7 +313,7 @@ func distanceAgreementCorrelation(vecs map[string][]float64, obs map[string][]Ob
 					continue
 				}
 				for _, ob := range obs[b] {
-					if ob.Source != obsSourceBench || ob.Backend != oa.Backend || ob.Thinking != oa.Thinking {
+					if ob.Source != obsSourceBench || ob.ModelHash != oa.ModelHash || ob.Thinking != oa.Thinking {
 						continue
 					}
 					shared++
@@ -489,6 +487,12 @@ func (v ValidationReport) verdict() string {
 //
 // The validation is opt-in via ?validate=1 because it is O(n²) in questions —
 // fine to run on demand, wrong to compute for a dashboard poll.
+//
+// The "backends" key holds MODEL identities now rather than worker ids, since
+// that is what the matrix files evidence under. The key name is left as it is
+// because no dashboard reads this endpoint — it is a curl-level diagnostic — and
+// renaming it would break whatever an operator has already scripted against it
+// to buy a word. See backendsWithEvidence for what the hashes are good for.
 func (r *Router) handleOutcomes(w http.ResponseWriter, req *http.Request) {
 	if req.Method != http.MethodGet {
 		methodNotAllowed(w)

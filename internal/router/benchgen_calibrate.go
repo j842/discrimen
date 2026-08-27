@@ -26,6 +26,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -59,6 +60,22 @@ type calibResult struct {
 	// difficulty, and letting it vote on difficulty is how a long question gets
 	// mistaken for a hard one.
 	Censored map[string]bool `json:"censored,omitempty"`
+	// Ungradeable records the observations where the QUESTION could not be
+	// scored, as against the worker getting it wrong or being too slow: test data
+	// that will never parse, an expected output that is not the JSON the grader
+	// needs, a body the sidecar will always refuse. Those are permanent — no
+	// worker can ever be scored on that question — so unlike an ungraded pair
+	// they are WRITTEN DOWN, and that is the point of the field. An unrecorded
+	// pair is retried by the resume path on every subsequent run, which for a
+	// permanently broken question is forever, at hard-tier cost, on every
+	// backend.
+	//
+	// Pass is set false alongside for the same reason Censored sets it: the
+	// resume path keys on the presence of the id in Pass. Nothing reads that
+	// false — benchSelect drops the whole question, on ANY backend's report,
+	// because "the answer key will not parse" is a fact about the question and
+	// one backend is enough to establish it. See the ungradeable counter there.
+	Ungradeable map[string]bool `json:"ungradeable,omitempty"`
 }
 
 func (c *calibration) forBackend(id string) *calibResult {
@@ -207,6 +224,20 @@ func benchCalibrate(routerURL, token, sandboxURL string, concurrency, limit int,
 							res.Censored = map[string]bool{}
 						}
 						res.Censored[q.ID] = true
+					case benchGradeUngradeable:
+						// The opposite of the ungraded case above, and the reason the two
+						// are not one kind. A sidecar having a bad minute must be retried;
+						// a question whose own test data will never parse must NOT be, or
+						// the resume path re-asks it on every run, on every backend,
+						// forever — at the hard-tier token budget, which is the most
+						// expensive question in the pool to keep getting nowhere with.
+						// Recorded so the resume path skips it and so emit can drop it.
+						res.Pass[q.ID] = false
+						if res.Ungradeable == nil {
+							res.Ungradeable = map[string]bool{}
+						}
+						res.Ungradeable[q.ID] = true
+						fmt.Fprintf(os.Stderr, "  UNGRADEABLE %s (%s) — dropped from the pool, not retried\n", q.ID, q.Task)
 					}
 					done++
 					// Checkpoint often: this runs for hours and will be interrupted.
@@ -331,12 +362,25 @@ func benchGradeOne(routerURL, token, backendID, sandboxURL string, q poolQuestio
 		if q.Match == benchMatchCodeExec {
 			pass, err := benchGradeCodeStandalone(sandboxURL, q, content)
 			if err != nil {
-				// Unreachable sandbox is not a wrong answer, and recording it as one
-				// would fail every coding question for every worker — the same shape
-				// of bug as the exact-list one. Report ungraded so the caller leaves
-				// the pair unrecorded and a later run retries it; a question that can
-				// never be graded is reported separately and dropped from the pool.
 				fmt.Fprintf(os.Stderr, "  sandbox: %v\n", err)
+				// TWO KINDS OF FAILURE, and collapsing them is what this errors.Is
+				// separates. An unreachable sandbox is not a wrong answer, and
+				// recording it as one would fail every coding question for every
+				// worker — the same shape of bug as the exact-list one — so it reports
+				// ungraded, the pair goes unrecorded, and a later run retries it.
+				//
+				// A question that can NEVER be graded is the other kind: unusable test
+				// data, an answer key that is not JSON, a body over the sidecar's own
+				// limit. Retrying that is not conservative, it is a loop — every run,
+				// every backend, at the hard-tier budget, producing the same failure.
+				// errBenchUngradeable is what codeexec.go wraps those in, and it is
+				// only a distinction if somebody reads it: for the whole life of the
+				// sentinel this branch treated every error alike and returned
+				// ungraded, which is the SAFE half of the distinction and not the
+				// whole of it.
+				if errors.Is(err, errBenchUngradeable) {
+					return false, benchGradeUngradeable
+				}
 				return false, benchGradeUngraded
 			}
 			return pass, benchGradeGraded
@@ -425,20 +469,29 @@ func benchSplitCSV(s string) map[string]bool {
 	return out
 }
 
-// benchGradeKind separates the three things that can come back from one
+// benchGradeKind separates the four things that can come back from one
 // (worker, question) attempt. They are NOT interchangeable and collapsing any
 // two of them has caused a real miscalibration:
 //
-//	graded    the worker answered and the answer was checked — the only kind
-//	          that is evidence about the question
-//	censored  the worker hit the deadline. Scored a fail (production does too),
-//	          but it measures throughput, not difficulty
-//	ungraded  nothing was learned — sidecar down, transport failure, dead row.
-//	          Recorded nowhere, so a later run retries it
+//	graded       the worker answered and the answer was checked — the only kind
+//	             that is evidence about the question
+//	censored     the worker hit the deadline. Scored a fail (production does
+//	             too), but it measures throughput, not difficulty
+//	ungraded     nothing was learned — sidecar down, transport failure, dead
+//	             row. Recorded nowhere, so a later run retries it
+//	ungradeable  nothing will EVER be learned: the question's own data is
+//	             unusable. Recorded, so no run retries it and emit drops it
+//
+// The last two are the pair most easily mistaken for each other, because both
+// mean "we did not get a verdict". The difference is whether trying again could
+// change that. `ungraded` is optimism with a basis — the sidecar comes back, the
+// row is re-added, the network settles. `ungradeable` is a question whose answer
+// key does not parse, and the honest thing to do with it is stop asking.
 type benchGradeKind int
 
 const (
 	benchGradeUngraded benchGradeKind = iota
 	benchGradeGraded
 	benchGradeCensored
+	benchGradeUngradeable
 )

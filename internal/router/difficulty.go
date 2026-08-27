@@ -30,8 +30,6 @@ import (
 	"math"
 	"net/http"
 	"os"
-	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -42,7 +40,6 @@ import (
 // ── Tunables ────────────────────────────────────────────────────────────────
 
 const (
-	defaultDifficultyBands = "0.40:2,0.70:7,1.0:9"
 	// bootstrapCooldown bounds how often we retry centroid bootstrap when the
 	// embeddings worker is down, so a misconfigured cluster isn't hammered.
 	bootstrapCooldown = 30 * time.Second
@@ -372,13 +369,6 @@ var directSeeds = []string{
 
 // ── Classifier ──────────────────────────────────────────────────────────────
 
-// difficultyBand maps an upper bound on the difficulty score [0,1] to a target
-// minimum backend quality. Bands are held sorted ascending by upTo.
-type difficultyBand struct {
-	upTo    float64
-	quality int
-}
-
 // classification holds both axis scores for a prompt, each in [0,1].
 type classification struct {
 	difficulty float64 // 0 = trivial, 1 = hard → model tier
@@ -402,7 +392,6 @@ type difficultyClassifier struct {
 	// production it points at Router.embedTexts. Must be concurrency-safe.
 	embed func(ctx context.Context, texts []string) ([][]float64, error)
 
-	bands              []difficultyBand
 	temp               float64 // softness of the margin → score map
 	reasoningThreshold float64 // reasoning score ≥ this → enable thinking
 	maxChars           int     // cap on classified prompt text length
@@ -421,9 +410,6 @@ type difficultyClassifier struct {
 }
 
 func newDifficultyClassifier(cfg *Config, embed func(context.Context, []string) ([][]float64, error)) *difficultyClassifier {
-	// Empty bands → automatic, fleet-derived tiers (see autoTargetQuality). An
-	// explicit ROUTER_DIFFICULTY_QUALITY_BANDS is an optional override.
-	bands := parseDifficultyBands(cfg.DifficultyBands)
 	temp := cfg.DifficultyTemp
 	if temp <= 0 {
 		temp = 0.10
@@ -442,7 +428,6 @@ func newDifficultyClassifier(cfg *Config, embed func(context.Context, []string) 
 	}
 	c := &difficultyClassifier{
 		embed:              embed,
-		bands:              bands,
 		temp:               temp,
 		reasoningThreshold: threshold,
 		maxChars:           maxChars,
@@ -547,64 +532,10 @@ func (c *difficultyClassifier) classify(req *ChatRequest) (classification, bool)
 	return cl, true
 }
 
-// targetQuality classifies a request and returns the target minimum backend
-// quality, the raw difficulty score, and ok=false when unavailable.
-func (c *difficultyClassifier) targetQuality(req *ChatRequest) (int, float64, bool) {
-	cl, ok := c.classify(req)
-	if !ok {
-		return 0, 0, false
-	}
-	return c.bandQuality(cl.difficulty), cl.difficulty, true
-}
-
-// targetForFleet maps a difficulty score to a target quality. With an explicit
-// bands override configured it uses that; otherwise it derives the target from
-// the candidate fleet's own quality range — zero-config and self-adapting.
-func (c *difficultyClassifier) targetForFleet(candidates []*Backend, score float64, thinkOff bool) int {
-	if len(c.bands) > 0 {
-		return c.bandQuality(score)
-	}
-	return autoTargetQuality(candidates, score, thinkOff)
-}
-
 // benchmarkQualityScale is the ceiling of runQualityBenchmark's score: quality
 // is the percentage of the versioned question set answered correctly, so the
 // scale is absolute and comparable across workers and across time.
 const benchmarkQualityScale = 100
-
-// autoTargetQuality maps a difficulty score onto the benchmark's own absolute
-// 0–100 scale: score 0 → no quality bar, score 1 → the (unreachable) perfect
-// score, clamped to the best quality actually registered so an out-of-reach
-// bar degrades to "the smartest there is" rather than an empty set. Still no
-// hand-set thresholds — the bar is a property of the QUESTION.
-//
-// It used to be linear over the fleet's own [qmin, qmax], which made "smart
-// enough" relative to whoever happened to be registered: measured 2026-08-13,
-// registering a quality-93 CPU worker (17 tok/s) stretched the range and
-// re-tiered the same d=0.65 question from q>=79 (a 1.8s GPU answer) to q>=87
-// (26.4s on the CPU worker) — the speed ranking never saw more than one
-// candidate. Anchoring the bar absolutely keeps every worker above it in the
-// race, and rankByDifficulty's expected-completion ordering does the rest.
-func autoTargetQuality(candidates []*Backend, score float64, thinkOff bool) int {
-	if len(candidates) == 0 {
-		return 0
-	}
-	// The clamp reads the score for the mode the request will be SERVED in: a
-	// no-think request clamps against the best no-think quality, so the bar a
-	// thinking-mode score set can't strand it above every worker's real
-	// no-think ability.
-	qmax := qualityFor(candidates[0], thinkOff)
-	for _, b := range candidates {
-		if q := qualityFor(b, thinkOff); q > qmax {
-			qmax = q
-		}
-	}
-	target := int(math.Round(clamp01(score) * benchmarkQualityScale))
-	if target > qmax {
-		return qmax
-	}
-	return target
-}
 
 // wantThinking maps a reasoning score to an enable_thinking decision. A low
 // threshold keeps thinking on for more prompts (conservative — only clearly
@@ -676,80 +607,7 @@ func (c *difficultyClassifier) bootstrap() (centroids, error) {
 	return cents, nil
 }
 
-// bandQuality maps a difficulty score to the configured target quality.
-func (c *difficultyClassifier) bandQuality(score float64) int {
-	for _, band := range c.bands {
-		if score <= band.upTo {
-			return band.quality
-		}
-	}
-	if len(c.bands) > 0 {
-		return c.bands[len(c.bands)-1].quality
-	}
-	return 0
-}
-
 // ── Candidate ordering ──────────────────────────────────────────────────────
-
-// rankByDifficulty orders candidates so the cheapest backend that clears the
-// target quality comes first, breaking ties within a quality tier by expected
-// completion time under current load. Backends below the bar trail (closest
-// first) as graceful fallback. The returned slice feeds pickAndAcquire, which
-// still spills past any momentarily-saturated front-runner.
-func rankByDifficulty(candidates []*Backend, target int, job jobCost, thinkOff bool) []*Backend {
-	sort.SliceStable(candidates, func(i, j int) bool {
-		a, b := candidates[i], candidates[j]
-		// Quality is read for the mode this request will be SERVED in — see
-		// qualityFor. A reasoning MoE ranks by its no-think score on a no-think
-		// request, not the thinking-mode score it benchmarked.
-		aq, bq := qualityFor(a, thinkOff), qualityFor(b, thinkOff)
-		// 1. Prefer a backend with a free slot (matches rankBackends; spilling is
-		//    still handled downstream by pickAndAcquire).
-		if af, bf := isFull(a), isFull(b); af != bf {
-			return !af
-		}
-		// 2. Prefer backends that clear the quality bar.
-		am, bm := aq >= target, bq >= target
-		if am != bm {
-			return am
-		}
-		// 3. Among those below the bar, the highest quality (closest) first.
-		if !am && aq != bq {
-			return aq > bq
-		}
-		// 3.5 Among those that CLEAR the bar, prefer the free ones (PLAN.md, P4).
-		//     Deliberately scoped to the above-bar group: below the bar the router
-		//     has already missed the quality it wanted, and buying a worse answer
-		//     to save money there is not a trade anyone asked for. Above it every
-		//     survivor is good enough by construction, so cost is free to decide.
-		//
-		//     This is only the ORDER. Refusing to spend is the acquire step's job:
-		//     qualityFloorPreference holds the request on the free set for the
-		//     existing grace before it will touch a paid endpoint at all.
-		if am {
-			if af, bf := isFreeBackend(a), isFreeBackend(b); af != bf {
-				return af
-			}
-		}
-		// 4. Otherwise pick whichever will FINISH FIRST — expected completion time
-		//    for THIS job from live prefill/decode rates + queue occupancy. For
-		//    backends that clear the bar this replaces "cheapest tier": slow workers
-		//    lose on latency on their own (no speed cutoff to tune), and a busy fast
-		//    worker sheds load to idle ones automatically.
-		if la, lb := expectedLatency(a, job), expectedLatency(b, job); la != lb {
-			return la < lb
-		}
-		// 5. Exact tie → keep the conversation where it is. Only reachable when the
-		//    completion-time estimate can't separate them at all (e.g. neither has a
-		//    measured prefill rate yet), where staying is free and switching costs a
-		//    cold prefix.
-		if ai, bi := sessionIncumbent(a, job), sessionIncumbent(b, job); ai != bi {
-			return ai
-		}
-		return a.ID < b.ID
-	})
-	return candidates
-}
 
 // sessionIncumbent reports whether b served the previous turn of this job's
 // conversation.
@@ -1680,28 +1538,6 @@ func (r *Router) embedTexts(ctx context.Context, texts []string) ([][]float64, e
 }
 
 // ── Config helpers ──────────────────────────────────────────────────────────
-
-func parseDifficultyBands(raw string) []difficultyBand {
-	out := []difficultyBand{}
-	for _, part := range strings.Split(raw, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		kv := strings.SplitN(part, ":", 2)
-		if len(kv) != 2 {
-			continue
-		}
-		upTo, err1 := strconv.ParseFloat(strings.TrimSpace(kv[0]), 64)
-		q, err2 := strconv.Atoi(strings.TrimSpace(kv[1]))
-		if err1 != nil || err2 != nil {
-			continue
-		}
-		out = append(out, difficultyBand{upTo: upTo, quality: q})
-	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].upTo < out[j].upTo })
-	return out
-}
 
 func envBool(key string, fallback bool) bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {

@@ -95,9 +95,6 @@ func TestRoutePreviewMatchesTheRealDecision(t *testing.T) {
 	if pv.WouldServe != plan.candidates[0].ID {
 		t.Fatalf("preview would_serve %q != real first candidate %q", pv.WouldServe, plan.candidates[0].ID)
 	}
-	if pv.TargetQuality != plan.target {
-		t.Fatalf("preview target %d != real target %d", pv.TargetQuality, plan.target)
-	}
 	if !pv.Classified || pv.Difficulty == nil || pv.Reasoning == nil {
 		t.Fatalf("hard prompt should be classified on both axes: %+v", pv)
 	}
@@ -261,10 +258,10 @@ func TestRoutePreviewGivesAClientTheDecisionWithoutTheFleet(t *testing.T) {
 	if pv.Job.PromptTokens == 0 {
 		t.Error("the job's own size must survive")
 	}
-	// The tier and the thinking mode too, on a prompt that earns both.
+	// The thinking mode too, on a prompt that earns it.
 	_, hard := postPreview(t, r, `{"model":"default","messages":[{"role":"user","content":"prove a hard theorem"}]}`)
-	if hard.TargetQuality == 0 || !hard.Thinking.Enabled || hard.Thinking.Source != "auto" {
-		t.Errorf("a client lost the tier or the thinking mode: target=%d thinking=%+v", hard.TargetQuality, hard.Thinking)
+	if !hard.Thinking.Enabled || hard.Thinking.Source != "auto" {
+		t.Errorf("a client lost the thinking mode: %+v", hard.Thinking)
 	}
 
 	// The same request from an admin still gets the full picture, which is what
@@ -286,5 +283,153 @@ func TestRoutePreviewRejectsNonPost(t *testing.T) {
 	r.handleRoutePreview(rec, httptest.NewRequest(http.MethodGet, "/v1/route-preview", nil))
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("want 405, got %d", rec.Code)
+	}
+}
+
+// ── The per-key allow-list ──────────────────────────────────────────────────
+
+const previewClientSecret = "sk-test-preview-client"
+
+// restrictedPreviewRouter is a two-model fleet plus a client key allowed only
+// the small one. "big" is faster and higher quality, so automatic routing
+// prefers it and the allow-list is the only thing that can keep it out.
+func restrictedPreviewRouter(t *testing.T, allowed ...string) *Router {
+	t.Helper()
+	reg := newTestRegistry()
+	for _, spec := range []struct {
+		id, model   string
+		quality, ps int
+	}{{"small", "small-model", 20, 200}, {"big", "big-model", 90, 400}} {
+		reg.upsert(BackendRegistration{
+			ID: spec.id, URL: "http://" + spec.id, Model: spec.model, Quality: spec.quality,
+			BaselineTPS: float64(spec.ps), MaxConcurrency: 4, TTLSeconds: 3600,
+			Features: []string{"chat"},
+		})
+		reg.finishCertification(spec.id, true, map[string]Check{}, float64(spec.ps), 10, "")
+	}
+	r := &Router{
+		cfg: &Config{
+			DefaultMaxTokens: 4096, AutoDifficulty: true, AutoThinking: true,
+			DifficultyTemp: 0.10, ReasoningThreshold: 0.35,
+			DifficultyTimeout: time.Second, DifficultyCacheSize: 16, DifficultyMaxChars: 4000,
+		},
+		registry:   reg,
+		classifier: testClassifierAuto(fakeEmbed),
+		sessions:   newSessionTracker(time.Hour, 16),
+		logs:       newTestLogStore(t),
+	}
+	issueKey(t, r, previewClientSecret, apiKey{Role: roleClient, Name: "restricted", Models: allowed})
+	return r
+}
+
+// A key restricted to one model must not be told that its request would land on
+// a worker it may not be served by.
+//
+// The preview shared planRoute and stopped there, but the proxy path calls
+// restrictToAllowList on the very next line — so the two disagreed for exactly
+// the callers that have a restriction. allowsModel refuses nothing to a caller
+// who named nothing, and "default" IS naming nothing (autoModelNames), so the
+// preview ranked the whole fleet and handed back the id of the largest worker in
+// it. Two failures at once: the answer was wrong, because the real request would
+// have been narrowed to the allowed set, and would_serve is in the CLIENT half of
+// the response, so it disclosed a worker id this key is not entitled to learn —
+// the inventory that moving GET /backends to admin scope was meant to withhold.
+func TestRoutePreviewAppliesTheKeysAllowList(t *testing.T) {
+	r := restrictedPreviewRouter(t, "small-model")
+
+	rec, pv := postPreviewAs(t, r,
+		`{"model":"default","messages":[{"role":"user","content":"prove a hard theorem"}]}`,
+		previewClientSecret)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if pv.WouldServe != "small" {
+		t.Errorf("would_serve %q: a key allowed only small-model was routed to a worker it may not use", pv.WouldServe)
+	}
+	if strings.Contains(rec.Body.String(), "big") {
+		t.Errorf("a worker outside the key's allow-list is named in its preview: %s", rec.Body.String())
+	}
+
+	// An unrestricted key still sees the whole fleet's answer, so the narrowing
+	// above is the allow-list and not a change to the ranking.
+	open := restrictedPreviewRouter(t)
+	_, all := postPreviewAs(t, open,
+		`{"model":"default","messages":[{"role":"user","content":"prove a hard theorem"}]}`,
+		previewClientSecret)
+	if all.WouldServe != "big" {
+		t.Fatalf("without an allow-list the fleet's own choice should stand, got %q", all.WouldServe)
+	}
+}
+
+// The same narrowing, in the case where it leaves nothing: the real request gets
+// restrictToAllowList's 503, so the preview must report that rather than a 200
+// describing a route the caller cannot have.
+func TestRoutePreviewReportsAnEmptyAllowList(t *testing.T) {
+	r := restrictedPreviewRouter(t, "a-model-nobody-serves")
+	rec, _ := postPreviewAs(t, r,
+		`{"model":"default","messages":[{"role":"user","content":"say hello"}]}`,
+		previewClientSecret)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("want 503 when no allowed worker is a candidate, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// The other direction, and the more embarrassing one: the preview REFUSED a
+// request /v1/chat/completions serves.
+//
+// enforceKeyLimits is allowsModel OR mayNameWorker, because an allow-list entry
+// is matched against the caller's spelling literally — so a key issued for
+// "small-model" naming the ID of the worker serving small-model is legitimate,
+// and is the spelling /relay/fleet advertises. The preview tested only the first
+// half and answered 403 to a request the router would have answered 200 to.
+func TestRoutePreviewAcceptsAWorkerIDTheAllowListCovers(t *testing.T) {
+	r := restrictedPreviewRouter(t, "small-model")
+	rec, pv := postPreviewAs(t, r,
+		`{"model":"small","messages":[{"role":"user","content":"say hello"}]}`,
+		previewClientSecret)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("naming the worker that serves an allowed model must be previewable, got %d: %s",
+			rec.Code, rec.Body.String())
+	}
+	if pv.WouldServe != "small" {
+		t.Errorf("would_serve %q, want small", pv.WouldServe)
+	}
+	// A model genuinely off the list is still refused, so the widening above did
+	// not turn the allow-list into a formality.
+	off, _ := postPreviewAs(t, r,
+		`{"model":"big-model","messages":[{"role":"user","content":"say hello"}]}`,
+		previewClientSecret)
+	if off.Code != http.StatusForbidden {
+		t.Fatalf("a model off the allow-list must still be 403, got %d: %s", off.Code, off.Body.String())
+	}
+}
+
+// ── What the preview says about the ordering ────────────────────────────────
+
+// The tier ranker's quality bar is gone, and with it target_quality and
+// above_bar. What replaces them on every live request is the matrix's own
+// prediction, carried per candidate — so the preview has to show THAT, or the one
+// tool for explaining a route explains a ranker that no longer exists.
+func TestRoutePreviewCarriesTheMatrixPrediction(t *testing.T) {
+	r := previewAdminRouter(t)
+	r.outcomes = newOutcomeMatrix(nil)
+	body := `{"model":"default","messages":[{"role":"user","content":"prove a hard theorem"}]}`
+	_, pv := postPreviewAs(t, r, body, adminSecret)
+	if len(pv.Candidates) == 0 {
+		t.Fatalf("admin preview lost its candidates")
+	}
+	for _, c := range pv.Candidates {
+		if c.Outcome == nil {
+			t.Errorf("%s carries no outcome-matrix prediction, which is what ordered it", c.ID)
+			continue
+		}
+		switch c.Outcome.Band {
+		case "able", "unmeasured", "unable":
+		default:
+			t.Errorf("%s landed in band %q, which is not one of chooseByOutcome's three", c.ID, c.Outcome.Band)
+		}
+	}
+	if !strings.Contains(strings.Join(pv.Notes, " "), "outcome matrix") {
+		t.Errorf("the notes should say what decided this route: %v", pv.Notes)
 	}
 }

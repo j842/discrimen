@@ -108,10 +108,17 @@ func benchLiveItems(t *testing.T) []benchLiveItem {
 
 // THE HAND EDIT. benchRenderFile prints the band header and the Tier field from
 // the same variable, so a generated file CANNOT have them disagree. When they
-// do, someone edited the file — and it says DO NOT EDIT because the question set
-// is part of the profile cache key, so an edit that changes a tier changes which
-// weight bucket a question scores in and which mode it is graded in, under an
-// unchanged benchmarkVersion.
+// do, someone edited the file.
+//
+// It says DO NOT EDIT because a tier is the one part of a question that is NOT
+// in its content hash. benchQuestionQID covers the prompt, the expected answer,
+// the match mode, the grader version and the code tests — not the Tier — so
+// editing a tier changes which weight bucket the question scores in and which
+// thinking mode it is graded in, while every cached verdict for it stays valid
+// and no worker re-profiles. The score moves and nothing says so. (The old
+// wording here blamed "the question set is part of the profile cache key",
+// which stopped being the mechanism when identity.go landed; the hazard is real
+// and is this one.)
 func TestLiveBankBandHeadersMatchTierFields(t *testing.T) {
 	for _, it := range benchLiveItems(t) {
 		if it.Header == 0 {
@@ -196,13 +203,7 @@ func TestLiveBankMatchesTheGeneratorsBandingRule(t *testing.T) {
 
 // benchBandForExact is benchBandFor without its fall back to the first band,
 // which would make an unknown tier look like a declared one.
-func benchBandForExact(tier int) (struct {
-	Tier    int
-	Target  int
-	MinRate float64
-	MaxRate float64
-	Reserve int
-}, bool) {
+func benchBandForExact(tier int) (benchTierTarget, bool) {
 	for _, b := range benchTierTargets {
 		if b.Tier == tier {
 			return b, true
@@ -492,13 +493,18 @@ func benchSelectFixture() (*benchPool, *calibration) {
 
 // The guard read `if band.Tier >= benchCodingTier`. The ceiling band moved from
 // tier 12 to tier 10 and benchCodingTier stayed 12, so the condition became
-// 10 >= 12 and the guard has been dead ever since — which is why the committed
+// 10 >= 12 and the guard was dead from that day until it was rewritten to key on
+// the band's ROLE (band.Reserve == reserveCeiling) — which is why the committed
 // tier-10 band went out unfiltered.
 //
-// It cannot be fixed by lowering the constant: benchCodingTier is what
+// It could not be fixed by lowering the constant: benchCodingTier is what
 // benchWeightedScore uses to decide the 20-point coding bucket, so tier 10 would
 // sweep 40 maths and olympiad questions into it and restore the exact fault that
 // moved the band off tier 12 in the first place.
+//
+// This test DRIVES selection rather than reading the source, so it stays honest
+// about the thing that actually went wrong: the condition compiled, read
+// plausibly, and matched nothing.
 func TestCeilingBandShapeGuardFires(t *testing.T) {
 	pool, calib := benchSelectFixture()
 	selected, _, err := benchSelect(pool, calib)
@@ -551,9 +557,9 @@ func TestCeilingBandShapeGuardFires(t *testing.T) {
 
 // Selection has to be a pure function of pool.json and the calibration, or the
 // committed bank cannot be reasoned about at all: two emits from one calibration
-// would produce two different question sets under one benchmarkVersion, and
-// every worker profiled between them would be scored on a bank nobody can
-// reconstruct.
+// would produce two different question sets, and every worker profiled between
+// them would be scored on a bank nobody can reconstruct — read afterwards on the
+// same absolute 0-100 scale as every other worker's.
 func TestBenchSelectIsDeterministic(t *testing.T) {
 	pool, calib := benchSelectFixture()
 	a, rhoA, err := benchSelect(pool, calib)

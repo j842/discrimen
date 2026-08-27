@@ -219,11 +219,27 @@ def _question_only(case: dict) -> dict:
 def _assemble(outcome: supervisor.Outcome, requested: int, timeout_ms: int,
               tests: list | None = None) -> dict:
     cases = outcome.all("case")
-    _decide(cases, tests or [])
+    data_fault = _decide(cases, tests or [])
     cases_run = len(cases)
     cases_passed = sum(1 for case in cases if case.get("pass"))
 
-    error = _run_error(outcome, timeout_ms)
+    # A fault in the QUESTION's own data has to reach the run-level error field,
+    # and for the whole life of _decide it did not: the message went onto the
+    # CASE and the run came back error:null, pass:false — which is the wire shape
+    # of "the model got it wrong". The router's codeRunFault lists "malformed
+    # expected output" as a permanent fault precisely so a question like that is
+    # dropped from the pool rather than counted against a worker, and that entry
+    # could never match, because the string never appeared in the field it reads.
+    # So a LiveBench row whose expected output is not JSON scored zero for every
+    # worker, calibrated as p=0 "nobody can pass this", and shipped in the
+    # ceiling band as headroom — indistinguishable from a genuinely hard item.
+    #
+    # Ranked BELOW _run_error rather than above it, so nothing about the existing
+    # ordering changes: a spawn failure, the child's own fatal record, a timeout
+    # and a signal all still win, because those describe a run that did not
+    # finish and a retry of it may yet reach the data fault. The only runs whose
+    # error field changes are the ones that were returning None.
+    error = _run_error(outcome, timeout_ms) or data_fault
     first_failure = None
     for case in cases:
         if not case.get("pass"):
@@ -259,8 +275,13 @@ def _assemble(outcome: supervisor.Outcome, requested: int, timeout_ms: int,
     }
 
 
-def _decide(cases: list, tests: list) -> None:
+def _decide(cases: list, tests: list) -> str | None:
     """Decide each case HERE, in the parent, from the value the child reported.
+
+    Returns the first TEST-DATA fault it hit, or None. That return value is not
+    decoration: a case whose expected output will not parse is a broken QUESTION,
+    the caller has to be able to tell that from a wrong answer, and the only
+    channel it reads is the run-level error field. See _assemble.
 
     The child shares an interpreter with the submission, so anything it computes
     a submission can rewrite — and the cheapest version of that attack needs no
@@ -286,6 +307,7 @@ def _decide(cases: list, tests: list) -> None:
     A case the child could not serialise, or one with no matching test, stays
     failed: an unverifiable answer is not a correct one.
     """
+    data_fault: str | None = None
     for case in cases:
         case.setdefault("expected", "")
         index = case.get("index")
@@ -302,9 +324,15 @@ def _decide(cases: list, tests: list) -> None:
         except compare.TestDataError as exc:
             # A fault in the QUESTION, not the answer. Reported as an error so the
             # caller can tell "we could not grade this" from "the model was wrong".
+            # Kept on the case for the failure report AND returned, because only
+            # the returned one reaches the field the caller actually reads.
             case["pass"] = False
             case["error"] = case.get("error") or f"malformed expected output: {exc}"
             case.pop("value", None)
+            # First one wins: the rest of the cases are graded anyway so
+            # cases_passed stays a real fraction, but one unparseable answer key
+            # already settles what the run is.
+            data_fault = data_fault or f"malformed expected output at case {index}: {exc}"
             continue
         case["expected"] = compare.render(expected)
 
@@ -334,6 +362,7 @@ def _decide(cases: list, tests: list) -> None:
         # The child's own rendering of what the submission returned is kept for
         # the failure report; only the verdict is recomputed.
         case.pop("value", None)
+    return data_fault
 
 
 def _run_error(outcome: supervisor.Outcome, timeout_ms: int) -> str | None:
@@ -344,6 +373,11 @@ def _run_error(outcome: supervisor.Outcome, timeout_ms: int) -> str | None:
     timeout beats a signal, because the signal IS the timeout's SIGKILL and
     reporting it as "killed by signal 9" would describe the cure rather than the
     disease.
+
+    Test-data faults are NOT here, because this function only sees the outcome
+    and they are found while the cases are being decided against the answer key
+    the child never saw. _assemble falls back to _decide's return value when
+    everything below reports nothing.
     """
     if outcome.spawn_error:
         return outcome.spawn_error

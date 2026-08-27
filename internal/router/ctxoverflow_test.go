@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // A prompt too long for the worker's window is a MISS, not an outage.
@@ -72,6 +73,75 @@ func TestAnOversizedPromptScoresAsAMissNotAnError(t *testing.T) {
 	// answer — on a 48K prompt, an expensive one.
 	if got := asked.Load(); got != 1 {
 		t.Errorf("%d requests sent, want 1 — the oversized prompt was dispatched anyway", got)
+	}
+}
+
+// THE WINDOW IS CHECKED BEFORE THE PERMACACHE, and it has to be.
+//
+// The permacache is keyed by MODEL: the same weights on two hosts share every
+// graded verdict, because correctness is a property of the weights, the engine
+// and the thinking mode. A CONTEXT WINDOW is not — modelHash carries
+// ModelCtxTrain (what the weights were trained at), not the -c the server was
+// started with, and the context probe measures each host separately. So a 128K
+// deployment answers the 48K rung, and a 32K deployment of the same weights would
+// have inherited that pass and been recorded as able to reason over 48K of
+// context it cannot even accept: a false PASS, which is the direction this file
+// refuses. Its own window is the better answer and it is free.
+func TestASmallWindowDoesNotInheritABigOnesLongContextPass(t *testing.T) {
+	saved := benchmarkQuestions
+	defer func() { benchmarkQuestions = saved }()
+	long := strings.Repeat("field log line with some padding text ", 4000) // ~150k chars
+	q := benchmarkQ{Tier: 9, Prompt: long + " How many entries are there?", Expect: "4000", Match: "numeric"}
+	benchmarkQuestions = []benchmarkQ{q}
+
+	var asked atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		asked.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{
+				"message": map[string]any{"role": "assistant", "content": "4000"}, "finish_reason": "stop",
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	// One model, two deployments. Everything modelHash reads is identical; only
+	// the served window differs.
+	big := &Backend{BackendRegistration: BackendRegistration{ID: "big-window", URL: srv.URL, Model: "m", ContextK: 128}}
+	big.ServedID, big.ModelParams, big.ModelSizeBytes, big.Engine = "gemma", 26e9, 17e9, engineLlamaCPP
+	small := &Backend{BackendRegistration: BackendRegistration{ID: "small-window", URL: srv.URL, Model: "m", ContextK: 8}}
+	small.ServedID, small.ModelParams, small.ModelSizeBytes, small.Engine = "gemma", 26e9, 17e9, engineLlamaCPP
+	if modelHash(big) != modelHash(small) {
+		t.Fatal("the two deployments do not share a model hash — the test is not testing what it says")
+	}
+
+	m := newOutcomeMatrix(nil)
+	r := &Router{cfg: &Config{}, benchClient: &http.Client{}, outcomes: m}
+
+	// The big-window worker answers it, and the verdict is filed under the model.
+	_, ok, _, _, details := r.runQualityBenchmark(big, 1)
+	if !ok || len(details) != 1 || !details[0].Pass {
+		t.Fatalf("the big-window worker did not pass the long question: ok=%v %+v", ok, details)
+	}
+	if err := m.record(t.Context(), observationsFromMixed(modelHash(big), big.ID, details, time.Unix(0, 0))); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+
+	// The small-window deployment must reach its own verdict.
+	asked.Store(0)
+	_, ok2, _, _, got := r.runQualityBenchmark(small, 1)
+	if !ok2 || len(got) != 1 {
+		t.Fatalf("the small-window run did not score: ok=%v %+v", ok2, got)
+	}
+	if got[0].Pass {
+		t.Errorf("a worker with an 8K window inherited a 128K deployment's pass on a ~38K prompt (got=%q)", got[0].Got)
+	}
+	if !strings.Contains(got[0].Got, "window") {
+		t.Errorf("the small-window result does not say why it failed: %q", got[0].Got)
+	}
+	if n := asked.Load(); n != 0 {
+		t.Errorf("%d requests sent, want 0 — the oversized prompt was dispatched anyway", n)
 	}
 }
 

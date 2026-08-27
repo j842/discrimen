@@ -19,17 +19,20 @@ code:
 
 - OpenAI surface on one port: `/v1/chat/completions`, `/v1/completions`,
   `/v1/embeddings`, `/v1/models`, with SSE streaming.
-- Automatic routing with no per-request configuration. An embedding-centroid
-  classifier scores prompt difficulty, maps it to a quality target, decides
-  whether the prompt needs reasoning, then ranks the survivors by expected
-  completion time and takes the soonest to finish.
+- Automatic routing with no per-request configuration. The prompt is embedded
+  once; a centroid pair decides whether it needs reasoning, and the embedding
+  is looked up against every graded benchmark answer the fleet has produced to
+  rank candidates by predicted correctness and then by speed.
 - Manual selection through the same standard fields. Name a model, an alias or
   a worker id and you get it; say nothing and the router chooses.
 - Cold-start profiling. The first time the router sees a worker it measures
   capabilities, context, speed, concurrency and quality, caches the result per
-  (worker id, model), and reuses it instantly on a warm restart.
-- Self-correction at runtime, from an online per-difficulty-bin tier adapter
-  and a background LLM-as-judge that grades a sample of cheap-tier answers.
+  (worker id, model), and reuses it instantly on a warm restart. The individual
+  graded answers are cached separately and permanently, keyed by question and
+  by model, so they outlive both the profiling run and the worker.
+- Self-correction at runtime, from a background LLM-as-judge that grades a
+  sample of answers served by a cheaper-than-best worker and writes the verdict
+  into the same evidence table profiling fills.
 - Push registration. Workers POST to `/backends/register` and re-post from a
   beacon sidecar every 60 seconds, gated on their own health endpoint.
 - Model aliasing, so `/v1/models` publishes `qwen3.8` rather than a
@@ -58,10 +61,14 @@ in this work.
 
 ### Operators don't tune routing
 
-There are no quality tiers to hand-set and no speed cutoffs to pick. The
-router scores each prompt and derives its targets from the fleet it can see.
-Every configuration surface added below governs which endpoints exist and who
-may call them, never how a request is routed.
+There are no quality tiers to hand-set and no speed cutoffs to pick. The router
+asks which endpoints have got questions like this one right, and picks the
+fastest of those. Every configuration surface added below governs which endpoints
+exist and who may call them, never how a request is routed.
+
+(When this was written the router derived a quality *target* from the fleet it
+could see. The principle survived the mechanism: the outcome matrix replaced the
+target, and there is still nothing to tune.)
 
 ### Measure, don't trust
 
@@ -89,12 +96,18 @@ frozen:
 - `DELETE /backends/{id}`.
 - The `ROUTER_*` environment variable names, including `ROUTER_WORKER_TOKEN`.
 - The `X-LLM-Route` and `X-LLM-Backend-*` response headers. Clients parse
-  these, and the tier adapter parses `route:d=` out of the first one.
+  these. The route string's *content* is not frozen and has moved with the
+  routing policy — it now reads `route:outcome:p=…,n=…,sup=…` on a matrix-routed
+  request. What is frozen is the `route:` / `model:` prefix, which is the
+  router's own record of whether it or the client chose, and which is what keeps
+  the router from learning from a decision a harness made for it.
 - Port 8585.
 - `LOG_DB_PATH` at `/data/llm-router/logs.sqlite`, and the container name used
   by the deployment template. The template derives its Docker volume name from
-  the container name, so renaming the container orphans the volume, takes
-  `worker_profiles` with it, and re-benchmarks the entire fleet from cold.
+  the container name, so renaming the container orphans the volume, taking both
+  `worker_profiles` and every graded answer with it and re-benchmarking the
+  entire fleet from cold. That volume is the only thing the fleet's measured
+  history lives in; back it up.
 
 So: the new name goes on the box, the old names stay on the plumbing. A
 registration that arrives without a `provider` field defaults to `local` at
@@ -133,7 +146,7 @@ These stay:
 | `BACKEND_IDLE_TIMEOUT_SECONDS` | Same. |
 | `ROUTER_SLOT_MAX_WAIT_SECONDS` | How long a caller queues before a 503, which is a promise to clients rather than a routing decision. |
 | `DEFAULT_MAX_TOKENS` | What to do when a client declares no budget. |
-| `ROUTER_AUTO_ROUTING` | New. One switch for the whole automatic layer: difficulty, thinking, adaptation and judging. Off turns discrimen into a plain load balancer with no embeddings dependency, which is a legitimate thing to want and the only reason to touch any of this. |
+| `ROUTER_AUTO_ROUTING` | New. One switch for the whole automatic layer: prompt classification (and therefore the outcome-matrix lookup it feeds), thinking detection, and judging. Off turns discrimen into a plain load balancer with no embeddings dependency, which is a legitimate thing to want and the only reason to touch any of this. Profiling is not part of it and keeps running. |
 
 Everything else becomes a constant in the binary: the four `ROUTER_ADAPT_*`
 rates, `ROUTER_REASONING_THRESHOLD`, `ROUTER_DIFFICULTY_QUALITY_BANDS`,
@@ -266,6 +279,12 @@ quality bar, prefer the free ones, and spill to a paid endpoint only when
 nothing free clears the bar or every free candidate is saturated past the
 existing grace period. Per-key budgets handle the rest.
 
+(As built, "clear the quality bar" became "are in the band the outcome matrix
+judged interchangeable on correctness". The scoping is what matters and it turned
+out to matter a great deal: applied to the whole ranked list rather than to a
+band, the cost preference sent every hard prompt to the one free local worker
+however confident the matrix was that it would answer wrong.)
+
 One interaction to fix here. The background judge grades with the best model
 in the fleet, on a sampled fraction of cheap answers. Once the best model is a
 paid one, that becomes a continuous spend on ordinary traffic. The judge
@@ -308,12 +327,12 @@ slot broker rather than a second classifier deciding a tier the downstream had
 already decided.
 
 **A measurement should cross rather than be repeated.** The quality benchmark
-is 130 questions and several hundred thousand output tokens of the upstream's
-GPU time, and it has already been run against exactly these workers. Running
-it again from the downstream would spend the same GPUs to learn the same
-answer. "Measure, don't trust" survives intact — they ARE measured, and
-`bench_version` on the wire is the statement that the two measurements are the
-same measurement. A mismatch is not papered over: capacity, context and
+is 401 questions and roughly a million output tokens of the upstream's GPU time,
+and it has already been run against exactly these workers. Running it again from
+the downstream would spend the same GPUs to learn the same answer. "Measure,
+don't trust" survives intact — they ARE measured, and `bench_version` on the wire
+is the statement that the two measurements were made the same way. A mismatch is
+not papered over: capacity, context and
 capabilities still cross, because those are facts about the deployment rather
 than the question set, and the quality is held at the provisional tier an
 unproven worker gets. Re-measuring locally is not an option a relay has, which
@@ -330,11 +349,11 @@ The row does: which endpoint served, what it cost, how long it took, which key
 spent it. An operator who could not see those could not answer "what is my
 fleet doing" about the traffic they did not send, and a per-key budget that
 stopped counting would not be a budget. Relayed outcomes are also kept out of
-the online adapter and the judge, on the same reasoning that already excludes
-a named-model route: both learn about a tier THIS router chose, and a relayed
-prompt was classified downstream against a fleet this router cannot see — so
-feeding it here would count one signal twice and move bins that describe
-somebody else's hardware.
+the judge, on the same reasoning that already excludes a named-model route: it
+learns about a route THIS router chose, and a relayed prompt was chosen
+downstream against a fleet this router cannot see — so feeding it here would
+count one signal twice and write evidence about somebody else's decision into
+this router's matrix.
 
 Relay is a flag on a client key rather than a fourth role: the roles map onto
 the three surfaces, and a relay calls the OpenAI one. The per-key model
@@ -393,20 +412,29 @@ The benchmark is published in full, questions and answer key both. That
 exposes the grading set to anything that scrapes GitHub, which over time means
 models trained on it. The LiveBench-derived half is already public so nothing
 changes there, but the hand-written trap questions have not been public
-before. The mitigation is the one LiveBench itself was designed around:
-refresh from upstream periodically and bump the benchmark version, which
-invalidates the cached profiles and re-measures the fleet against questions
-the models have not seen. Publishing is the right call anyway, because a
-quality score nobody can inspect is a number you have to take on faith, and
-the whole point of this router is not taking numbers on faith.
+before. The mitigation is the one LiveBench itself was designed around: refresh
+from upstream periodically, so the fleet is measured against questions the models
+have not seen. Publishing is the right call anyway, because a quality score
+nobody can inspect is a number you have to take on faith, and the whole point of
+this router is not taking numbers on faith.
 
-Profiling a paid model costs real money. The set is 130 questions, 122 of them
-graded thinking-on with a 16k token ceiling, so a cold profile lands somewhere
-near 250-400k output tokens. That is once per (worker id, model), and warm
-restarts reuse the cache, but a benchmark version bump re-runs it across the
-whole fleet including the paid endpoints. Profiling stays aggressive by
-choice. The UI should show what a run cost once it has finished, so the number
-is at least visible.
+**A refresh is much cheaper than this paragraph originally assumed.** It used to
+mean bumping the benchmark version, invalidating every cached profile, and
+re-running the whole set on every worker. A graded answer is now filed under a
+hash of the question and a hash of the model, so a refreshed question is simply a
+new question with no cached verdict, while the questions that survived the
+refresh keep theirs on every worker. Bumping `benchmarkVersion` is for a change
+to the profiling *method*, not to the questions.
+
+Profiling a paid model costs real money. The set is 401 questions, 393 of them
+graded thinking-on with a 32k token ceiling, so a cold profile lands somewhere
+near 0.8-1.2M output tokens, plus around 400k prompt tokens for the long-context
+questions across the two passes. That is once per **model**, not per worker, and
+it survives the worker: decommission the box and redeploy the same weights
+elsewhere and nothing is re-asked. Warm restarts reuse the profile, and a version
+bump re-runs the probes rather than the questions. Profiling stays aggressive by
+choice. The UI should show what a run cost once it has finished, so the number is
+at least visible.
 
 A relay is trusted, and cannot be anything else. The downstream adopts the
 upstream's quality, capacity and capabilities as measured, so an upstream that
@@ -422,4 +450,6 @@ It also couples the two deployments' benchmark versions. Bump one side and the
 imported quality stops being adoptable until the other follows, which is a
 version skew nothing else in this design has. The alternative — a version-free
 quality — would be worse, because it is exactly the number that must not be
-comparable by accident.
+comparable by accident. A mismatch is not an outage: capacity and capabilities
+still cross and the imported worker is held at the provisional 30 until the
+versions agree, which `/health` reports under `relays`.

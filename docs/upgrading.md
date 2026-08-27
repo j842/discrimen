@@ -44,7 +44,12 @@ curl -sS -b /tmp/cj -X POST http://SERVER:8585/admin/keys \
 ```
 
 Then expect every worker to re-benchmark once, in the background, over the
-following hours. The fleet keeps serving throughout at a provisional quality.
+following hours. The fleet keeps serving throughout at a provisional quality, and
+`GET /backends` (or `ask -l`) shows each worker's phase and an ETA while it runs.
+
+This is a one-off. Graded answers are now cached permanently, keyed by the
+question and the model, so once the fleet is through this pass a future upgrade
+re-runs the probes and re-asks nothing it has already answered.
 
 To roll back: set `TEMPLATE` back to `llm-router` and run `ds install` twice
 again, for the same reason as step 4.
@@ -94,7 +99,7 @@ exists to solve.
 | `ROUTER_JUDGE_SAMPLE_RATE` | `judgeSampleRate` = 0.2 (`main.go`), gated on `ROUTER_AUTO_ROUTING` |
 | `ROUTER_LATENCY_EST_THINK_TOKENS` | `latencyEstThinkTokens` = 1500 (`difficulty.go`) |
 | `ROUTER_LATENCY_EST_TOKENS` | `latencyEstTokens` = 256 (`difficulty.go`) |
-| `ROUTER_ONLINE_ADAPT` | `AdaptOnline` now follows `ROUTER_AUTO_ROUTING` |
+| `ROUTER_ONLINE_ADAPT` | Removed with the online tier adapter itself, along with `tier_adapter.json` and `POST /v1/route-feedback`. Nothing consulted its learned bias: it fed only the difficulty-tier branch, which the outcome matrix supersedes on every classified request |
 | `ROUTER_PROFILE_WORKERS` | `ProfileWorkers: true` in `loadConfig` |
 | `ROUTER_QUALITY_FLOOR_WAIT_SECONDS` | `qualityFloorWait` = 10s (`main.go`) |
 | `ROUTER_REASONING_THRESHOLD` | `reasoningThreshold` = 0.35 (`main.go`) |
@@ -139,26 +144,32 @@ Twenty-seven of those twenty-nine were tuning knobs nobody touched. Two were not
 re-measuring a fleet: it made the router trust declared values and skip the
 cold-start benchmark. There is no replacement. Profiling is unconditional, and
 the only lever left over what gets measured is `ROUTER_AUTO_ROUTING=false`, which
-turns off difficulty scoring, thinking detection, adaptation and judging but does
-**not** stop the benchmark. If you were using this to avoid spending money on a
-metered endpoint, plan for the cold profile described below instead.
+turns off prompt classification, the outcome-matrix lookup it feeds, thinking
+detection and judging but does **not** stop the benchmark. If you were using this
+to avoid spending money on a metered endpoint, plan for the cold profile
+described below instead.
 
 **`ROUTER_DIFFICULTY_QUALITY_BANDS`** let you hand-set the band table mapping
 difficulty to a target quality. `loadConfig` now hard-wires it to the empty
 string, which is what the old binary read as "automatic, fleet-derived". The
 reasoning is that a hand-set band table is a claim about which endpoint is good
 enough for which prompt, and that claim is the measurement the router already
-makes. If you had a band table, it is now ignored and the fleet-derived one is in
-use.
+makes.
+
+Since then the whole quality-target mechanism has been superseded: routing ranks
+by predicted correctness on graded questions near the prompt, then by speed, and
+computes no target at all. A band table is not merely ignored now — there is no
+longer anything for it to override on the live path. See "How a request is
+routed" in the README.
 
 ### Not removed, renamed
 
 Three more variables changed rather than disappearing.
 
 - `ROUTER_AUTO_DIFFICULTY` and `ROUTER_AUTO_THINKING` are replaced by the single
-  `ROUTER_AUTO_ROUTING`, which also governs online adaptation and background
-  judging. It defaults to **true**. The old pair defaulted to false in the binary
-  and true in the deployment template.
+  `ROUTER_AUTO_ROUTING`, which also governs background judging (and the online
+  adapter, now removed). It defaults to **true**. The old
+  pair defaulted to false in the binary and true in the deployment template.
 - `ROUTER_CLIENT_TOKEN` (singular) was the default for the `-token` flag on the
   `arena` and `bench` subcommands. It is now `ROUTER_ADMIN_KEY`, because both
   subcommands list the fleet through `GET /backends`, which is admin scope.
@@ -180,14 +191,18 @@ These moved from client scope to admin scope:
 
 `DELETE /backends/{id}` moved the other way: it used to accept a worker token
 **or** any client token, and now accepts a worker credential or admin. A client
-token no longer evicts workers.
+token no longer evicts workers. It is also a smaller action than it was — it
+removes the registration and the stored profile and deliberately keeps the
+worker's graded answers, which are evidence about the model rather than about the
+box.
 
 The reasoning is `/logs` in particular. Its rows carry every stored prompt and
 response, so a client token there reads every other client's traffic. That was
 acceptable when the only client token was yours and stops being acceptable the
 moment a token goes to someone else. `/debug/backends/{id}/certify` re-runs a
-cold-start profile, which on a metered endpoint spends your money and on a local
-one takes the worker out of rotation for minutes.
+cold-start profile, which takes the worker out of rotation while the probes run —
+though it is now much cheaper than it was, because the questions the model has
+already answered come from the permanent cache rather than being re-asked.
 
 **The fix is one key, not two.** An admin-role API key satisfies client scope and
 worker scope as well, because there is no authority a client has that an admin
@@ -255,38 +270,76 @@ without authentication can still tidy its keys table.
 
 ## The fleet re-benchmarks once
 
-`benchmarkVersion` moved from **32** to **35**, and a cached profile is reused
+`benchmarkVersion` moved from **32** to **43**, and a cached profile is reused
 only on an exact version match:
 
 ```go
 if prof, ok := r.logs.LoadWorkerProfile(ctx, id, model); ok && prof.BenchVersion == benchmarkVersion {
 ```
 
-So every worker in `worker_profiles` cold-profiles on the first start after the
-upgrade. There is no partial reuse and no way to opt out.
+So every worker in `worker_profiles` re-profiles on the first start after the
+upgrade. There is no partial reuse of the *profile* and no way to opt out.
 
-The benchmark is now **130 questions across 12 tiers**, up from 102 across 11.
-122 of them are graded thinking-on against a 16384-token ceiling and 8
-thinking-off against a 1024-token one, so budget roughly 250-370k output tokens
-per endpoint. On a local fleet that is GPU time. On a metered provider it is a
-bill. See [benchmark.md](benchmark.md) for the whole question set.
+That is a much smaller event than it was when this page was first written, and
+the difference is worth understanding before you budget for it. A re-profile
+re-runs the capability, speed, capacity and context probes — seconds — and then
+asks the question bank. **The questions themselves are cached separately, keyed
+by the question and the model rather than by the profiling run, and that cache is
+never invalidated by a version bump.** So a worker whose weights have not changed
+answers nothing it has already answered.
+
+Coming from `llm-router` you are crossing that change, so this particular upgrade
+does pay a genuine cold pass: the old binary predates the cache and the old
+`observations` table used an unreachable key format, so there is nothing to hit.
+Budget for it once.
+
+The benchmark is now **401 questions across 12 tiers**, up from 102 across 11:
+130 hand-authored, 262 generated from LiveBench, and 9 long-context. 393 are
+graded thinking-on against a 32768-token ceiling and 8 thinking-off against a
+1024-token one, so budget roughly **0.8-1.2M output tokens** per endpoint, plus
+about 400k prompt tokens for the long-context questions across the two passes. On
+a local fleet that is GPU time. On a metered provider it is a bill. A thinking-on
+pass gives up after 90 minutes of wall clock once 48 questions are away, which
+bounds the worst case on a slow endpoint. See [benchmark.md](benchmark.md) for
+the whole question set.
 
 Profiling splits in two, so the fleet does not black out while this runs: the
 quick half (capabilities, speed, context) makes each endpoint routable in
 seconds, and the benchmark runs in the background and then refines the live
 quality. An endpoint whose benchmark has not finished holds a provisional quality
-of 30 and only draws easy traffic.
+of 30 and only draws easy traffic. `GET /backends` publishes a `profile_progress`
+object while it runs — phase, questions done, in flight, elapsed, and an ETA — so
+you can watch it rather than guess; `ask -l` renders it as a progress bar.
 
 Afterwards the profile is cached and looked up by **(endpoint id, model)**. A
 restart reloads it with no re-measurement. The table holds one row per endpoint
-id, so changing a worker's model re-profiles it and replaces the row, and only a
-new endpoint, a changed model or the next `benchmarkVersion` bump pays the cost
-again.
+id, so changing a worker's model replaces the row.
+
+**The graded answers are keyed differently, and this is the part that changes how
+you operate the fleet.** They are filed under a hash of the question (its text,
+expected answer, match mode and grader version) and a hash of the model (served
+id, parameter count, quantisation, size, trained context, engine) — not the
+endpoint id. Three consequences:
+
+- **Deleting a worker does not delete its grading.** `DELETE /backends/{id}`
+  removes the registration and the profile row and deliberately leaves the graded
+  answers alone. Decommissioning a box costs you its speed and capacity
+  measurements, not its hours of grading.
+- **The same weights on another host inherit the whole thing.** Move a model to a
+  different machine and it starts with its record already earned. Only the
+  latency is re-measured, because a duration is a property of the box and a
+  verdict is a property of the weights.
+- **A grader fix is cheap.** Bumping one entry in `graderVersions` re-asks that
+  mode's questions and leaves every other verdict addressable. Bumping
+  `benchmarkVersion` for it — which is what the old rule said to do — used to
+  discard about 5,600 gradings across the fleet to re-derive verdicts that had
+  not changed.
 
 One deployment trap worth repeating here: the dropshell template derives its
-Docker volume name from the container name, and `worker_profiles` lives inside
-that volume. Renaming the container orphans the volume and re-benchmarks the
-whole fleet from cold.
+Docker volume name from the container name, and both `worker_profiles` and the
+graded answers live inside that volume. Renaming the container orphans the volume
+and re-benchmarks the whole fleet from cold — which is now the *only* thing that
+does. Back it up.
 
 ## Error bodies changed shape
 
@@ -341,10 +394,20 @@ tested. Two properties make it work:
 
 What rolling back costs you:
 
-**The fleet re-profiles again.** The old binary carries `benchmarkVersion = 32`,
-which does not match the 35 written into every profile by the new one, so every
-worker cold-profiles a second time against the old 102-question set. Rolling
-forward again re-profiles a third time.
+**The fleet re-profiles again, and this time the questions really are re-asked.**
+The old binary carries `benchmarkVersion = 32`, which does not match the 43
+written into every profile by the new one, so every worker cold-profiles a second
+time against the old 102-question set. It predates the permanent answer cache, so
+none of the grading the new binary accumulated is available to it — and its
+questions are a different set anyway. Rolling forward again re-profiles a third
+time; the forward pass is the cheap one, because by then the new binary's cache
+holds the answers.
+
+**And the graded answers themselves go.** The rollback DDL is not the only thing
+that matters here: the `observations` table the new binary writes is keyed in a
+format the old one does not understand, and the new binary drops and re-creates
+it when it finds an unrecognised key format. Take a copy of the SQLite file
+before you roll back if you want the grading to survive the round trip.
 
 **Provider pricing stops applying.** Prices live in the `registration_json` blob
 on `backend_registrations`, and the old binary's registration struct has no

@@ -180,15 +180,15 @@ func TestSSEStatsGenTokens(t *testing.T) {
 // on that dialect must still be detected as inadequate.
 func TestResponseInadequateVLLMEmptyToolCalls(t *testing.T) {
 	body := []byte(`{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":null,"tool_calls":[]}}]}`)
-	if !responseInadequate(body, false) {
-		t.Error("empty vLLM response with tool_calls:[] not flagged inadequate")
+	if classifyResponse(body, false) != responseEmpty {
+		t.Error("empty vLLM response with tool_calls:[] not flagged empty")
 	}
 	withCall := []byte(`{"choices":[{"finish_reason":"tool_calls","message":{"content":null,"tool_calls":[{"id":"x","function":{"name":"f","arguments":"{}"}}]}}]}`)
-	if responseInadequate(withCall, false) {
+	if classifyResponse(withCall, false) != responseOK {
 		t.Error("real tool call flagged inadequate")
 	}
 	reasoningOnly := []byte(`{"choices":[{"finish_reason":"stop","message":{"content":null,"reasoning":"worked it out","tool_calls":[]}}]}`)
-	if responseInadequate(reasoningOnly, false) {
+	if classifyResponse(reasoningOnly, false) != responseOK {
 		t.Error("reasoning-only response flagged inadequate")
 	}
 }

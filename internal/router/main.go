@@ -69,14 +69,6 @@ type Config struct {
 	AutoThinking       bool
 	ReasoningThreshold float64 // reasoning score ≥ this → enable thinking
 
-	// Online tier adapter (self-improving). Learns an upward score bias per
-	// difficulty region from inadequate (empty/truncated) responses.
-	AdaptOnline  bool
-	AdaptMaxBias float64
-	AdaptLRUp    float64
-	AdaptLRDown  float64
-	AdaptBins    int
-
 	// JudgeSampleRate is the fraction of served answers graded in the background
 	// by another worker; the verdict is recorded in the outcome matrix, which is
 	// the only evidence the router ever gets about the traffic it actually serves
@@ -290,9 +282,14 @@ type Registry struct {
 	// Per-backend concurrency slot channels, indexed by backend ID. A backend
 	// with max_concurrency=N has a channel of capacity N pre-filled with N
 	// tokens; callers acquire one via tryAcquireSlot before dispatching and put
-	// it back with releaseSlot. Backends with no declared cap have no entry,
-	// in which case tryAcquireSlot returns a nil slot that is always available
-	// and releaseSlot is a no-op (unbounded).
+	// it back with releaseSlot. A REGISTERED backend with no declared cap has no
+	// entry, in which case tryAcquireSlot returns a nil slot that is always
+	// available and releaseSlot is a no-op (unbounded).
+	//
+	// An absent entry is not enough on its own to mean "uncapped", because
+	// remove() and upsert()'s uncapped branch delete the entry too — so
+	// tryAcquireSlot checks the backends map first and refuses a worker that has
+	// gone away rather than reading it as infinite capacity. See tryAcquireSlot.
 	slots   map[string]chan struct{}
 	slotCap map[string]int
 }
@@ -683,11 +680,6 @@ func Main() {
 			cfg.AutoDifficulty, cfg.DifficultyBands, cfg.AutoThinking, cfg.ReasoningThreshold)
 		go router.warnIfNoEmbeddings()
 	}
-	if cfg.AdaptOnline {
-		router.adapter = newTierAdapter(cfg, filepath.Join(filepath.Dir(cfg.LogDBPath), "tier_adapter.json"))
-		go router.adapter.persistLoop()
-		log.Printf("online tier adaptation enabled (max_bias=%.2f bins=%d)", cfg.AdaptMaxBias, cfg.AdaptBins)
-	}
 	if cfg.JudgeSampleRate > 0 {
 		router.judgeSem = make(chan struct{}, judgeMaxConcurrent)
 		log.Printf("background answer judging enabled (sample rate=%.2f, %d concurrent)", cfg.JudgeSampleRate, judgeMaxConcurrent)
@@ -743,7 +735,6 @@ type Router struct {
 	benchClient  *http.Client // no client-level timeout — the cold-start benchmark bounds each request by benchAnswerDeadline via context instead
 	logs         *LogStore
 	classifier   *difficultyClassifier // nil unless auto difficulty routing is enabled
-	adapter      *tierAdapter          // nil unless online tier adaptation is enabled
 	// outcomes is the measured record of which worker answered which question
 	// correctly, and how fast — the thing routing queries instead of comparing a
 	// quality percentage against a difficulty score. Nil disables it, in which
@@ -823,17 +814,15 @@ const (
 	// enabled.
 	reasoningThreshold = 0.35
 
-	// The adapter's learning rates. Up is four times down because the signal it
-	// learns from is asymmetric: an inadequate answer is direct evidence the tier
-	// was too low, while an adequate one is only weak evidence it was too high.
-	adaptMaxBias = 0.30
-	adaptLRUp    = 0.04
-	adaptLRDown  = 0.01
-	adaptBins    = 10
-
-	// judgeSampleRate is the fraction of cheaper-than-best answers the best model
-	// grades in the background. This is the signal that makes a fast-but-dim
+	// judgeSampleRate is the fraction of SERVED answers graded in the background
+	// by another worker in the fleet. This is the signal that makes a fast-but-dim
 	// worker safe to route to, so it is on whenever auto-routing is.
+	//
+	// Every served answer is eligible, and the grader is chosen per PROMPT rather
+	// than being the fleet's best model (see judgeGrader). It used to be "the
+	// fraction of cheaper-than-best answers, graded by the best model", which was
+	// gated on the retired Quality scalar and meant the strongest worker was never
+	// graded at all — see Config.JudgeSampleRate.
 	judgeSampleRate = 0.2
 
 	// capacityProbeMax caps the concurrency ramp during profiling. A declared
@@ -860,9 +849,14 @@ const (
 // path, which re-dispatches them to a better model, so a budget too small to
 // think in gets diagnosed as inadequate quality.
 //
-// It also matches benchThinkMaxTokens: at 4096 ordinary traffic was getting a
-// quarter of the budget this router's own benchmark requires before it will
-// judge a model competent.
+// It was also chosen to MATCH benchThinkMaxTokens, which was 16384 at the time:
+// at 4096 ordinary traffic was getting a quarter of the budget this router's own
+// benchmark requires before it will judge a model competent. The two have since
+// parted company — benchThinkMaxTokens went to 32768 so that the answer DEADLINE
+// binds a graded question rather than a token ceiling (see benchmark.go, v40) —
+// so ordinary traffic now gets half the benchmark's budget rather than all of it.
+// That is a deliberate difference and not drift: a benchmark question may run to
+// its deadline, while a client that declared no budget at all should not.
 //
 // The trade, from the same measurement: this does not fix a true runaway. It
 // converts the chains that would have concluded between 4k and 16k into
@@ -924,12 +918,6 @@ func loadConfig() *Config {
 
 		AutoThinking:       auto,
 		ReasoningThreshold: reasoningThreshold,
-
-		AdaptOnline:  auto,
-		AdaptMaxBias: adaptMaxBias,
-		AdaptLRUp:    adaptLRUp,
-		AdaptLRDown:  adaptLRDown,
-		AdaptBins:    adaptBins,
 
 		JudgeSampleRate: judge,
 
@@ -996,8 +984,6 @@ func (r *Router) routes() *http.ServeMux {
 	// froze it there, and anything new is admin-scoped under /admin.
 	mux.HandleFunc("/admin/usage", r.handleUsage)
 	mux.HandleFunc("/admin/outcomes", r.handleOutcomes)
-	mux.HandleFunc("/v1/route-feedback", r.handleRouteFeedback)
-	mux.HandleFunc("/route-feedback", r.handleRouteFeedback)
 	mux.HandleFunc("/v1/route-preview", r.handleRoutePreview)
 	mux.HandleFunc("/route-preview", r.handleRoutePreview)
 	mux.HandleFunc("/debug/backends/", r.handleDebugBackends)
@@ -1451,53 +1437,6 @@ func (r *Router) handleRegisterBackend(w http.ResponseWriter, req *http.Request)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"status": "registered", "id": backend.ID})
-}
-
-// handleRouteFeedback records an explicit outcome for a previously auto-routed
-// request, feeding the online tier adapter a stronger signal than the passive
-// empty/truncated detection. A client (e.g. the agent on escalation) POSTs the
-// X-LLM-Route of the response it's grading plus a verdict. No-op when online
-// adaptation is disabled.
-// handleRouteFeedback stays CLIENT scope: a caller grading its own answer feeds
-// the adapter a signal only that caller has, and the payload names no worker,
-// no other client and nothing about the fleet.
-func (r *Router) handleRouteFeedback(w http.ResponseWriter, req *http.Request) {
-	if req.Method != http.MethodPost {
-		methodNotAllowed(w)
-		return
-	}
-	if _, ok := r.requireClient(w, req); !ok {
-		return
-	}
-	var fb struct {
-		Route   string   `json:"route"`   // X-LLM-Route being graded, e.g. "route:d=0.42,q>=2"
-		Score   *float64 `json:"score"`   // alternative: the raw difficulty score directly
-		Verdict string   `json:"verdict"` // "inadequate"/"escalate"/"bad" → needs higher; else clean
-	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, req.Body, 1<<20)).Decode(&fb); err != nil {
-		writeJSON(w, http.StatusBadRequest, validationError{Message: fmt.Sprintf("invalid json: %s", err)})
-		return
-	}
-	if r.adapter == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"status": "ignored", "reason": "online adaptation disabled"})
-		return
-	}
-	var score float64
-	if fb.Score != nil {
-		score = *fb.Score
-	} else if s, ok := parseRouteScore(fb.Route); ok {
-		score = s
-	} else {
-		writeJSON(w, http.StatusBadRequest, validationError{Message: "feedback needs a difficulty `route` (route:d=…) or a `score`"})
-		return
-	}
-	needHigher := false
-	switch strings.ToLower(strings.TrimSpace(fb.Verdict)) {
-	case "inadequate", "escalate", "bad", "retry", "higher":
-		needHigher = true
-	}
-	r.adapter.observe(score, needHigher)
-	writeJSON(w, http.StatusOK, map[string]any{"status": "recorded"})
 }
 
 // handleModels stays CLIENT scope, and has to: a client cannot use an OpenAI
@@ -1967,7 +1906,7 @@ func (r *Router) handleCompletions(w http.ResponseWriter, req *http.Request) {
 	if !r.enforceKeyLimits(w, ident, requestedModel(chatReq)) {
 		return
 	}
-	candidates, route, _, _, err := r.selectBackends(chatReq, callerBudget(req, chatReq))
+	candidates, route, _, err := r.selectBackends(chatReq, callerBudget(req, chatReq))
 	if err != nil {
 		writeUnavailable(w, r.retryAfterUnavailable(), err.Error())
 		return
@@ -2085,8 +2024,9 @@ func setBackendCredential(proxyReq *http.Request, backend *Backend) {
 }
 
 // genCharsPerToken is the chars-per-token divisor the budgeting fallbacks use.
-// The same 4.8 sseStats.genTokens applies to a streamed generation, so the
-// buffered and streamed estimates cannot drift apart.
+// It is the same 4.8 sseStats.genTokens applies to a streamed generation, so the
+// buffered and streamed estimates agree — the two are separate literals, so
+// change them together (capture.go).
 const genCharsPerToken = 4.8
 
 // estimateGenTokens turns a reply's size in bytes into a generated-token
@@ -2335,13 +2275,6 @@ func (r *Router) proxyPassthrough(w http.ResponseWriter, req *http.Request, iden
 	}
 }
 
-// logSlotUnavailable records the 503 we return when no candidate backend had a
-// free slot before the deadline. Attributed to the primary (best-ranked)
-// candidate for context.
-//
-// It takes the caller for the same reason the success path does: a relayed
-// request's prompt must not reach the log store on the failure path either, and
-// a redaction that only covered the requests that worked would be no redaction.
 // clientIP is the address a request came in from, for the usage graph and for
 // the caller line on a log row.
 //
@@ -2395,6 +2328,14 @@ func parseHost(addr string) string {
 	return addr
 }
 
+// logSlotUnavailable records the 503 we return when no candidate backend had a
+// free slot before the deadline. Attributed to the primary (best-ranked)
+// candidate for context.
+//
+// It takes the caller for the same reason the success path does: a relayed
+// request's prompt must not reach the log store on the failure path either, and
+// a redaction that only covered the requests that worked would be no redaction.
+//
 // from is the caller's address, threaded in because this is the one place a
 // request is logged without the *http.Request still being in scope.
 func (r *Router) logSlotUnavailable(ident *identity, from string, primary *Backend, route string, stream bool, input []byte, start time.Time, cause error) {
@@ -2571,6 +2512,27 @@ type acquirePreference struct {
 	why string
 }
 
+// The rung labels `why` carries. Constants rather than bare literals because the
+// labels are READ in another function — proxyToBackend picks which "missed"
+// story to tell from them — and a literal compared against a literal written
+// somewhere else is exactly how the cost line came to notice only one of the two
+// free-preferring rungs.
+const (
+	prefLocalFree    = "local-free"
+	prefFreeFirst    = "free-first"
+	prefQualityFloor = "quality-floor"
+	prefSessionLock  = "session-lock"
+)
+
+// preferredFree reports whether this preference was holding out for a worker
+// that costs nothing, so that landing elsewhere spent money the router was
+// trying not to spend. Both free-preferring rungs count; prefQualityFloor does
+// not, because there every above-bar worker was metered from the start and no
+// amount of waiting would have found a free one.
+func (p acquirePreference) preferredFree() bool {
+	return p.why == prefLocalFree || p.why == prefFreeFirst
+}
+
 // qualityFor is the quality score to judge b by for a request served in the
 // given thinking mode. A no-think request reads the no-think benchmark score —
 // the model that client actually talks to.
@@ -2580,12 +2542,10 @@ type acquirePreference struct {
 // says nothing about the model a no-think client gets. The old fallback made
 // being unmeasured an advantage — a still-profiling 284B CPU worker inherited
 // its mixed q=93 on no-think requests, outranked every honestly-measured
-// worker (whose real no-think scores it also held the target above, via
-// autoTargetQuality's qmax) and drew all of Atlas's planner traffic onto a
-// 10 tok/s single slot (2026-08-25). Unmeasured now ranks below every
-// measured worker and cannot anchor the target; it is still routable as the
-// below-bar graceful fallback when nothing measured is available — "almost
-// never", not "never".
+// worker and drew all of Atlas's planner traffic onto a 10 tok/s single slot
+// (2026-08-25). Unmeasured now ranks below every measured worker. The tier
+// target that incident also poisoned no longer exists, but the rule still
+// matters: backendScore reads this, and so does the judge's grader choice.
 //
 // A NON-thinking worker keeps reading Quality: it serves the same model in
 // either mode, so the mixed score IS its no-think score — exact, and also
@@ -2603,8 +2563,9 @@ func qualityFor(b *Backend, thinkOff bool) int {
 	return b.Quality
 }
 
-// qualityFloorPreference is the bounded first choice for an ordinary request:
-// the workers at or above the classified tier and, among those, the FREE ones.
+// acquirePreferenceFor is the bounded first choice for an ordinary request: the
+// workers the outcome matrix judged interchangeable on correctness and, among
+// those, the FREE ones.
 //
 // Cost rides INSIDE the quality floor rather than beside it. PLAN.md's rule is
 // "among the workers that clear the quality bar, prefer the free ones, and
@@ -2626,6 +2587,7 @@ func qualityFor(b *Backend, thinkOff bool) int {
 // unclassified request, or the fallback ranker) makes the tier test vacuous and
 // leaves free-first on its own, which is what "prefer the free ones" means when
 // there is no bar to clear.
+//
 // able bounds the cost/locality ladder to the leading candidates the outcome
 // matrix judged interchangeable on correctness. Zero means unbounded, which is
 // the tier path and the matrix's own fallback — neither has a correctness
@@ -2647,17 +2609,18 @@ func qualityFor(b *Backend, thinkOff bool) int {
 // and blind to the upstream's own clients, so ranking on remote completion times
 // alone over-picks remote. That corrects a biased estimator. It just must not
 // reach across a correctness boundary to do it.
-func qualityFloorPreference(candidates []*Backend, target int, thinkOff bool, able int) acquirePreference {
-	inBand := func(b *Backend) bool { return true }
+func acquirePreferenceFor(candidates []*Backend, able int) acquirePreference {
+	// The quality-target arm is gone with the tier ranker that set it. It read
+	// `target <= 0 || qualityFor(b, thinkOff) >= target` and target was always 0
+	// on the matrix path, so it admitted everything; what actually bounds the
+	// ladder is the matrix's own correctness band.
+	aboveBar := func(b *Backend) bool { return true }
 	if able > 0 && able < len(candidates) {
 		ids := make(map[string]bool, able)
 		for _, b := range candidates[:able] {
 			ids[b.ID] = true
 		}
-		inBand = func(b *Backend) bool { return ids[b.ID] }
-	}
-	aboveBar := func(b *Backend) bool {
-		return inBand(b) && (target <= 0 || qualityFor(b, thinkOff) >= target)
+		aboveBar = func(b *Backend) bool { return ids[b.ID] }
 	}
 	free := func(b *Backend) bool { return aboveBar(b) && isFreeBackend(b) }
 	ladder := []struct {
@@ -2673,13 +2636,13 @@ func qualityFloorPreference(candidates []*Backend, target int, thinkOff bool, ab
 		// competing for those same slots. Remote completion times are therefore
 		// systematically optimistic, and ranking on them alone over-picks remote.
 		// This corrects a biased estimator, not an operator's preference.
-		{"local-free", func(b *Backend) bool { return free(b) && !isRelayRow(b) }},
+		{prefLocalFree, func(b *Backend) bool { return free(b) && !isRelayRow(b) }},
 		// Costs nothing, anywhere. Reached when every local worker above the bar
 		// is loaded — an idle remote worker beats waiting on a busy local one.
-		{"free-first", free},
+		{prefFreeFirst, free},
 		// Clears the bar at any price. Reached when the only above-bar workers
 		// left are metered.
-		{"quality-floor", aboveBar},
+		{prefQualityFloor, aboveBar},
 	}
 	// Keep the rungs that actually decide something: an empty set selects
 	// nothing, and one equal to the whole candidate list is not a preference.
@@ -2710,16 +2673,8 @@ func sessionLockPreference(incumbent string) acquirePreference {
 	return acquirePreference{
 		keep: func(b *Backend) bool { return b.ID == incumbent },
 		wait: sessionLockWait,
-		why:  "session-lock",
+		why:  prefSessionLock,
 	}
-}
-
-// pickAndAcquireWithFloor is pickAndAcquire under the quality-floor preference.
-// Retained as the named entry point for the floor policy (and its tests).
-func (r *Router) pickAndAcquireWithFloor(ctx context.Context, candidates []*Backend, target int, thinkOff bool) (*Backend, chan struct{}, bool, error) {
-	// able=0: this is the tier-path entry point, which has a numeric bar rather
-	// than a matrix band to protect.
-	return r.pickAndAcquirePreferred(ctx, candidates, qualityFloorPreference(candidates, target, thinkOff, 0))
 }
 
 // pickAndAcquirePreferred is pickAndAcquire plus a bounded first-choice set.
@@ -2796,7 +2751,7 @@ func (r *Router) pickAndAcquirePreferred(ctx context.Context, candidates []*Back
 // above-target worker before spilling below it (fix #2). The pinned/debug callers
 // pass a bare plan, so their behaviour is unchanged.
 func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident *identity, plan *routePlan, body []byte, chatReq *ChatRequest) {
-	candidates, route, target := plan.candidates, plan.route, plan.target
+	candidates, route := plan.candidates, plan.route
 	if len(candidates) == 0 {
 		writeUnavailable(w, r.retryAfterUnavailable(), "no backend available")
 		return
@@ -2845,7 +2800,7 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 	// is open the session lock wins instead — handing a tool result to a model that
 	// never emitted the matching tool call breaks the loop outright, which is worse
 	// than serving that turn a tier low.
-	pref := qualityFloorPreference(candidates, target, tr.noThink, plan.able)
+	pref := acquirePreferenceFor(candidates, plan.able)
 	if plan.session.locked() {
 		pref = sessionLockPreference(plan.session.incumbent)
 	}
@@ -2872,13 +2827,13 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 	// clone, so an aged-out verdict is re-tested rather than believed for ever.
 	// Usually empty, and then free.
 	body = r.stripLearned(body, rawBody, backend.ID)
-	// Make a missed preference observable WITHOUT touching X-LLM-Route (its
-	// route:d=…,q>=… form is parsed by parseRouteScore): a dedicated response
-	// header plus a log line. The route header still records the target the prompt
+	// Make a missed preference observable WITHOUT touching X-LLM-Route, which
+	// clients and the arena both parse: a dedicated response header plus a log
+	// line. The route header still records the target the prompt
 	// was classified to need; this records that we couldn't honour it within the
 	// grace and served elsewhere.
 	if missedPref {
-		if pref.why == "session-lock" {
+		if pref.why == prefSessionLock {
 			log.Printf("session lock: %s tool loop moved off incumbent=%s to backend=%s after %s grace — no incumbent slot freed",
 				route, plan.session.incumbent, backend.ID, sessionLockWait)
 		} else {
@@ -2886,14 +2841,16 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 			// off the preference: one missed floor can be a tier downgrade, a spill
 			// onto a paid endpoint, or both, and a slot that frees during the
 			// handover can make it neither.
-			if pref.why == "free-first" && !isFreeBackend(backend) {
+			//
+			// EITHER free-preferring rung counts. This tested "free-first" alone,
+			// which is the rung reached only when there is no free LOCAL worker to
+			// hold out for — so on the ordinary fleet, local workers that cost
+			// nothing beside a metered endpoint, the top rung is "local-free" and
+			// the one spill that actually spends money was the one nothing said a
+			// word about.
+			if pref.preferredFree() && !isFreeBackend(backend) {
 				log.Printf("cost: %s served on PAID backend=%s (in %g / out %g per Mtok) after %s grace — no free worker above the bar freed a slot",
 					route, backend.ID, backend.InputPricePerMtok, backend.OutputPricePerMtok, qualityFloorWait)
-			}
-			if target > 0 && qualityFor(backend, tr.noThink) < target {
-				w.Header().Set("X-LLM-Quality-Floor", "downgraded")
-				log.Printf("quality floor: %s served below target q>=%d on backend=%s (q=%d) after %s grace — no above-bar slot freed",
-					route, target, backend.ID, qualityFor(backend, tr.noThink), qualityFloorWait)
 			}
 		}
 	}
@@ -2932,9 +2889,8 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 	if chatReq.Stream {
 		stats = &sseStats{}
 	}
-	// escalated records that an inline escalation happened, so the adapter still
-	// learns the region needed a better model even though the answer it finally
-	// returned was fine.
+	// escalated records that an inline escalation happened, so X-Llm-Escalated can
+	// report the repair even though the answer finally returned was fine.
 	escalated := false
 	defer func() {
 		logEntry.DurationMillis = time.Since(start).Milliseconds()
@@ -2978,44 +2934,19 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 		}
 		entry := redactForRelay(logEntry, ident)
 		served := backend
-		didEscalate := escalated
 		caller := ident
 		autoRoute := plan.auto
 		go func() {
 			r.recordKeyUse(caller, charged)
-			// Self-improvement: feed this auto-routed request's outcome back to the
-			// online tier adapter (no-op unless enabled and this was a "route:d=" pick).
-			// A failed/aborted transfer (client hung up mid-stream, worker died) says
-			// nothing about answer quality — feeding it as "inadequate" ratcheted
-			// bins toward expensive workers on exactly the slow-prefill prompts
-			// clients abort most.
-			// A relayed request was classified by the router that sent it, which is
-			// already learning from this same outcome — see learnFromRelay.
+			// A failed or aborted transfer (client hung up mid-stream, worker died)
+			// says nothing about answer quality, so it teaches nothing. A relayed
+			// request was classified by the router that sent it, which is already
+			// learning from this same outcome — see learnFromRelay.
 			clean := entry.Error == "" && entry.StatusCode >= 200 && entry.StatusCode < 300
-			// The ADAPTER needs the numeric difficulty score, so it still keys on
-			// the "route:d=" form — that is the tier machinery learning about tiers,
-			// and a matrix route has no tier for it to learn about.
-			if r.adapter != nil && learnFromRelay(caller) && clean {
-				if score, ok := parseRouteScore(route); ok {
-					// Streamed inadequacy comes from the full-stream stats; the capture
-					// may have truncated the middle away.
-					inadequate := false
-					if stats != nil {
-						inadequate = stats.inadequate()
-					} else {
-						inadequate = responseInadequate(capture.Bytes(), false)
-					}
-					// An escalation REPAIRED the answer, so the body now looks clean —
-					// but the tier the router originally picked was the wrong one, which
-					// is exactly what the adapter exists to learn. Without this the
-					// repair would teach it the opposite.
-					r.adapter.observe(score, inadequate || didEscalate)
-				}
-			}
-			// The JUDGE is gated separately, on whether the router chose the worker
-			// — NOT on the adapter's score format. It feeds the outcome matrix, and
-			// keying it on "route:d=" meant it never ran on a matrix-routed request:
-			// the matrix's own feedback loop was open, closing only when the
+			// The judge is gated on whether THE ROUTER chose this worker, structurally
+			// (plan.auto), not by sniffing the route string. It used to key on a
+			// literal "route:d=" prefix, which meant it never ran on a matrix-routed
+			// request: the matrix's own feedback loop was open, closing only when the
 			// embeddings worker was down and the tier path took over.
 			//
 			// Judging parses the answer text back out of the capture, so it is
@@ -3137,9 +3068,11 @@ func (r *Router) dispatchStreaming(w http.ResponseWriter, req *http.Request, d *
 			resp.Body.Close()
 		}
 		backend, resp, err = other, newResp, nil
+		// Keep the local mirror of what was actually sent. The URL is NOT
+		// re-derived: streamFailover has already dialled the new worker, and a
+		// second copy of the address nothing reads is a value computed and thrown
+		// away.
 		body = d.body
-		upstreamURL = upstreamChatURL(backend)
-		_ = upstreamURL // re-derived for clarity; the dial has already happened
 		w.Header().Set("X-LLM-Failover", fmt.Sprintf("%s->%s", logEntry.BackendID, backend.ID))
 		logEntry.BackendID = backend.ID
 		logEntry.BackendModel = backend.Model
@@ -3234,19 +3167,24 @@ func setRouteHeaders(w http.ResponseWriter, backend *Backend, route string, logE
 	w.Header().Set("X-LLM-Speed-Score", strconv.Itoa(logEntry.SpeedScore))
 }
 
-// selectBackends returns the eligible backends that satisfy the request's hard
-// context/feature requirements, ranked best-first, alongside the prompt's
-// classification (nil when classification was unavailable or the request had no
-// messages) so the caller can thread it into the body patch without
-// re-classifying, and the auto-difficulty target QUALITY FLOOR (0 ⇒ no floor —
-// the fallback/feature paths and any non-auto request). The caller
-// (pickAndAcquireWithFloor) spills down the list when the top backend has no free
-// slot, so a burst spreads across the fleet instead of queueing on one backend;
-// a non-zero target additionally makes it wait BRIEFLY for an above-target worker
-// before spilling below the floor (fix #2). Model-tier selection is always
-// automatic (difficulty-based) — there are no client quality/speed overrides;
-// capability hints (thinking, required_features, min_context_k) only hard-filter,
-// they never pick a tier.
+// selectBackends is the narrow view of planRoute: the eligible backends that
+// satisfy the request's hard context/feature requirements, ranked best-first,
+// alongside the prompt's classification (nil when classification was unavailable
+// or the request had no messages) so the caller can thread it into the body patch
+// without re-classifying, and the auto-difficulty target QUALITY FLOOR (0 ⇒ no
+// floor — the fallback/feature paths and any non-auto request). Model-tier
+// selection is always automatic (difficulty-based) — there are no client
+// quality/speed overrides; capability hints (thinking, required_features,
+// min_context_k) only hard-filter, they never pick a tier.
+//
+// Its one production caller is /v1/completions, which forwards the body verbatim
+// through proxyPassthrough and therefore takes the plain pickAndAcquire spill —
+// the candidate list is walked best-first when the top backend has no free slot,
+// so a burst spreads across the fleet, but there is no bounded grace and the
+// target it returns is DISCARDED. The quality floor described above is applied on
+// the chat path only, where proxyToBackend builds an acquirePreferenceFor from
+// the whole plan. The chat path does not go through here at all: it
+// calls planRoute directly, because it needs the rest of the plan.
 //
 // The request is classified ONCE here; both axes are used: difficulty drives the
 // quality tier, and reasoning drives the thinking decision — which now also gates
@@ -3254,14 +3192,15 @@ func setRouteHeaders(w http.ResponseWriter, backend *Backend, route string, logE
 // thinking-capable worker (soft for auto, hard for explicit "on"), so the
 // enable_thinking we later forward lands on a worker that can act on it instead of
 // being a no-op on a non-thinking model.
+//
 // budget is how long the caller is still willing to wait (0 = unknown); when
 // known, workers that cannot finish the job inside it are filtered out first.
-func (r *Router) selectBackends(req *ChatRequest, budget time.Duration) ([]*Backend, string, *classification, int, error) {
+func (r *Router) selectBackends(req *ChatRequest, budget time.Duration) ([]*Backend, string, *classification, error) {
 	plan, err := r.planRoute(req, budget, false)
 	if err != nil {
-		return nil, "", nil, 0, err
+		return nil, "", nil, err
 	}
-	return plan.candidates, plan.route, plan.cl, plan.target, nil
+	return plan.candidates, plan.route, plan.cl, nil
 }
 
 // routePlan is everything selection decided about one request. selectBackends
@@ -3283,10 +3222,10 @@ type routePlan struct {
 	cl   *classification
 	// able is how many LEADING candidates the outcome matrix judged
 	// interchangeable on correctness. Acquisition may reorder inside that prefix
-	// and must not reorder across it — see qualityFloorPreference. Zero means no
-	// prefix is protected, which is the tier path and the matrix's own fallback.
+	// and must not reorder across it — see acquirePreferenceFor. Zero means no
+	// prefix is protected, which is the matrix's own fallback and the degraded
+	// ranker.
 	able    int
-	target  int
 	job     jobCost
 	tr      thinkingResolution
 	session sessionRoute
@@ -3536,18 +3475,32 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 		filtered = trimmed
 	}
 
-	// Auto difficulty routing infers a target quality tier from the prompt, then
-	// lets rankByDifficulty pick the backend that clears it and will finish
-	// soonest. This is the ONLY model-tier mechanism — there are no client-tunable
-	// quality/speed levers. Best-effort: if the classifier is unavailable (no
-	// embeddings worker) or the request carries no messages (a bare /v1/completions
-	// call), fall through to the quality-ranked fallback below.
+	// Classify once, use both axes: difficulty carries the vector the outcome
+	// matrix ranks on, reasoning decides thinking mode. There are no
+	// client-tunable quality or speed levers. Best-effort — if the classifier is
+	// unavailable (no embeddings worker) or the request carries no messages (a
+	// bare /v1/completions call), fall through to the degraded ranker below.
 	// FIRST: the outcome matrix, which answers the routing question directly —
 	// which of these workers got questions like this one right, and which of
 	// those is fastest. No quality score, no difficulty target, nothing compared
-	// against anything. It supersedes the tier path below wherever it has
-	// evidence, and declines (leaving the tier path in place) where it does not,
-	// so the two can run side by side until the tier machinery is removed.
+	// against anything.
+	//
+	// IT NEVER DECLINES, and this comment used to say it did — "supersedes the
+	// tier path wherever it has evidence, and declines where it does not, so the
+	// two can run side by side". That sentence was wrong and expensive. It is the
+	// reason the tier branch below LOOKS reachable, and three separate audits had
+	// to re-derive from the code that it is not.
+	//
+	// chooseByOutcome RANKS; it does not filter. With no evidence it falls through
+	// to its own bank-rate fallback and still returns every candidate in some
+	// order. Its only empty return needs len(cands) == 0, which is already
+	// excluded above. r.outcomes is assigned unconditionally at startup, and
+	// classify() cannot report ok without having written a vector. So whenever
+	// cl != nil this branch returns, and NOTHING BELOW IT RUNS.
+	//
+	// The tier ranker that used to sit below has been deleted on the strength of
+	// exactly that argument. What remains below is the DEGRADED ranker, which is a
+	// different thing: it runs when there is no classification to rank on at all.
 	if cl != nil && r.outcomes != nil && len(cl.vec) > 0 {
 		// Self-healing: cheap when already filled (one atomic load), and the only
 		// thing that fills the bank after a warm restart.
@@ -3572,35 +3525,17 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 		}
 	}
 
-	if cl != nil && r.cfg.AutoDifficulty {
-		target := r.classifier.targetForFleet(filtered, r.adapter.adjust(cl.difficulty), tr.noThink)
-		// target is surfaced as the quality floor so the acquire step prefers to
-		// wait BRIEFLY for an above-target worker before spilling below it (fix #2);
-		// routing too cheap is the quality-risky direction.
-		//
-		// A client-named model reports as "model:…" rather than "route:…" on
-		// purpose: parseRouteScore only reads the "route:d=" form, so the online
-		// tier adapter and the background judge learn from tiers the ROUTER chose
-		// and not from ones a harness chose for it.
-		return &routePlan{
-			candidates: rankByDifficulty(filtered, target, job, tr.noThink),
-			auto:       wantModel == "",
-			route:      fmt.Sprintf("%s:d=%.2f,q>=%d", routeKind(wantModel), cl.difficulty, target),
-			cl:         cl,
-			target:     target,
-			job:        job,
-			tr:         tr,
-			session:    sess,
-			group:      gr,
-			expert:     expert,
-			rejected:   rejected,
-		}, nil
-	}
-
-	// Fallback when auto-tiering can't run: rank by quality, with speed and
-	// current load breaking ties. No hard filter — every eligible backend stays a
-	// candidate, so the request is always served. target=0 ⇒ no quality floor
-	// (everyone is above-bar), so the acquire step behaves exactly as before.
+	// Reached when the matrix could not run at all: no classifier, or a
+	// classification that produced no vector — which in practice means the
+	// embeddings worker is down. Rank by measured quality with speed and current
+	// load breaking ties (backendScore), and hard-filter nothing, so the request
+	// is always served by somebody.
+	//
+	// This is the ONLY fallback now. The difficulty-tier ranker that used to sit
+	// between here and the matrix is gone: it scored a prompt to a quality target
+	// and ranked the fleet against it, and nothing reached it — the matrix branch
+	// above returns for every classified request, and an unclassified one has no
+	// difficulty score to tier by.
 	return &routePlan{
 		candidates: rankBackends(filtered, job, tr.noThink),
 		// The ROUTER still chose this worker — the classifier being unavailable
@@ -3717,7 +3652,7 @@ const profileRetryDelay = 2 * time.Minute
 // for before it stops trying.
 //
 // There has to be a limit, and it has to be small. An abort is not free: the
-// benchmark set is 130 questions, runQualityBenchmark only gives up after
+// benchmark set is ~400 questions, runQualityBenchmark only gives up after
 // wg.Wait(), and a metered endpoint that sustains 429s under the benchmark's
 // concurrency fails the same way every time — so an unbounded retry is an
 // unbounded bill, spent on measurements that are discarded the moment they
@@ -3888,10 +3823,15 @@ func (r *Router) certifyBackend(id string) {
 			// results — only the hard tiers re-run, thinking-off — so the worker
 			// keeps serving on its certified values throughout. This is the
 			// deliberate alternative to bumping benchmarkVersion, which would
-			// re-run the FULL suite on every worker in the fleet and park each at
-			// provisional quality to learn one new number. Too long in the guard
-			// for the certification path (minutes, not the seconds the other
-			// backfills cost), hence the ownership handoff, same as cold start.
+			// re-profile every worker in the fleet and park each at a provisional
+			// quality to learn one new number. (The permacache has since made a bump
+			// much cheaper — a thinking-on question this model has already answered
+			// is served from cache rather than re-asked, see benchOne — but it does
+			// not make one free here: the no-think verdicts are exactly the ones no
+			// model has ever been asked for, so they are the half that would still
+			// have to be generated.) Too long in the guard for the certification
+			// path (minutes, not the seconds the other backfills cost), hence the
+			// ownership handoff, same as cold start.
 			if needsNoThinkBackfill(prof) {
 				owned = false // guard ownership moves to the background backfill
 				go func() {
@@ -4134,24 +4074,6 @@ func (r *Router) speedProbe(backend *Backend) (float64, int64, error) {
 // fleet rather than the ~5 minutes an 8k prompt would.
 const prefillProbeTokens = 1024
 
-// backfillCachedProfile fills in measurements that a cached profile predates.
-//
-// A profile is only re-measured when benchmarkVersion changes, so a probe added
-// WITHOUT a version bump never runs on an already-profiled fleet. That is exactly what
-// happened to the prefill probe: it shipped, every worker stayed certified from its
-// cached profile, and 5 of 7 never acquired a prefill rate — including both 284B
-// workers, the ones whose TTFT is most sensitive to prompt length and the reason the
-// probe was written. Bumping benchmarkVersion is the wrong instrument: it discards the
-// quality benchmark too and costs ~14 min/worker to recover a 1-second probe.
-//
-// ANY future addition to WorkerProfile needs a clause here, or it inherits the same
-// silent failure — shipped, cached over, never measured.
-//
-// There is a SECOND class of staleness with the same cure: a field that can change on
-// the WORKER between restarts without changing the (id, model) cache key. Context is
-// the known one — CTX_SIZE is a deployment choice, not a property of the model — and
-// it is handled below. Anything else that a service.env edit can move belongs here
-// too, provided it is cheap enough to re-measure unconditionally.
 // speedProbeVersion is bumped when the DECODE measurement itself changes, so
 // cached profiles re-measure their BaselineTPS on load without paying for a full
 // BenchVersion re-profile.
@@ -4163,6 +4085,32 @@ const prefillProbeTokens = 1024
 //	    fleet's spec-decode workers at ~40% of their real decode rate
 const speedProbeVersion = 3
 
+// backfillCachedProfile fills in measurements that a cached profile predates.
+//
+// A profile is only re-measured when benchmarkVersion changes, so a probe added
+// WITHOUT a version bump never runs on an already-profiled fleet. That is exactly what
+// happened to the prefill probe: it shipped, every worker stayed certified from its
+// cached profile, and 5 of 7 never acquired a prefill rate — including both 284B
+// workers, the ones whose TTFT is most sensitive to prompt length and the reason the
+// probe was written. Bumping benchmarkVersion is still the wrong instrument: it takes
+// EVERY worker in the fleet back through a cold profile and parks each at a
+// provisional quality, to recover a one-second probe on the few that lack it.
+//
+// It is no longer the cliff it was, and the reason is worth knowing before reading
+// the rest of this: since the permacache, a re-profile does not re-earn the graded
+// answers. Every question this model has already answered, graded this way, is
+// served from cache (see benchOne and identity.go), so a bump costs the capability,
+// speed, capacity and context probes rather than hours of grading. What it still
+// costs is the fleet-wide disruption, which is why the clauses below exist.
+//
+// ANY future addition to WorkerProfile needs a clause here, or it inherits the same
+// silent failure — shipped, cached over, never measured.
+//
+// There is a SECOND class of staleness with the same cure: a field that can change on
+// the WORKER between restarts without changing the (id, model) cache key. Context is
+// the known one — CTX_SIZE is a deployment choice, not a property of the model — and
+// it is handled below. Anything else that a service.env edit can move belongs here
+// too, provided it is cheap enough to re-measure unconditionally.
 func (r *Router) backfillCachedProfile(id string, backend *Backend, prof *WorkerProfile) {
 	if prof.SpeedVersion < speedProbeVersion {
 		if tps, ttft, err := r.speedProbe(backend); err != nil {
@@ -4281,22 +4229,6 @@ func (r *Router) backfillCachedProfile(id string, backend *Backend, prof *Worker
 	log.Printf("worker %s: backfilled prefill rate %.0f tok/s into its cached profile", id, rate)
 }
 
-// prefillProbe measures how fast a worker turns prompt tokens into a first token, by
-// sending a prompt of KNOWN length with a 1-token budget and timing the call.
-//
-// The live EWMA cannot fill this gap on its own. observe() only records a prefill
-// sample from NON-thinking requests — TTFT is not comparable across engines otherwise,
-// because vLLM buffers reasoning into TTFT while llama.cpp streams it — so a worker the
-// router mostly sends thinking traffic to never accumulates one, and prefillSeconds()
-// falls back to a flat TTFT average that ignores prompt length entirely. Measured on
-// llm-naples-deepseek-284B-q4: the router priced its time-to-first-token at 978ms while
-// a 4116-token prompt really took 178s, a 140x underestimate, so it kept sending long
-// prompts to the one worker in the fleet that could not serve them.
-//
-// Thinking is disabled here precisely so the number IS comparable across engines. The
-// single generated token is included in the elapsed time, which slightly understates
-// the rate (~6% on a fast GPU worker, well under 1% on a CPU one) — erring toward
-// pessimism, the safe direction for a latency estimate.
 // prefillProbeSamples is how many times prefillProbe measures before believing a
 // number. One sample is not enough, and the failure is not hypothetical: on
 // 2026-08-08 llm-a750-Granite4.1-8B was probed while a CPU worker on the SAME host
@@ -4342,8 +4274,24 @@ func init() {
 // one run cannot collide with the samples of the next.
 func nextProbeSalt() uint32 { return probeSalt.Add(prefillProbeSamples) }
 
-// prefillProbe measures prefill rate, taking the best of prefillProbeSamples runs.
-// Returns the last error only if EVERY sample failed.
+// prefillProbe measures how fast a worker turns prompt tokens into a first token, by
+// sending a prompt of KNOWN length with a 1-token budget and timing the call. It takes
+// the best of prefillProbeSamples runs, and returns the last error only if EVERY
+// sample failed.
+//
+// The live EWMA cannot fill this gap on its own. observe() only records a prefill
+// sample from NON-thinking requests — TTFT is not comparable across engines otherwise,
+// because vLLM buffers reasoning into TTFT while llama.cpp streams it — so a worker the
+// router mostly sends thinking traffic to never accumulates one, and prefillSeconds()
+// falls back to a flat TTFT average that ignores prompt length entirely. Measured on
+// llm-naples-deepseek-284B-q4: the router priced its time-to-first-token at 978ms while
+// a 4116-token prompt really took 178s, a 140x underestimate, so it kept sending long
+// prompts to the one worker in the fleet that could not serve them.
+//
+// Thinking is disabled here precisely so the number IS comparable across engines. The
+// single generated token is included in the elapsed time, which slightly understates
+// the rate (~6% on a fast GPU worker, well under 1% on a CPU one) — erring toward
+// pessimism, the safe direction for a latency estimate.
 func (r *Router) prefillProbe(backend *Backend) (float64, error) {
 	best, lastErr := 0.0, error(nil)
 	base := nextProbeSalt()
@@ -5200,8 +5148,9 @@ func backendScore(b *Backend, thinkOff bool) int {
 // rankBackends sorts candidates best-first and returns the slice. The first
 // element is the single best choice; the remaining order lets pickAndAcquire
 // spill to the next-best backend when the best one has no free slot. This is the
-// fallback ranker for when auto-tiering can't run; the auto path uses
-// rankByDifficulty instead.
+// the DEGRADED ranker, used when there is no classification to rank on — no
+// embeddings worker, or a request with no messages. The live path ranks by the
+// outcome matrix (chooseByOutcome).
 func rankBackends(candidates []*Backend, job jobCost, thinkOff bool) []*Backend {
 	sort.SliceStable(candidates, func(i, j int) bool {
 		a, b := candidates[i], candidates[j]
@@ -5220,7 +5169,7 @@ func rankBackends(candidates []*Backend, job jobCost, thinkOff bool) []*Backend 
 		//      path (the classifier is unavailable), so cost only gets to separate
 		//      workers this ranker already considers interchangeable. Holding a
 		//      request off a paid endpoint entirely is the acquire step's job, not
-		//      this one — see qualityFloorPreference.
+		//      this one — see acquirePreferenceFor.
 		if af, bf := isFreeBackend(a), isFreeBackend(b); af != bf {
 			return af
 		}
@@ -5245,9 +5194,16 @@ func rankBackends(candidates []*Backend, job jobCost, thinkOff bool) []*Backend 
 	return candidates
 }
 
-// speedScore returns a stable score derived from the backend's declared
-// baseline_tps (set during registration, not dynamic), scaled to the SAME 0-100
-// range as Quality so the two are commensurable in backendScore.
+// speedScore returns a stable score derived from the backend's baseline_tps,
+// scaled to the SAME 0-100 range as Quality so the two are commensurable in
+// backendScore.
+//
+// "Stable" means profile-time, not registration-time: on a beacon row
+// BaselineTPS is whatever the speed probe MEASURED (applyProfileIfGen overwrites
+// the declared value, and a cached profile re-measures it when speedProbeVersion
+// moves); only an operator-entered manual row keeps the number a human typed.
+// Either way it does not move with load — that is ObservedTPS, the live EWMA,
+// which ranking reads separately through expectedLatency.
 //
 // It was bucketed 1-10 back when quality was also 1-10. Quality is now a 0-100
 // benchmark percentage, which left speed contributing ~3% of backendScore — and
@@ -5939,11 +5895,7 @@ func (r *Registry) observe(id string, ttft, decodeWindow time.Duration, tokens, 
 	if decodeSampleRefTokens > 0 {
 		alpha *= math.Min(1, float64(tokens)/float64(decodeSampleRefTokens))
 	}
-	if b.ObservedTPS == 0 {
-		b.ObservedTPS = decodeTPS
-	} else {
-		b.ObservedTPS = b.ObservedTPS*(1-alpha) + decodeTPS*alpha
-	}
+	ewma(&b.ObservedTPS, decodeTPS, alpha)
 	// The same two samples again, kept per mode. Nothing here assumes the modes
 	// agree; if they turn out to, the two EWMAs simply converge and cost nothing.
 	// The generated-length EWMA uses a fixed weight rather than the
@@ -5973,19 +5925,11 @@ func (r *Registry) observe(id string, ttft, decodeWindow time.Duration, tokens, 
 			return
 		}
 	}
-	ms := float64(ttft.Milliseconds())
-	if b.ObservedTTFTMillis == 0 {
-		b.ObservedTTFTMillis = ms
-	} else {
-		b.ObservedTTFTMillis = b.ObservedTTFTMillis*0.7 + ms*0.3
-	}
+	// Fixed 0.3 for both, unlike the tokens-weighted alpha above: a prefill sample
+	// is one prompt, and there is no "how much of it did we observe" to weight by.
+	ewma(&b.ObservedTTFTMillis, float64(ttft.Milliseconds()), 0.3)
 	if promptTokens >= minPrefillTokens {
-		prefillTPS := float64(promptTokens) / ttft.Seconds()
-		if b.ObservedPrefillTPS == 0 {
-			b.ObservedPrefillTPS = prefillTPS
-		} else {
-			b.ObservedPrefillTPS = b.ObservedPrefillTPS*0.7 + prefillTPS*0.3
-		}
+		ewma(&b.ObservedPrefillTPS, float64(promptTokens)/ttft.Seconds(), 0.3)
 	}
 }
 
@@ -6217,15 +6161,11 @@ func (s *LogStore) init(ctx context.Context) error {
 			value TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		)`,
-		// Upstream routers this one may relay through (see relay.go). The name is
-		// stored already lowercased (see relayKey), so the primary key is the
-		// lookup key. api_key is sealed with the same box that protects a backend's
-		// credential; the backends this relay expands into are DERIVED and are not
-		// persisted anywhere — the refresh loop rebuilds them from this row.
-		// One graded answer per (question, worker, thinking mode, source). REPLACE
+		// One graded answer per (question, model, thinking mode, source). REPLACE
 		// on that key, so a re-profile supersedes its predecessor rather than
-		// accumulating beside it — a worker's history would otherwise drag its
+		// accumulating beside it — a model's history would otherwise drag its
 		// current estimate. See outcomes.go.
+		//
 		// Keyed by MODEL, not by worker. A graded answer is evidence about the
 		// weights that produced it, so it outlives the box: decommission a worker
 		// and its results stay, deploy the same model elsewhere and the profile is
@@ -6233,30 +6173,32 @@ func (s *LogStore) init(ctx context.Context) error {
 		// latency this worker measured from one another deployment measured on
 		// different hardware.
 		//
-		// The old table was keyed (qid, backend_id, thinking, source) and its qids
-		// were an FNV of prompt+expect with no match mode and no grader version.
-		// Every row in it is unreachable under the new identity, so it is dropped
-		// rather than migrated: carrying a second, dead key format forever to
-		// preserve rows nothing can look up is worse than re-earning them, and the
-		// bench half is re-earned by the profile run that follows this deploy.
-		`DROP TABLE IF EXISTS observations`,
-		// The vectors go with them. observation_vectors is keyed by qid and holds
-		// only judged rows, whose ids move to the same hash the bank uses — so
-		// every row in it belongs to an observation that no longer exists.
-		`DROP TABLE IF EXISTS observation_vectors`,
+		// The PRE-MODEL-HASH table is dropped by dropLegacyObservations below, NOT
+		// from this list. Putting a DROP here made it run on EVERY startup rather
+		// than once: init() is a plain statement list executed by NewLogStore each
+		// boot, so the permacache was emptied on every restart, and the judged half
+		// — up to maxJudgedQuestions production questions and the vectors persisted
+		// precisely so they would survive — was destroyed with no second copy to
+		// rebuild from. A one-shot migration has to be able to tell that it has
+		// already run.
 		`CREATE TABLE IF NOT EXISTS observations (
 			qid TEXT NOT NULL,
 			model_hash TEXT NOT NULL,
 			backend_id TEXT NOT NULL DEFAULT '',
 			thinking INTEGER NOT NULL,
 			correct INTEGER NOT NULL,
+			loose INTEGER NOT NULL DEFAULT 0,
 			latency_ms INTEGER NOT NULL DEFAULT 0,
-			output_tokens INTEGER NOT NULL DEFAULT 0,
 			source TEXT NOT NULL,
 			created_at TEXT NOT NULL,
 			PRIMARY KEY (qid, model_hash, thinking, source)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_observations_model ON observations (model_hash)`,
+		// Upstream routers this one may relay through (see relay.go). The name is
+		// stored already lowercased (see relayKey), so the primary key is the
+		// lookup key. api_key is sealed with the same box that protects a backend's
+		// credential; the backends this relay expands into are DERIVED and are not
+		// persisted anywhere — the refresh loop rebuilds them from this row.
 		`CREATE TABLE IF NOT EXISTS router_relays (
 			name TEXT PRIMARY KEY,
 			url TEXT NOT NULL,
@@ -6264,6 +6206,10 @@ func (s *LogStore) init(ctx context.Context) error {
 			enabled INTEGER NOT NULL DEFAULT 1,
 			updated_at TEXT NOT NULL
 		)`,
+	}
+	// Before the CREATEs, so the new table is created after the old one is gone.
+	if err := s.dropLegacyObservations(ctx); err != nil {
+		return err
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
@@ -6289,9 +6235,6 @@ func (s *LogStore) init(ctx context.Context) error {
 		// this build for twelve hours. That is the honest rendering; the
 		// alternative of hiding those rows would make a busy router look idle.
 		`ALTER TABLE request_logs ADD COLUMN client_ip TEXT NOT NULL DEFAULT ''`,
-		// Whether a key belongs to a downstream router rather than a client
-		// (see relay.go). Every key issued before relays existed is not one, and
-		// 0 is what the default gives them.
 		// Timing-model columns. Existing rows keep their defaults and there is
 		// nothing to backfill them from: token counts were parsed and dropped,
 		// and TTFT, thinking mode and concurrency were never recorded at all. A
@@ -6304,6 +6247,9 @@ func (s *LogStore) init(ctx context.Context) error {
 		`ALTER TABLE request_logs ADD COLUMN ttft_ms INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE request_logs ADD COLUMN thinking INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE request_logs ADD COLUMN concurrency INTEGER NOT NULL DEFAULT 0`,
+		// Whether a key belongs to a downstream router rather than a client
+		// (see relay.go). Every key issued before relays existed is not one, and
+		// 0 is what the default gives them.
 		`ALTER TABLE api_keys ADD COLUMN relay INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -6879,14 +6825,18 @@ func publicBackends(backends []*Backend) []*Backend {
 	return out
 }
 
-// readSSEStream accumulates a streamed completion's content and reasoning text
-// separately (both dialects' reasoning field names — see extract.go).
-// firstChunk fires on the first non-empty delta of EITHER kind: for a thinking
-// model the reasoning tokens ARE the first generated output, and stamping TTFT
-// only on content would fold the whole reasoning phase into first-token latency.
-// readSSEStream drains a streamed completion. tokens prefers the stream's
-// usage.completion_tokens (sent when the request asked for
-// stream_options.include_usage), falling back to counting non-empty deltas.
+// readSSEStream drains a streamed completion, accumulating its content and
+// reasoning text separately (both dialects' reasoning field names — see
+// extract.go).
+//
+// firstChunk fires on EVERY non-empty delta of EITHER kind, and the caller
+// latches the first (see speedProbe). Either kind, because for a thinking model
+// the reasoning tokens ARE the first generated output, and stamping TTFT only on
+// content would fold the whole reasoning phase into first-token latency.
+//
+// tokens prefers the stream's usage.completion_tokens (sent when the request
+// asked for stream_options.include_usage), falling back to counting non-empty
+// deltas.
 //
 // The fallback is a COUNT only for engines that emit one token per delta.
 // Speculative decoding breaks that: vLLM with MTP packs each accepted
@@ -6973,7 +6923,8 @@ func mapBool(ok bool, yes string, no string) string {
 }
 
 // countSSETokens counts actual generated tokens from a captured SSE stream.
-// Each "data: {...}" line with a non-empty content delta represents one token.
+// Each "data: {...}" line with a non-empty content OR reasoning delta represents
+// one token — see the loop body for why reasoning has to count too.
 func countSSETokens(data []byte) int {
 	tokens := 0
 	for _, line := range bytes.Split(data, []byte("\n")) {
@@ -7187,4 +7138,64 @@ func ewma(slot *float64, sample, alpha float64) {
 		return
 	}
 	*slot = *slot*(1-alpha) + sample*alpha
+}
+
+// dropLegacyObservations removes the pre-model-hash observation tables, once.
+//
+// The old table was keyed (qid, backend_id, thinking, source) and its qids were an
+// FNV of prompt+expect carrying no match mode and no grader version. Every row in
+// it is unreachable under the content-addressed identity (see identity.go), so it
+// is dropped rather than migrated: carrying a second, dead key format forever to
+// preserve rows nothing can look up is worse than re-earning them.
+//
+// The migration is CONDITIONAL, and that is the whole point of it being a function
+// rather than two statements in init()'s list. That list runs on every startup, so
+// an unconditional DROP is not a migration at all — it is a boot-time wipe. It
+// emptied the permacache on every restart, and took the judged half with it: those
+// rows have no second copy, and the vectors beside them are persisted precisely
+// because a judged question's text is never stored and its vector cannot be
+// re-derived.
+//
+// "Already migrated" is read off the schema itself rather than a version counter:
+// the new table has a model_hash column and the old one does not. A table that is
+// absent entirely is a fresh database and needs nothing.
+func (s *LogStore) dropLegacyObservations(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(observations)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	columns, hasModelHash := 0, false
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var dflt sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			return err
+		}
+		columns++
+		if name == "model_hash" {
+			hasModelHash = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if columns == 0 || hasModelHash {
+		return nil // fresh database, or already on the current schema
+	}
+	log.Printf("outcome matrix: dropping the pre-model-hash observation tables (one-off migration)")
+	for _, stmt := range []string{
+		`DROP TABLE IF EXISTS observations`,
+		// The vectors go with them: observation_vectors is keyed by qid, and every
+		// judged qid moved to the same hash the bank now uses.
+		`DROP TABLE IF EXISTS observation_vectors`,
+	} {
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
 }

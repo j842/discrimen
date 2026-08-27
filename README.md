@@ -10,16 +10,26 @@ with no routing fields, and discrimen decides which endpoint answers it.
 The two ideas it is built on:
 
 **Operators don't tune routing.** There are no quality tiers to hand-set and no
-speed cutoffs to pick. The router scores each prompt and derives its targets
-from the fleet it can see. Every configuration surface in this repository
-governs which endpoints exist and who may call them, never how a request is
-routed.
+speed cutoffs to pick. The router asks a different question instead: *which of
+these endpoints has got questions like this one right, and which of those is
+fastest*. It answers from graded evidence it collected itself. Every
+configuration surface in this repository governs which endpoints exist and who
+may call them, never how a request is routed.
 
 **Measure, don't trust.** An endpoint declares almost nothing: an id, a URL, an
 API key, and the handful of tags that cannot be probed. Quality, speed,
 capacity, context and capabilities are all measured, by running an objective
 benchmark and a set of probes against it. Internet providers are profiled on
 exactly the same terms as local ones.
+
+**Nothing measured is ever thrown away.** A graded answer is filed under a hash
+of the question (its text, its expected answer, how it is matched, and the
+version of the grader that scores it) and a hash of the model (served id,
+parameter count, quantisation, file size, trained context, serving engine). So
+it is evidence about the *weights*, not about the box: decommission a worker and
+its results stay, deploy the same model on another host and it inherits the
+whole profile instead of re-earning it, and fixing one grader re-asks that
+grader's questions and nothing else.
 
 A client that *does* want to choose says so in plain OpenAI, with `model` and
 `reasoning_effort`, and gets what it asked for. Both live on the one port:
@@ -115,14 +125,33 @@ properly, and that takes a while.
 
 Profiling splits in two so a fresh deployment does not black out the fleet. The
 quick half (capabilities, speed, context) makes the endpoint routable in
-**seconds**. The slow half, a concurrency ramp and a 130-question graded
+**seconds**. The slow half, a concurrency ramp and a 401-question graded
 benchmark, runs in the background and then refines the live values. Until the
 benchmark finishes, an unproven endpoint holds a conservative provisional
 quality of 30, so it only draws easy traffic.
 
+While the slow half runs, `GET /backends` publishes what it is doing rather than
+a bare `profiling` boolean: a `profile_progress` object with the phase
+(`capabilities`, `capacity`, `prefill`, `quality`, `quality/nothink`,
+`context`), how many questions of that phase are done, how many are in flight,
+how long it has been going and — once eight questions have finished, which is
+enough for the rate to mean anything — an estimate of how much longer. `ask -l`
+renders it as a progress bar under the worker's row. A profile is the longest
+thing this router runs, and "is it stuck?" used to have no answer short of
+reading container logs.
+
 The result is cached per `(endpoint id, model)` in SQLite, so a restart is
-**instant**: same id, same model, profile reloaded, no re-measurement. Only a
-brand-new endpoint or a changed model pays the cost again.
+**instant**: same id, same model, profile reloaded, no re-measurement.
+
+And when something *does* force a re-profile, the expensive part usually does not
+run again. The probes are re-run — they are seconds — but every question the
+model has already answered is served from the permanent cache described above,
+because the cache is keyed by question and model rather than by profiling run.
+So a grader fix re-asks that grader's questions on every worker and leaves the
+rest alone, and a worker that comes back after a rebuild inherits its own
+grading. The one thing that genuinely costs a full pass is a model the router
+has never graded — a new endpoint, or a real change to the weights behind an
+existing one.
 
 The context window is the exception, because it is a deployment choice rather
 than a property of the model: raise `--ctx-size` (or vLLM's `--max-model-len`),
@@ -131,14 +160,20 @@ the old window. Discrimen re-reads it — one metadata GET, no benchmark — on
 every certification and again on the health loop's periodic check, so a change
 lands within ten minutes of the restart with nothing to do by hand.
 
-On a paid endpoint, that cost is money. The benchmark is 130 questions: 122 of
-them graded thinking-on against a 16384-token ceiling, and 8 graded thinking-off
-against a 1024-token one. A reasoning answer on this set runs roughly 2000 to
-3000 output tokens, well short of the ceiling, which puts a cold profile near
-**250-370k output tokens**. Once. The worst case, every thinking-on answer
-running to its ceiling, is 2.0M, but a model doing that is being scored as
-truncated on most of the set anyway. See [docs/benchmark.md](docs/benchmark.md)
-for the whole question set and its answer key.
+On a paid endpoint, that cost is money. The benchmark is 401 questions: 393
+graded thinking-on against a 32768-token ceiling, and 8 — the two control tiers —
+graded thinking-off against a 1024-token one. A reasoning answer on this set runs
+roughly 2000 to 3000 output tokens, well short of the ceiling, so a cold profile
+lands near **0.8-1.2M output tokens**. Once, per model. Nine of the questions are
+deliberately enormous on the *input* side (see below), which adds about 200k
+prompt tokens to the thinking-on pass and the same again to the no-think one.
+
+Two things bound that. The permanent cache means the number above is what a model
+the router has never seen costs, not what every profiling run costs. And a
+thinking-on pass is capped at 90 minutes of wall clock once at least 48 questions
+are away, so a very slow endpoint is scored on what it managed rather than
+holding a slot indefinitely. See [docs/benchmark.md](docs/benchmark.md) for the
+question set and its answer key.
 
 An endpoint that can think is scored **twice**: the headline quality grades the
 hard tiers thinking-on (the mode discrimen serves them in when it decides), and
@@ -150,10 +185,38 @@ measured on this fleet, a 35B A3B at quality 84 thinking-on wrote deterministic
 garbage SQL thinking-off. A request that will be served without thinking (an
 explicit `requirements.thinking: "off"`, `reasoning_effort: "none"`, a pinned
 `enable_thinking: false`, or a direct verdict from the auto classifier) is
-filtered, ranked and floor-checked against the no-think score; every other
-request uses the headline score. Profiles cached before the second score
-existed fall back to the headline number — the pre-two-score behaviour — until
-their endpoint re-profiles.
+answered from the fleet's no-think evidence. That separation runs the whole way
+down: every graded answer in the outcome matrix records which mode produced it,
+and a lookup only ever matches rows from the same mode, so a model's thinking-on
+record cannot vouch for its thinking-off behaviour. `quality_nothink` is the
+human-readable summary of the same split.
+
+### Nine very long questions
+
+Since the bank gained long-context questions, three of the tiers also test how
+much of a large prompt a model actually uses. Three synthetic machine logs at
+roughly 4K, 16K and 48K tokens, each asked three ways: sum a set of values
+scattered through the log, order a set of events and name the third, and find the
+one record that contradicts a roster stated in the header. Every answer is
+settled at least halfway down, and the first half of each log yields a *different*
+answer, so a model that skims the opening and stops cannot pass.
+
+They are not a needle-in-a-haystack test — the context probe already does single
+needle lookup, and that is deliberately the one shape not used here.
+
+**Their difficulty tiers (6, 9 and 10) are provisional and uncalibrated.** Every
+other tier in the bank is a measured fleet pass-rate band; these three are an
+author's ordering of three input lengths, assigned without running a single
+worker. Treat the ordering as the only defensible claim — 48K is not easier than
+16K, which is not easier than 4K — and re-band them from measured pass rates
+before reading anything into the numbers. `docs/benchmark.md` says how.
+
+A worker whose context window is too small for one of these is scored as having
+**missed** it, decided before the request is dispatched so nothing is spent. That
+is the honest answer for a weakness map: it used to be sent anyway, rejected by
+the server, and recorded as an error — and an errored question stays out of the
+denominator, so a 32K worker read as *unmeasured* at the 48K rung rather than as
+unable to do it.
 
 ## How a request is routed
 
@@ -165,25 +228,64 @@ For each `POST /v1/chat/completions`:
    required features (`tools` detected from the request's `tools` field,
    `vision` from image content), or thinking required and unsupported.
 
-2. **Difficulty to target quality.** An embedding-centroid classifier scores the
-   prompt's difficulty in `[0,1]` and maps it onto the benchmark's absolute
-   0-100 scale, clamped to the best quality actually registered. The bar is a
-   property of the question, not of the fleet, so registering a high-quality
-   slow endpoint cannot re-tier questions the existing fleet was already
-   clearing. The online adapter adds a learned upward bias for that difficulty
-   region.
+2. **Embed the prompt, once.** An embeddings worker turns the prompt into a
+   vector. Everything below reads that one vector: the reasoning score, and the
+   lookup into the outcome matrix. A second centroid pair on the same vector
+   scores prompt *difficulty*, which survives as a fallback and is what
+   `X-LLM-Route` reports as `d=` when the matrix is not available.
 
-3. **Reasoning to thinking mode.** A second centroid pair scores whether the
-   prompt needs reasoning, and if so the router turns thinking on, in whichever
-   dialect it measured the chosen endpoint to speak. Simple prompts run with
-   thinking off.
+3. **Reasoning to thinking mode.** A centroid pair scores whether the prompt
+   needs reasoning, and if so the router turns thinking on, in whichever dialect
+   it measured the chosen endpoint to speak. Simple prompts run with thinking
+   off. Thinking-on and thinking-off are treated as two different models
+   everywhere below, because on this fleet they measure like two different
+   models.
 
-4. **Rank by expected completion time.** Among the endpoints that clear the
-   quality bar, take the one that will **finish soonest**: prefill time for this
-   prompt, plus decode time for the expected output, plus queue occupancy. This
-   replaces "cheapest tier". Slow endpoints lose on latency by themselves, with
-   no speed cutoff to tune, and a busy fast endpoint sheds load to idle ones
-   automatically.
+4. **Rank by predicted correctness, then by speed.** This is the whole routing
+   policy, and it is not a quality bar.
+
+   The router finds the graded questions nearest this prompt in embedding space
+   (up to 12 of them, cosine ≥ 0.55) and asks, per candidate, how that model did
+   on those questions in this thinking mode. That gives a similarity-weighted hit
+   rate, a confidence, and the weight of evidence behind it. Candidates fall into
+   three bands, ranked in this order:
+
+   | band | meaning | ordered by |
+   |---|---|---|
+   | **able** | predicted to get this right | correctness margin, then speed |
+   | **unmeasured** | nothing like this has been graded on it | speed |
+   | **unable** | graded on questions like this, and got them wrong | predicted correctness |
+
+   Admission to the *able* band is on the hit rate **discounted for how thin the
+   evidence is**, not on the raw rate — the penalty falls off as the square root
+   of the evidence weight. That discount is not cosmetic: a worker that got one
+   of two nearby questions right sat exactly on the 0.5 floor, was admitted, and
+   because the band then sorted purely on speed it beat a worker with a dozen
+   observations at 0.95 on a 3% speed edge.
+
+   Nothing is ever *dropped* here, only ordered. An unmeasured worker is not a
+   bad worker, and the ranked list is what failover and escalation walk along —
+   shrinking it leaves them nowhere to go at exactly the moment the first choice
+   has failed.
+
+   **Exploration.** One in twenty opportunities (an opportunity being a request
+   where there is both something known-good and something unmeasured to learn
+   about), the fastest unmeasured worker is promoted to the head instead. That is
+   how a newly registered endpoint earns evidence without waiting for a full
+   profile, and it is the only place this step does not return its own best
+   answer. Explored requests protect no ordering downstream, so the cost step
+   below cannot quietly undo them.
+
+   **When the matrix has nothing to say** about a prompt — which is the ordinary
+   case for traffic unlike the question bank — it falls back to each model's
+   overall graded hit rate, taking the fastest worker within 15 points of the
+   best. A model never graded in this mode reads as a fleet-neutral 0.5 rather
+   than as zero, so a fresh endpoint is not excluded from everything.
+
+   **Where the time estimate comes from.** "Fastest" is prefill time for this
+   prompt, plus decode time for the expected output, plus queue occupancy, plus
+   one term the live figures cannot supply: how long questions *like this one*
+   have historically made this worker generate for.
 
    The estimate is per *request*, not per endpoint. Prefill scales with the
    prompt (an agent turn's system prompt and tool schemas run to thousands of
@@ -205,29 +307,58 @@ For each `POST /v1/chat/completions`:
    grows: unweighted short replies had one CPU worker reporting 51 tok/s when it
    sustained 17 over 1700 tokens.
 
-5. **Cost.** Among endpoints that clear the quality bar, prefer the free ones.
-   Spill to a paid endpoint only when nothing free clears the bar, or every free
-   candidate is saturated past the grace period below. Price is a declared fact
-   about an endpoint, in the same category as an `uncensored` tag, not a
-   routing knob.
+5. **Cost, inside the correctness band.** Among the workers the matrix judged
+   interchangeable — the *able* band, or every candidate when there is no
+   correctness judgement to protect — prefer the free ones, and among those the
+   local ones. Spill to a paid endpoint only when nothing free is left in the
+   band, or every free candidate is saturated past the grace period below. Price
+   is a declared fact about an endpoint, in the same category as an `uncensored`
+   tag, not a routing knob.
+
+   **The band is the point.** Preferring local is not really about the link being
+   slow — prefill already prices the round trip, and it is milliseconds against a
+   generation measured in seconds. It is that the two occupancy numbers are not
+   equally trustworthy: a local queue depth is exact and live, while a relayed
+   one is a snapshot up to 15 seconds old and blind to the upstream router's own
+   clients. Ranking on remote completion times alone systematically over-picks
+   remote, and this corrects that. What it must not do is reach *across* a
+   correctness boundary to do it — applied to the whole ranked list, it sent
+   every hard prompt to the one free local CPU worker no matter how confident the
+   matrix was that the worker would get it wrong.
 
 6. **Spill.** Walk the ranked list and take the first endpoint with a free
    concurrency slot, so a saturated top pick overflows to the next. Two bounded
-   preferences can briefly hold a request first: the quality floor waits for an
-   above-target endpoint to free a slot, and while a tool loop is open the
-   session lock waits for the incumbent. Neither can refuse a request; they only
-   reorder who gets tried first.
+   preferences can briefly hold a request first: the cost preference above waits
+   inside its band, and while a tool loop is open the session lock waits for the
+   incumbent. Neither can refuse a request; they only reorder who gets tried
+   first.
 
-The decision is reported back in headers: `X-LLM-Route` (`route:d=0.92,q>=10`
-for an automatic pick, `route` for an explicit one), `X-LLM-Backend-Model` for
-who answered, `X-LLM-Session` for what affinity did, `X-LLM-Escalated` when an
-empty answer was repaired, `X-LLM-Group` when a group fell back to automatic.
+The decision is reported back in headers: `X-LLM-Route`
+(`route:outcome:p=0.95,n=12,sup=8.3` for an automatic pick — predicted
+correctness, observation count and evidence weight for the worker at the head —
+`route:outcome:explore,1in20` when the request was spent on exploration,
+`route:outcome:unknown,fallback-speed,q=0.71` when nothing similar had been
+graded, and bare `route` when the classifier was unavailable),
+`X-LLM-Backend-Model` for who answered, `X-LLM-Session` for what affinity did,
+`X-LLM-Escalated` when an empty answer was repaired, `X-LLM-Group` when a group
+fell back to automatic. A route the *client* chose reports `model:` in place of
+`route:`, which is how the router keeps its own learning off decisions a harness
+made for it.
 
 **Want the decision without paying for the answer?** `POST /v1/route-preview`
 with the same body runs the whole pipeline and returns what it *would* do:
-classification, tier, thinking mode, session state, the ranked candidates with
-their completion-time estimates, and why each excluded endpoint was excluded. It
+classification, thinking mode, session state, group and ensemble resolution, and
+which worker would serve. An admin caller additionally gets, for every candidate,
+the matrix's prediction — band, predicted correctness, the evidence-discounted
+figure band admission actually used, confidence, evidence weight, observation
+count, how many of those came from the background judge — alongside the
+completion-time estimates and the reason each excluded endpoint was excluded. It
 contacts no endpoint and changes no state.
+
+Note what it does *not* return on a matrix-routed request: `target_quality` is 0
+and `above_bar` is absent, because there is no quality bar involved. Both belong
+to the difficulty-tier ranker described under "What is left of the tier system"
+below.
 
 ## Session affinity
 
@@ -255,8 +386,9 @@ Expressing stickiness as a prefill discount rather than a bias gives it the
 right shape for free: it grows with the conversation, vanishes for a short
 one-off, and a genuinely faster endpoint still wins.
 
-The tool-loop lock deliberately outranks the quality floor. Half a tool loop
-served by two models is worse than all of it served by the cheaper one.
+The tool-loop lock deliberately outranks the cost preference, and the correctness
+band with it. Half a tool loop served by two models is worse than all of it
+served by the weaker one.
 
 Honest limit: the router cannot see an endpoint's KV cache. That needs
 llm-d or Dynamo-style cache-event streams from the engine, not an OpenAI HTTP
@@ -265,9 +397,9 @@ it.
 
 ## Inline escalation
 
-An inadequate answer used to only nudge the tier adapter: the region got routed
-higher *next* time, while the caller who hit the problem was handed the empty
-response. Now, when an endpoint returns a 2xx with nothing in it, the request is
+An inadequate answer used to be a lesson for the *next* caller only: something
+was nudged, and the caller who hit the problem was handed the empty response.
+Now, when an endpoint returns a 2xx with nothing in it, the request is
 re-dispatched to a strictly better endpoint before replying.
 
 Four deliberate boundaries:
@@ -281,33 +413,75 @@ Four deliberate boundaries:
 - **One hop.** If the better endpoint is also empty, the original response is
   returned.
 
-The escalation is fed to the adapter as "this bin needed a better model".
-Without that, the repair would teach it the opposite, since the body it finally
-returns looks clean.
+An escalation repairs the request in front of it and teaches routing nothing
+directly. What the outcome matrix learns from the same exchange arrives by the
+other route: the background judge grades the answer that
+was finally returned and attributes it to the worker that produced it, which is
+the escalated one. The worker that returned nothing is not currently credited
+with having done so.
 
 ## Profiling, and self-improvement
 
-Profiling is the cold-start rating. Two runtime mechanisms correct the drift a
-static benchmark misses.
-
-**Online tier adapter.** A per-difficulty-bin, upward-only bias. It rises when a
-response comes back inadequate and decays on clean ones, and is added before the
-tier is computed, so regions that keep failing get routed higher over time.
-Persisted, so learning survives a restart.
+Profiling is the cold-start rating. One runtime mechanism keeps it honest against
+the traffic the question bank does not resemble.
 
 **Background LLM-as-judge.** A sampled fraction of answers served by a
-cheaper-than-best endpoint are graded in the background by the best model, good
-or bad. A bad verdict raises that bin's floor. This is what makes a fast-but-dim
-endpoint safe rather than merely contained: a complete-but-wrong answer looks
-like success to the inadequacy check, but the judge catches it. Judging is
-dormant until you run something below the top tier, since the best model has
-nothing better to grade it. It prefers the best *free* model, and falls back to
-a paid one only under a budget cap. Otherwise the arrival of a paid frontier
-model would turn background grading into continuous spend on ordinary traffic.
+cheaper-than-best endpoint are graded in the background by a stronger model, good
+or bad, and the verdict is written into the outcome matrix as evidence about that
+model on that kind of prompt — the same table profiling writes into, alongside
+the prompt's embedding so future prompts can find it. This is what makes a
+fast-but-dim endpoint safe rather than merely contained: a complete-but-wrong
+answer looks like success to the inadequacy check, but the judge catches it.
+
+The grader is picked per *prompt*, not per worker average: the judge reuses the
+embedding routing already computed and asks which worker is strong on prompts
+*like this one*. Choosing on overall hit rate sent every verdict to whichever
+model happened to score best on the bank, including for subjects it was weak at.
+It prefers the best *free* model and falls back to a paid one only under a budget
+cap — otherwise the arrival of a paid frontier model would turn background
+grading into continuous spend on ordinary traffic.
+
+Judged evidence is deliberately weaker than bench evidence. It counts half as
+much toward the "is there enough to go on" threshold, so two judged verdicts do
+not qualify a worker on their own, and it is discounted again in the
+evidence-weighted rate. It was graded by another model, on a prompt that merely
+resembles the one being routed; it is good routing evidence and it is not a
+substitute for asking the question. Judged rows are also the only rows that are
+ever pruned — the oldest are dropped past a cap of 4000 questions, while a
+question with any bench grading behind it is never pruned at all, because the
+bank is the fixed instrument every worker's summary is computed over.
 
 **Throughput accounting** counts both content and reasoning tokens, so a
 thinking-heavy endpoint is not mistaken for a slow one, which would poison the
 latency ranking.
+
+### What is left of the tier system
+
+Routing used to work the other way round: score the prompt's difficulty, map that
+onto a target quality on the benchmark's 0-100 scale, and take the fastest worker
+clearing the bar. The outcome matrix replaced it, for a reason worth stating
+plainly — a single number per worker cannot say that a model is excellent at
+maths and poor at code, and compressing a fleet's measured strengths into one
+scalar is exactly the information the router needed to keep.
+
+Three pieces of the old system are still in the tree and it is worth knowing what
+they now do:
+
+- **The quality scores** (`quality`, `quality_nothink`) are still measured and
+  still published on `/backends` and `ask -l`. They are a good summary for a
+  person. Routing no longer ranks on them.
+- **The difficulty-tier ranker** is still there as a fallback for a router with
+  no outcome matrix, which in practice means the test suite. On a deployed
+  router the matrix ranks rather than declining, so the tier branch is not
+  reached.
+- **The online tier adapter is gone.** It learned a per-difficulty-bin upward
+  bias from inadequate answers and fed the tier branch above, which nothing
+  reaches. Removed outright rather than left switched on and inert: its config
+  knobs, its `tier_adapter.json` persistence, its "online tier adaptation
+  enabled" boot line and the `POST /v1/route-feedback` endpoint that was its
+  only remaining writer have all gone with it. Its response-adequacy classifier
+  was never really the adapter's and lives on in
+  `internal/router/inadequacy.go`, where escalation and the expert panel use it.
 
 ## Client guidance
 
@@ -338,9 +512,11 @@ Levels are passed through verbatim rather than validated: the meaningful set
 belongs to the endpoint's chat template, not to the router. DeepSeek branches on
 `high` and `max`, other templates on other words.
 
-A named model reports as `X-LLM-Route: model:d=…` instead of `route:d=…`, which
-is also how the adapter and the judge know to learn only from tiers the *router*
-chose.
+A named model reports as `X-LLM-Route: model:…` instead of `route:…`, so an
+operator can tell a client's choice from the router's at a glance. Nothing
+branches on the spelling — the judge is gated on a structural flag set where the
+plan is built — but it is the first thing worth knowing when a route looks
+wrong.
 
 `max_tokens` is a ceiling, not a reservation. The context filter charges a
 nominal answer rather than the client's declared cap, and the cap is trimmed to
@@ -387,8 +563,9 @@ five disagreeing ones would be worse than any single model's answer.
 
 The route reports itself in headers: `X-LLM-Route: expert` and
 `X-LLM-Expert: members=3,skipped=1,synth=<endpoint id>`. It deliberately does
-not look like a router-chosen tier, so the online adapter and the background
-judge learn nothing from it.
+not look like a router-chosen route, so the background judge learns nothing from
+it: the answer is a synthesis of the whole fleet's work, and crediting it to the
+synthesiser would record a hit rate for a model that did not earn it alone.
 
 ## Endpoints
 
@@ -399,16 +576,17 @@ judge learn nothing from it.
 | POST | `/v1/embeddings` | client | Embeddings |
 | GET | `/v1/models` | client | The model menu, aliases included |
 | GET | `/v1/models/{id}` | client | One model |
-| POST | `/v1/route-preview` | client | What this request *would* do. No generation, no state change. An admin caller additionally gets the per-worker estimates and the reason each worker was excluded |
-| POST | `/v1/route-feedback` | client | Report a route outcome; feeds the adapter |
+| POST | `/v1/route-preview` | client | What this request *would* do. No generation, no state change. An admin caller additionally gets the per-worker outcome predictions and time estimates, and the reason each worker was excluded |
 | GET | `/health` | none | Health and `auto_routing` status |
 | POST | `/backends/register` | worker | Endpoint self-registration. Frozen interface |
-| DELETE | `/backends/{id}` | worker or admin | Remove an entry, its persisted row and its cached profile |
-| GET | `/backends` | admin | The fleet: quality, throughput, features, status |
+| DELETE | `/backends/{id}` | worker or admin | Remove an entry, its persisted row and its cached profile. **Its graded answers stay**: they are evidence about the model, not about the box |
+| GET | `/backends` | admin | The fleet: measured hit rate and its per-topic breakdown in both thinking modes, quality scores, throughput, features, status, and live `profile_progress` while a cold profile runs |
 | GET | `/backends/{id}` | admin | One endpoint's row in full |
-| GET | `/backends/{id}/benchmark` | admin | Per-question results from that endpoint's last profiling run, plus the per-category breakdown (coding / maths / reasoning) in both thinking modes |
+| GET | `/backends/{id}/benchmark` | admin | Per-question results for that endpoint's stored profile, plus the per-category breakdown (coding / maths / reasoning / general) in both thinking modes. Answers served from the permanent cache are marked as cached rather than re-asked |
 | POST | `/debug/backends/{id}/certify`, `/debug/backends/{id}/chat` | admin | Re-profile one endpoint, or prompt it directly |
 | GET | `/logs` | admin | Stored request logs |
+| GET | `/admin/usage` | admin | Spend and traffic per key and per endpoint |
+| GET | `/admin/outcomes` | admin | Whether the matrix's predictions hold up: held-out accuracy over the graded evidence it is routing on |
 | any | `/admin/providers[/{id}]` | admin | CRUD over manually-entered endpoints |
 | any | `/admin/keys[/{id}]` | admin | Issue, list, disable and delete API keys |
 | any | `/admin/groups[/{id}]` | admin | CRUD over named groups |
@@ -454,14 +632,15 @@ working with no edits.
 Fourteen environment variables. The test for whether a setting belongs here is
 whether it describes something only the operator can know: hardware, network,
 ports, credentials, retention, how long a caller is willing to queue. Learning
-rates, classifier thresholds, latency estimates and tier bands are not: they are
-the router's own decisions, and a site that has to set them has been handed the
-problem the router exists to solve. They are constants in the binary.
+rates, classifier thresholds, latency estimates, the correctness floor, the
+exploration rate and the old tier bands are not: they are the router's own
+decisions, and a site that has to set them has been handed the problem the router
+exists to solve. They are constants in the binary.
 
 | Variable | Default | |
 |---|---|---|
 | `ROUTER_PORT` | `8585` | |
-| `LOG_DB_PATH` | `/data/llm-router/logs.sqlite` | Also where the adapter state and the persistence keyfile land |
+| `LOG_DB_PATH` | `/data/llm-router/logs.sqlite` | The request log, and in the same file the outcome matrix — so a profile's graded results and the requests that produced them are backed up and restored together. Its directory is also where the persistence keyfile lands |
 | `ROUTER_ADMIN_PASSWORD` | *(empty)* | Seeds the admin password, and resets it on any start where it is set. Unset leaves a stored password alone |
 | `ROUTER_WORKER_TOKEN` | *(empty)* | Bearer token an endpoint presents to register |
 | `ROUTER_CLIENT_TOKENS` | *(empty)* | Comma-separated client bearer tokens |
@@ -476,9 +655,11 @@ problem the router exists to solve. They are constants in the binary.
 | `ROUTER_AUTO_ROUTING` | `true` | One switch for the whole automatic layer |
 
 `ROUTER_AUTO_ROUTING=false` turns discrimen into a plain load balancer with no
-embeddings dependency: no difficulty scoring, no thinking detection, no
-adaptation, no judging. That is a legitimate thing to want, and the only reason
-to touch any of this.
+embeddings dependency: no prompt classification, so no outcome-matrix lookup and
+no thinking detection, and no judging. Ranking falls back to quality and speed.
+Profiling still runs — the benchmark is how the fleet is measured, not part of
+the automatic layer — so the scores and the graded answers keep accumulating.
+That is a legitimate thing to want, and the only reason to touch any of this.
 
 The full `.env.example` explains each one in context.
 
@@ -546,21 +727,22 @@ size of the other's queue.
 
 **The profile crosses instead of being re-measured.** Quality, capacity,
 context, capabilities and the thinking dialect were already measured upstream by
-the same graded benchmark this binary carries — 130 questions and several
-hundred thousand output tokens of somebody's GPU time. `bench_version` on the
-wire is what says the two measurements are the same measurement; when it does
-not match, capacity and capabilities still cross and the quality is held at the
-provisional tier an unproven worker gets, rather than adopting a score from
-another scale. `/health` reports the mismatch under `relays`.
+the same graded benchmark this binary carries — 401 questions and roughly a
+million output tokens of somebody's GPU time. `bench_version` on the wire is what
+says the two measurements were made the same way; when it does not match,
+capacity and capabilities still cross and the quality is held at the provisional
+30 an unproven worker gets, rather than adopting a score derived by a different
+method. `/health` reports the mismatch under `relays`.
 
 **Relayed traffic leaves no prompts upstream.** A relay key marks its caller,
 and a marked caller's request and response bodies are dropped before the log row
 is written. The row itself stays — which endpoint served, what it cost, how long
 it took, which key spent it — because that is capacity accounting rather than
 content, and a per-key budget that stopped counting would be a budget nobody
-could enforce. Relayed outcomes also do not teach the tier adapter or the
-background judge: the downstream classified that prompt against its own fleet
-and is already learning from the same outcome.
+could enforce. Relayed outcomes are also not judged, so they never reach the
+outcome matrix that ranks this fleet: the downstream router classified that
+prompt against its own fleet and is already learning from the same answer, and
+recording it twice would weight one exchange as two.
 
 **Trust.** A relay is a router you run. The downstream adopts the upstream's
 measurements sight unseen, so an upstream that claims quality 100 is believed.
@@ -584,8 +766,8 @@ is a slot broker rather than a second classifier.
 ## Measuring the router
 
 The cold-start benchmark measures **endpoints**. `discrimen arena` measures the
-**router**: whether the classifier actually sends each prompt to the cheapest
-endpoint that can answer it, which is the one claim the whole design rests on.
+**router**: whether it actually sends each prompt to the cheapest endpoint that
+can answer it, which is the one claim the whole design rests on.
 
 ```bash
 discrimen arena run -router http://localhost:8585 -dataset sub_10.jsonl -oracle -robustness
@@ -671,8 +853,10 @@ If you use [dropshell](https://github.com/j842/dropshell), there is a template
 at [`deploy/dropshell/discrimen`](deploy/dropshell/discrimen) that pulls the
 published image, converges the container, and backs the data volume up through
 restic. Its README covers the one migration trap: the Docker volume name is
-derived from the container name, so renaming the container orphans the volume,
-takes the cached profiles with it, and re-benchmarks the entire fleet from cold.
+derived from the container name, so renaming the container orphans the volume —
+and the volume is where both the stored profiles and the graded answers live, so
+losing it is the one event that genuinely costs the fleet a cold re-benchmark.
+Back it up.
 
 Images are published multi-arch (amd64 and arm64) to `ghcr.io/j842/discrimen`,
 `ghcr.io/j842/discrimen-embeddings` and `ghcr.io/j842/discrimen-sandbox` on every
@@ -696,13 +880,17 @@ standard library.
 | | |
 |---|---|
 | `main.go` | server, registry, proxy, selection, persistence, health and certification loops |
-| `difficulty.go` | embedding-centroid classifier, target quality, ranking, latency estimates |
+| `outcomes.go`, `outcomes_bank.go` | **the routing policy**: the outcome matrix, the neighbour lookup, the three bands, exploration, and the backfill that rebuilds it from stored profiles |
+| `outcomes_validate.go` | `/admin/outcomes` — whether the matrix's predictions actually hold up |
+| `identity.go` | what makes a question and a model identifiable, and therefore what the permanent cache is keyed by |
+| `difficulty.go` | embedding-centroid classifier, and the superseded target-quality ranker it still hosts |
 | `profile.go` | cold-start profiling: capability, speed, context and capacity probes, and their persistence |
-| `benchmark.go`, `benchmark_data.go` | the tiered quality benchmark |
+| `progress.go` | what a cold-start profile is doing while it does it |
+| `benchmark.go`, `benchmark_data*.go` | the tiered quality benchmark, its graders, and the question bank |
 | `session.go` | conversation identity, tool-loop detection, affinity tracker |
 | `escalate.go` | buffered dispatch, inline escalation, strip-and-retry |
 | `relay.go` | routing through another discrimen: the relay key, `/relay/fleet`, the loop guard, and the fleet import |
-| `adapter.go` | online tier adapter |
+| `inadequacy.go` | the response-adequacy classifier — is a 2xx body actually an answer, and is it empty (the worker's failure, escalated) or truncated (the caller's ceiling, not escalated). Split out when the online tier adapter that used to share the file was removed |
 | `judge.go` | background LLM-as-judge |
 | `preview.go` | `/v1/route-preview` |
 | `arena.go` | the router-level regression gate |

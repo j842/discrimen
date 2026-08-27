@@ -935,6 +935,7 @@ func (r *Router) routes() *http.ServeMux {
 	// admin block: /logs is unprefixed only because the compatibility contract
 	// froze it there, and anything new is admin-scoped under /admin.
 	mux.HandleFunc("/admin/usage", r.handleUsage)
+	mux.HandleFunc("/admin/outcomes", r.handleOutcomes)
 	mux.HandleFunc("/v1/route-feedback", r.handleRouteFeedback)
 	mux.HandleFunc("/route-feedback", r.handleRouteFeedback)
 	mux.HandleFunc("/v1/route-preview", r.handleRoutePreview)

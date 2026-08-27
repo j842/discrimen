@@ -54,6 +54,12 @@ type draftVerdict struct {
 	// worth telling apart when tuning.
 	Similarity float64
 	Elapsed    time.Duration
+	// PromptTokens and CompletionTokens are what the drafts COST, summed. The
+	// caller is billed for them whether or not the gate fired: they were spent on
+	// their request. Reporting zero would make a gated request look free and
+	// silently under-charge every budgeted key.
+	PromptTokens     int
+	CompletionTokens int
 	// Ran distinguishes "the gate declined to apply" from "the gate ran and the
 	// drafts disagreed". Only the second is evidence about the prompt.
 	Ran bool
@@ -91,11 +97,18 @@ func (r *Router) draftGate(ctx context.Context, b *Backend, chatReq *ChatRequest
 	if r.cfg == nil || !r.cfg.DraftGating || b == nil || chatReq == nil {
 		return draftVerdict{}
 	}
-	// Only where the router made the thinking decision itself. An explicit
-	// requirements.thinking, a reasoning_effort or a kwargs override is the
-	// caller's instruction, and second-guessing it by experiment is not this
-	// gate's business.
-	if !tr.softThink || tr.hardThink {
+	// Only where the ROUTER inferred the mode. An explicit requirements.thinking,
+	// a reasoning_effort or a kwargs override is the caller's instruction, not a
+	// hypothesis to test — and note that explicit "off" and classifier-decided
+	// "off" produce otherwise identical resolutions, which is why this keys on a
+	// dedicated field rather than on noThink.
+	//
+	// It runs whichever way the classifier leaned. Agreement is evidence the
+	// prompt is easy and thinking can be skipped; disagreement is evidence it is
+	// not, INCLUDING when the classifier had already decided no-think — which is
+	// the case where the guess would otherwise have shipped a bad answer with
+	// nothing to catch it.
+	if !tr.autoDecided {
 		return draftVerdict{}
 	}
 	if chatReq.Stream {
@@ -111,17 +124,22 @@ func (r *Router) draftGate(ctx context.Context, b *Backend, chatReq *ChatRequest
 	started := time.Now()
 
 	drafts := make([]string, draftCount)
+	usage := make([]usageCount, draftCount)
 	var wg sync.WaitGroup
 	for i := 0; i < draftCount; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			drafts[i], _ = r.sampleDraft(ctx, b, chatReq)
+			drafts[i], usage[i] = r.sampleDraft(ctx, b, chatReq)
 		}(i)
 	}
 	wg.Wait()
 
 	v := draftVerdict{Ran: true, Elapsed: time.Since(started)}
+	for _, u := range usage {
+		v.PromptTokens += u.prompt
+		v.CompletionTokens += u.completion
+	}
 	for _, d := range drafts {
 		if strings.TrimSpace(d) == "" {
 			return v // a failed draft is not a disagreement; it is no measurement
@@ -135,7 +153,7 @@ func (r *Router) draftGate(ctx context.Context, b *Backend, chatReq *ChatRequest
 }
 
 // sampleDraft asks the worker for one cheap no-think answer.
-func (r *Router) sampleDraft(ctx context.Context, b *Backend, chatReq *ChatRequest) (string, error) {
+func (r *Router) sampleDraft(ctx context.Context, b *Backend, chatReq *ChatRequest) (string, usageCount) {
 	payload := map[string]any{
 		"model":                probeModel(b),
 		"stream":               false,
@@ -146,10 +164,10 @@ func (r *Router) sampleDraft(ctx context.Context, b *Backend, chatReq *ChatReque
 	}
 	raw, err := r.benchCompletion(ctx, b, payload)
 	if err != nil {
-		return "", err
+		return "", usageCount{}
 	}
 	content, _ := completionContent(raw)
-	return content, nil
+	return content, usageFrom(raw)
 }
 
 // draftsAgree reports whether the drafts landed in the same place.
@@ -226,7 +244,7 @@ func looksMultipleChoice(prompt string) bool {
 
 // draftAnswerBody renders an agreed draft as a chat completion, so a gated
 // request returns the same shape as any other.
-func draftAnswerBody(model, answer string) []byte {
+func draftAnswerBody(model, answer string, promptTokens, completionTokens int) []byte {
 	body, _ := json.Marshal(map[string]any{
 		"object": "chat.completion",
 		"model":  model,
@@ -235,6 +253,14 @@ func draftAnswerBody(model, answer string) []byte {
 			"message":       map[string]string{"role": "assistant", "content": answer},
 			"finish_reason": "stop",
 		}},
+		// What the DRAFTS cost, not what the served one did. Both were generated
+		// for this caller, so both are theirs to pay for — and per-key budgeting
+		// reads this block, so omitting it would make a gated request free.
+		"usage": map[string]int{
+			"prompt_tokens":     promptTokens,
+			"completion_tokens": completionTokens,
+			"total_tokens":      promptTokens + completionTokens,
+		},
 	})
 	return body
 }

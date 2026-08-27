@@ -1,8 +1,13 @@
 package router
 
 import (
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The single most dangerous mistake in this file: sampling the drafts greedily.
@@ -89,15 +94,15 @@ func TestDraftGateDeclines(t *testing.T) {
 		tr   thinkingResolution
 	}{
 		{"streamed request cannot be recalled", &ChatRequest{Stream: true, Messages: msg},
-			thinkingResolution{softThink: true}},
+			thinkingResolution{autoDecided: true}},
 		{"caller demanded thinking", &ChatRequest{Messages: msg},
 			thinkingResolution{hardThink: true}},
 		{"caller demanded no thinking", &ChatRequest{Messages: msg},
-			thinkingResolution{noThink: true}},
+			thinkingResolution{patch: true, noThink: true}},
 		{"router did not choose the mode", &ChatRequest{Messages: msg},
 			thinkingResolution{}},
-		{"multiple choice", mcqRequest(), thinkingResolution{softThink: true}},
-		{"no user text", &ChatRequest{Messages: nil}, thinkingResolution{softThink: true}},
+		{"multiple choice", mcqRequest(), thinkingResolution{autoDecided: true}},
+		{"no user text", &ChatRequest{Messages: nil}, thinkingResolution{autoDecided: true}},
 	}
 	for _, c := range cases {
 		if v := r.draftGate(t.Context(), b, c.req, c.tr); v.Ran {
@@ -107,7 +112,7 @@ func TestDraftGateDeclines(t *testing.T) {
 	// ...and declines entirely when disabled, which is the default.
 	off := &Router{cfg: &Config{DraftGating: false}}
 	if v := off.draftGate(t.Context(), b, &ChatRequest{Messages: msg},
-		thinkingResolution{softThink: true}); v.Ran {
+		thinkingResolution{autoDecided: true}); v.Ran {
 		t.Error("gate ran while disabled")
 	}
 }
@@ -115,9 +120,12 @@ func TestDraftGateDeclines(t *testing.T) {
 // An agreed draft must come back in the ordinary chat-completion shape, or a
 // gated request would look different to every client.
 func TestDraftAnswerBody(t *testing.T) {
-	body := string(draftAnswerBody("qwen", "391"))
+	body := string(draftAnswerBody("qwen", "391", 120, 8))
 	for _, want := range []string{`"object":"chat.completion"`, `"model":"qwen"`,
-		`"role":"assistant"`, `"content":"391"`, `"finish_reason":"stop"`} {
+		`"role":"assistant"`, `"content":"391"`, `"finish_reason":"stop"`,
+		// The drafts' cost must be reported: per-key budgeting reads this block,
+		// and omitting it would make every gated request free.
+		`"prompt_tokens":120`, `"completion_tokens":8`, `"total_tokens":128`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("draft response missing %s:\n%s", want, body)
 		}
@@ -181,5 +189,145 @@ func TestAutoRouteIsStructuralNotStringSniffed(t *testing.T) {
 	// The old string gate agreed on this case, which is why it survived so long.
 	if _, ok := parseRouteScore("model:d=0.62,q>=62"); ok {
 		t.Error("parseRouteScore accepted a named-model route")
+	}
+}
+
+// ── the gate wired into the request path ───────────────────────────────────
+
+// draftFleet stands up one upstream whose replies are scripted, so the number of
+// generations and the mode each was asked in can both be asserted.
+type draftUpstream struct {
+	replies  []string      // one per call, last repeats
+	thinking []interface{} // enable_thinking seen on each call
+	bodies   []string
+}
+
+func newDraftRouter(t *testing.T, up *draftUpstream) (*Router, *dispatch, *httptest.ResponseRecorder, *http.Request) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		raw, _ := io.ReadAll(req.Body)
+		up.bodies = append(up.bodies, string(raw))
+		var parsed map[string]any
+		_ = json.Unmarshal(raw, &parsed)
+		var think interface{}
+		if kw, ok := parsed["chat_template_kwargs"].(map[string]any); ok {
+			think = kw["enable_thinking"]
+		}
+		up.thinking = append(up.thinking, think)
+		reply := up.replies[len(up.replies)-1]
+		if len(up.thinking)-1 < len(up.replies) {
+			reply = up.replies[len(up.thinking)-1]
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"` + reply +
+			`"}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	reg := newTestRegistry()
+	reg.upsert(BackendRegistration{ID: "w", URL: srv.URL, Model: "m", TTLSeconds: 3600, MaxConcurrency: 4})
+	r := &Router{cfg: &Config{DraftGating: true, BackendIdleTimeout: 5 * time.Second},
+		registry: reg, client: &http.Client{}, streamClient: &http.Client{}, benchClient: &http.Client{}}
+	backend := reg.get("w")
+	slot := make(chan struct{}, 1)
+	escalated := false
+	chatReq := &ChatRequest{Messages: []Message{{Role: "user", Content: "What is 17 times 23?"}}}
+	d := &dispatch{
+		backend: &backend, slot: &slot,
+		body: []byte(`{"messages":[]}`), raw: []byte(`{"messages":[]}`),
+		plan:    &routePlan{auto: true, route: "route:outcome:p=0.9,n=8", candidates: []*Backend{reg.get("w")}},
+		chatReq: chatReq, job: nominalJob(),
+		// The classifier guessed THINKING; the gate is about to test that guess.
+		tr:     thinkingResolution{patch: true, enable: true, softThink: true, autoDecided: true},
+		log:    &RequestLog{BackendID: "w"},
+		output: &strings.Builder{}, escalated: &escalated,
+	}
+	return r, d, httptest.NewRecorder(),
+		post("/v1/chat/completions", `{"messages":[{"role":"user","content":"What is 17 times 23?"}]}`, "")
+}
+
+// Agreement means the prompt was easy: the draft IS the answer, and no third
+// generation happens. That saving is the entire justification for the gate.
+func TestDraftGateAgreementServesTheDraft(t *testing.T) {
+	up := &draftUpstream{replies: []string{"391", "391."}}
+	r, d, rec, req := newDraftRouter(t, up)
+
+	r.dispatchBuffered(rec, req, d)
+
+	if len(up.thinking) != draftCount {
+		t.Errorf("upstream called %d times, want %d — agreement must skip the real generation",
+			len(up.thinking), draftCount)
+	}
+	for i, th := range up.thinking {
+		if th != false {
+			t.Errorf("draft %d asked with enable_thinking=%v, want false", i, th)
+		}
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "391") {
+		t.Errorf("the draft was not served: %s", rec.Body.String())
+	}
+	if g := rec.Header().Get("X-LLM-Draft-Gate"); !strings.HasPrefix(g, "agreed") {
+		t.Errorf("X-LLM-Draft-Gate = %q, want agreed…", g)
+	}
+	// The drafts cost real tokens and the caller must be billed for them.
+	if !strings.Contains(rec.Body.String(), `"total_tokens":30`) {
+		t.Errorf("usage does not report both drafts' cost: %s", rec.Body.String())
+	}
+}
+
+// Disagreement is evidence the prompt is NOT easy: the request proceeds, and it
+// proceeds with thinking ON regardless of which way the classifier leaned.
+func TestDraftGateDisagreementForcesThinking(t *testing.T) {
+	up := &draftUpstream{replies: []string{"391", "17", "391 exactly"}}
+	r, d, rec, req := newDraftRouter(t, up)
+
+	r.dispatchBuffered(rec, req, d)
+
+	if len(up.thinking) != draftCount+1 {
+		t.Fatalf("upstream called %d times, want %d (two drafts then the real generation)",
+			len(up.thinking), draftCount+1)
+	}
+	if got := up.thinking[draftCount]; got != true {
+		t.Errorf("the real generation asked with enable_thinking=%v, want true — disagreement "+
+			"is the evidence that this prompt needs a scratchpad", got)
+	}
+	if g := rec.Header().Get("X-LLM-Draft-Gate"); !strings.HasPrefix(g, "disagreed") {
+		t.Errorf("X-LLM-Draft-Gate = %q, want disagreed…", g)
+	}
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "391 exactly") {
+		t.Errorf("the real answer was not served: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// Disabled is the default, and must cost exactly one generation.
+func TestDraftGateDisabledCostsOneGeneration(t *testing.T) {
+	up := &draftUpstream{replies: []string{"391"}}
+	r, d, rec, req := newDraftRouter(t, up)
+	r.cfg.DraftGating = false
+
+	r.dispatchBuffered(rec, req, d)
+
+	if len(up.thinking) != 1 {
+		t.Errorf("upstream called %d times with the gate off, want 1", len(up.thinking))
+	}
+	if rec.Header().Get("X-LLM-Draft-Gate") != "" {
+		t.Error("the gate stamped a header while disabled")
+	}
+}
+
+// A mode the CALLER specified is an instruction, not a hypothesis. The gate must
+// not spend two generations second-guessing it.
+func TestDraftGateRespectsAnExplicitMode(t *testing.T) {
+	up := &draftUpstream{replies: []string{"391"}}
+	r, d, rec, req := newDraftRouter(t, up)
+	d.tr = thinkingResolution{patch: true, enable: false, noThink: true} // explicit off
+
+	r.dispatchBuffered(rec, req, d)
+
+	if len(up.thinking) != 1 {
+		t.Errorf("upstream called %d times, want 1 — an explicit mode must not be gated", len(up.thinking))
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func testAdapter(t *testing.T) *tierAdapter {
@@ -131,9 +132,88 @@ func TestHandleRouteFeedback(t *testing.T) {
 	}
 }
 
+// TestTheAdapterIsNotConsultedOnADeployedRouter pins the reachability claim in
+// the banner at the top of adapter.go, so that a banner saying "not consulted"
+// cannot quietly become false.
+//
+// Every other test in this file — TestAdapterShiftsRoutingUp below included —
+// builds a Router with NO outcome matrix, which is what keeps the difficulty-tier
+// branch of planRoute alive for them. A deployed router always has one (Main
+// assigns it unconditionally), and the matrix branch sits above the tier branch
+// and returns. So the adapter can be driven to its ceiling and the decision does
+// not move.
+//
+// If this test starts failing, the banner is wrong and should be deleted along
+// with whatever re-wired routing back through adjust(). If it fails because the
+// route is no longer an "outcome:" one, the matrix branch stopped being taken and
+// that is the thing to look at first.
+func TestTheAdapterIsNotConsultedOnADeployedRouter(t *testing.T) {
+	reg := newTestRegistry()
+	readyBackend(reg, "tiny", 2, 200, 2)
+	readyBackend(reg, "big", 90, 140, 6)
+	cfg := &Config{
+		DefaultMaxTokens: 4096, AutoDifficulty: true, AutoThinking: true,
+		DifficultyTemp: 0.10, ReasoningThreshold: 0.35,
+		DifficultyTimeout: time.Second, DifficultyCacheSize: 16, DifficultyMaxChars: 4000,
+		AdaptMaxBias: 0.30, AdaptLRUp: 0.40, AdaptLRDown: 0.01, AdaptBins: 10,
+	}
+	r := &Router{
+		cfg:        cfg,
+		registry:   reg,
+		classifier: testClassifierAuto(fakeEmbed),
+		adapter:    newTierAdapter(cfg, filepath.Join(t.TempDir(), "tier_adapter.json")),
+		outcomes:   newOutcomeMatrix(nil), // what Main builds on every start
+	}
+
+	plan := func() *routePlan {
+		t.Helper()
+		p, err := r.planRoute(userReq("say hello"), 0, false)
+		if err != nil {
+			t.Fatalf("planRoute: %v", err)
+		}
+		return p
+	}
+
+	before := plan()
+	if before.target != 0 {
+		t.Fatalf("the matrix path must carry no quality target, got %d (route %q)", before.target, before.route)
+	}
+	if !strings.Contains(before.route, "outcome:") {
+		t.Fatalf("route %q is not an outcome-matrix route; the tier branch was taken", before.route)
+	}
+
+	// Saturate every bin. On the tier path this is the largest correction the
+	// adapter can make, and TestAdapterShiftsRoutingUp shows it moves the choice.
+	for bin := 0; bin < cfg.AdaptBins; bin++ {
+		for i := 0; i < 50; i++ {
+			r.adapter.observe(float64(bin)/float64(cfg.AdaptBins)+0.01, true)
+		}
+	}
+	for _, b := range r.adapter.snapshot() {
+		if b != r.adapter.maxBias {
+			t.Fatalf("the adapter did not saturate, so this test proves nothing: %v", r.adapter.snapshot())
+		}
+	}
+
+	after := plan()
+	if after.target != before.target || after.route != before.route {
+		t.Errorf("a saturated adapter changed the decision: %q/target=%d became %q/target=%d",
+			before.route, before.target, after.route, after.target)
+	}
+	if ids(after.candidates)[0] != ids(before.candidates)[0] {
+		t.Errorf("a saturated adapter changed the chosen worker: %v became %v",
+			ids(before.candidates), ids(after.candidates))
+	}
+}
+
 // TestAdapterShiftsRoutingUp is the end-to-end behaviour: a region the cheap
 // tier keeps failing on is lifted to a higher tier, then decays back once it
 // recovers — all without any config change.
+//
+// Note the Router below has NO outcome matrix. That is what keeps this path
+// reachable, and it is the whole point of
+// TestTheAdapterIsNotConsultedOnADeployedRouter above: this is the behaviour the
+// adapter still HAS, exercised in the only configuration that still reaches it.
 func TestAdapterShiftsRoutingUp(t *testing.T) {
 	reg := newTestRegistry()
 	readyBackend(reg, "tiny", 2, 200, 2)

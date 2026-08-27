@@ -127,10 +127,10 @@ func (r *Router) escalate(req *http.Request, d *dispatch, orig bufferedResult) (
 	if r.cfg == nil || !r.cfg.EscalateInline {
 		return nil, orig, false
 	}
-	// Only for tiers the ROUTER picked. parseRouteScore accepts exactly the
-	// "route:d=" form, which is the same gate the adapter and the judge use — a
-	// named model ("model:d="), a pin or /debug all fall out here.
-	if _, auto := parseRouteScore(d.plan.route); !auto {
+	// Only where the ROUTER picked the worker. Structural: this used to parse the
+	// route string for a "route:d=" prefix, which quietly stopped matching the
+	// moment a second auto branch emitted a different shape.
+	if !d.plan.auto {
 		return nil, orig, false
 	}
 	// Never inside an open tool loop. Moving a mid-loop turn to another model hands

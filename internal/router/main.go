@@ -2841,6 +2841,7 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 		served := backend
 		didEscalate := escalated
 		caller := ident
+		autoRoute := plan.auto
 		go func() {
 			r.recordKeyUse(caller, charged)
 			// Self-improvement: feed this auto-routed request's outcome back to the
@@ -2851,7 +2852,11 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 			// clients abort most.
 			// A relayed request was classified by the router that sent it, which is
 			// already learning from this same outcome — see learnFromRelay.
-			if r.adapter != nil && learnFromRelay(caller) && entry.Error == "" && entry.StatusCode >= 200 && entry.StatusCode < 300 {
+			clean := entry.Error == "" && entry.StatusCode >= 200 && entry.StatusCode < 300
+			// The ADAPTER needs the numeric difficulty score, so it still keys on
+			// the "route:d=" form — that is the tier machinery learning about tiers,
+			// and a matrix route has no tier for it to learn about.
+			if r.adapter != nil && learnFromRelay(caller) && clean {
 				if score, ok := parseRouteScore(route); ok {
 					// Streamed inadequacy comes from the full-stream stats; the capture
 					// may have truncated the middle away.
@@ -2866,12 +2871,20 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 					// is exactly what the adapter exists to learn. Without this the
 					// repair would teach it the opposite.
 					r.adapter.observe(score, inadequate || didEscalate)
-					// Judging parses the answer text back out of the capture — skip when
-					// truncation removed part of it (a half answer grades as garbage).
-					if capture.truncated() <= 0 {
-						r.maybeJudge(chatReq.Messages, chatReq.Stream, served, score, entry.Output, entry.Thinking == thinkingOn, entry.DurationMillis)
-					}
 				}
+			}
+			// The JUDGE is gated separately, on whether the router chose the worker
+			// — NOT on the adapter's score format. It feeds the outcome matrix, and
+			// keying it on "route:d=" meant it never ran on a matrix-routed request:
+			// the matrix's own feedback loop was open, closing only when the
+			// embeddings worker was down and the tier path took over.
+			//
+			// Judging parses the answer text back out of the capture, so it is
+			// skipped when truncation removed part of it — a half answer grades as
+			// garbage.
+			if autoRoute && learnFromRelay(caller) && clean && capture.truncated() <= 0 {
+				r.maybeJudge(chatReq.Messages, chatReq.Stream, served, route, entry.Output,
+					entry.Thinking == thinkingOn, entry.DurationMillis)
 			}
 			if err := r.logs.Insert(context.Background(), entry); err != nil {
 				log.Printf("request log insert failed backend=%s: %v", served.ID, err)
@@ -3079,11 +3092,20 @@ func (r *Router) selectBackends(req *ChatRequest, budget time.Duration) ([]*Back
 type routePlan struct {
 	candidates []*Backend
 	route      string
-	cl         *classification
-	target     int
-	job        jobCost
-	tr         thinkingResolution
-	session    sessionRoute
+	// auto records that the ROUTER chose this worker, structurally rather than by
+	// sniffing the route string. Three things hang off "did we choose this":
+	// inline escalation, the online tier adapter and the background judge, and all
+	// three used to test the route for a literal "route:d=" prefix. That worked
+	// only while every auto route produced that exact shape — the moment the
+	// outcome matrix started emitting "route:outcome:…" all three silently
+	// switched off, taking the judge (and therefore the matrix's own feedback
+	// loop) with them. A field cannot drift out of sync with a format string.
+	auto    bool
+	cl      *classification
+	target  int
+	job     jobCost
+	tr      thinkingResolution
+	session sessionRoute
 	// group is what group resolution decided, and is the zero value when the
 	// client named no group (see groups.go).
 	group groupRoute
@@ -3346,14 +3368,18 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 		if ordered, reason := r.outcomes.chooseByOutcome(filtered, cl.vec, !tr.noThink, job); len(ordered) > 0 {
 			return &routePlan{
 				candidates: ordered,
-				route:      fmt.Sprintf("%s:%s", routeKind(wantModel), reason),
-				cl:         cl,
-				job:        job,
-				tr:         tr,
-				session:    sess,
-				group:      gr,
-				expert:     expert,
-				rejected:   rejected,
+				// A client-named model is never "auto" however it was ranked: the
+				// caller made the choice, so escalating or judging it would be
+				// second-guessing an instruction.
+				auto:     wantModel == "",
+				route:    fmt.Sprintf("%s:%s", routeKind(wantModel), reason),
+				cl:       cl,
+				job:      job,
+				tr:       tr,
+				session:  sess,
+				group:    gr,
+				expert:   expert,
+				rejected: rejected,
 			}, nil
 		}
 	}
@@ -3370,6 +3396,7 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 		// and not from ones a harness chose for it.
 		return &routePlan{
 			candidates: rankByDifficulty(filtered, target, job, tr.noThink),
+			auto:       wantModel == "",
 			route:      fmt.Sprintf("%s:d=%.2f,q>=%d", routeKind(wantModel), cl.difficulty, target),
 			cl:         cl,
 			target:     target,

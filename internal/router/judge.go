@@ -101,8 +101,13 @@ func (b *judgeBudget) charge(tokens int) {
 // verdict can be recorded in the outcome matrix against the right (worker, mode)
 // pair. Without the mode a judged result would be filed against whichever mode
 // the matrix happened to be queried for, which is the one thing goal 3 forbids.
-func (r *Router) maybeJudge(messages []Message, stream bool, served *Backend, score float64, output string, thinking bool, latencyMS int64) {
-	if r.adapter == nil || r.judgeSem == nil || r.cfg.JudgeSampleRate <= 0 {
+func (r *Router) maybeJudge(messages []Message, stream bool, served *Backend, route, output string, thinking bool, latencyMS int64) {
+	// The adapter is NO LONGER required. Judging serves two consumers now: the
+	// tier adapter, which needs a numeric difficulty score and therefore only
+	// learns from tier-routed requests, and the outcome matrix, which needs
+	// neither. Requiring the adapter here is what kept the matrix from ever
+	// seeing a judged answer on the path that routes most traffic.
+	if r.judgeSem == nil || r.cfg == nil || r.cfg.JudgeSampleRate <= 0 {
 		return
 	}
 	n := uint64(math.Round(1 / r.cfg.JudgeSampleRate))
@@ -135,9 +140,16 @@ func (r *Router) maybeJudge(messages []Message, stream bool, served *Backend, sc
 		if !ok {
 			return
 		}
+		// The tier adapter only understands a difficulty score, which exists only
+		// on a tier route. On a matrix route the verdict still lands in the matrix
+		// below — that is the whole point of grading it.
 		if bad {
-			r.adapter.observe(score, true)
-			log.Printf("judge: %s answer for d=%.2f graded BAD by %s → raised tier bias", served.ID, score, best.ID)
+			if score, ok := parseRouteScore(route); ok && r.adapter != nil {
+				r.adapter.observe(score, true)
+				log.Printf("judge: %s answer for d=%.2f graded BAD by %s → raised tier bias", served.ID, score, best.ID)
+			} else {
+				log.Printf("judge: %s answer graded BAD by %s (route %q)", served.ID, best.ID, route)
+			}
 		}
 		// BOTH verdicts are recorded. The tier adapter only ever cared about bad
 		// ones — it is a correction signal — but the matrix is an estimate of a

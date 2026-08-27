@@ -120,6 +120,58 @@ import (
 // measured formatting, not knowledge. Strict grading is unchanged — nobody's full
 // credit moved — loose only ADDS credit, and the tally keeps the formatting cost
 // visible per worker.
+// v43: eight grading and profiling corrections, all reproduced against the real
+// graders. Every one of them moved scores, and — as always here — a mis-graded
+// question is indistinguishable from a wrong answer, so none of them showed up
+// as anything but a plausible number:
+//
+//	the numeric grader broke on the word "and". "and" was a clause break, so
+//	"The sum of 8 and 5 is 13." (the TIER-1 CONTROL question) had a leading
+//	clause of "The sum of 8", whose single number the grader then COMMITTED to.
+//	13 graded wrong; so did "There are 7 sons and 1 sister, so 8." and "20 and 5
+//	more makes 25.". 137 of 392 questions are numeric, and any model that
+//	explains its working was understated. See benchLeadBreakRe.
+//
+//	the mcq last-standalone-letter fallback passed a WRONG pick: "The answer
+//	must be option D, since vitamin C is irrelevant here" graded as C. Tiers
+//	9-10 carry TEN options and invite exactly that shape of reply, so this let a
+//	weak model draw hard traffic. See benchBareLetterPick.
+//
+//	"contains"/"final-contains" read only the FINAL clause, so a correct answer
+//	that was then EXPLAINED failed: "The answer is Paris. It is located on the
+//	Seine." graded wrong. Those 16 questions are the sanity band — both tier-1
+//	controls, three of the four tier-2 floor questions and all three tier-3 echo
+//	traps. See containsFinalAnswer.
+//
+//	the no-think pass counted ERRORED questions in its denominator, which v41
+//	fixed in the mixed pass and not in its twin. Measured: same worker, same 10
+//	tier-5 questions, 5 errored — mixed 100, no-think 50, fabricating a
+//	thinking-vs-no-think collapse that never happened.
+//
+//	the no-think give-up guard divided by the questions the pass INTENDED to
+//	ask rather than the ones it dispatched, so a budget-stopped pass that
+//	errored on all 48 of ~300 returned a score near 0 with ok=true — and ok=true
+//	is what persists a profile.
+//
+//	the carried-over easy tiers dropped their latency and their text, and
+//	profile.go appends those rows AFTER the mixed rows with the same matrix key,
+//	so the zeroed row superseded the good one and destroyed the latency
+//	prediction for easy no-think traffic.
+//
+//	the busy-retry loop had no per-question cap: `continue` skipped the attempt
+//	check and the only exit was a SHARED streak that any other question's
+//	success reset. A rate-limited endpoint could hang wg.Wait() forever, and
+//	with it profileBackend and the caller's `defer r.profiling.Delete(id)` — so
+//	the worker showed "profiling" for the life of the process and could never be
+//	re-certified. See benchBusyMaxWait.
+//
+//	benchRequestFor appended " Give the number only." to 21 LiveBench spatial
+//	items whose own text already says "put your answer in **bold** as a single
+//	integer". The model was told to do two contradictory things, so whatever it
+//	did violated one of them — a confound on the numeric grader, and the only
+//	place instruction-following enters the score at all (the bank has no
+//	instruction-following category). See benchStatesAnswerFormat.
+//
 // v42: the generated question set is re-tiered to match the emit rules — the 40
 // unpassable headroom items move off tier 12 (benchCodingTier), which they were
 // filling with maths, so the 20-point coding bucket is now 28 coding questions
@@ -178,7 +230,7 @@ import (
 // FRAGMENTS continuing a partial solution shown in the prompt), which had scored the two
 // strongest workers 0% on that task while the weakest scored highest. See
 // benchAnswerDeadline and poolCode.Prefix.
-const benchmarkVersion = 42
+const benchmarkVersion = 43
 
 // benchmarkQ is one graded question in the cold-start quality benchmark. The
 // question set lives in benchmark_data.go.
@@ -250,6 +302,17 @@ var (
 	benchDeclaredRe = regexp.MustCompile(`(?i)\banswer\s*(?:is)?\s*:?\s*\(?(?:(?-i:([A-HJ]))\b|([a-hj])(?:\s*[).:,!—–-]|\s*$)|([i])(?:\s*[).:,!—–-]|\s*$))`)
 	benchLeadingRe  = regexp.MustCompile(`(?i)^\s*\(?([a-j])(?:[).:,\n]|\s*$)`)
 	benchLetterRe   = regexp.MustCompile(`\b[A-HJbc]\b`)
+	// benchFinalLetterRe matches a standalone option letter that ENDS the reply —
+	// only trailing punctuation, emphasis or whitespace may follow it ("…so C.",
+	// "…→ H", "**B**"). A pick a model writes last is a pick; a letter it wrote
+	// while ruling an option out is not. Trailing '*' is allowed so an emphasised
+	// answer reads, since emphasis is where a model that ignored "just the
+	// letter" puts its choice (see benchEmphasisRe).
+	benchFinalLetterRe = regexp.MustCompile(`\b([A-HJbc])[\s.,;:!?)\]*_"'’—–-]*$`)
+	// benchLetterOrRe matches an undecided disjunction of two option letters ("a
+	// or b", "C or D"). A model offering two letters has picked neither, and the
+	// bare last-letter rule read the one after "or" as its answer.
+	benchLetterOrRe = regexp.MustCompile(`(?i)\b([a-j])\s+or\s+\(?([a-j])\b`)
 	// benchEnumRe finds option anchors — an A-J letter opening the string, a line, or
 	// a clause, written "X)" / "X." — so checkAnswer can tell an answer that
 	// ENUMERATES the options ("A) … no. B) … no. C) … yes.") from one that leads
@@ -270,10 +333,26 @@ var (
 	// inside a number is never read as a clause break by benchLeadNumber.
 	benchThousandsRe = regexp.MustCompile(`[0-9]+(?:,[0-9]{3})+`)
 	// benchLeadBreakRe ends the leading clause of a numeric answer: clause
-	// punctuation, parens, or the conjunction "and" ("…costs 5 cents and the bat
-	// costs 105 cents"). A '.'/',' between digits is part of a number and is
+	// punctuation or parens. A '.'/',' between digits is part of a number and is
 	// skipped by benchLeadNumber.
-	benchLeadBreakRe = regexp.MustCompile(`[.!?;:,\n—–()]|\s-\s|\band\b`)
+	//
+	// v43: `\band\b` was in this set and is not any more. A conjunction joins two
+	// coordinate clauses; it does not end an assertion, and treating it as one
+	// made benchLeadNumber COMMIT to the first number of any reply that used the
+	// word. The TIER-1 CONTROL question was graded wrong by it — "The sum of 8
+	// and 5 is 13." led with "The sum of 8" — as were "There are 7 sons and 1
+	// sister, so 8." and "20 and 5 more makes 25.". 137 of 392 questions are
+	// numeric, so this understated every model that explains its working.
+	// Coordinate replies are read by benchCoordinateLeadNumber instead, which
+	// offers a candidate rather than a commitment.
+	benchLeadBreakRe = regexp.MustCompile(`[.!?;:,\n—–()]|\s-\s`)
+	// benchCoordAndRe finds the conjunction that joins two coordinate clauses.
+	benchCoordAndRe = regexp.MustCompile(`\band\b`)
+	// benchAssertVerbRe marks a clause that STATES a value ("the ball costs 5
+	// cents", "there are 7 sons") rather than naming one in passing ("the sum of
+	// 8", "20"). Without it the first coordinate of "The sum of 8 and 5 is 13."
+	// would be offered as an answer, and an operand is not an answer.
+	benchAssertVerbRe = regexp.MustCompile(`(?i)\b(?:is|are|was|were|has|have|had|costs?|makes?|gives?|leaves?|equals?|remains?|weighs?|holds?|contains?)\b|[=:]`)
 	// benchNumListRe matches a line-leading list marker ("1. ", "2) "); two or more
 	// mean the answer is a numbered list, whose lead number is a marker, not the answer.
 	benchNumListRe = regexp.MustCompile(`(?m)^\s*[0-9]{1,2}[.)]\s`)
@@ -336,7 +415,7 @@ const (
 	// no free slot right now, which is the normal state of a fleet being profiled
 	// while it also serves production. Failing the question would grade the queue
 	// rather than the model, so a busy response waits benchBusyWait and tries
-	// again, for as long as it takes.
+	// again.
 	//
 	// benchBusyMaxStreak is the circuit breaker on that patience: a worker that
 	// has been busy this many times CONSECUTIVELY (across the whole run, reset by
@@ -408,6 +487,28 @@ const (
 	benchCodingWeight  = 20
 )
 
+// benchBusyMaxWait bounds how long ONE question may spend being told the worker
+// is busy, and benchBusyMaxRetries bounds how many times it may be told.
+//
+// The shared streak (benchBusyMaxStreak) is NOT enough on its own, and believing
+// it was is how a profile could hang forever. busy.ok() clears the streak
+// whenever ANY OTHER concurrent question succeeds, so on a rate-limited endpoint
+// that answers some requests and 429s the rest, the streak never reaches its
+// ceiling while the unlucky questions retry at 1/sec indefinitely. The busy path
+// `continue`s, so it never reaches the attempt cap either, and the profile budget
+// gates DISPATCH only — wg.Wait() is unbounded. runQualityBenchmark then never
+// returns, profileBackend never returns, and the caller's
+// `defer r.profiling.Delete(id)` never runs: that worker shows "profiling"
+// forever and can never be re-certified or re-profiled for the life of the
+// process. A per-question budget is what makes the wait terminate.
+//
+// Vars rather than consts so the test that proves termination can shrink them;
+// nothing in the router writes them.
+var (
+	benchBusyMaxWait    = 10 * time.Minute
+	benchBusyMaxRetries = 600
+)
+
 // benchOutcome is the graded result of one benchmark question against one worker.
 type benchOutcome struct {
 	// latencyMS is how long the answer took. Recorded per question because the
@@ -474,6 +575,7 @@ func (r *Router) benchOne(b *Backend, q benchmarkQ, think bool, busy *benchBusyT
 	var slow bool
 	deadline := benchAnswerDeadline
 	abandoned := false
+	busyRetries, busyStarved := 0, false
 	// Timed across the whole call including retries, because that is the wall
 	// clock a caller would have experienced. A busy-retry is time the request
 	// really spent waiting.
@@ -496,14 +598,27 @@ func (r *Router) benchOne(b *Backend, q benchmarkQ, think bool, busy *benchBusyT
 			slow = true
 			break // too slow → a usability fail for this question, never retried
 		}
-		// A busy worker is a queue, not an answer: wait a beat and ask again for
-		// as long as the streak breaker allows, rather than grading the congestion.
+		// A busy worker is a queue, not an answer: wait a beat and ask again,
+		// rather than grading the congestion. Two things bound the patience — the
+		// shared streak breaker (this worker is gone) and this question's OWN
+		// budget (this question is starving while others get through). The second
+		// is what keeps the run finite on a rate-limited endpoint, where the first
+		// never fires because every success resets it.
 		if benchBusyStatus(err) {
 			if busy != nil && busy.busy() {
 				abandoned = true
 				break
 			}
-			time.Sleep(benchBusyWait)
+			busyRetries++
+			wait := benchBusyWait
+			if left := benchBusyMaxWait - time.Since(started); left < wait {
+				wait = left
+			}
+			if busyRetries >= benchBusyMaxRetries || wait <= 0 {
+				abandoned, busyStarved = true, true
+				break
+			}
+			time.Sleep(wait)
 			continue
 		}
 		if attempt >= benchMaxAttempts {
@@ -514,11 +629,17 @@ func (r *Router) benchOne(b *Backend, q benchmarkQ, think bool, busy *benchBusyT
 	res.latencyMS = time.Since(started).Milliseconds()
 	switch {
 	case abandoned:
-		// Not a wrong answer and not this question's fault: the worker stopped
-		// responding for the whole run. Marked errored so the score is reported
-		// incomplete rather than as a zero the worker did not earn.
+		// Not a wrong answer and not this question's fault: the worker had no slot
+		// for it, either for the whole run (the shared streak) or for this
+		// question's whole budget (benchBusyMaxWait). Marked ERRORED, not failed,
+		// so it stays out of the denominator and the score is reported incomplete
+		// rather than as a zero the worker did not earn.
 		res.errd = true
 		res.got = "(abandoned — worker busy)"
+		if busyStarved {
+			res.got = fmt.Sprintf("(abandoned — busy for %d attempts over %s)",
+				busyRetries, time.Since(started).Round(time.Second))
+		}
 	case slow:
 		res.slow = true // answered too slowly to be usable — counts as a wrong answer, not an outage
 		res.got = "(too slow)"
@@ -844,13 +965,27 @@ func (r *Router) runNoThinkQualityBenchmark(b *Backend, concurrency int, mixed [
 	pass := make([]int, maxTier+1)
 	loose := make([]int, maxTier+1)
 	count := make([]int, maxTier+1)
-	errored, slowFailed, truncated := 0, 0, 0
+	// asked is the give-up guard's denominator: every question this pass has an
+	// answer (or an error) for. Counted here rather than taken from `dispatched`
+	// so it covers the same population as `errored` — see the guard below.
+	errored, slowFailed, truncated, asked := 0, 0, 0, 0
 	outcomes := make([]benchOutcome, len(benchmarkQuestions))
 	for i, m := range mixed {
 		// Easy tiers ran thinking-off in the mixed pass; carry them over verbatim,
-		// INCLUDING whether they were asked at all.
+		// INCLUDING whether they were asked at all, how long they took and what
+		// the worker actually said.
+		//
+		// latencyMS and got used to be dropped here, and "verbatim" was a lie about
+		// six fields out of eight. The detail row below then wrote LatencyMS: 0,
+		// and profile.go appends these rows AFTER the mixed rows into the outcome
+		// matrix, where record() supersedes on (QID, Backend, Thinking, Source).
+		// An easy tier is Thinking=false in BOTH passes, so the zeroed row
+		// overwrote the measured one and the matrix's latency prediction for easy
+		// no-think traffic — the traffic these rows exist to predict — was
+		// destroyed. Dropping `got` cost the stored answer for the same rows.
 		outcomes[i] = benchOutcome{tier: m.Tier, pass: m.Pass, loose: m.Loose,
-			errd: m.Errored, slow: m.Slow, trunc: m.Truncated, skipped: m.Skipped}
+			errd: m.Errored, slow: m.Slow, trunc: m.Truncated, skipped: m.Skipped,
+			latencyMS: m.LatencyMS, got: m.Got}
 	}
 	for j, i := range hardIdx {
 		outcomes[i] = rerun[j]
@@ -864,7 +999,19 @@ func (r *Router) runNoThinkQualityBenchmark(b *Backend, concurrency int, mixed [
 			})
 			continue
 		}
-		count[res.tier]++
+		asked++
+		// Same rule as the mixed pass, which is the only reason to state it twice:
+		// an ERRORED question stays out of the denominator. It is one we could not
+		// GRADE, and counting it leaves a zero over a one — arithmetically
+		// identical to a wrong answer. v41 fixed this in runQualityBenchmark and
+		// not in its twin here, and the two scores are compared against each other
+		// on one absolute scale, so the asymmetry manufactured exactly the signal
+		// the two-score design exists to detect: measured on one worker, the same
+		// 10 tier-5 questions with 5 errored scored mixed=100 and no-think=50 — a
+		// thinking-vs-no-think collapse that never happened.
+		if !res.errd {
+			count[res.tier]++
+		}
 		details = append(details, BenchResult{
 			Tier: q.Tier, Prompt: q.Prompt, Expect: q.Expect,
 			Got: res.got, Pass: res.pass, Truncated: res.trunc, Errored: res.errd, Slow: res.slow,
@@ -885,9 +1032,19 @@ func (r *Router) runNoThinkQualityBenchmark(b *Backend, concurrency int, mixed [
 		}
 	}
 	// Same give-up rule as the mixed run, judged over the questions this pass
-	// actually asked: a worker that went unreachable mid-run is unmeasurable,
-	// not bad.
-	if errored*2 > len(hardIdx) {
+	// actually ASKED: a worker that went unreachable mid-run is unmeasurable, not
+	// bad.
+	//
+	// It used to divide by len(hardIdx) — the questions the pass INTENDED to ask —
+	// while the comment claimed otherwise, and against that denominator the guard
+	// could not trip on a truncated run: a budget-stopped pass that dispatched 48
+	// of ~300 hard questions and errored on all 48 asks whether 96 > 300, decides
+	// the worker is fine, and returns a score near 0 with ok=true. ok=true is what
+	// persists the profile and routes on it. The mixed pass has always divided by
+	// what it dispatched; this is the same arithmetic, counted over the same
+	// population `errored` is (the hard questions dispatched here PLUS the easy
+	// tiers carried over from the mixed pass, since both are in the merged score).
+	if asked > 0 && errored*2 > asked {
 		return 0, false, "", nil
 	}
 	ok2, score2 := benchWeightedScore(pass, loose, count, maxTier)
@@ -1153,6 +1310,15 @@ func checkAnswer(q benchmarkQ, answer string) bool {
 		if n, ok := benchLeadNumber(digits); ok {
 			return numericMatches(n, exp)
 		}
+		// A conjunction joins two coordinate assertions, and the reply commits to
+		// neither: "The ball costs 5 cents and the bat costs 105 cents." states
+		// both, and so does the same sentence with its clauses swapped. So the
+		// first coordinate is tried and, when it misses, the last number still
+		// decides — where the lead rule above SHORT-CIRCUITS, which is what
+		// graded the tier-1 control ("The sum of 8 and 5 is 13.") wrong.
+		if n, ok := benchCoordinateLeadNumber(digits); ok && numericMatches(n, exp) {
+			return true
+		}
 		ns := benchNumberRe.FindAllString(digits, -1)
 		return len(ns) > 0 && numericMatches(ns[len(ns)-1], exp)
 	case "mcq":
@@ -1224,8 +1390,17 @@ func checkAnswer(q benchmarkQ, answer string) bool {
 // ("… = 42"), an emphasised option pick ("**B) backward…**"), or the expected option's
 // own text — never anywhere-in-the-text, which would hand half credit to a value
 // merely mentioned while reasoning. Only the numeric and mcq modes have a loose
-// reading: "contains"/"final-contains"/"exact-list" already accept any format, so
-// failing them means the answer is absent, not misformatted.
+// reading: "contains"/"final-contains"/"exact-list" accept any format, so failing
+// them means the answer is absent, not misformatted.
+//
+// v43: that last sentence used to be false and is now true. "contains" and
+// "final-contains" read only the reply's FINAL CLAUSE, so an answer that was
+// stated and then explained ("The answer is Paris. It is located on the Seine.")
+// failed strict grading with nothing to catch it here — a formatting failure
+// dressed as ignorance, across the questions that are supposed to be the floor.
+// The fix belongs in strict grading rather than in half credit, because a right
+// answer with an explanation after it deserves the whole point; see
+// containsFinalAnswer.
 func checkAnswerLoose(q benchmarkQ, answer string) bool {
 	a := normalizeBenchAnswer(answer)
 	exp := strings.TrimSpace(q.Expect)
@@ -1420,24 +1595,75 @@ func benchLooseTextMatch(answer, option string) bool {
 // lastSubmatch returns the non-empty capture group of the LAST match of re in s.
 // Both declared-answer regexes grade by their final match, so a self-correction's
 // closing claim beats anything stated while reasoning.
-// matchesMCQ is the letter-answer grader, unchanged in behaviour and split out
-// only so mcq-repeat can fall back to it. An explicitly declared pick wins — the
-// LAST one, since verbose models restate the options ("A) …") while reasoning
-// and only commit at the end — then a letter leading the answer, then the last
-// standalone letter (see the benchDeclaredRe var block for why bare lowercase
-// a/d never count). An answer that ENUMERATES the options starts with an option
-// label rather than its pick, so the leading-letter rule stands aside there.
+// matchesMCQ is the letter-answer grader, split out so mcq-repeat can fall back
+// to it. An explicitly declared pick wins — the LAST one, since verbose models
+// restate the options ("A) …") while reasoning and only commit at the end — then
+// a letter leading the answer, then benchBareLetterPick (see the benchDeclaredRe
+// var block for why bare lowercase a/d never count). An answer that ENUMERATES
+// the options starts with an option label rather than its pick, so the
+// leading-letter rule stands aside there.
 func matchesMCQ(a, exp string) bool {
 	if pick, ok := lastSubmatch(benchDeclaredRe, a); ok {
 		return strings.EqualFold(pick, exp)
 	}
-	if !benchEnumerates(a) {
+	enumerates := benchEnumerates(a)
+	if !enumerates {
 		if m := benchLeadingRe.FindStringSubmatch(a); m != nil {
 			return strings.EqualFold(m[1], exp)
 		}
 	}
-	ms := benchLetterRe.FindAllString(a, -1)
-	return len(ms) > 0 && strings.EqualFold(ms[len(ms)-1], exp)
+	pick, ok := benchBareLetterPick(a, enumerates)
+	return ok && strings.EqualFold(pick, exp)
+}
+
+// benchBareLetterPick reads a pick out of a reply that neither declared one nor
+// led with one. It is the last resort, and it used to be "the last standalone
+// letter anywhere in the reply" — which is a bet that the last letter a model
+// types is the one it chose, and the bet loses on the exact shape tiers 9-10
+// invite. All four of these graded as a PASS for a pick the model never made:
+//
+//	expect C   "The answer must be option D, since vitamin C is irrelevant here"
+//	expect B   "I pick E.\nNote: option B was a decoy"
+//	expect G   "J — though G is tempting"
+//	expect B   "It could be a or b"
+//
+// That is the false-positive direction — it lets a weak model draw hard traffic
+// — and with TEN options a reply that names several letters while eliminating
+// them is the norm rather than the exception. So the fallback now wants a reason
+// to believe the letter is a choice:
+//
+//	the reply ENDS on it ("…so C.", "I'd say D", "…0.78 → H", "**C**"), or
+//	the reply enumerates the options, in which case its concluding option
+//	anchor ("… C) it fails with an error — yes.") is the pick, or
+//	the reply contains exactly ONE candidate letter, so there is nothing else
+//	it could have meant ("Working through each option, the correct one is C").
+//
+// A letter disjunction vetoes all three: "a or b" is a model declining to pick.
+func benchBareLetterPick(a string, enumerates bool) (string, bool) {
+	if benchLetterOrRe.MatchString(a) {
+		return "", false
+	}
+	if m := benchFinalLetterRe.FindStringSubmatch(a); m != nil {
+		return m[1], true
+	}
+	if enumerates {
+		// The option labels are the reply's own structure, so its LAST anchor is
+		// the option it worked its way to — better evidence than a stray letter
+		// in the prose, which is what the old rule graded.
+		if ms := benchEnumRe.FindAllStringSubmatch(a, -1); len(ms) > 0 {
+			return ms[len(ms)-1][1], true
+		}
+	}
+	seen := map[string]bool{}
+	last := ""
+	for _, m := range benchLetterRe.FindAllString(a, -1) {
+		seen[strings.ToUpper(m)] = true
+		last = m
+	}
+	if len(seen) == 1 {
+		return last, true
+	}
+	return "", false
 }
 
 // lastRepeatedLetter finds the final standalone run of three or more identical
@@ -1692,16 +1918,36 @@ func numericMatches(n, exp string) bool {
 
 // benchLeadNumber extracts the single number asserted by the leading clause of an
 // answer-then-breakdown reply: "He has 16 cows: the 8 that survived plus the 8 he
-// bought." asserts 16, "The ball costs 5 cents and the bat costs 105 cents."
-// asserts 5. It declines when the lead holds zero or several numbers (an
+// bought." asserts 16. It declines when the lead holds zero or several numbers (an
 // arithmetic chain like "12*8 = 96, …" is working, not an assertion), when the
 // lead value is re-used later (then it's an operand mid-computation — "total
 // distance 200 m, 200/100 = …" — and the final value must grade), or when the
 // answer is a numbered list (a line-leading "1." is a marker, not the answer).
+//
+// What it returns is a COMMITMENT: the caller grades on it and does not look
+// further, because the rest of such a reply is a breakdown of the value asserted
+// here and its numbers are components, not conclusions. That is only sound
+// because the lead ends at real clause punctuation — see benchCoordinateLeadNumber
+// for the conjunction case, which is not a commitment.
 func benchLeadNumber(s string) (string, bool) {
 	if len(benchNumListRe.FindAllString(s, -1)) >= 2 {
 		return "", false
 	}
+	cut := benchLeadCut(s)
+	lead := benchNumberRe.FindAllString(s[:cut], -1)
+	if len(lead) != 1 {
+		return "", false
+	}
+	for _, later := range benchNumberRe.FindAllString(s[cut:], -1) {
+		if numericMatches(later, lead[0]) {
+			return "", false // lead value re-used in the working below it
+		}
+	}
+	return lead[0], true
+}
+
+// benchLeadCut returns where the leading clause of s ends.
+func benchLeadCut(s string) int {
 	cut := len(s)
 	for _, loc := range benchLeadBreakRe.FindAllStringIndex(s, -1) {
 		// A separator flanked by digits is part of a calculation, not a clause break: a
@@ -1715,16 +1961,57 @@ func benchLeadNumber(s string) (string, bool) {
 		cut = loc[0]
 		break
 	}
-	lead := benchNumberRe.FindAllString(s[:cut], -1)
-	if len(lead) != 1 {
+	return cut
+}
+
+// benchCoordinateLeadNumber reads the value stated by the FIRST of two coordinate
+// clauses joined by "and": "The ball costs 5 cents and the bat costs 105 cents."
+// states 5 as well as 105.
+//
+// Unlike benchLeadNumber this is a CANDIDATE, not a commitment — the caller falls
+// through to the last-number rule when it does not match. It has to be, because
+// the two orderings of that sentence are structurally identical: "The bat costs
+// 105 cents and the ball costs 5 cents." is the same reply with its clauses
+// swapped, and no positional rule can pick the ball's price out of both. The old
+// code treated "and" as a clause break and committed to whatever came first,
+// which graded the reversed (equally natural) ordering WRONG — along with every
+// reply that reached its conclusion after an "and": "The sum of 8 and 5 is 13."
+// (the tier-1 control), "There are 7 sons and 1 sister, so 8.", "20 and 5 more
+// makes 25.".
+//
+// KNOWN TRADE-OFF: offering both values means a reply that VOLUNTEERS a second
+// quantity can be graded on it — "The ball costs 5 cents and the bat costs 105
+// cents." now also grades a question expecting 105. That is a real widening, and
+// it is the direction this file normally refuses. It is accepted here because it
+// is unavoidable (see the symmetry argument above), because the model did state
+// the value in a full assertion rather than leaving it lying in the working, and
+// because the alternative was a systematic false NEGATIVE across 137 numeric
+// questions including a tier-1 control. benchAssertVerbRe keeps the widening to
+// clauses that actually state something, so an operand ("The sum of 8") is not
+// offered.
+func benchCoordinateLeadNumber(s string) (string, bool) {
+	if len(benchNumListRe.FindAllString(s, -1)) >= 2 {
+		return "", false // a numbered list's lead is a marker, not the answer
+	}
+	cut := benchLeadCut(s)
+	loc := benchCoordAndRe.FindStringIndex(s[:cut])
+	if loc == nil {
 		return "", false
 	}
-	for _, later := range benchNumberRe.FindAllString(s[cut:], -1) {
-		if numericMatches(later, lead[0]) {
-			return "", false // lead value re-used in the working below it
+	first := s[:loc[0]]
+	if !benchAssertVerbRe.MatchString(first) {
+		return "", false
+	}
+	ns := benchNumberRe.FindAllString(first, -1)
+	if len(ns) != 1 {
+		return "", false
+	}
+	for _, later := range benchNumberRe.FindAllString(s[loc[1]:], -1) {
+		if numericMatches(later, ns[0]) {
+			return "", false // re-used below: an operand, not a conclusion
 		}
 	}
-	return lead[0], true
+	return ns[0], true
 }
 
 func isASCIIDigit(b byte) bool { return b >= '0' && b <= '9' }
@@ -1733,13 +2020,31 @@ func isASCIIDigit(b byte) bool { return b >= '0' && b <= '9' }
 // and dashes (a hyphen only when it stands alone, so hyphenated words survive).
 var benchClauseRe = regexp.MustCompile(`[.!?;:,\n—–]|\s-\s`)
 
-// containsFinalAnswer implements "final-contains": tok must stand as its own word
-// where the answer is asserted — in the final clause, or in a terse (≤3-word) leading
-// clause followed by a declarative break ("Mary, of course." / "Mount Everest — it
-// just hadn't been discovered yet."). These questions plant tok in the prompt, and a
-// wrong answer restating the premise carries it only possessive-attached ("Mary's
-// father…") or inside a longer subordinate clause ("Before Mount Everest was
-// discovered, K2 …") — never as the finally-asserted answer.
+// containsFinalAnswer implements "contains" and "final-contains": tok must stand
+// as its own word where the answer is asserted — in the reply's last ASSERTION,
+// or in a terse (≤3-word) leading clause followed by a declarative break ("Mary,
+// of course." / "Mount Everest — it just hadn't been discovered yet."). These
+// questions plant tok in the prompt, and a wrong answer restating the premise
+// carries it only possessive-attached ("Mary's father…") or inside a longer
+// subordinate clause ("Before Mount Everest was discovered, K2 …") — never as
+// the finally-asserted answer.
+//
+// v43: a DECLARED answer counts wherever it sits, not only in the final clause.
+// Reading the final clause alone failed a CORRECT answer the moment the model
+// explained it, and these 16 questions are the benchmark's sanity band — both
+// tier-1 controls, three of the four tier-2 floor questions and all three tier-3
+// echo traps. Reproduced, expecting "Paris":
+//
+//	"The answer is Paris. It is located on the Seine."      graded WRONG
+//	"Answer: Paris\nExplanation: it has been the capital…"  graded WRONG
+//	"The capital is Paris\n- Since 987 AD"                  graded WRONG
+//
+// and, expecting "Mary", "The answer is Mary, because the puzzle names four
+// daughters and then the speaker." All four state the answer and then say
+// something about it. See benchDeclaresAnswer for why a DECLARATION is the thing
+// to look for rather than "the last clause that mentions the token": the echo
+// traps mention it too, and the whole point of these questions is that a
+// mention is not an answer.
 func containsFinalAnswer(s, tok string) bool {
 	clauses := benchClauseRe.Split(s, -1)
 	for i := len(clauses) - 1; i >= 0; i-- {
@@ -1761,11 +2066,96 @@ func containsFinalAnswer(s, tok string) bool {
 			return true
 		}
 	}
-	return false
+	// Last: an answer DECLARED anywhere and then explained.
+	return benchDeclaresAnswer(s, tok)
 }
 
 // benchRetractRe marks a clause that contradicts what came before it.
 var benchRetractRe = regexp.MustCompile(`(?i)\b(?:but|actually|however|wait)\b`)
+
+// benchRetractLeadRe marks a clause that OPENS by walking back what came before
+// it ("but actually it was K2", "No, it was K2"). Anchored at the start, because
+// the marker has to be what the clause opens with: "It was not K2 but Everest"
+// contains "but" and ASSERTS the token.
+var benchRetractLeadRe = regexp.MustCompile(`(?i)^(?:but|actually|however|wait|no|nope|correction)\b`)
+
+// benchLineRe splits a reply into lines. A declaration is tested against lines
+// as well as clauses because ':' is itself a clause separator — "Answer: Paris"
+// is two clauses, neither of which holds both the marker and the token.
+var benchLineRe = regexp.MustCompile(`\n`)
+
+// benchSegment is one clause or line of a reply, with the offset just past it so
+// what FOLLOWS a declaration can be checked for a retraction.
+type benchSegment struct {
+	text string
+	end  int
+}
+
+// benchDeclaresAnswer reports whether the reply DECLARES tok as its answer
+// anywhere in the text — a clause or line ending on "<copula|:|=> tok" ("The
+// answer is Paris", "Answer: Paris", "The capital is Paris") — and does not walk
+// it back afterwards.
+//
+// A declaration rather than a mention, and that distinction is the whole design
+// of this mode: these questions plant the expected token in the PROMPT, so a
+// wrong answer restating the premise contains it too. "Before Mount Everest was
+// discovered, K2 was the tallest mountain." puts the token in FRONT of the
+// copula rather than after it, and "Thursday, Friday, Saturday. So it is
+// Saturday." puts it in an enumeration with no copula at all — so neither
+// declares anything, while every shape a right answer takes does. Scanning for
+// the token instead would pass all of them, which is exactly what the plain
+// substring "contains" did before v39.
+func benchDeclaresAnswer(s, tok string) bool {
+	re := regexp.MustCompile(`(?i)(?:\bis|\bare|\bwas|\bwere|\bbe|:|=|->|→)\s*["'“‘*_(]*` +
+		regexp.QuoteMeta(tok) + `\b["'”’*_)\]]*\s*[.!?]?\s*$`)
+	for _, seg := range benchDeclSegments(s) {
+		t := strings.TrimSpace(seg.text)
+		// tokenAsAnswer as well as the shape, so a possessive or a negated token
+		// ("it wasn't Everest") cannot read as a declaration.
+		if !re.MatchString(t) || !tokenAsAnswer(t, tok) {
+			continue
+		}
+		if benchRetractedAfter(s[seg.end:]) {
+			continue // "The answer is Everest. Wait — K2 was taller at the time."
+		}
+		return true
+	}
+	return false
+}
+
+// benchDeclSegments returns every clause and every line of s, each with the
+// offset just past it.
+func benchDeclSegments(s string) []benchSegment {
+	var out []benchSegment
+	for _, re := range []*regexp.Regexp{benchClauseRe, benchLineRe} {
+		start := 0
+		for _, loc := range re.FindAllStringIndex(s, -1) {
+			out = append(out, benchSegment{text: s[start:loc[0]], end: loc[0]})
+			start = loc[1]
+		}
+		out = append(out, benchSegment{text: s[start:], end: len(s)})
+	}
+	return out
+}
+
+// benchRetractedAfter reports whether anything following a declaration walks it
+// back. EVERY following clause is checked rather than just the next one, because
+// a self-correction can arrive a sentence later ("The answer is Paris. Hmm,
+// wait, actually it's Lyon.") and a declaration the model abandoned is not an
+// answer. Conservative by design: it costs a right answer whose explanation
+// happens to open on "but", where the other direction costs a wrong answer full
+// credit.
+func benchRetractedAfter(rest string) bool {
+	for _, c := range benchClauseRe.Split(rest, -1) {
+		if c = strings.TrimSpace(c); c == "" {
+			continue
+		}
+		if benchRetractLeadRe.MatchString(c) {
+			return true
+		}
+	}
+	return false
+}
 
 // retractsLead reports whether the clause following a terse lead walks the lead
 // back ("Everest, but actually it was K2." / "Everest. No, it was K2.") rather
@@ -1942,7 +2332,12 @@ func (t *benchBusyTracker) abandoned() bool {
 // wrong quality score is worse than a slow profile. A worker slow enough to need
 // longer than the budget for even this many still gets scored — it just takes as
 // long as it takes.
-const (
+//
+// Vars rather than consts so a test can shrink them: what a budget-stopped pass
+// does with its results is exactly where the no-think give-up guard was wrong,
+// and reproducing that against the real 90 minutes is not a test anyone runs.
+// Nothing in the router writes them; timing_log_test.go asserts their values.
+var (
 	benchProfileBudget       = 90 * time.Minute
 	benchMinProfileQuestions = 48
 )
@@ -2050,9 +2445,10 @@ func benchRequestFor(q benchmarkQ, think bool, ctxTokens int) (prompt string, ma
 	prompt = q.Prompt
 	// Only NUMERIC grading is fooled by a verbose reasoned reply (an intermediate
 	// or a trailing restatement gets read as the answer), so make the worker
-	// answer with just the number — unless the prompt already says so. mcq
-	// (letter) and contains (substring) grade fine through a long reply.
-	if q.Match == "numeric" && !strings.Contains(q.Prompt, "number only") && !strings.Contains(q.Prompt, "only the output") {
+	// answer with just the number — unless the prompt already states an answer
+	// format of its own. mcq (letter) and contains (substring) grade fine through
+	// a long reply.
+	if q.Match == "numeric" && !benchStatesAnswerFormat(q.Prompt) {
 		prompt += " Give the number only."
 	}
 	// The budget is a property of the QUESTION, not of the thinking mode. Tying
@@ -2087,6 +2483,42 @@ func benchRequestFor(q benchmarkQ, think bool, ctxTokens int) (prompt string, ma
 		prompt += " /no_think" // belt-and-suspenders with the kwarg (matches chatProbe)
 	}
 	return prompt, maxTokens
+}
+
+// benchStatesAnswerFormat reports whether a prompt already tells the worker how
+// to shape its answer, in which case benchRequestFor must not append one of its
+// own.
+//
+// v43: 21 of the LiveBench spatial items say, verbatim, "put your answer in
+// **bold** as a single integer (for example, **0**)" — and the benchmark then
+// appended " Give the number only." to all of them. The model was told to do two
+// contradictory things in one prompt, so whatever it did violated one of them.
+// That is a confound on the very grader the suffix exists to help, and since the
+// bank has no instruction-following category (maths 199, reasoning 147, coding
+// 38, general 8), the only place instruction-following showed up at all was as
+// noise inside the numeric score.
+//
+// Detected from the prompt TEXT rather than from a list of question ids, because
+// `bench emit` regenerates the bank and an id list would rot silently. The test
+// is deliberately loose: skipping the suffix on a question that did not need it
+// costs a little parse robustness, while adding it to one that specifies its own
+// format corrupts the measurement, so when in doubt, skip.
+func benchStatesAnswerFormat(prompt string) bool {
+	p := strings.ToLower(prompt)
+	for _, marker := range []string{
+		"number only", "only the output", // the shapes this file's own questions use
+		"put your answer", "put your final answer", "in **bold**", "in bold",
+		"following format", "single integer", "single number", "single word",
+		"answer with", "answer as", "answer in the form", "give your answer",
+		"give the answer", "give only", "respond with", "reply with",
+		"output only", "state only", "format your answer", "express your answer",
+		"for example, **",
+	} {
+		if strings.Contains(p, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // benchQuestionHash is a stable content hash used to order questions within a

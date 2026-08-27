@@ -562,10 +562,20 @@ func TestCheckAnswerNumericDeclared(t *testing.T) {
 		ans    string
 		want   bool
 	}{
-		{"16", cows, true},      // was a false fail: last-number graded the trailing 8
-		{"8", cows, false},      // …and the breakdown's 8 must no longer pass
-		{"5", batBall, true},    // was a false fail: last-number graded the bat's 105
-		{"105", batBall, false}, // …and the bat's price must no longer pass
+		{"16", cows, true},   // was a false fail: last-number graded the trailing 8
+		{"8", cows, false},   // …and the breakdown's 8 must no longer pass
+		{"5", batBall, true}, // was a false fail: last-number graded the bat's 105
+		// v43: the bat's price passes too, where it used to fail. That is a real
+		// widening and it is not avoidable. This reply and the same sentence with
+		// its clauses swapped ("The bat costs 105 cents and the ball costs 5
+		// cents.") are structurally identical — both are <X costs N> and <Y costs
+		// M> joined by "and" — and the reversed one has to grade 5, which it did
+		// not: committing to the leading clause is what broke the tier-1 control
+		// question. Any rule that reads 5 out of coordinate position 2 there reads
+		// 105 out of coordinate position 2 here. What still fails is a number the
+		// reply never asserted — see TestNumericGraderReadsPastAnd, which pins
+		// both orderings and the operand cases.
+		{"105", batBall, true},
 		// the LAST declaration wins, so a self-correction grades by its final claim
 		{"1", "The answer is 2... no wait, the answer is 1.", true},
 		{"2", "The answer is 2... no wait, the answer is 1.", false},

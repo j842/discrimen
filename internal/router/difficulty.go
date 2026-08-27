@@ -532,54 +532,10 @@ func (c *difficultyClassifier) targetQuality(req *ChatRequest) (int, float64, bo
 	return c.bandQuality(cl.difficulty), cl.difficulty, true
 }
 
-// targetForFleet maps a difficulty score to a target quality. With an explicit
-// bands override configured it uses that; otherwise it derives the target from
-// the candidate fleet's own quality range — zero-config and self-adapting.
-func (c *difficultyClassifier) targetForFleet(candidates []*Backend, score float64, thinkOff bool) int {
-	if len(c.bands) > 0 {
-		return c.bandQuality(score)
-	}
-	return autoTargetQuality(candidates, score, thinkOff)
-}
-
 // benchmarkQualityScale is the ceiling of runQualityBenchmark's score: quality
 // is the percentage of the versioned question set answered correctly, so the
 // scale is absolute and comparable across workers and across time.
 const benchmarkQualityScale = 100
-
-// autoTargetQuality maps a difficulty score onto the benchmark's own absolute
-// 0–100 scale: score 0 → no quality bar, score 1 → the (unreachable) perfect
-// score, clamped to the best quality actually registered so an out-of-reach
-// bar degrades to "the smartest there is" rather than an empty set. Still no
-// hand-set thresholds — the bar is a property of the QUESTION.
-//
-// It used to be linear over the fleet's own [qmin, qmax], which made "smart
-// enough" relative to whoever happened to be registered: measured 2026-08-13,
-// registering a quality-93 CPU worker (17 tok/s) stretched the range and
-// re-tiered the same d=0.65 question from q>=79 (a 1.8s GPU answer) to q>=87
-// (26.4s on the CPU worker) — the speed ranking never saw more than one
-// candidate. Anchoring the bar absolutely keeps every worker above it in the
-// race, and rankByDifficulty's expected-completion ordering does the rest.
-func autoTargetQuality(candidates []*Backend, score float64, thinkOff bool) int {
-	if len(candidates) == 0 {
-		return 0
-	}
-	// The clamp reads the score for the mode the request will be SERVED in: a
-	// no-think request clamps against the best no-think quality, so the bar a
-	// thinking-mode score set can't strand it above every worker's real
-	// no-think ability.
-	qmax := qualityFor(candidates[0], thinkOff)
-	for _, b := range candidates {
-		if q := qualityFor(b, thinkOff); q > qmax {
-			qmax = q
-		}
-	}
-	target := int(math.Round(clamp01(score) * benchmarkQualityScale))
-	if target > qmax {
-		return qmax
-	}
-	return target
-}
 
 // wantThinking maps a reasoning score to an enable_thinking decision. A low
 // threshold keeps thinking on for more prompts (conservative — only clearly

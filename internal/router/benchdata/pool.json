@@ -15,6 +15,7 @@
     "class": "Solution",
     "func": "maxPartitionsAfterOperations",
     "starter": "class Solution:\n    def maxPartitionsAfterOperations(self, s: str, k: int) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def maxPartitionsAfterOperations(self, s, k):\n        \"\"\"\n        :type s: str\n        :type k: int\n        :rtype: int\n        \"\"\"\n        def popcount(n):\n            n = (n \u0026 0x55555555) + ((n \u003e\u003e 1) \u0026 0x55555555)\n            n = (n \u0026 0x33333333) + ((n \u003e\u003e 2) \u0026 0x33333333)\n            n = (n \u0026 0x0F0F0F0F) + ((n \u003e\u003e 4) \u0026 0x0F0F0F0F)\n            n = (n \u0026 0x00FF00FF) + ((n \u003e\u003e 8) \u0026 0x00FF00FF)\n            n = (n \u0026 0x0000FFFF) + ((n \u003e\u003e 16) \u0026 0x0000FFFF)\n            return n\n\n        left = [0]*(len(s)+1)\n        left_mask = [0]*(len(s)+1)\n        cnt = mask = 0\n        for i in range(len(s)):\n            mask |= 1\u003c\u003c(ord(s[i])-ord('a'))\n            if popcount(mask) \u003e k:\n                cnt += 1\n                mask = 1\u003c\u003c(ord(s[i])-ord('a'))\n            left[i+1] = cnt\n            left_mask[i+1] = mask\n        right = [0]*(len(s)+1)\n        right_mask = [0]*(len(s)+1)\n        cnt = mask = 0\n        for i in reversed(range(len(s))):\n            mask |= 1\u003c\u003c(ord(s[i])-ord('a'))\n            if popcount(mask) \u003e k:\n                cnt += 1\n                mask = 1\u003c\u003c(ord(s[i])-ord('a'))\n            right[i] = cnt\n            right_mask[i] = mask\n\n        result = 0\n        for i in range(len(s)):\n            curr = left[i]+right[i+1]\n            mask = left_mask[i]|right_mask[i+1]\n",
     "public": "[{\"input\": \"\\\"accca\\\"\\n2\", \"output\": \"3\", \"testtype\": \"functional\"}, {\"input\": \"\\\"aabaab\\\"\\n3\", \"output\": \"1\", \"testtype\": \"functional\"}, {\"input\": \"\\\"xxyz\\\"\\n1\", \"output\": \"4\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -32,6 +33,7 @@
     "class": "Solution",
     "func": "minOperations",
     "starter": "class Solution:\n    def minOperations(self, nums: List[int], k: int) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def minOperations(self, nums, k):\n        \"\"\"\n        :type nums: List[int]\n",
     "public": "[{\"input\": \"[2, 11, 10, 1, 3]\\n10\", \"output\": \"3\", \"testtype\": \"functional\"}, {\"input\": \"[1, 1, 2, 4, 9]\\n1\", \"output\": \"0\", \"testtype\": \"functional\"}, {\"input\": \"[1, 1, 2, 4, 9]\\n9\", \"output\": \"4\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -106,6 +108,7 @@
     "class": "Solution",
     "func": "largestPerimeter",
     "starter": "class Solution:\n    def largestPerimeter(self, nums: List[int]) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def largestPerimeter(self, nums):\n        \"\"\"\n        :type nums: List[int]\n        :rtype: int\n        \"\"\"\n        nums.sort()\n        prefix = sum(nums)\n        for i in reversed(range(2, len(nums))):\n            prefix -= nums[i]\n            if prefix \u003e nums[i]:\n",
     "public": "[{\"input\": \"[5, 5, 5]\", \"output\": \"15\", \"testtype\": \"functional\"}, {\"input\": \"[1, 12, 1, 2, 5, 50, 3]\", \"output\": \"12\", \"testtype\": \"functional\"}, {\"input\": \"[5, 5, 50]\", \"output\": \"-1\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -177,6 +180,7 @@
     "class": "Solution",
     "func": "canMakePalindromeQueries",
     "starter": "class Solution:\n    def canMakePalindromeQueries(self, s: str, queries: List[List[int]]) -\u003e List[bool]:\n        ",
+    "prefix": "class Solution(object):\n    def canMakePalindromeQueries(self, s, queries):\n        \"\"\"\n        :type s: str\n        :type queries: List[List[int]]\n        :rtype: List[bool]\n        \"\"\"\n        def check(left1, right1, left2, right2):\n            def same(left, right):\n                return all(prefixs1[right+1][i]-prefixs1[left][i] == prefixs2[right+1][i]-prefixs2[left][i] for i in range(d))\n\n            min_left, max_left = min(left1, left2), max(left1, left2)\n            min_right, max_right = min(right1, right2), max(right1, right2)\n            if not (prefix[min_left]-prefix[0] == prefix[-1]-prefix[max_right+1] == 0):\n                return False\n            if min_right \u003c max_left:  # non-overlapped\n                return prefix[max_left]-prefix[min_right+1] == 0 and same(min_left, min_right) and same(max_left, max_right)\n            # overlapped\n            if (left1 == min_left) == (right1 == max_right):  # inside another\n                return same(min_left, max_right)\n            # not inside another\n            p1, p2 = (prefixs1, prefixs2) if min_left == left1 else (prefixs2, prefixs1)\n            diff1 = [(p1[min_right+1][i]-p1[min_left][i])-(p2[max_left][i]-p2[min_left][i]) for i in range(d)]\n            diff2 = [(p2[max_right+1][i]-p2[max_left][i])-(p1[max_right+1][i]-p1[min_right+1][i]) for i in range(d)]\n            return diff1 == diff2 and all(x \u003e= 0 for x in diff1)  # test case: s = \"aabbba\", queries = [[0,1,3,4]]\n\n        lookup = [-1]*26\n        d = 0\n        for x in s:\n            if lookup[ord(x)-ord('a')] != -1:\n                continue\n            lookup[ord(x)-ord('a')] = d\n            d += 1\n        prefix = [0]*(len(s)//2+1)\n        prefixs1 = [[0]*d for _ in range(len(s)//2+1)]\n        prefixs2 = [[0]*d for _ in range(len(s)//2+1)]\n",
     "public": "[{\"input\": \"\\\"abcabc\\\"\\n[[1, 1, 3, 5], [0, 2, 5, 5]]\", \"output\": \"[true, true]\", \"testtype\": \"functional\"}, {\"input\": \"\\\"abbcdecbba\\\"\\n[[0, 2, 7, 9]]\", \"output\": \"[false]\", \"testtype\": \"functional\"}, {\"input\": \"\\\"acbcab\\\"\\n[[1, 2, 4, 5]]\", \"output\": \"[true]\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -405,6 +409,7 @@
     "class": "Solution",
     "func": "longestCommonPrefix",
     "starter": "class Solution:\n    def longestCommonPrefix(self, arr1: List[int], arr2: List[int]) -\u003e int:\n        ",
+    "prefix": "from functools import reduce\nclass Solution(object):\n    def longestCommonPrefix(self, arr1, arr2):\n        \"\"\"\n        :type arr1: List[int]\n        :type arr2: List[int]\n        :rtype: int\n        \"\"\"\n        _trie = lambda: collections.defaultdict(_trie)\n        trie = _trie()\n        for x in arr1:\n            reduce(dict.__getitem__, str(x), trie)\n        result = 0\n        for x in arr2:\n            curr = trie\n            for i, c in enumerate(str(x)):\n                if c not in curr:\n                    break\n                curr = curr[c]\n",
     "public": "[{\"input\": \"[1, 10, 100]\\n[1000]\", \"output\": \"3\", \"testtype\": \"functional\"}, {\"input\": \"[1, 2, 3]\\n[4, 4, 4]\", \"output\": \"0\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -509,6 +514,7 @@
     "class": "Solution",
     "func": "minimumArrayLength",
     "starter": "class Solution:\n    def minimumArrayLength(self, nums: List[int]) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def minimumArrayLength(self, nums):\n        \"\"\"\n        :type nums: List[int]\n        :rtype: int\n        \"\"\"\n",
     "public": "[{\"input\": \"[1, 4, 3, 1]\", \"output\": \"1\", \"testtype\": \"functional\"}, {\"input\": \"[5, 5, 5, 10, 5]\", \"output\": \"2\", \"testtype\": \"functional\"}, {\"input\": \"[2, 3, 4]\", \"output\": \"1\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -526,6 +532,7 @@
     "class": "Solution",
     "func": "minOrAfterOperations",
     "starter": "class Solution:\n    def minOrAfterOperations(self, nums: List[int], k: int) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def minOrAfterOperations(self, nums, k):\n        \"\"\"\n        :type nums: List[int]\n        :type k: int\n        :rtype: int\n        \"\"\"\n        result = 0\n        l = max(nums).bit_length()\n        mask = (1\u003c\u003cl)-1\n        for i in reversed(range(l)):\n            result \u003c\u003c= 1\n            curr, cnt = mask, 0\n            for x in nums:\n                curr \u0026= x\u003e\u003ei\n                if curr\u0026~result:\n                    cnt += 1\n                else:\n",
     "public": "[{\"input\": \"[3, 5, 3, 2, 7]\\n2\", \"output\": \"3\", \"testtype\": \"functional\"}, {\"input\": \"[7, 3, 15, 14, 2, 8]\\n4\", \"output\": \"2\", \"testtype\": \"functional\"}, {\"input\": \"[10, 7, 10, 3, 9, 14, 9, 4]\\n1\", \"output\": \"15\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -553,6 +560,7 @@
     "class": "Solution",
     "func": "missingInteger",
     "starter": "class Solution:\n    def missingInteger(self, nums: List[int]) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def missingInteger(self, nums):\n        \"\"\"\n        :type nums: List[int]\n        :rtype: int\n",
     "public": "[{\"input\": \"[1, 2, 3, 2, 5]\", \"output\": \"6\", \"testtype\": \"functional\"}, {\"input\": \"[3, 4, 5, 1, 12, 14, 13]\", \"output\": \"15\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -881,6 +889,7 @@
     "class": "Solution",
     "func": "maximumLength",
     "starter": "class Solution:\n    def maximumLength(self, s: str) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def maximumLength(self, s):\n        \"\"\"\n        :type s: str\n        :rtype: int\n        \"\"\"\n        lookup = [[0]*3 for _ in range(26)]\n        result = cnt = 0\n        for i, c in enumerate(s):\n            cnt += 1\n            if i+1 != len(s) and s[i+1] == s[i]:\n                continue\n            curr = lookup[ord(c)-ord('a')]\n            for j in range(len(curr)):\n                if curr[j] \u003c cnt:\n                    cnt, curr[j] = curr[j], cnt\n",
     "public": "[{\"input\": \"\\\"aaaa\\\"\", \"output\": \"2\", \"testtype\": \"functional\"}, {\"input\": \"\\\"abcdef\\\"\", \"output\": \"-1\", \"testtype\": \"functional\"}, {\"input\": \"\\\"abcaba\\\"\", \"output\": \"1\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -955,6 +964,7 @@
     "class": "Solution",
     "func": "numberOfGoodPartitions",
     "starter": "class Solution:\n    def numberOfGoodPartitions(self, nums: List[int]) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def numberOfGoodPartitions(self, nums):\n        \"\"\"\n        :type nums: List[int]\n        :rtype: int\n        \"\"\"\n        MOD = 10**9+7\n        lookup = {x:i for i, x in enumerate(nums)}\n        result = 1\n        right = cnt = 0\n        for left, x in enumerate(nums):\n            if left == right+1:\n",
     "public": "[{\"input\": \"[1, 2, 3, 4]\", \"output\": \"8\", \"testtype\": \"functional\"}, {\"input\": \"[1, 1, 1, 1]\", \"output\": \"1\", \"testtype\": \"functional\"}, {\"input\": \"[1, 2, 1, 3]\", \"output\": \"2\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -999,6 +1009,7 @@
     "class": "Solution",
     "func": "maxFrequencyElements",
     "starter": "class Solution:\n    def maxFrequencyElements(self, nums: List[int]) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def maxFrequencyElements(self, nums):\n        \"\"\"\n        :type nums: List[int]\n",
     "public": "[{\"input\": \"[1, 2, 2, 3, 1, 4]\", \"output\": \"4\", \"testtype\": \"functional\"}, {\"input\": \"[1, 2, 3, 4, 5]\", \"output\": \"5\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -1157,6 +1168,7 @@
     "class": "Solution",
     "func": "areaOfMaxDiagonal",
     "starter": "class Solution:\n    def areaOfMaxDiagonal(self, dimensions: List[List[int]]) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def areaOfMaxDiagonal(self, dimensions):\n",
     "public": "[{\"input\": \"[[9, 3], [8, 6]]\", \"output\": \"48\", \"testtype\": \"functional\"}, {\"input\": \"[[3, 4], [4, 3]]\", \"output\": \"12\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -1281,6 +1293,7 @@
     "class": "Solution",
     "func": "flowerGame",
     "starter": "class Solution:\n    def flowerGame(self, n: int, m: int) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def flowerGame(self, n, m):\n        \"\"\"\n        :type n: int\n        :type m: int\n        :rtype: int\n",
     "public": "[{\"input\": \"3\\n2\", \"output\": \"3\", \"testtype\": \"functional\"}, {\"input\": \"1\\n1\", \"output\": \"0\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -1308,6 +1321,7 @@
     "class": "Solution",
     "func": "maximumSetSize",
     "starter": "class Solution:\n    def maximumSetSize(self, nums1: List[int], nums2: List[int]) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def maximumSetSize(self, nums1, nums2):\n        \"\"\"\n        :type nums1: List[int]\n        :type nums2: List[int]\n        :rtype: int\n        \"\"\"\n        lookup1, lookup2 = set(nums1), set(nums2)\n        n, c = len(nums1), len(lookup1\u0026lookup2)\n",
     "public": "[{\"input\": \"[1, 2, 1, 2]\\n[1, 1, 1, 1]\", \"output\": \"2\", \"testtype\": \"functional\"}, {\"input\": \"[1, 2, 3, 4, 5, 6]\\n[2, 3, 2, 3, 2, 3]\", \"output\": \"5\", \"testtype\": \"functional\"}, {\"input\": \"[1, 1, 2, 2, 3, 3]\\n[4, 4, 5, 5, 6, 6]\", \"output\": \"6\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -1389,6 +1403,7 @@
     "class": "Solution",
     "func": "earliestSecondToMarkIndices",
     "starter": "class Solution:\n    def earliestSecondToMarkIndices(self, nums: List[int], changeIndices: List[int]) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def earliestSecondToMarkIndices(self, nums, changeIndices):\n        \"\"\"\n        :type nums: List[int]\n        :type changeIndices: List[int]\n        :rtype: int\n        \"\"\"\n        def check(t):\n            lookup = [-1]*len(nums)\n            for i in range(t):\n                lookup[changeIndices[i]-1] = i\n            if -1 in lookup:\n                return False\n            cnt = 0\n            for i in range(t):\n                if i != lookup[changeIndices[i]-1]:\n                    cnt += 1\n                    continue\n                cnt -= nums[changeIndices[i]-1]\n                if cnt \u003c 0:\n                    return False\n            return True\n\n        left, right = sum(nums)+len(nums), len(changeIndices) \n        while left \u003c= right:\n            mid = left+(right-left)//2\n",
     "public": "[{\"input\": \"[2, 2, 0]\\n[2, 2, 2, 2, 3, 2, 2, 1]\", \"output\": \"8\", \"testtype\": \"functional\"}, {\"input\": \"[1, 3]\\n[1, 1, 1, 2, 1, 1, 1]\", \"output\": \"6\", \"testtype\": \"functional\"}, {\"input\": \"[0, 1]\\n[2, 2, 2]\", \"output\": \"-1\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -1584,6 +1599,7 @@
     "class": "Solution",
     "func": "lastNonEmptyString",
     "starter": "class Solution:\n    def lastNonEmptyString(self, s: str) -\u003e str:\n        ",
+    "prefix": "class Solution(object):\n    def lastNonEmptyString(self, s):\n        \"\"\"\n        :type s: str\n        :rtype: str\n        \"\"\"\n        cnt = [0]*26\n        for x in s:\n            cnt[ord(x)-ord('a')] += 1\n        mx = max(cnt)\n        result = []\n        for x in reversed(s):\n            if cnt[ord(x)-ord('a')] != mx:\n                continue\n",
     "public": "[{\"input\": \"\\\"aabcbbca\\\"\", \"output\": \"\\\"ba\\\"\", \"testtype\": \"functional\"}, {\"input\": \"\\\"abcd\\\"\", \"output\": \"\\\"abcd\\\"\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -1621,6 +1637,7 @@
     "class": "Solution",
     "func": "maximumLength",
     "starter": "class Solution:\n    def maximumLength(self, nums: List[int]) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def maximumLength(self, nums):\n        \"\"\"\n        :type nums: List[int]\n        :rtype: int\n        \"\"\"\n        cnt = collections.Counter(nums)\n        dp = {}\n        result = 0\n        for x in cnt.keys():\n            if x == 1:\n                result = max(result, cnt[x]-(1 if cnt[x]%2 == 0 else 0))\n                continue\n            stk = []\n            while x not in dp and x in cnt and cnt[x] \u003e= 2:\n                stk.append(x)\n                x *= x\n            if x not in dp:\n                if x not in cnt:\n                    x = stk.pop()\n                dp[x] = 1\n            l = dp[x]\n",
     "public": "[{\"input\": \"[5, 4, 1, 2, 2]\", \"output\": \"3\", \"testtype\": \"functional\"}, {\"input\": \"[1, 3, 2, 4]\", \"output\": \"1\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -1668,6 +1685,7 @@
     "class": "Solution",
     "func": "countPrefixSuffixPairs",
     "starter": "class Solution:\n    def countPrefixSuffixPairs(self, words: List[str]) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def countPrefixSuffixPairs(self, words):\n        \"\"\"\n        :type words: List[str]\n        :rtype: int\n        \"\"\"\n        _trie = lambda: collections.defaultdict(_trie)\n",
     "public": "[{\"input\": \"[\\\"a\\\", \\\"aba\\\", \\\"ababa\\\", \\\"aa\\\"]\", \"output\": \"4\", \"testtype\": \"functional\"}, {\"input\": \"[\\\"pa\\\", \\\"papa\\\", \\\"ma\\\", \\\"mama\\\"]\", \"output\": \"2\", \"testtype\": \"functional\"}, {\"input\": \"[\\\"abab\\\", \\\"ab\\\"]\", \"output\": \"0\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -1715,6 +1733,7 @@
     "class": "Solution",
     "func": "minimumOperationsToMakeEqual",
     "starter": "class Solution:\n    def minimumOperationsToMakeEqual(self, x: int, y: int) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def minimumOperationsToMakeEqual(self, x, y):\n        \"\"\"\n        :type x: int\n        :type y: int\n        :rtype: int\n        \"\"\"\n        def memoization(x):\n            if y \u003e= x:\n                return y-x\n            if x not in lookup:\n                lookup[x] = min(x-y, min(min(x%d, d-x%d)+memoization(x//d+int(d-x%d \u003c x%d))+1 for d in (5, 11)))\n            return lookup[x]\n",
     "public": "[{\"input\": \"26\\n1\", \"output\": \"3\", \"testtype\": \"functional\"}, {\"input\": \"54\\n2\", \"output\": \"4\", \"testtype\": \"functional\"}, {\"input\": \"25\\n30\", \"output\": \"5\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -1802,6 +1821,7 @@
     "class": "Solution",
     "func": "minimumCost",
     "starter": "class Solution:\n    def minimumCost(self, source: str, target: str, original: List[str], changed: List[str], cost: List[int]) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def minimumCost(self, source, target, original, changed, cost):\n        \"\"\"\n        :type source: str\n        :type target: str\n        :type original: List[str]\n        :type changed: List[str]\n        :type cost: List[int]\n        :rtype: int\n        \"\"\"\n        INF = float(\"inf\")\n        def dijkstra(start):\n            best = {start:0}\n            min_heap = [(0, start)]\n            while min_heap:\n                curr, u = heapq.heappop(min_heap)\n                if curr \u003e best[u]:\n                    continue\n                if u not in dist:\n                    continue\n                for v, w in dist[u].items():     \n                    if v in best and best[v] \u003c= curr+w:\n                        continue\n                    best[v] = curr+w\n                    heapq.heappush(min_heap, (best[v], v))\n            return best\n\n        memo = {}\n        def memoization(u, v):\n            if u not in memo:\n                memo[u] = dijkstra(u)\n            return memo[u][v] if v in memo[u] else INF\n\n        dist = {}\n        for i in range(len(original)):\n            u, v = ord(original[i])-ord('a'), ord(changed[i])-ord('a')\n",
     "public": "[{\"input\": \"\\\"abcd\\\"\\n\\\"acbe\\\"\\n[\\\"a\\\", \\\"b\\\", \\\"c\\\", \\\"c\\\", \\\"e\\\", \\\"d\\\"]\\n[\\\"b\\\", \\\"c\\\", \\\"b\\\", \\\"e\\\", \\\"b\\\", \\\"e\\\"]\\n[2, 5, 5, 1, 2, 20]\", \"output\": \"28\", \"testtype\": \"functional\"}, {\"input\": \"\\\"aaaa\\\"\\n\\\"bbbb\\\"\\n[\\\"a\\\", \\\"c\\\"]\\n[\\\"c\\\", \\\"b\\\"]\\n[1, 2]\", \"output\": \"12\", \"testtype\": \"functional\"}, {\"input\": \"\\\"abcd\\\"\\n\\\"abce\\\"\\n[\\\"a\\\"]\\n[\\\"e\\\"]\\n[10000]\", \"output\": \"-1\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -1906,6 +1926,7 @@
     "class": "Solution",
     "func": "getGoodIndices",
     "starter": "class Solution:\n    def getGoodIndices(self, variables: List[List[int]], target: int) -\u003e List[int]:\n        ",
+    "prefix": "class Solution(object):\n    def getGoodIndices(self, variables, target):\n        \"\"\"\n        :type variables: List[List[int]]\n        :type target: int\n        :rtype: List[int]\n",
     "public": "[{\"input\": \"[[2, 3, 3, 10], [3, 3, 3, 1], [6, 1, 1, 4]]\\n2\", \"output\": \"[0, 2]\", \"testtype\": \"functional\"}, {\"input\": \"[[39, 3, 1000, 1000]]\\n17\", \"output\": \"[]\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -2064,6 +2085,7 @@
     "class": "Solution",
     "func": "minimumSteps",
     "starter": "class Solution:\n    def minimumSteps(self, s: str) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def minimumSteps(self, s):\n        \"\"\"\n        :type s: str\n        :rtype: int\n        \"\"\"\n        result = left = 0\n        for right in range(len(s)):\n            if s[right] != '0':\n                continue\n            result += right-left\n",
     "public": "[{\"input\": \"\\\"101\\\"\", \"output\": \"1\", \"testtype\": \"functional\"}, {\"input\": \"\\\"100\\\"\", \"output\": \"2\", \"testtype\": \"functional\"}, {\"input\": \"\\\"0111\\\"\", \"output\": \"0\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -2091,6 +2113,7 @@
     "class": "Solution",
     "func": "countCompleteSubstrings",
     "starter": "class Solution:\n    def countCompleteSubstrings(self, word: str, k: int) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def countCompleteSubstrings(self, word, k):\n        \"\"\"\n        :type word: str\n        :type k: int\n        :rtype: int\n        \"\"\"\n        result = valid = 0\n        cnt = [0]*26\n        for c in range(1, len(set(word))+1):\n            left = 0\n            for right in range(len(word)):\n                cnt[ord(word[right])-ord('a')] += 1\n                curr = cnt[ord(word[right])-ord('a')]\n                valid += 1 if curr == k else -1 if curr == k+1 else 0\n                if right-left+1 == c*k+1:\n                    curr = cnt[ord(word[left])-ord('a')]\n                    valid -= 1 if curr == k else -1 if curr == k+1 else 0\n                    cnt[ord(word[left])-ord('a')] -= 1\n                    left += 1\n                if valid == c:\n                    result += 1\n                if right+1 == len(word) or abs(ord(word[right+1])-ord(word[right])) \u003e 2:\n                    while left \u003c right+1:\n",
     "public": "[{\"input\": \"\\\"igigee\\\"\\n2\", \"output\": \"3\", \"testtype\": \"functional\"}, {\"input\": \"\\\"aaabbbccc\\\"\\n3\", \"output\": \"6\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -2226,6 +2249,7 @@
     "class": "Solution",
     "func": "returnToBoundaryCount",
     "starter": "class Solution:\n    def returnToBoundaryCount(self, nums: List[int]) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def returnToBoundaryCount(self, nums):\n        \"\"\"\n",
     "public": "[{\"input\": \"[2, 3, -5]\", \"output\": \"1\", \"testtype\": \"functional\"}, {\"input\": \"[3, 2, -3, -4]\", \"output\": \"0\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -2243,6 +2267,7 @@
     "class": "Solution",
     "func": "maximumSubarraySum",
     "starter": "class Solution:\n    def maximumSubarraySum(self, nums: List[int], k: int) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def maximumSubarraySum(self, nums, k):\n        \"\"\"\n        :type nums: List[int]\n        :type k: int\n        :rtype: int\n        \"\"\"\n        prefix = collections.defaultdict(lambda: float(\"inf\"))\n        curr = 0\n        result = float(\"-inf\")\n        for x in nums:\n            prefix[x] = min(prefix[x], curr)\n",
     "public": "[{\"input\": \"[1, 2, 3, 4, 5, 6]\\n1\", \"output\": \"11\", \"testtype\": \"functional\"}, {\"input\": \"[-1, 3, 2, 4, 5]\\n3\", \"output\": \"11\", \"testtype\": \"functional\"}, {\"input\": \"[-1, -2, -3, -4]\\n2\", \"output\": \"-6\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -2327,6 +2352,7 @@
     "class": "Solution",
     "func": "countKeyChanges",
     "starter": "class Solution:\n    def countKeyChanges(self, s: str) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def countKeyChanges(self, s):\n",
     "public": "[{\"input\": \"\\\"aAbBcC\\\"\", \"output\": \"2\", \"testtype\": \"functional\"}, {\"input\": \"\\\"AaAaAaaA\\\"\", \"output\": \"0\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -2505,6 +2531,7 @@
     "class": "Solution",
     "func": "hasTrailingZeros",
     "starter": "class Solution:\n    def hasTrailingZeros(self, nums: List[int]) -\u003e bool:\n        ",
+    "prefix": "class Solution(object):\n    def hasTrailingZeros(self, nums):\n        \"\"\"\n",
     "public": "[{\"input\": \"[1, 2, 3, 4, 5]\", \"output\": \"true\", \"testtype\": \"functional\"}, {\"input\": \"[2, 4, 8, 16]\", \"output\": \"true\", \"testtype\": \"functional\"}, {\"input\": \"[1, 3, 5, 7, 9]\", \"output\": \"false\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -2730,6 +2757,7 @@
     "class": "Solution",
     "func": "stringCount",
     "starter": "class Solution:\n    def stringCount(self, n: int) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def stringCount(self, n):\n        \"\"\"\n        :type n: int\n        :rtype: int\n        \"\"\"\n        MOD = 10**9+7\n        return (pow(26, n, MOD)-\n                (25+25+25+n)*pow(25, n-1, MOD)+      # no l, t, e, ee\n",
     "public": "[{\"input\": \"4\", \"output\": \"12\", \"testtype\": \"functional\"}, {\"input\": \"10\", \"output\": \"83943898\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -2777,6 +2805,7 @@
     "class": "Solution",
     "func": "maxPalindromesAfterOperations",
     "starter": "class Solution:\n    def maxPalindromesAfterOperations(self, words: List[str]) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def maxPalindromesAfterOperations(self, words):\n        \"\"\"\n        :type words: List[str]\n        :rtype: int\n        \"\"\"\n        cnt = [0]*26\n        for w in words:\n            for c in w:\n                cnt[ord(c)-ord('a')] += 1\n        curr = sum(x//2 for x in cnt)\n        for i, l in enumerate(sorted(map(len, words))):\n            curr -= l//2\n",
     "public": "[{\"input\": \"[\\\"abbb\\\", \\\"ba\\\", \\\"aa\\\"]\", \"output\": \"3\", \"testtype\": \"functional\"}, {\"input\": \"[\\\"abc\\\", \\\"ab\\\"]\", \"output\": \"2\", \"testtype\": \"functional\"}, {\"input\": \"[\\\"cd\\\", \\\"ef\\\", \\\"a\\\"]\", \"output\": \"1\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -2908,6 +2937,7 @@
     "class": "Solution",
     "func": "minOperations",
     "starter": "class Solution:\n    def minOperations(self, nums: List[int], k: int) -\u003e int:\n        ",
+    "prefix": "from functools import reduce\nclass Solution(object):\n    def minOperations(self, nums, k):\n        \"\"\"\n        :type nums: List[int]\n        :type k: int\n        :rtype: int\n        \"\"\"\n        def popcount(x):\n            return bin(x).count('1')\n",
     "public": "[{\"input\": \"[2, 1, 3, 4]\\n1\", \"output\": \"2\", \"testtype\": \"functional\"}, {\"input\": \"[2, 0, 2, 0]\\n0\", \"output\": \"0\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -2925,6 +2955,7 @@
     "class": "Solution",
     "func": "maxSubarrayLength",
     "starter": "class Solution:\n    def maxSubarrayLength(self, nums: List[int], k: int) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def maxSubarrayLength(self, nums, k):\n        \"\"\"\n        :type nums: List[int]\n        :type k: int\n        :rtype: int\n        \"\"\"\n        cnt = collections.Counter()\n        result = left = 0\n        for right in range(len(nums)):\n            cnt[nums[right]] += 1\n            while not (cnt[nums[right]] \u003c= k):\n                cnt[nums[left]] -= 1\n",
     "public": "[{\"input\": \"[1, 2, 3, 1, 2, 3, 1, 2]\\n2\", \"output\": \"6\", \"testtype\": \"functional\"}, {\"input\": \"[1, 2, 1, 2, 1, 2, 1, 2]\\n1\", \"output\": \"2\", \"testtype\": \"functional\"}, {\"input\": \"[5, 5, 5, 5, 5, 5, 5]\\n4\", \"output\": \"4\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -2942,6 +2973,7 @@
     "class": "Solution",
     "func": "canSortArray",
     "starter": "class Solution:\n    def canSortArray(self, nums: List[int]) -\u003e bool:\n        ",
+    "prefix": "class Solution(object):\n    def canSortArray(self, nums):\n        \"\"\"\n        :type nums: List[int]\n        :rtype: bool\n        \"\"\"\n        def popcount(x):\n            return bin(x).count(\"1\")\n    \n        left = mx = 0\n        for right in range(len(nums)):\n            if right+1 != len(nums) and popcount(nums[right+1]) == popcount(nums[right]):\n                continue\n            if mx \u003e min(nums[i] for i in range(left, right+1)):\n                return False\n",
     "public": "[{\"input\": \"[8, 4, 2, 30, 15]\", \"output\": \"true\", \"testtype\": \"functional\"}, {\"input\": \"[1, 2, 3, 4, 5]\", \"output\": \"true\", \"testtype\": \"functional\"}, {\"input\": \"[3, 16, 8, 4, 2]\", \"output\": \"false\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -2959,6 +2991,7 @@
     "class": "Solution",
     "func": "minimumCost",
     "starter": "class Solution:\n    def minimumCost(self, nums: List[int]) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def minimumCost(self, nums):\n        \"\"\"\n        :type nums: List[int]\n        :rtype: int\n        \"\"\"\n        def nth_element(nums, n, left=0, compare=lambda a, b: a \u003c b):\n            def tri_partition(nums, left, right, target, compare):\n                mid = left\n                while mid \u003c= right:\n                    if nums[mid] == target:\n                        mid += 1\n                    elif compare(nums[mid], target):\n                        nums[left], nums[mid] = nums[mid], nums[left]\n                        left += 1\n                        mid += 1\n                    else:\n                        nums[mid], nums[right] = nums[right], nums[mid]\n                        right -= 1\n                return left, right\n            \n            right = len(nums)-1\n",
     "public": "[{\"input\": \"[1, 2, 3, 12]\", \"output\": \"6\", \"testtype\": \"functional\"}, {\"input\": \"[5, 4, 3]\", \"output\": \"12\", \"testtype\": \"functional\"}, {\"input\": \"[10, 3, 1, 1]\", \"output\": \"12\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -2993,6 +3026,7 @@
     "class": "Solution",
     "func": "maxOperations",
     "starter": "class Solution:\n    def maxOperations(self, nums: List[int]) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def maxOperations(self, nums):\n        \"\"\"\n        :type nums: List[int]\n        :rtype: int\n        \"\"\"\n",
     "public": "[{\"input\": \"[3, 2, 1, 4, 5]\", \"output\": \"2\", \"testtype\": \"functional\"}, {\"input\": \"[3, 2, 6, 1, 4]\", \"output\": \"1\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -3010,6 +3044,7 @@
     "class": "Solution",
     "func": "maximumXorProduct",
     "starter": "class Solution:\n    def maximumXorProduct(self, a: int, b: int, n: int) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def maximumXorProduct(self, a, b, n):\n        \"\"\"\n        :type a: int\n        :type b: int\n        :type n: int\n        :rtype: int\n        \"\"\"\n        MOD = 10**9+7\n        for i in reversed(range(n)):\n            base = 1\u003c\u003ci\n",
     "public": "[{\"input\": \"12\\n5\\n4\", \"output\": \"98\", \"testtype\": \"functional\"}, {\"input\": \"6\\n7\\n5\", \"output\": \"930\", \"testtype\": \"functional\"}, {\"input\": \"1\\n6\\n3\", \"output\": \"12\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -3477,6 +3512,7 @@
     "class": "Solution",
     "func": "beautifulIndices",
     "starter": "class Solution:\n    def beautifulIndices(self, s: str, a: str, b: str, k: int) -\u003e List[int]:\n        ",
+    "prefix": "class Solution(object):\n    def beautifulIndices(self, s, a, b, k):\n        \"\"\"\n        :type s: str\n        :type a: str\n        :type b: str\n        :type k: int\n        :rtype: List[int]\n        \"\"\"\n        def getPrefix(pattern):\n            prefix = [-1]*len(pattern)\n            j = -1\n            for i in range(1, len(pattern)):\n                while j+1 \u003e 0 and pattern[j+1] != pattern[i]:\n                    j = prefix[j]\n                if pattern[j+1] == pattern[i]:\n                    j += 1\n                prefix[i] = j\n            return prefix\n\n        def KMP(text, pattern):\n            prefix = getPrefix(pattern)\n            j = -1\n            for i in range(len(text)):\n                while j+1 \u003e 0 and pattern[j+1] != text[i]:\n                    j = prefix[j]\n                if pattern[j+1] == text[i]:\n                    j += 1\n                if j+1 == len(pattern):\n                    yield i-j\n                    j = prefix[j]\n\n        result = []\n        if not (len(a) \u003c= len(s) and len(b) \u003c= len(s)):\n            return result\n        lookup = list(KMP(s, b))\n",
     "public": "[{\"input\": \"\\\"isawsquirrelnearmysquirrelhouseohmy\\\"\\n\\\"my\\\"\\n\\\"squirrel\\\"\\n15\", \"output\": \"[16, 33]\", \"testtype\": \"functional\"}, {\"input\": \"\\\"abcd\\\"\\n\\\"a\\\"\\n\\\"a\\\"\\n4\", \"output\": \"[0]\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -3651,6 +3687,7 @@
     "class": "Solution",
     "func": "removeAlmostEqualCharacters",
     "starter": "class Solution:\n    def removeAlmostEqualCharacters(self, word: str) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def removeAlmostEqualCharacters(self, word):\n        \"\"\"\n        :type word: str\n        :rtype: int\n        \"\"\"\n        result = 0\n        for i in range(len(word)-1):\n            if (i+1)+result \u003e= len(word):\n                break\n            if abs(ord(word[(i+1)+result])-ord(word[i+result])) \u003c= 1:\n",
     "public": "[{\"input\": \"\\\"aaaaa\\\"\", \"output\": \"2\", \"testtype\": \"functional\"}, {\"input\": \"\\\"abddez\\\"\", \"output\": \"2\", \"testtype\": \"functional\"}, {\"input\": \"\\\"zyxyxyz\\\"\", \"output\": \"3\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -3698,6 +3735,7 @@
     "class": "Solution",
     "func": "maxSelectedElements",
     "starter": "class Solution:\n    def maxSelectedElements(self, nums: List[int]) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def maxSelectedElements(self, nums):\n        \"\"\"\n        :type nums: List[int]\n        :rtype: int\n        \"\"\"\n        nums.sort()\n        result = 1\n        dp = [1]*2  # dp[i]: the maximum length of a consecutive sequence ending with x+i, where x is the last visited value\n        for i in range(1, len(nums)):\n            if nums[i] == nums[i-1]:\n                dp[1] = dp[0]+1\n            elif nums[i] == nums[i-1]+1:\n                dp[0] += 1\n                dp[1] += 1\n            elif nums[i] == nums[i-1]+2:\n                dp[0] = dp[1]+1\n                dp[1] = 1\n",
     "public": "[{\"input\": \"[2, 1, 5, 1, 1]\", \"output\": \"3\", \"testtype\": \"functional\"}, {\"input\": \"[1, 4, 7, 10]\", \"output\": \"1\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -3852,6 +3890,7 @@
     "class": "Solution",
     "func": "findMaximumNumber",
     "starter": "class Solution:\n    def findMaximumNumber(self, k: int, x: int) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def findMaximumNumber(self, k, x):\n        \"\"\"\n        :type k: int\n        :type x: int\n        :rtype: int\n        \"\"\"\n        def floor_log2(x):\n            return x.bit_length()-1\n\n        def binary_search_right(left, right, check):\n            while left \u003c= right:\n                mid = left+(right-left)//2\n                if not check(mid):\n                    right = mid-1\n                else:\n                    left = mid+1\n            return right\n    \n        def count(l):\n            return (prefix_cnt\u003c\u003c(x*l))+lookup[l]\n\n        result = prefix_cnt = 0\n        lookup = [0]\n        i = 0\n        while (lookup[-1]\u003c\u003cx)+(1\u003c\u003c(i+x-1)) \u003c= k:\n            lookup.append((lookup[-1]\u003c\u003cx)+(1\u003c\u003c(i+x-1)))\n            i += x\n        while k \u003e= prefix_cnt:\n            # l = result.bit_length()\n            # assert(prefix_cnt == sum(c == '1' and (l-i)%x == 0 for i, c in enumerate(bin(result)[2:])))\n            l = binary_search_right(1, len(lookup)-1, lambda l: count(l) \u003c= k)\n            cnt, i = count(l), x*l\n            c = min(floor_log2(k//cnt) if cnt else float(\"inf\"), x-1)\n",
     "public": "[{\"input\": \"9\\n1\", \"output\": \"6\", \"testtype\": \"functional\"}, {\"input\": \"7\\n2\", \"output\": \"9\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -3916,6 +3955,7 @@
     "class": "Solution",
     "func": "maxFrequencyScore",
     "starter": "class Solution:\n    def maxFrequencyScore(self, nums: List[int], k: int) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def maxFrequencyScore(self, nums, k):\n        \"\"\"\n        :type nums: List[int]\n        :type k: int\n        :rtype: int\n        \"\"\"\n        nums.sort()\n        result = left = curr = 0\n        for right in range(len(nums)):\n            # \"-+  \" =\u003e \"-0+ \"\n            # \"-0+ \" =\u003e \"--++\"\n            curr += nums[right]-nums[(left+right)//2]\n            if not curr \u003c= k:\n                # \"--++\" =\u003e \" -0+\"\n                # \" -0+\" =\u003e \"  -+\"\n",
     "public": "[{\"input\": \"[1, 2, 6, 4]\\n3\", \"output\": \"3\", \"testtype\": \"functional\"}, {\"input\": \"[1, 4, 4, 2, 4]\\n0\", \"output\": \"3\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -3973,6 +4013,7 @@
     "class": "Solution",
     "func": "numberOfPowerfulInt",
     "starter": "class Solution:\n    def numberOfPowerfulInt(self, start: int, finish: int, limit: int, s: str) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def numberOfPowerfulInt(self, start, finish, limit, s):\n        \"\"\"\n        :type start: int\n        :type finish: int\n        :type limit: int\n        :type s: str\n        :rtype: int\n        \"\"\"\n        def count(x):\n            def length(x):\n                result = 0\n                while x:\n                    x //= 10\n                    result += 1\n                return result\n\n            result = 0\n            n = length(x)\n            base = 10**n\n            l = n-len(s)\n            cnt = (limit+1)**l\n            for i in range(l):\n                base //= 10\n                curr = x//base%10\n                cnt //= limit+1\n                result += (min(curr-1, limit)-0+1)*cnt\n                if curr \u003e limit:\n                    break\n",
     "public": "[{\"input\": \"1\\n6000\\n4\\n\\\"124\\\"\", \"output\": \"5\", \"testtype\": \"functional\"}, {\"input\": \"15\\n215\\n6\\n\\\"10\\\"\", \"output\": \"2\", \"testtype\": \"functional\"}, {\"input\": \"1000\\n2000\\n4\\n\\\"3000\\\"\", \"output\": \"0\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -4067,6 +4108,7 @@
     "class": "Solution",
     "func": "findMaximumLength",
     "starter": "class Solution:\n    def findMaximumLength(self, nums: List[int]) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def findMaximumLength(self, nums):\n        \"\"\"\n        :type nums: List[int]\n        :rtype: int\n        \"\"\"\n        dp = prefix = left = 0\n        stk = [(0, 0, 0)]\n        for right in range(len(nums)):\n            prefix += nums[right]\n            while left+1 \u003c len(stk) and stk[left+1][0] \u003c= prefix:\n                left += 1\n            last, dp = prefix-stk[left][1], stk[left][2]+1\n            while stk and stk[-1][0] \u003e= last+prefix:\n                stk.pop()\n",
     "public": "[{\"input\": \"[5, 2, 2]\", \"output\": \"1\", \"testtype\": \"functional\"}, {\"input\": \"[1, 2, 3, 4]\", \"output\": \"4\", \"testtype\": \"functional\"}, {\"input\": \"[4, 3, 2, 6]\", \"output\": \"3\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -4238,6 +4280,7 @@
     "class": "Solution",
     "func": "resultArray",
     "starter": "class Solution:\n    def resultArray(self, nums: List[int]) -\u003e List[int]:\n        ",
+    "prefix": "class Solution(object):\n    def resultArray(self, nums):\n        \"\"\"\n        :type nums: List[int]\n        :rtype: List[int]\n        \"\"\"\n        a, b = [nums[0]], [nums[1]]\n",
     "public": "[{\"input\": \"[2, 1, 3]\", \"output\": \"[2, 3, 1]\", \"testtype\": \"functional\"}, {\"input\": \"[5, 4, 3, 8]\", \"output\": \"[5, 3, 4, 8]\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -4784,6 +4827,7 @@
     "class": "Solution",
     "func": "isPossibleToSplit",
     "starter": "class Solution:\n    def isPossibleToSplit(self, nums: List[int]) -\u003e bool:\n        ",
+    "prefix": "class Solution(object):\n    def isPossibleToSplit(self, nums):\n",
     "public": "[{\"input\": \"[1, 1, 2, 2, 3, 4]\", \"output\": \"true\", \"testtype\": \"functional\"}, {\"input\": \"[1, 1, 1, 1]\", \"output\": \"false\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -5126,6 +5170,7 @@
     "class": "Solution",
     "func": "countSubarrays",
     "starter": "class Solution:\n    def countSubarrays(self, nums: List[int], k: int) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def countSubarrays(self, nums, k):\n        \"\"\"\n        :type nums: List[int]\n        :type k: int\n        :rtype: int\n        \"\"\"\n        mx = max(nums)\n        result = left = cnt = 0\n        for right in range(len(nums)):\n            cnt += int(nums[right] == mx)\n            while cnt == k:\n                cnt -= int(nums[left] == mx)\n",
     "public": "[{\"input\": \"[1, 3, 2, 3, 3]\\n2\", \"output\": \"6\", \"testtype\": \"functional\"}, {\"input\": \"[1, 4, 2, 1]\\n3\", \"output\": \"0\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -5160,6 +5205,7 @@
     "class": "Solution",
     "func": "beautifulSubstrings",
     "starter": "class Solution:\n    def beautifulSubstrings(self, s: str, k: int) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def beautifulSubstrings(self, s, k):\n        \"\"\"\n        :type s: str\n        :type k: int\n        :rtype: int\n        \"\"\"\n        VOWELS = set(\"aeiou\")\n        prefix = [0]*(len(s)+1)\n        for i in range(len(s)):\n            prefix[i+1] = prefix[i]+(+1 if s[i] in VOWELS else -1)\n        new_k = 1\n        x = k\n        for i in range(2, k+1):\n            if i*i \u003e k:\n                break\n            cnt = 0\n            while x%i == 0:\n                x //= i\n                cnt += 1\n            if cnt:\n                new_k *= i**((cnt+1)//2+int(i == 2))\n        if x != 1:\n            new_k *= x**((1+1)//2+int(x == 2))\n        cnt = collections.Counter()\n",
     "public": "[{\"input\": \"\\\"baeyh\\\"\\n2\", \"output\": \"2\", \"testtype\": \"functional\"}, {\"input\": \"\\\"abba\\\"\\n1\", \"output\": \"3\", \"testtype\": \"functional\"}, {\"input\": \"\\\"bcdf\\\"\\n1\", \"output\": \"0\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -5177,6 +5223,7 @@
     "class": "Solution",
     "func": "minimumTimeToInitialState",
     "starter": "class Solution:\n    def minimumTimeToInitialState(self, word: str, k: int) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def minimumTimeToInitialState(self, word, k):\n        \"\"\"\n        :type word: str\n        :type k: int\n        :rtype: int\n        \"\"\"\n        def ceil_divide(a, b):\n            return (a+b-1)//b\n    \n        def z_function(s):  # Time: O(n), Space: O(n)\n            z = [0]*len(s)\n            l, r = 0, 0\n            for i in range(1, len(z)):\n                if i \u003c= r:\n                    z[i] = min(r-i+1, z[i-l])\n                while i+z[i] \u003c len(z) and s[z[i]] == s[i+z[i]]:\n                    z[i] += 1\n                if i+z[i]-1 \u003e r:\n                    l, r = i, i+z[i]-1\n            return z\n\n",
     "public": "[{\"input\": \"\\\"abacaba\\\"\\n3\", \"output\": \"2\", \"testtype\": \"functional\"}, {\"input\": \"\\\"abacaba\\\"\\n4\", \"output\": \"1\", \"testtype\": \"functional\"}, {\"input\": \"\\\"abcbabcd\\\"\\n2\", \"output\": \"4\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -5315,6 +5362,7 @@
     "class": "Solution",
     "func": "minimumAddedCoins",
     "starter": "class Solution:\n    def minimumAddedCoins(self, coins: List[int], target: int) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def minimumAddedCoins(self, coins, target):\n        \"\"\"\n        :type coins: List[int]\n        :type target: int\n        :rtype: int\n        \"\"\"\n        coins.sort()\n        result = reachable = 0\n        for x in coins:\n            # if x \u003e target:\n            #     break\n            while not reachable \u003e= x-1:\n                result += 1\n                reachable += reachable+1\n            reachable += x\n        while not reachable \u003e= target:\n",
     "public": "[{\"input\": \"[1, 4, 10]\\n19\", \"output\": \"2\", \"testtype\": \"functional\"}, {\"input\": \"[1, 4, 10, 5, 7, 19]\\n19\", \"output\": \"1\", \"testtype\": \"functional\"}, {\"input\": \"[1, 1, 1]\\n20\", \"output\": \"3\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -5332,6 +5380,7 @@
     "class": "Solution",
     "func": "minOperations",
     "starter": "class Solution:\n    def minOperations(self, nums1: List[int], nums2: List[int]) -\u003e int:\n        ",
+    "prefix": "class Solution(object):\n    def minOperations(self, nums1, nums2):\n        \"\"\"\n        :type nums1: List[int]\n        :type nums2: List[int]\n        :rtype: int\n        \"\"\"\n        cnt = [0]*2\n        for x, y in zip(nums1, nums2):\n            if not (min(x, y) \u003c= min(nums1[-1], nums2[-1]) and max(x, y) \u003c= max(nums1[-1], nums2[-1])):\n                return -1\n            if not (x \u003c= nums1[-1] and y \u003c= nums2[-1]):\n                cnt[0] += 1\n",
     "public": "[{\"input\": \"[1, 2, 7]\\n[4, 5, 3]\", \"output\": \"1\", \"testtype\": \"functional\"}, {\"input\": \"[2, 3, 4, 5, 9]\\n[8, 8, 4, 4, 4]\", \"output\": \"2\", \"testtype\": \"functional\"}, {\"input\": \"[1, 5, 4]\\n[2, 5, 3]\", \"output\": \"-1\", \"testtype\": \"functional\"}]",
     "has_private": true
    }
@@ -5717,6 +5766,7 @@
     "class": "Solution",
     "func": "lexicographicallySmallestArray",
     "starter": "class Solution:\n    def lexicographicallySmallestArray(self, nums: List[int], limit: int) -\u003e List[int]:\n        ",
+    "prefix": "class Solution(object):\n    def lexicographicallySmallestArray(self, nums, limit):\n        \"\"\"\n        :type nums: List[int]\n        :type limit: int\n        :rtype: List[int]\n        \"\"\"\n        idxs = list(range(len(nums)))\n        idxs.sort(key=lambda x: nums[x])\n        groups = []\n        for i in range(len(nums)):\n            if i-1 \u003c 0 or nums[idxs[i]]-nums[idxs[i-1]] \u003e limit:\n                groups.append([])\n            groups[-1].append(idxs[i])\n        result = [-1]*len(nums)\n        for g in groups:\n",
     "public": "[{\"input\": \"[1, 5, 3, 9, 8]\\n2\", \"output\": \"[1, 3, 5, 8, 9]\", \"testtype\": \"functional\"}, {\"input\": \"[1, 7, 6, 18, 2, 1]\\n3\", \"output\": \"[1, 6, 7, 18, 1, 2]\", \"testtype\": \"functional\"}, {\"input\": \"[1, 7, 28, 19, 10]\\n3\", \"output\": \"[1, 7, 28, 19, 10]\", \"testtype\": \"functional\"}]",
     "has_private": true
    }

@@ -164,8 +164,38 @@ func benchEmit(sandboxURL string) error {
 		return err
 	}
 	calib := benchLoadCalibration()
-	if len(calib.Results) == 0 {
-		return fmt.Errorf("no calibration data (run `bench calibrate` first)")
+	selected, rho, err := benchSelect(pool, calib)
+	if err != nil {
+		return err
+	}
+	src, err := benchRenderFile(selected, pool, rho, sandboxURL)
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(benchAppDir(), "benchmark_data_live.go")
+	if err := os.WriteFile(path, src, 0o644); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "\nwrote %s (%d questions)\n", path, len(selected))
+	fmt.Fprint(os.Stderr, "\nNEXT: bump benchmarkVersion, delete tiers 4/5/7/8 from benchmark_data.go,\n"+
+		"and commit both in the SAME commit — the question set is part of the profile cache key.\n")
+	return nil
+}
+
+// benchSelect is the whole of emit EXCEPT writing the file: rank the fleet, score
+// every candidate, and fill each band. Split out from benchEmit so it can be
+// driven by a test.
+//
+// That split is not tidiness. Rendering needs a live code-execution sidecar (a
+// coding question's test cases arrive base64(zlib(pickle)) and only the sidecar
+// may decode them) and stamps time.Now() into the file header, so the emit
+// command as a whole cannot run in CI and cannot produce the same bytes twice.
+// Selection has neither property — pool.json and the calibration file in,
+// question list out — so it is the part that can be asserted deterministic. See
+// benchgen_bank_test.go.
+func benchSelect(pool *benchPool, calib *calibration) ([]scoredQuestion, float64, error) {
+	if calib == nil || len(calib.Results) == 0 {
+		return nil, 0, fmt.Errorf("no calibration data (run `bench calibrate` first)")
 	}
 
 	// Rank backends by the score they got on THIS pool, not by the router's q:
@@ -201,7 +231,7 @@ func benchEmit(sandboxURL string) error {
 		fleet = append(fleet, f)
 	}
 	if len(fleet) < 2 {
-		return fmt.Errorf("need at least 2 calibrated backends to measure discrimination, have %d", len(fleet))
+		return nil, 0, fmt.Errorf("need at least 2 calibrated backends to measure discrimination, have %d", len(fleet))
 	}
 	sort.Slice(fleet, func(i, j int) bool { return fleet[i].score > fleet[j].score })
 
@@ -232,7 +262,7 @@ func benchEmit(sandboxURL string) error {
 	// as 0-0, every question is discarded as "negative discrimination", and emit
 	// writes a valid-looking file with nothing in it.
 	if len(fleet) < 2 {
-		return fmt.Errorf("only %d backend(s) qualify as difficulty observers (need 2); "+
+		return nil, 0, fmt.Errorf("only %d backend(s) qualify as difficulty observers (need 2); "+
 			"the rest were excluded as censored or non-separating — calibrate more workers, "+
 			"or give the slow ones a deadline they can finish inside", len(fleet))
 	}
@@ -318,15 +348,55 @@ func benchEmit(sandboxURL string) error {
 			if band.Reserve == reserveCeiling {
 				src = ceiling
 			}
-			// The coding bucket has shape rules of its own (benchmark_test.go's
-			// TestCodingTierShape): no multiple choice, because at this tier the
-			// grader would be measuring option length rather than the answer, and
-			// no empty or negative Expect. Filter here so a headroom band cannot
-			// break the build with a question it had no way to grade anyway.
-			if band.Tier >= benchCodingTier {
+			// Shape rules for the CEILING band, and the condition is the band's
+			// ROLE rather than its tier number for a reason worth writing down.
+			//
+			// It used to read `if band.Tier >= benchCodingTier`. When the ceiling
+			// band moved from tier 12 to tier 10 (see benchTierTargets above)
+			// benchCodingTier stayed 12, so the test became 10 >= 12 and the guard
+			// has been dead ever since — the committed tier-10 band went out
+			// unfiltered. Lowering the constant is NOT the fix: benchCodingTier is
+			// what benchWeightedScore uses to decide which questions land in the
+			// 20-point coding bucket (and what benchmark_test.go's
+			// TestCodingTierShape walks), so setting it to 10 would sweep all 40
+			// ceiling questions into the coding bucket and restore the exact fault
+			// that moved the band off tier 12. The guard has to key on the thing it
+			// is actually about, which is "this is the headroom band".
+			//
+			// A MULTIPLE-CHOICE ITEM CANNOT BE HEADROOM. This band is selected FOR
+			// p == 0, and on a five-option question p == 0 across a five-worker
+			// fleet happens by luck about a third of the time even for an item half
+			// the fleet would normally get right — so "nobody passed it" is close
+			// to no evidence at all when there is a guess floor under it. Free
+			// response has no such floor and p == 0 means what it says. (The floor
+			// band is the mirror image and needs no such rule: p == 1 on five
+			// five-option questions is a 0.03% fluke.)
+			//
+			// Note what is NOT filtered, having been checked against the committed
+			// band: long exact-list answers. The ordered permutations in there run
+			// to 30 elements and look unpassable, but the measured pass rates say
+			// otherwise — a 29-element item sits at p=0.20 — so excluding them
+			// would be a guess overriding a measurement.
+			if band.Reserve == reserveCeiling {
 				kept := src[:0:0]
 				for _, s := range src {
 					if s.q.Match == "mcq" || s.q.Match == "mcq-repeat" {
+						continue
+					}
+					// The Expect rules apply only to a question that HAS an Expect,
+					// and skipping code-exec is not a nicety — it is most of the band.
+					// A code question's ground truth is its test cases and its Expect
+					// is empty by construction, so applying the empty-Expect rule to it
+					// removes 59 of the 116 ceiling candidates measured against
+					// benchdata's calibration: every coding question, which is the
+					// fault this whole area keeps producing. What each rule is for:
+					// an empty Expect makes checkAnswer grade any text correct, and a
+					// negative one is what TestCodingTierShape forbids should this band
+					// ever move back above benchCodingTier. Both are belt and braces —
+					// benchSelfGrades already drops an empty Expect on a string-graded
+					// question — and neither matches anything in the committed band.
+					if s.q.Match == benchMatchCodeExec {
+						kept = append(kept, s)
 						continue
 					}
 					if s.q.Expect == "" || strings.HasPrefix(s.q.Expect, "-") {
@@ -378,21 +448,9 @@ func benchEmit(sandboxURL string) error {
 		selected = append(selected, pick...)
 	}
 	if len(selected) == 0 {
-		return fmt.Errorf("nothing selected — is the calibration complete?")
+		return nil, 0, fmt.Errorf("nothing selected — is the calibration complete?")
 	}
-
-	src, err := benchRenderFile(selected, pool, rho, sandboxURL)
-	if err != nil {
-		return err
-	}
-	path := filepath.Join(benchAppDir(), "benchmark_data_live.go")
-	if err := os.WriteFile(path, src, 0o644); err != nil {
-		return err
-	}
-	fmt.Fprintf(os.Stderr, "\nwrote %s (%d questions)\n", path, len(selected))
-	fmt.Fprint(os.Stderr, "\nNEXT: bump benchmarkVersion, delete tiers 4/5/7/8 from benchmark_data.go,\n"+
-		"and commit both in the SAME commit — the question set is part of the profile cache key.\n")
-	return nil
+	return selected, rho, nil
 }
 
 // benchHalfRate is one half of the fleet's pass rate on one question, over the
@@ -608,6 +666,17 @@ func benchSelfGrades(q poolQuestion) bool {
 		if q.Code == nil || (q.Code.PublicJSON == "" && !q.Code.HasPrivate) {
 			return false // nothing to run the answer against
 		}
+		// The sidecar needs an ENTRY POINT for a functional test case, and this
+		// checked Prefix and PublicJSON and HasPrivate but never Func. A question
+		// with an empty Func fails sandbox/runner.py's resolve_entry — "no entry
+		// function was given for a functional test" — before a single case runs,
+		// so it fails every worker in calibration, is classified as p=0 "nobody can
+		// pass this", and ships in the ceiling band as an item nobody can answer.
+		// Unlike the other faults in this function it is invisible from the pool
+		// data alone: the question looks complete.
+		if !benchCodeEntryOK(q) {
+			return false
+		}
 		// A completion answer is a fragment and is only runnable when appended to
 		// the partial solution. Emitting one without its prefix restores the bug
 		// that scored the two strongest workers 0% on this task, so it is caught
@@ -632,6 +701,41 @@ func benchSelfGrades(q poolQuestion) bool {
 	}
 	for _, a := range shapes {
 		if !checkAnswer(bq, a) {
+			return false
+		}
+	}
+	return true
+}
+
+// benchCodeEntryOK reports whether a coding question names the entry point its
+// own test cases will demand.
+//
+// The rule is the sidecar's, not this file's, and is read straight off
+// sandbox/runner.py's run_grade: resolve_entry is called if ANY case has a
+// testtype other than "stdin", and it raises the moment Func is empty. A
+// stdin-only question needs no entry point at all and passing one would be
+// meaningless — which is why "Func must be set" is not the rule and 38 of this
+// pool's 78 LCB_generation rows (all stdin) would be wrongly rejected by it.
+//
+// A case with NO testtype counts as functional, matching runner.py's own
+// `case.get("testtype") or "functional"` default. So does a question whose
+// public cases cannot be parsed or are absent: the testtype is then unknowable
+// here, and the sidecar's default would demand an entry point. Erring towards
+// "needs one" costs at most a question; erring the other way ships one that can
+// only ever grade as wrong.
+func benchCodeEntryOK(q poolQuestion) bool {
+	if q.Code == nil {
+		return false
+	}
+	if q.Code.Func != "" {
+		return true
+	}
+	var cases []benchCase
+	if q.Code.PublicJSON == "" || json.Unmarshal([]byte(q.Code.PublicJSON), &cases) != nil || len(cases) == 0 {
+		return false
+	}
+	for _, c := range cases {
+		if !strings.EqualFold(strings.TrimSpace(c.Testtype), "stdin") {
 			return false
 		}
 	}

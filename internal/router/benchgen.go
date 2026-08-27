@@ -251,11 +251,29 @@ func benchCodePayload(row map[string]any) (*poolCode, bool) {
 		return nil, false
 	}
 	// metadata is a JSON string nested inside the JSON row, not an object.
+	//
+	// The error is CHECKED, and that is the whole point of this block. It used to
+	// be `_ = json.Unmarshal(...)`, so a metadata blob that would not parse left
+	// Func at its zero value and the row was returned ok=true anyway. Func is the
+	// method the sandbox calls: sandbox/runner.py's resolve_entry raises
+	// "no entry function was given for a functional test" the moment it is empty,
+	// which fails EVERY case for EVERY worker. Calibration then measures p=0,
+	// benchEmit files it under the ceiling band as headroom nobody can reach, and
+	// it ships as a question no model can answer — indistinguishable, from the
+	// outside, from a genuinely hard one.
+	//
+	// An ABSENT func_name is a different thing and stays legal: LiveCodeBench's
+	// stdin-style problems have no entry point to name, resolve_entry is never
+	// called for them, and 38 of this pool's 78 LCB_generation rows are that
+	// shape. benchSelfGrades is what tells the two apart, by reading the test
+	// cases' testtype.
 	var md struct {
 		FuncName string `json:"func_name"`
 	}
 	if oj.Metadata != "" {
-		_ = json.Unmarshal([]byte(oj.Metadata), &md)
+		if err := json.Unmarshal([]byte(oj.Metadata), &md); err != nil {
+			return nil, false
+		}
 	}
 	pub, _ := row["public_test_cases"].(string)
 	priv, _ := row["private_test_cases"].(string)
@@ -599,9 +617,31 @@ func benchLoadPool() (*benchPool, error) {
 	// Backfill on every load, so calibrate and emit see identical questions
 	// whether pool.json predates the field or not. Cheap: one regexp over 50
 	// prompts.
+	//
+	// A MISS IS FATAL, not a warning. It used to print one and carry on, which
+	// meant the failure mode was: benchSelfGrades rejects a completion question
+	// with no prefix, emit counts it under "ungradeable", and the run ends with a
+	// cheerful summary line — so the whole coding_completion task could vanish
+	// from the bank without anything in the pipeline stopping. That is not a
+	// hypothetical shape: it is why the shipped bank has zero executable coding
+	// questions. A prompt with no fenced partial solution means the task's format
+	// changed under benchCompletionPrefix, which is a decision for a human (fix
+	// the extractor, or drop the task from benchAllowedTasks) and not something
+	// to absorb silently.
 	if _, missing := benchFillPrefixes(p.Questions); missing > 0 {
-		fmt.Fprintf(os.Stderr, "warning: %d coding_completion questions have no partial solution in their prompt "+
-			"and would be graded as bare fragments — they are excluded\n", missing)
+		var ids []string
+		for _, q := range p.Questions {
+			if q.Task == "coding_completion" && (q.Code == nil || q.Code.Prefix == "") {
+				ids = append(ids, q.ID[:12])
+			}
+			if len(ids) == 5 {
+				break
+			}
+		}
+		return nil, fmt.Errorf("%d coding_completion questions carry no fenced partial solution in their prompt "+
+			"(e.g. %s) — their answers are FRAGMENTS and would be graded standalone, which scores a correct "+
+			"completion zero. Fix benchCompletionPrefix for the new prompt format, or drop coding_completion "+
+			"from benchAllowedTasks and re-fetch", missing, strings.Join(ids, ", "))
 	}
 	return &p, nil
 }

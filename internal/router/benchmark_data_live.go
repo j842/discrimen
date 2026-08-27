@@ -35,7 +35,7 @@ func init() {
 
 var benchmarkQuestionsLive = []benchmarkQ{
 
-	// ---- Tier 2 — measured fleet pass rate 0%–0% ----
+	// ---- Tier 3 — measured fleet pass rate 0%–0% ----
 	// math_comp 02a28b14de48  p=1.00 d=0.00
 	{Tier: 3, Match: "mcq-repeat", Expect: "C", Prompt: "What is the degree measure of the acute angle formed by lines with slopes $2$ and $\\tfrac{1}{3}$? $\\textbf{(A)}~30\\qquad\\textbf{(B)}~37.5\\qquad\\textbf{(C)}~45\\qquad\\textbf{(D)}~52.5\\qquad\\textbf{(E)}~60$ If you cannot determine the correct multiple-choice answer, take your best guess. Once you have your answer, please duplicate that letter five times in a single string. For example, if the answer is F, then write FFFFF."},
 	// math_comp 07a0d7af7b14  p=1.00 d=0.00
@@ -489,7 +489,7 @@ var benchmarkQuestionsLive = []benchmarkQ{
 	// math_comp ce3ea859fc95  p=0.20 d=0.50
 	{Tier: 8, Match: "numeric", Expect: "321", Prompt: "Let $\\omega\\neq 1$ be a 13th root of unity. Find the remainder when\\[\\prod_{k=0}^{12}(2-2\\omega^k+\\omega^{2k})\\]is divided by 1000. Please think step by step, and then display the answer at the very end of your response. The answer is an integer consisting of exactly 3 digits (including leading zeros), ranging from 000 to 999, inclusive. For example, the answer might be 068 or 972. If you cannot determine the correct answer, take your best guess. Remember to have the three digits as the last part of the response."},
 
-	// ---- Tier 12 — measured fleet pass rate 0%–0% ----
+	// ---- Tier 10 — measured fleet pass rate 0%–0% ----
 	// math_comp 1876935a385c  p=0.00 d=0.00
 	{Tier: 10, Match: "numeric", Expect: "080", Prompt: "Let $ABCDEF$ be a convex equilateral hexagon in which all pairs of opposite sides are parallel. The triangle whose sides are extensions of segments $\\overline{AB}$, $\\overline{CD}$, and $\\overline{EF}$ has side lengths $200, 240,$ and $300$. Find the side length of the hexagon. Please think step by step, and then display the answer at the very end of your response. The answer is an integer consisting of exactly 3 digits (including leading zeros), ranging from 000 to 999, inclusive. For example, the answer might be 068 or 972. If you cannot determine the correct answer, take your best guess. Remember to have the three digits as the last part of the response."},
 	// olympiad 053691b9b00f  p=0.00 d=0.00

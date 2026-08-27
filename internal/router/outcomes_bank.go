@@ -12,7 +12,9 @@ package router
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"strings"
 	"time"
@@ -164,7 +166,15 @@ func (r *Router) recordJudgedOutcome(backendID, question string, thinking, corre
 			// must not fill the log with one line per sampled request.
 			return
 		}
-		r.outcomes.setVector(qid, vecs[0])
+		// Persisted, not just held: the question text is stored nowhere, so a
+		// vector lost at restart cannot be re-derived and the observation below
+		// becomes permanently unqueryable. See setJudgedVector.
+		if err := r.outcomes.setJudgedVector(ctx, qid, vecs[0]); err != nil {
+			// The vector is in memory either way, so this run still benefits. Worth
+			// a line because the cost is silent and deferred: it is the NEXT restart
+			// that loses the row.
+			log.Printf("outcome matrix: persisting the vector for a judged answer failed, it will not survive a restart: %v", err)
+		}
 	}
 	obs := []Observation{{
 		QID: qid, Backend: backendID, Thinking: thinking, Correct: correct,
@@ -294,4 +304,109 @@ func observationsFromMixed(backendID string, results []BenchResult, at time.Time
 		})
 	}
 	return out
+}
+
+// backfillOutcomesFromProfiles rebuilds the matrix from profiles already on disk.
+//
+// WHY THIS EXISTS. The only writer of bench observations was profileBackend, and
+// it runs only when a profile COMPLETES IN THIS PROCESS; load() reads the
+// observations table and nothing else. But worker_profiles already holds the
+// same evidence in the same shape — BenchResults and BenchResultsNoThink, which
+// are exactly what observationsFromMixed and observationsFrom consume — for
+// every worker ever profiled, under any binary. So an empty observations table
+// meant no routing evidence at all, recoverable only by re-profiling the whole
+// fleet: hours of GPU time, every worker at once, to reconstruct rows sitting in
+// the next table over. Measured on the live fleet: /admin/outcomes reported "0
+// questions, 392 vectors, 0 observations" and every routed request came back
+// route:outcome:unknown,fallback-speed, while one worker held a complete
+// 392-result profile contributing nothing.
+//
+// It is what makes a benchmarkVersion bump survivable rather than a fleet-wide
+// outage of the routing evidence base, and what makes a profile written by an
+// older binary visible at all.
+//
+// Idempotent, and safe beside the live writers:
+//
+//	A profile whose BenchVersion is not the current one is SKIPPED. Its answers
+//	were graded against a different question set or a different grader, which is
+//	the one thing that genuinely invalidates an observation — and record()'s key
+//	does not include the version, so filing them would corrupt the current set
+//	rather than sit beside it.
+//
+//	Rows are filed at the profile's MeasuredAt, and recordIfNewer refuses to
+//	replace an observation already at least as fresh. So a backfill that races a
+//	completing profile, or one that runs after the judge has been writing for a
+//	week, cannot walk newer evidence backwards. Ties go to the incumbent, which
+//	makes a repeated run a no-op.
+//
+// Intended to be called once at startup, after outcomeMatrix.load.
+func (r *Router) backfillOutcomesFromProfiles(ctx context.Context) error {
+	if r.outcomes == nil || r.logs == nil || r.logs.db == nil {
+		return nil
+	}
+	// Read EVERYTHING first, then write. The log store runs on a single
+	// connection (SetMaxOpenConns(1)), so an insert issued while this cursor is
+	// still open would wait for a connection the cursor is holding.
+	type stored struct {
+		id   string
+		prof *WorkerProfile
+	}
+	var profiles []stored
+	rows, err := r.logs.db.QueryContext(ctx, `SELECT id, profile_json FROM worker_profiles`)
+	if err != nil {
+		return err
+	}
+	unreadable := 0
+	for rows.Next() {
+		var id, raw string
+		if err := rows.Scan(&id, &raw); err != nil {
+			rows.Close()
+			return err
+		}
+		var p WorkerProfile
+		if json.Unmarshal([]byte(raw), &p) != nil {
+			// A profile this binary cannot parse is skipped rather than fatal: the
+			// rest of the fleet's evidence is worth more than a clean failure.
+			unreadable++
+			continue
+		}
+		profiles = append(profiles, stored{id: id, prof: &p})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	var recovered, stale, workers int
+	for _, s := range profiles {
+		if s.prof.BenchVersion != benchmarkVersion {
+			stale++
+			continue
+		}
+		// The profile's own timestamp, not now(): these observations describe what
+		// happened when the profile ran, and dating them now would let a
+		// reconstruction outrank a measurement taken since. A profile written
+		// before MeasuredAt existed carries the zero time, which reads as the
+		// oldest possible evidence — exactly what an undated profile is.
+		at := s.prof.MeasuredAt.UTC()
+		obs := observationsFromMixed(s.id, s.prof.BenchResults, at)
+		obs = append(obs, observationsFrom(s.id, s.prof.BenchResultsNoThink, false, at)...)
+		if len(obs) == 0 {
+			continue
+		}
+		n, err := r.outcomes.recordIfNewer(ctx, obs)
+		if err != nil {
+			return fmt.Errorf("backfilling %s: %w", s.id, err)
+		}
+		if n > 0 {
+			recovered += n
+			workers++
+		}
+	}
+	if recovered > 0 || stale > 0 || unreadable > 0 {
+		log.Printf("outcome matrix: recovered %d observations from %d stored profiles (%d at an older bench version, %d unreadable) — %s",
+			recovered, workers, stale, unreadable, r.outcomes)
+	}
+	return nil
 }

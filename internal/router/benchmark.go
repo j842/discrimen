@@ -536,6 +536,29 @@ type benchOutcome struct {
 func (r *Router) benchOne(b *Backend, q benchmarkQ, think bool, busy *benchBusyTracker) benchOutcome {
 	res := benchOutcome{tier: q.Tier}
 	prompt, maxTokens := benchRequestFor(q, think, usableContextTokens(b))
+	// A prompt that does not fit the worker's window is a MISS, not an outage.
+	//
+	// The request would otherwise go out anyway, the worker would reject it for
+	// length, and the generic retry path would record res.errd — which leaves the
+	// question out of the denominator entirely. A 32K worker asked a 48K question
+	// would come back neither right nor wrong but UNMEASURED, reported exactly
+	// like a worker the profile budget never got to.
+	//
+	// That is backwards for the one thing these questions exist to measure. "This
+	// model cannot reason over 48K of context" is a real, useful weakness and the
+	// reason the long-context set was added; recording it as "we could not tell"
+	// hides precisely the finding. Judged before dispatch because the verdict does
+	// not need the worker's opinion — it follows from the advertised window — and
+	// asking anyway would spend a real generation to learn something already known.
+	//
+	// Only when the window is actually KNOWN. usableContextTokens returns 0 for a
+	// worker still being profiled, and guessing a miss from a missing number would
+	// fail questions for a worker that can answer them.
+	if ctx := usableContextTokens(b); ctx > 0 && benchPromptTokenEstimate(prompt)+benchMinAnswerTokens > ctx {
+		res.got = fmt.Sprintf("(prompt needs ~%d tokens, worker window is %d)",
+			benchPromptTokenEstimate(prompt)+benchMinAnswerTokens, ctx)
+		return res // pass=false, errd=false: counted, and counted as a miss
+	}
 	// Greedy decoding (temperature 0): a graded benchmark must be
 	// deterministic, so the same (model, question) returns the same answer on
 	// every run and two identical models on different hosts score identically.

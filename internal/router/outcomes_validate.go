@@ -120,7 +120,7 @@ func (m *outcomeMatrix) validate(domainOf func(qid string) string) ValidationRep
 	models := map[string]bool{}
 	for _, list := range obs {
 		for _, o := range list {
-			models[o.Backend] = true
+			models[o.ModelHash] = true
 		}
 	}
 	rep.Workers = len(models)
@@ -184,7 +184,7 @@ func scoreOver(vecs map[string][]float64, obs map[string][]Observation,
 			}
 			// Predict this MODEL on this question WITHOUT using the question
 			// itself, and without anything `allowed` excludes.
-			p := predictExcluding(vecs, obs, v, o.Backend, o.Thinking, func(other string) bool {
+			p := predictExcluding(vecs, obs, v, o.ModelHash, o.Thinking, func(other string) bool {
 				return other != qid && allowed(other)
 			})
 			if !p.known() {
@@ -313,7 +313,7 @@ func distanceAgreementCorrelation(vecs map[string][]float64, obs map[string][]Ob
 					continue
 				}
 				for _, ob := range obs[b] {
-					if ob.Source != obsSourceBench || ob.Backend != oa.Backend || ob.Thinking != oa.Thinking {
+					if ob.Source != obsSourceBench || ob.ModelHash != oa.ModelHash || ob.Thinking != oa.Thinking {
 						continue
 					}
 					shared++

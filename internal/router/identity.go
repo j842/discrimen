@@ -170,10 +170,21 @@ func writeField(h interface{ Write([]byte) (int, error) }, s string) {
 // judgedQuestionQID is the identity of a PRODUCTION question, so repeated asks of
 // the same thing accumulate evidence instead of scattering it.
 //
-// Same hash as a bank question and a different prefix, because the two are not
-// interchangeable: a bank question is graded against a known answer, a production
-// one by another model. There is no grader version here — the judge is not a
-// match mode, and its verdicts are already weighted below bench evidence.
+// The same hash CONSTRUCTION as a bank question — sha256 over length-delimited
+// fields, truncated to the same width — over different fields, and behind a
+// different prefix. The prefix is what stops the two ever colliding, and they
+// must not, because they are not interchangeable evidence: a bank question is
+// graded against a known answer, a production one by another model. There is no
+// grader version in here — the judge is not a match mode, and its verdicts are
+// already weighted below bench evidence.
+//
+// Over the TRUNCATED question, which is deliberate and has to stay that way. The
+// vector filed under this qid is an embedding of the same truncation
+// (recordJudgedOutcome), so two prompts that differ only past benchEmbedMaxChars
+// share one identity AND one vector — consistent, and the alternative is worse:
+// hashing the full text would give them separate rows pointing at
+// indistinguishable neighbours, splitting the evidence for a difference the
+// embedder cannot see.
 func judgedQuestionQID(question string) string {
 	h := sha256.New()
 	writeField(h, truncateForEmbed(question))
@@ -189,6 +200,13 @@ func judgedQuestionQID(question string) string {
 // only if the grading has not changed. A prompt no longer in the bank yields
 // nothing, which is right — that question was removed and its answers are
 // unreachable by construction.
+//
+// It assumes bank prompts are UNIQUE, and would quietly lose a question if they
+// were not: two questions with the same text and different match modes are two
+// qids but only one entry here, so the second would shadow the first and every
+// stored result for it would resolve to the wrong grading. Cheap to get wrong
+// while adding questions and invisible afterwards, so it is asserted rather than
+// assumed — see TestBankPromptsAreUnique.
 func bankQIDByPrompt() map[string]string {
 	out := make(map[string]string, len(benchmarkQuestions))
 	for _, q := range benchmarkQuestions {

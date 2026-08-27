@@ -30,15 +30,23 @@ FD LAYOUT, and why it is not simply stdout:
       carries a per-run nonce so a submission that goes looking for the
       descriptor and sprays JSON at it still cannot forge a passing case.
 
-The nonce is a speed bump, not a proof, and the difference should be stated
-plainly: the harness and the submission share one interpreter, so a determined
-submission can reach into this module's globals and read the nonce, or rewrite
-compare.values_equal, or set the results list to whatever it likes. That is
-inherent to grading in-process, it is equally true of LiveCodeBench's own
-harness, and it is not what the jail is for. The jail exists to stop a
-submission harming the HOST. Keeping a benchmark honest is a different problem
-and the answer to it is that the questions are secret, not that the grader is
-unforgeable.
+THE VERDICT IS NOT DECIDED HERE. This process shares one interpreter with the
+submission, so anything it computes the submission can rewrite — and the
+cheapest version of that needs no knowledge of the question at all:
+
+    import sys
+    sys.modules['compare'].values_equal = lambda *a, **k: True
+
+Two lines, and every case reports a pass. This docstring used to answer that
+with "the questions are secret", which defends against a submission that knows
+the ANSWER and not at all against one that redefines what CORRECT MEANS. So this
+process now reports what the submission returned and main.py decides, in an
+address space the submission never touches (see _decide).
+
+The nonce remains a speed bump against a submission spraying JSON at the result
+descriptor, and it is still not a proof — but forging a record now only lets a
+submission lie about what it RETURNED, which the parent then compares against the
+expected value and rejects.
 """
 
 from __future__ import annotations
@@ -368,16 +376,15 @@ def run_functional_case(factory, case: dict) -> dict:
     except BaseException as exc:  # noqa: BLE001 — a submission may raise SystemExit
         return _failure(expected, None, _describe(exc))
 
+    # NO VERDICT HERE. The child reports what the submission RETURNED; the
+    # parent decides whether it is correct. See _verifiable.
     try:
-        matched = compare.values_equal(expected, got)
+        return _verifiable(expected, got, None)
     except RecursionError:
         # A submission that returned a self-referential structure. MAX_DEPTH
         # normally catches this first; this is the case where the recursion is
         # in a __eq__ the submission wrote.
         return _failure(expected, None, "the returned value could not be compared (recursive structure)")
-    if matched:
-        return {"pass": True}
-    return _failure(expected, got, None)
 
 
 def run_stdin_case(source: str, case: dict) -> dict:
@@ -424,9 +431,42 @@ def run_stdin_case(source: str, case: dict) -> dict:
     got = sink.value()
     if sink.truncated():
         return _failure(expected, got, f"stdout exceeded {STDOUT_CAPTURE_LIMIT} bytes")
-    if compare.compare_stdout(expected, got):
-        return {"pass": True}
-    return _failure(expected, got, None)
+    return _verifiable(expected, got, None, stdout=True)
+
+
+def _verifiable(expected, got, error: str | None, stdout: bool = False) -> dict:
+    """One case, reported so the PARENT can decide it.
+
+    The verdict deliberately does not come from this process. The harness and the
+    submission share one interpreter, so a submission can reach into this
+    module's globals or rewrite ``compare.values_equal`` — and unlike the forgery
+    the nonce guards against, that attack needs no knowledge of the question:
+
+        import sys
+        sys.modules['compare'].values_equal = lambda *a, **k: True
+
+    Two lines, and every case passes. The module docstring used to answer this
+    with "the questions are secret", which is a defence against a submission that
+    KNOWS the answer and no defence at all against one that redefines what
+    correct means. So the child now emits the raw value and the parent compares,
+    outside any namespace a submission can reach.
+
+    ``value`` is JSON so it survives the pipe. A value that will not serialise is
+    reported as unverifiable rather than as a pass: the outputs these questions
+    have are all JSON by construction, so an unserialisable return is not a right
+    answer that we failed to read.
+    """
+    record = {
+        "expected": compare.render(expected),
+        "got": compare.render(got),
+        "error": error,
+        "stdout_case": stdout,
+    }
+    try:
+        record["value"] = json.dumps(got, default=str)
+    except (TypeError, ValueError, RecursionError) as exc:
+        record["error"] = error or f"the returned value could not be serialised: {exc}"
+    return record
 
 
 def _failure(expected, got, error: str | None) -> dict:

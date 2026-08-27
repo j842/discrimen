@@ -120,6 +120,13 @@ import (
 // measured formatting, not knowledge. Strict grading is unchanged — nobody's full
 // credit moved — loose only ADDS credit, and the tally keeps the formatting cost
 // visible per worker.
+// v42: the generated question set is re-tiered to match the emit rules — the 40
+// unpassable headroom items move off tier 12 (benchCodingTier), which they were
+// filling with maths, so the 20-point coding bucket is now 28 coding questions
+// rather than 28 real ones diluted by 40 impossible non-code ones. Max
+// achievable quality goes from ~88 back to 100. Also: the no-think pass now asks
+// only the questions the mixed pass actually asked, so the two scores are
+// computed over the same exam before being compared on one absolute scale.
 // v41: three grading and profiling corrections, each of which changed scores.
 // An ERRORED question no longer counts in the denominator — it used to be a zero
 // over a one, arithmetically identical to a wrong answer, so an unreachable
@@ -171,7 +178,7 @@ import (
 // FRAGMENTS continuing a partial solution shown in the prompt), which had scored the two
 // strongest workers 0% on that task while the weakest scored highest. See
 // benchAnswerDeadline and poolCode.Prefix.
-const benchmarkVersion = 41
+const benchmarkVersion = 42
 
 // benchmarkQ is one graded question in the cold-start quality benchmark. The
 // question set lives in benchmark_data.go.
@@ -775,9 +782,20 @@ func (r *Router) runNoThinkQualityBenchmark(b *Backend, concurrency int, mixed [
 	if concurrency < 1 {
 		concurrency = 1
 	}
+	// Only the hard questions the MIXED pass actually asked. The two scores are
+	// compared against each other and against the whole fleet on one absolute
+	// 0-100 scale, so they have to be computed over the same exam — and they were
+	// not: this pass gets a fresh budget, and no-think answers are short, so it
+	// routinely completed while the mixed pass truncated. Measured on one worker:
+	// 137 questions in the mixed pass against 380 here, meaning 255 hard questions
+	// were graded no-think that Quality never saw.
+	//
+	// A question the mixed pass skipped is therefore skipped here too, which also
+	// keeps the pair meaningful per question: the matrix records both modes for
+	// the same item or neither.
 	var hardIdx []int
 	for i, q := range benchmarkQuestions {
-		if q.Tier >= benchHardTier {
+		if q.Tier >= benchHardTier && !mixed[i].Skipped {
 			hardIdx = append(hardIdx, i)
 		}
 	}

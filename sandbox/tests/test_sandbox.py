@@ -951,3 +951,60 @@ class TestGradingRobustness(unittest.TestCase):
         # near-miss does not.
         self.assertTrue(compare.compare_stdout("2", "2.0"))
         self.assertFalse(compare.compare_stdout("2", "2.0000001"))
+
+
+class TestVerdictIsNotDecidedInTheJail(SandboxCase):
+    """The child shares an interpreter with the submission, so it cannot be
+    trusted to say whether the submission was right — only what it returned.
+
+    The attack these pin needs no knowledge of the question, which is what makes
+    "the questions are secret" no defence against it.
+    """
+
+    TESTS = [{"input": str(i), "output": "424242", "testtype": "functional"} for i in range(5)]
+
+    def test_monkey_patching_the_comparator_does_not_pass(self):
+        code = (
+            "import sys\n"
+            "sys.modules['compare'].values_equal = lambda *a, **k: True\n"
+            "class Solution:\n"
+            "    def f(self, n):\n"
+            "        return 'obviously wrong'\n"
+        )
+        result = grade(code, self.TESTS, func="f")
+        self.assertFalse(result["pass"], result)
+        self.assertEqual(result["cases_passed"], 0, result)
+
+    def test_replacing_compare_stdout_does_not_pass(self):
+        code = (
+            "import sys\n"
+            "sys.modules['compare'].compare_stdout = lambda *a, **k: True\n"
+            "print('nonsense')\n"
+        )
+        result = grade(code, [{"input": "", "output": "42\n", "testtype": "stdin"}], func="")
+        self.assertFalse(result["pass"], result)
+
+    def test_an_honest_answer_still_passes(self):
+        code = "class Solution:\n    def f(self, n):\n        return 424242\n"
+        result = grade(code, self.TESTS, func="f")
+        self.assertTrue(result["pass"], result)
+        self.assertEqual(result["cases_passed"], 5, result)
+
+    def test_an_honest_wrong_answer_still_fails(self):
+        code = "class Solution:\n    def f(self, n):\n        return 7\n"
+        result = grade(code, self.TESTS, func="f")
+        self.assertFalse(result["pass"], result)
+        self.assertEqual(result["cases_passed"], 0, result)
+
+    def test_an_unserialisable_return_is_not_a_pass(self):
+        # An answer the parent cannot read is not an answer it can verify, and
+        # an unverifiable answer is not a correct one.
+        code = (
+            "class Weird:\n"
+            "    def __repr__(self): return 'weird'\n"
+            "class Solution:\n"
+            "    def f(self, n):\n"
+            "        return Weird()\n"
+        )
+        result = grade(code, self.TESTS, func="f")
+        self.assertFalse(result["pass"], result)

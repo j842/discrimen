@@ -60,6 +60,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import compare
 import supervisor  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -177,7 +178,7 @@ def handle_grade(request: dict) -> dict:
         "stop_on_first_failure": bool(request.get("stop_on_first_failure")),
     }
     outcome = _run("grade", payload, timeout_ms)
-    result = _assemble(outcome, len(tests), timeout_ms)
+    result = _assemble(outcome, len(tests), timeout_ms, tests)
     # Version marker, and the only defence against a silent regrade. A sidecar
     # that predates prefix support drops the field and grades a completion
     # answer as a standalone fragment — which never compiles, so every
@@ -189,8 +190,10 @@ def handle_grade(request: dict) -> dict:
     return result
 
 
-def _assemble(outcome: supervisor.Outcome, requested: int, timeout_ms: int) -> dict:
+def _assemble(outcome: supervisor.Outcome, requested: int, timeout_ms: int,
+              tests: list | None = None) -> dict:
     cases = outcome.all("case")
+    _decide(cases, tests or [])
     cases_run = len(cases)
     cases_passed = sum(1 for case in cases if case.get("pass"))
 
@@ -228,6 +231,63 @@ def _assemble(outcome: supervisor.Outcome, requested: int, timeout_ms: int) -> d
         "first_failure": first_failure,
         "error": error,
     }
+
+
+def _decide(cases: list, tests: list) -> None:
+    """Decide each case HERE, in the parent, from the value the child reported.
+
+    The child shares an interpreter with the submission, so anything it computes
+    a submission can rewrite — and the cheapest version of that attack needs no
+    knowledge of the question at all:
+
+        import sys
+        sys.modules['compare'].values_equal = lambda *a, **k: True
+
+    Two lines, and every case reports a pass. The runner's docstring used to
+    answer this with "the questions are secret", which defends against a
+    submission that knows the answer and not at all against one that redefines
+    what correct means. So the child reports what the submission RETURNED and the
+    verdict is taken here, in a process it never touches.
+
+    A case the child could not serialise, or one with no matching test, stays
+    failed: an unverifiable answer is not a correct one.
+    """
+    for case in cases:
+        if case.get("error"):
+            case["pass"] = False
+            continue
+        index = case.get("index")
+        if not isinstance(index, int) or index < 0 or index >= len(tests):
+            case["pass"] = False
+            case.setdefault("error", "no test case to verify this result against")
+            continue
+        if "value" not in case:
+            case["pass"] = False
+            case.setdefault("error", "the child reported no value to verify")
+            continue
+        try:
+            got = json.loads(case["value"])
+        except (TypeError, ValueError) as exc:
+            case["pass"] = False
+            case.setdefault("error", f"unreadable result: {exc}")
+            continue
+        raw_expected = tests[index].get("output") or ""
+        try:
+            if case.get("stdout_case"):
+                case["pass"] = compare.compare_stdout(raw_expected, got if isinstance(got, str) else str(got))
+            else:
+                case["pass"] = compare.values_equal(compare.parse_expected(raw_expected), got)
+        except compare.TestDataError as exc:
+            # A fault in the QUESTION, not the answer. Reported as an error so the
+            # caller can tell "we could not grade this" from "the model was wrong".
+            case["pass"] = False
+            case["error"] = f"malformed expected output: {exc}"
+        except RecursionError:
+            case["pass"] = False
+            case["error"] = "the returned value could not be compared (recursive structure)"
+        # The child's own rendering of both sides is kept for the failure report;
+        # only the verdict is recomputed.
+        case.pop("value", None)
 
 
 def _run_error(outcome: supervisor.Outcome, timeout_ms: int) -> str | None:

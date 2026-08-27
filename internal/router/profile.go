@@ -378,6 +378,28 @@ func (r *Router) profileBackend(b *Backend, model string) (*WorkerProfile, error
 	if err != nil {
 		return nil, err
 	}
+	// Carry the MEASURED context window onto the local Backend before anything
+	// downstream reads it.
+	//
+	// b is a clone (Registry.get returns cloneBackend), and a beacon worker
+	// declares no context at all — the payload is {id, url, model}. profileQuick
+	// discovers the real window and writes it to the PROFILE, which reaches the
+	// registry later via applyProfileIfGen; the clone in hand stays at zero for
+	// the whole of this function. Two things silently depended on it:
+	//
+	//	runContextProbe saw AdvertisedTokens 0, returned without making a single
+	//	HTTP call, and the `> 0` guard meant nothing was ever stored — so no
+	//	beacon worker has ever had a measured usable context.
+	//
+	//	benchOne's usableContextTokens(b) was 0, so the answer-ceiling clamp was
+	//	skipped and every hard question asked for the full 32768 tokens
+	//	regardless of the window — on an 8K worker that truncates, and truncation
+	//	is scored a failure. The same worker profiled WARM (after the health loop
+	//	reconciles the registry) gets the clamp and passes. Same worker, opposite
+	//	verdicts, decided by router lifecycle timing.
+	if p.ContextK > 0 {
+		b.ContextK = p.ContextK
+	}
 	capN, capOK := r.capacityProbe(b)
 	// Abort BEFORE the benchmark when the capacity probe already failed: a hung
 	// worker otherwise burns 28 questions × attempts × the request timeout

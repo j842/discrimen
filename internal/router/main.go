@@ -189,7 +189,13 @@ type Backend struct {
 	ObservedGenNoThink float64 `json:"observed_gen_nothink,omitempty"`
 	ObservedTTFTMillis float64 `json:"observed_ttft_ms,omitempty"`     // live EWMA of first-token latency (prefill + queue), ms
 	ObservedPrefillTPS float64 `json:"observed_prefill_tps,omitempty"` // live EWMA of PREFILL throughput (prompt tokens / TTFT), tok/s
-	ThinkingDialect    string  `json:"thinking_dialect,omitempty"`     // measured spelling of the thinking gate (see WorkerProfile.ThinkingDialect)
+	// ConcurrencyAlpha is the measured batching exponent from the capacity ramp:
+	// aggregate throughput scales as agg(1)*n^alpha, so 1 is perfect batching and 0
+	// is none. Routing prices a queued request with it (see loadPenalty). Zero
+	// means unmeasured, which loadPenalty reads as 1 — no penalty — so a worker
+	// profiled before the curve existed keeps exactly the load model it had.
+	ConcurrencyAlpha float64 `json:"concurrency_alpha,omitempty"`
+	ThinkingDialect  string  `json:"thinking_dialect,omitempty"` // measured spelling of the thinking gate (see WorkerProfile.ThinkingDialect)
 	// RemoteActive is how many requests the UPSTREAM says are in flight against a
 	// relay row's model, refreshed on every relay poll. It exists because
 	// ActiveRequests counts only what this router dispatched, and the point of a
@@ -4162,6 +4168,19 @@ func (r *Router) backfillCachedProfile(id string, backend *Backend, prof *Worker
 	// profile cached before they existed keeps its zero, which reads as "not
 	// measured" and never as "free" — see the field comment for why the token
 	// count is what carries that distinction.
+	//
+	// CapacityCurve gets no clause either, for the same reason and with a stated
+	// consequence. Re-deriving it means re-running the concurrency ramp, which
+	// fires up to CapacityProbeMax simultaneous generations at a worker that is
+	// serving live traffic — the most disruptive probe there is, and nothing like
+	// the one-GET cost that makes the context re-read unconditional.
+	//
+	// The staleness is bounded rather than silent: an absent curve prices as
+	// alpha = 1 (see concurrencyAlphaFor), the neutral default, so a worker cached
+	// without one keeps exactly the load model it had before the curve existed. It
+	// is never priced WRONGLY, only un-refined, and each worker acquires a curve at
+	// its next cold profile. The benchmarkVersion bump that ships this re-profiles
+	// the fleet anyway, so in practice no worker waits.
 	if prof.PrefillTPS != 0 {
 		return
 	}

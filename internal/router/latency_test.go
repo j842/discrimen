@@ -122,13 +122,16 @@ func TestLoadPenaltyDegradesContinuously(t *testing.T) {
 	// sub-linearly, the shape every batching engine has: 900 tok/s alone, 3400
 	// across eight, so each of the eight is worth under half of the one.
 	const id = "batched"
-	publishConcurrencyAlpha(id, []CapacityLevel{{N: 1, TPS: 900}, {N: 2, TPS: 1500}, {N: 4, TPS: 2300}, {N: 8, TPS: 3400}})
-	t.Cleanup(func() { concurrencyAlphas.Delete(id) })
+	alpha := concurrencyAlpha([]CapacityLevel{{N: 1, TPS: 900}, {N: 2, TPS: 1500}, {N: 4, TPS: 2300}, {N: 8, TPS: 3400}})
+	if alpha <= 0 || alpha >= 1 {
+		t.Fatalf("fixture wrong: sub-linear scaling should fit 0 < alpha < 1, got %v", alpha)
+	}
 
 	at := func(active int) *Backend {
 		return &Backend{
 			BackendRegistration: BackendRegistration{ID: id, MaxConcurrency: 8},
 			ObservedTPS:         50, ObservedPrefillTPS: 4000, ActiveRequests: active,
+			ConcurrencyAlpha: alpha,
 		}
 	}
 	job := jobCost{promptTokens: 1000, outputTokens: 256}
@@ -378,14 +381,15 @@ func TestCapacityIsPublishedBeforeTheBenchmarkFinishes(t *testing.T) {
 func TestWarmRestartRepublishesTheCapacityCurve(t *testing.T) {
 	reg := newTestRegistry()
 	register(t, reg, "warm", 0)
-	t.Cleanup(func() { concurrencyAlphas.Delete("warm") })
-
 	reg.applyProfileIfGen("warm", 0, &WorkerProfile{
 		Model: "m", BenchVersion: benchmarkVersion, MaxConcurrency: 4,
 		CapacityCurve: []CapacityLevel{{N: 1, TPS: 100}, {N: 2, TPS: 100}, {N: 4, TPS: 100}},
 	})
-	if got := concurrencyAlphaFor(reg.get("warm")); got != 0 {
-		t.Errorf("a cached profile's serialising curve was not re-published: alpha = %.3f, want 0", got)
+	// A flat curve is a MEASURED zero — a worker that gets nothing from batching.
+	// It is stored as minMeasuredAlpha so it stays distinguishable from the
+	// unmeasured default of 1, which is its exact opposite.
+	if got := concurrencyAlphaFor(reg.get("warm")); got != minMeasuredAlpha {
+		t.Errorf("a cached profile's serialising curve was not re-published: alpha = %.3f, want %.3f", got, minMeasuredAlpha)
 	}
 	// A profile with no curve — cached before this existed, or imported from a
 	// relay — must leave the worker on the neutral default rather than zero.

@@ -202,43 +202,48 @@ func concurrencyAlpha(curve []CapacityLevel) float64 {
 	return math.Max(0, math.Min(1, sxy/sxx))
 }
 
-// concurrencyAlphas carries a worker's measured batching exponent from
-// profiling, where it is measured, to routing, where it is priced.
+// minMeasuredAlpha keeps a measured exponent distinguishable from an unmeasured
+// one on a plain float field.
 //
-// It is a package-level side table rather than a field on Backend, and that is a
-// constraint on this change rather than a design: Backend is declared in main.go.
-// The one-line fix is `ConcurrencyAlpha float64` on Backend, assigned beside
-// MaxConcurrency in applyProfileIfGen and publishCapacity; when it lands,
-// loadPenalty should read b.ConcurrencyAlpha and this table should go with it.
+// concurrencyAlpha legitimately returns 0 — a worker whose aggregate throughput
+// does not grow with batch size at all, which is what a single-stream llama.cpp
+// row measures — and that is the OPPOSITE of the unmeasured default of 1. On a
+// float field with no presence bit the two would be the same number, and every
+// fully-serial worker would silently be priced as a perfect batcher: exactly the
+// wrong direction, since that worker is the one whose queue actually hurts.
 //
-// Keyed by backend id and written once per profile, so it holds one float per
-// worker the router has ever profiled — bounded by the fleet, and a removed
-// worker leaves a float behind. Read for every ranked candidate of every request,
-// hence a sync.Map rather than a mutex.
-var concurrencyAlphas sync.Map // backend id -> float64
+// A measured zero is therefore stored as this floor instead. The cost is
+// arithmetically nil — loadPenalty raises batch to 1-alpha, so 0.01 differs from
+// 0 by batch^0.01, under 3% at a batch of 16 — and it buys an unambiguous zero
+// value. The alternative, a *float64, would alias across cloneBackend.
+const minMeasuredAlpha = 0.01
 
-// publishConcurrencyAlpha records what a capacity ramp measured about how a
-// worker degrades under load. A curve with nothing to fit publishes nothing,
-// which leaves the worker priced with no load penalty — see concurrencyAlpha.
-func publishConcurrencyAlpha(id string, curve []CapacityLevel) {
-	if id == "" || len(curve) < 2 {
+// setConcurrencyAlpha records what a capacity ramp measured about how a worker
+// degrades under load. A curve with nothing to fit records nothing, leaving the
+// worker at the neutral default — see concurrencyAlphaFor.
+//
+// Callers hold the registry write lock and own b.
+func setConcurrencyAlpha(b *Backend, curve []CapacityLevel) {
+	if b == nil || len(curve) < 2 {
 		return
 	}
-	concurrencyAlphas.Store(id, concurrencyAlpha(curve))
+	alpha := concurrencyAlpha(curve)
+	if alpha < minMeasuredAlpha {
+		alpha = minMeasuredAlpha
+	}
+	b.ConcurrencyAlpha = alpha
 }
 
 // concurrencyAlphaFor is the exponent routing prices a backend's load with. The
 // default of 1 (perfect batching, no penalty) covers a worker whose ramp predates
 // the curve, one still on its provisional profile, and a relay row whose upstream
-// sends a capacity but no curve behind it.
+// sends a capacity but no curve behind it — all cases where the router has not
+// measured the worker under load and should not invent a penalty for it.
 func concurrencyAlphaFor(b *Backend) float64 {
-	if b == nil {
+	if b == nil || b.ConcurrencyAlpha <= 0 {
 		return 1
 	}
-	if v, ok := concurrencyAlphas.Load(b.ID); ok {
-		return v.(float64)
-	}
-	return 1
+	return b.ConcurrencyAlpha
 }
 
 // A capacity-probe level is only believed to be the ceiling after this many
@@ -913,7 +918,7 @@ func (r *Registry) publishCapacity(id string, gen int64, n int, curve []Capacity
 		b.MaxConcurrency = n
 	}
 	r.syncSlotsLocked(id, b.MaxConcurrency)
-	publishConcurrencyAlpha(id, curve)
+	setConcurrencyAlpha(b, curve)
 	return true
 }
 
@@ -1343,8 +1348,8 @@ func (r *Registry) applyProfileIfGen(id string, gen int64, p *WorkerProfile) boo
 	// did — otherwise the exponent would exist only for the minutes between a cold
 	// ramp and the next restart. Unconditional: a profile with no curve (cached
 	// before this existed, imported from a relay, provisional) publishes nothing
-	// and the worker keeps the neutral default. See publishConcurrencyAlpha.
-	publishConcurrencyAlpha(id, p.CapacityCurve)
+	// and the worker keeps the neutral default. See setConcurrencyAlpha.
+	setConcurrencyAlpha(b, p.CapacityCurve)
 	return true
 }
 

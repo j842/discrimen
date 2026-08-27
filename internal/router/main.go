@@ -594,6 +594,22 @@ func Main() {
 	if runPricesCommand(os.Args) {
 		return
 	}
+	// `discrimen snapshot DEST` writes a VACUUM INTO copy of the request log
+	// database (see snapshot.go). Unlike the three above this one IS run in the
+	// container: the deployment template's backup.sh calls it so restic captures
+	// a consistent database rather than a live one read mid-write.
+	if runSnapshotCommand(os.Args) {
+		return
+	}
+	// Everything else in argv[1] is a typo, not a server invocation. Without
+	// this the server starts and silently ignores the argument — which is how
+	// `discrimen snapshot …` run against an image too old to know the subcommand
+	// turns a backup step into a second router running until something kills it.
+	// Leading dashes are left alone so the server can grow flags later.
+	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
+		fmt.Fprintf(os.Stderr, "discrimen: unknown command %q\nCommands: bench, arena, prices, snapshot\n", os.Args[1])
+		os.Exit(2)
+	}
 
 	cfg := loadConfig()
 	registry := &Registry{

@@ -192,3 +192,34 @@ serving while template files are swapped.
 throws away the measured fleet. Neither has anything to preserve for the
 sandbox: it has no volume, and every run's scratch space is a tmpfs directory
 deleted with the run.
+
+## Backup and restore
+
+`ds backupdata` runs `backup.sh`, which stages one manifest line — the whole
+data volume — and lets dropshell's restic pass mount it read-only and copy the
+raw files. It does not stop the router, so `logs.sqlite`, `logs.sqlite-wal` and
+`logs.sqlite-shm` are each read at a slightly different instant and the archived
+set is only as good as WAL recovery makes it.
+
+So `backup.sh` first writes `/data/snapshot/logs.sqlite` with
+`discrimen snapshot`, which is SQLite's `VACUUM INTO`: one read transaction
+across the whole database, no write lock, nothing blocked. It runs in a one-shot
+container rather than via `docker exec`, so the same code path works whether the
+service is up or stopped. Measured against the live 66 MB production database:
+0.12s, with the source files untouched.
+
+The snapshot lives inside the volume, so the existing manifest line carries it
+and the archive holds both copies. `restore.sh` promotes the consistent one over
+the raw files afterwards, deleting the restored `-wal` and `-shm` as it goes —
+they belong to the copy being overwritten, and a WAL beside a database it did
+not come from is frames SQLite may replay. An archive with no snapshot in it
+(taken before this existed, or by a run that warned the snapshot had failed) is
+restored as-is.
+
+Costs roughly 2× the volume size on disk, since the vacuumed copy has a
+different page layout from its source and restic cannot dedup the two against
+each other. At this database's size that is ~65 MB.
+
+Note the deploy ordering: `backup.sh` calls a subcommand that only exists in the
+new image, so let the Actions build finish publishing before `ds install`.
+Against an older image the snapshot step warns and falls back to the hot copy.

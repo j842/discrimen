@@ -49,23 +49,117 @@ func TestClassifyResponse(t *testing.T) {
 	}
 }
 
-func TestBetterCandidates(t *testing.T) {
-	from := &Backend{BackendRegistration: BackendRegistration{ID: "mid", Quality: 50}}
-	worse := &Backend{BackendRegistration: BackendRegistration{ID: "tiny", Quality: 20}}
-	equal := &Backend{BackendRegistration: BackendRegistration{ID: "twin", Quality: 50}}
-	better := &Backend{BackendRegistration: BackendRegistration{ID: "big", Quality: 90, BaselineTPS: 100}}
-	best := &Backend{BackendRegistration: BackendRegistration{ID: "huge", Quality: 99, BaselineTPS: 5}}
+// ── Defect: the two failure modes ranked candidates differently ────────────
+//
+// A 5xx went through failover → nextCandidates, which preserves the matrix's
+// ordering. An empty 200 went through escalate → betterCandidates, which kept a
+// strict `Quality >` predicate and then RE-SORTED what survived it. Same request,
+// same plan.candidates, two different rankers depending on how the worker failed.
+//
+// Two consequences, both live: if the matrix routed to the worker holding the
+// fleet's highest bank score, betterCandidates returned nothing and escalation
+// never fired at all — the client got the empty answer even where the matrix had
+// confident evidence that another worker gets this topic right. And a worker the
+// matrix had ranked LAST, because it predicts WRONG here, could be picked as the
+// repair purely on its score against someone else's question bank.
 
-	got := betterCandidates([]*Backend{from, worse, equal, better, best}, from, nominalJob())
-	if len(got) != 2 {
-		t.Fatalf("only strictly-better workers qualify, got %v", ids(got))
+// orderedFleet stands up two workers whose PLAN order deliberately contradicts
+// the retired quality scalar: the matrix put "primary" first and "rescue"
+// second, while "rescue" carries the lower bank score. Any ranker that consults
+// Quality therefore disagrees with the plan, which is what makes the two failure
+// modes comparable.
+func orderedFleet(t *testing.T, primary, rescue http.HandlerFunc) (*Router, *dispatch, *httptest.ResponseRecorder, *http.Request) {
+	t.Helper()
+	a := httptest.NewServer(primary)
+	t.Cleanup(a.Close)
+	b := httptest.NewServer(rescue)
+	t.Cleanup(b.Close)
+
+	reg := newTestRegistry()
+	reg.upsert(BackendRegistration{ID: "primary", URL: a.URL, Model: "m", Quality: 90,
+		BaselineTPS: 100, MaxConcurrency: 2, TTLSeconds: 3600, Features: []string{"chat"}})
+	reg.upsert(BackendRegistration{ID: "rescue", URL: b.URL, Model: "m", Quality: 30,
+		BaselineTPS: 100, MaxConcurrency: 2, TTLSeconds: 3600, Features: []string{"chat"}})
+
+	r := &Router{
+		cfg: &Config{EscalateInline: true, BackendIdleTimeout: 5 * time.Second}, registry: reg,
+		client: &http.Client{Timeout: 5 * time.Second}, streamClient: &http.Client{},
 	}
-	// Among the better ones, soonest-to-finish leads.
-	if got[0].ID != "big" {
-		t.Fatalf("want the fastest better worker first, got %v", ids(got))
+	backend := reg.get("primary")
+	slot := make(chan struct{}, 1)
+	escalated := false
+	d := &dispatch{
+		backend: &backend, slot: &slot,
+		body: []byte(`{"messages":[]}`), raw: []byte(`{"messages":[]}`),
+		plan: &routePlan{
+			auto:       true,
+			route:      "route:outcome:p=0.90,n=8",
+			candidates: []*Backend{reg.get("primary"), reg.get("rescue")},
+		},
+		job: nominalJob(), log: &RequestLog{BackendID: "primary"},
+		output: &strings.Builder{}, escalated: &escalated,
 	}
-	if n := betterCandidates([]*Backend{from, worse, equal}, from, nominalJob()); n != nil {
-		t.Fatalf("nothing better ⇒ no escalation, got %v", ids(n))
+	return r, d, httptest.NewRecorder(),
+		post("/v1/chat/completions", `{"messages":[{"role":"user","content":"hi"}]}`, "")
+}
+
+// The two failure modes must differ only in POLICY — what counts as a failure,
+// how many hops are allowed, whether the deadline permits it — never in which
+// worker is next.
+func TestEmptyAnswerAndFailoverPickTheSameCandidate(t *testing.T) {
+	empty := func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(emptyAnswer))
+	}
+	down := func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"Loading model"}`))
+	}
+	answers := func(w http.ResponseWriter, _ *http.Request) { jsonAnswer(w, "the capital is Paris") }
+
+	// An empty 200 from the plan's first choice.
+	rEmpty, dEmpty, recEmpty, reqEmpty := orderedFleet(t, empty, answers)
+	rEmpty.dispatchBuffered(recEmpty, reqEmpty, dEmpty)
+	viaEscalation := recEmpty.Header().Get("X-LLM-Backend-ID")
+
+	// A 5xx from the plan's first choice. Same plan, same order, same request.
+	rDown, dDown, recDown, reqDown := orderedFleet(t, down, answers)
+	rDown.dispatchBuffered(recDown, reqDown, dDown)
+	viaFailover := recDown.Header().Get("X-LLM-Backend-ID")
+
+	if viaFailover != "rescue" {
+		t.Fatalf("test premise wrong: 5xx failover served from %q, want rescue", viaFailover)
+	}
+	if viaEscalation != viaFailover {
+		t.Fatalf("the same plan produced %q for an empty answer and %q for a 5xx — the empty-answer "+
+			"path is ranking candidates for itself instead of walking the plan", viaEscalation, viaFailover)
+	}
+	if got := recEmpty.Header().Get("X-LLM-Escalated"); got != "primary->rescue" {
+		t.Errorf("X-LLM-Escalated = %q, want primary->rescue", got)
+	}
+	if !strings.Contains(recEmpty.Body.String(), "Paris") {
+		t.Errorf("client kept the empty answer: %s", recEmpty.Body.String())
+	}
+}
+
+// The plan's ORDER is the answer, not a starting point to re-sort. A candidate
+// list the matrix built for this prompt, in this thinking mode, must reach both
+// movers unchanged.
+func TestEscalationWalksThePlanOrder(t *testing.T) {
+	plan := &routePlan{candidates: []*Backend{
+		{BackendRegistration: BackendRegistration{ID: "matrix-first", Quality: 10, BaselineTPS: 5}},
+		{BackendRegistration: BackendRegistration{ID: "matrix-second", Quality: 99, BaselineTPS: 100}},
+	}}
+	// Everything a ranker could reach for — bank score, throughput — points the
+	// other way, so an order-preserving filter is the only thing that yields this.
+	got := nextCandidates(plan, map[string]bool{})
+	if len(got) != 2 || got[0].ID != "matrix-first" {
+		t.Fatalf("plan order not preserved: %v", ids(got))
+	}
+	from := plan.candidates[0]
+	next := nextCandidates(plan, map[string]bool{from.ID: true})
+	if len(next) != 1 || next[0].ID != "matrix-second" {
+		t.Fatalf("after the plan's first choice failed, next = %v, want [matrix-second]", ids(next))
 	}
 }
 

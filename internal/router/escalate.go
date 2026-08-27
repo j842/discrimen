@@ -9,11 +9,17 @@ package router
 // and the wrong shape for a request that is still in flight and still fixable.
 //
 // So: when a worker returns a 2xx with NOTHING in it, re-dispatch the same
-// request to a strictly better worker before replying. Cheap-first with a verify
-// step and escalation on failure is the pattern the cascade routers converged on
-// (NadirClaw, Maestro); this is that loop with the verifier the router already
-// had. The adapter still learns — an escalation is fed to it as "this bin needed
-// a better model", precisely so the repair doesn't teach it the opposite.
+// request to the next worker on the plan's own candidate list before replying.
+// Cheap-first with a verify step and escalation on failure is the pattern the
+// cascade routers converged on (NadirClaw, Maestro); this is that loop with the
+// verifier the router already had. The adapter still learns — an escalation is
+// fed to it as "this bin needed a better model", precisely so the repair doesn't
+// teach it the opposite.
+//
+// "The next worker" and not "a better worker": the plan's candidates arrive from
+// the outcome matrix already ordered "expected to answer this prompt correctly,
+// fastest first", so the next one down is by construction the router's own
+// second choice for THIS prompt. See escalate.
 //
 // Five deliberate boundaries:
 //
@@ -131,8 +137,11 @@ func (r *Router) dispatchBuffered(w http.ResponseWriter, req *http.Request, d *d
 
 	if res.ok() && classifyResponse(res.body, false) == responseEmpty {
 		if better, betterRes, ok := r.escalate(req, d, res); ok {
-			log.Printf("escalation: %s returned an empty answer for %s → re-served by %s (q %d→%d)",
-				backend.ID, d.plan.route, better.ID, backend.Quality, better.Quality)
+			// No quality figures in the line: the pair it used to print was the
+			// retired scalar, which had stopped being the reason either worker was
+			// chosen. The route string already says how the plan was built.
+			log.Printf("escalation: %s returned an empty answer for %s → re-served by %s",
+				backend.ID, d.plan.route, better.ID)
 			backend = better
 			res = betterRes
 			*d.escalated = true
@@ -154,10 +163,31 @@ func (r *Router) dispatchBuffered(w http.ResponseWriter, req *http.Request, d *d
 	r.writeBuffered(w, req, backend, d, res)
 }
 
-// escalate re-runs the request on the best worker strictly better than the one
+// escalate re-runs the request on the next worker in the plan, after the one
 // that came back empty. Returns ok=false — leaving the original answer in place —
-// whenever there is no better worker, no slot for it in time, or its answer is no
-// better. It never returns something worse than what it was given.
+// whenever there is no candidate left, no slot for one in time, or its answer is
+// no better. It never returns something worse than what it was given.
+//
+// It walks the SAME list, in the SAME order, that failover walks via
+// nextCandidates. The two differ only in POLICY — what counts as a failure, and
+// what an acceptable replacement is — never in how candidates are ranked. They
+// did differ, and both halves of that hurt:
+//
+//   - The predicate was `Quality >`, so if the matrix had routed to the worker
+//     with the highest bank score, escalation found nothing and NEVER FIRED. The
+//     client got the empty answer even where the matrix held confident evidence
+//     that another worker gets this topic right.
+//   - What survived the predicate was then re-sorted by rankByDifficulty, which
+//     threw the matrix's ordering away — so a worker the matrix had ranked LAST,
+//     because it predicts WRONG on this topic, could be chosen as the repair on
+//     the strength of its score on someone else's question bank.
+//
+// It also read b.Quality rather than qualityFor(b, thinkOff) and ranked with
+// thinkOff hardcoded false, so a no-think request was escalated on the mixed-mode
+// score — the exact merging of two models that goal 3 exists to forbid. Deferring
+// to the plan's order fixes that by construction: plan.candidates was ranked for
+// this request's resolved thinking mode, once, by the code that owns the
+// decision.
 //
 // On success the caller's slot and active-request accounting have ALREADY been
 // moved to the returned worker.
@@ -181,7 +211,10 @@ func (r *Router) escalate(req *http.Request, d *dispatch, orig bufferedResult) (
 		return nil, orig, false
 	}
 	from := *d.backend
-	better := betterCandidates(d.plan.candidates, from, d.job)
+	// The plan minus the worker that just came back empty — the identical call
+	// failover makes, so the same request cannot be handed to two different
+	// rankers depending on HOW its worker failed.
+	better := nextCandidates(d.plan, map[string]bool{from.ID: true})
 	if len(better) == 0 {
 		return nil, orig, false
 	}
@@ -250,6 +283,27 @@ func (r *Router) redispatch(req *http.Request, d *dispatch, orig bufferedResult,
 		tried[target.ID] = true
 	}
 
+	// From here the target's slot and active count are OWNED, and they are given
+	// back on every exit path including a panic. This was the one incActive site
+	// in the codebase not paired with a defer: the decrement and the release sat
+	// on ordinary statement paths, so a panic in requestBufferedWithDelays or in
+	// accept() leaked both. proxyToBackend's own defers do not cover it, because
+	// they unwind through *d.backend / *d.slot and the swap below has not
+	// happened yet — they would release the OLD worker a second time and leave
+	// the target permanently +1. ActiveRequests only ever clamps at zero, never
+	// corrects downward, so a max_concurrency:1 worker that took one such hit
+	// looked saturated for the rest of the process's life and was ranked last
+	// for all of it.
+	committed := false
+	r.registry.incActive(target.ID, 1)
+	defer func() {
+		if committed {
+			return // ownership passed to the caller's dispatch; releasing here would double-release
+		}
+		r.registry.incActive(target.ID, -1)
+		r.registry.releaseSlot(slot)
+	}()
+
 	// Re-patch from the CLIENT's body, not the already-patched one: the previous
 	// worker's context ceiling may have clamped max_tokens, and inheriting that
 	// clamp would hand the new worker a budget shaped by a worker it is replacing.
@@ -257,19 +311,34 @@ func (r *Router) redispatch(req *http.Request, d *dispatch, orig bufferedResult,
 	body := patchForwardedBody(d.raw, d.inject, budgetCeiling(target, d.job), d.tr.forBackend(target), target.ServedID)
 	body = r.stripLearned(body, d.raw, target.ID)
 
-	r.registry.incActive(target.ID, 1)
 	// No delay ladder on the first attempt against a fresh worker: the point of
 	// moving is that this one has not just failed.
 	res := r.requestBufferedWithDelays(req, target, body, nil, d.remainingBudget())
 	if !accept(res) {
-		// No better off. Give the slot back and leave everything as it was.
-		r.registry.incActive(target.ID, -1)
-		r.registry.releaseSlot(slot)
+		// No better off — but the TARGET still produced this, and must be judged
+		// for it. Nothing was recorded here at all: no noteFailedAttempt, no
+		// noteProxyResult, and requestBufferedWithDelays writes setError only for a
+		// transport error, never for a 5xx status. So with two wedged workers, every
+		// request 503'd on A, failed over to B, took a 503 there and returned A's
+		// error — A accrued proxyFailures and was ejected after three, while B
+		// stayed at proxyFailures=0 with a blank LastError and rendered on /backends
+		// as healthy. B only started being judged once A was gone and it became
+		// primary. This is the same hole the comment in failover records closing for
+		// `from`, on the other side of the same call.
+		//
+		// A client hangup is excluded for the reason it is everywhere else: it says
+		// nothing about the worker.
+		if req.Context().Err() == nil {
+			r.noteFailedAttempt(target.ID, res)
+		}
 		return nil, orig, false
 	}
 
 	// Commit: hand the caller's slot/active accounting over to the new worker so
-	// proxyToBackend's deferred unwind releases the right one.
+	// proxyToBackend's deferred unwind releases the right one. The order is
+	// load-bearing and unchanged; committed is set first so the guard above stands
+	// down before the handover it is guarding starts.
+	committed = true
 	r.registry.incActive(from.ID, -1)
 	r.registry.releaseSlot(*d.slot)
 	*d.backend = target
@@ -279,36 +348,22 @@ func (r *Router) redispatch(req *http.Request, d *dispatch, orig bufferedResult,
 }
 
 // nextCandidates is the request's candidates minus the workers already tried,
-// order preserved.
+// order preserved. It is the ONLY way a request moves to another worker: both
+// failover and escalate go through it.
 //
 // Order is the whole value: plan.candidates arrives from the outcome matrix as
 // "workers expected to answer this prompt correctly, fastest first", so the next
 // one is already the right next one. Under the quality scalar this needed a
-// predicate to find something BETTER; it no longer does, and betterCandidates'
-// strict `Quality >` is now inconsistent with how routing actually ranks.
+// predicate to find something BETTER, and escalation kept one — a strict
+// `Quality >` followed by a re-sort — long after routing had stopped ranking
+// that way. Filtering and NOT re-ranking is the point: the plan has already been
+// ordered once, for this prompt, in this thinking mode, by the code that owns
+// that decision. Anything here that sorts again is a second, worse opinion.
 func nextCandidates(plan *routePlan, tried map[string]bool) []*Backend {
 	if plan == nil {
 		return nil
 	}
 	return filterCandidates(plan.candidates, func(b *Backend) bool { return !tried[b.ID] })
-}
-
-// betterCandidates returns the request's candidates that are strictly higher
-// quality than the worker that failed, soonest-to-finish first. Strictly higher
-// on purpose: re-running on an equal-quality worker is a coin flip dressed up as
-// a fix, and the whole justification for spending a second generation is that the
-// replacement is measurably better at this kind of prompt.
-func betterCandidates(candidates []*Backend, from *Backend, job jobCost) []*Backend {
-	out := filterCandidates(candidates, func(b *Backend) bool {
-		return b.ID != from.ID && b.Quality > from.Quality
-	})
-	if len(out) == 0 {
-		return nil
-	}
-	// The incumbent discount is meaningless here — we are deliberately leaving the
-	// worker that holds the prefix — so rank on the undiscounted job.
-	job.incumbent = ""
-	return rankByDifficulty(out, 0, job, false)
 }
 
 // requestBuffered runs one buffered exchange against a worker, including the
@@ -922,6 +977,18 @@ func (r *Router) streamFailover(ctx context.Context, req *http.Request, d *dispa
 			if newResp != nil {
 				newResp.Body.Close()
 			}
+			// The failover TARGET failed too, and it must be judged for that — the
+			// same hole the buffered redispatch had. A target that is also wedged
+			// reached no writeBuffered and no noteFailedAttempt, so it sat at
+			// proxyFailures=0 with a blank LastError while the worker in front of it
+			// took every strike and was ejected.
+			if dialErr2 != nil {
+				if ctx.Err() == nil && req.Context().Err() == nil {
+					r.noteFailedAttempt(target.ID, bufferedResult{netErr: dialErr2})
+				}
+			} else {
+				r.noteFailedAttempt(target.ID, bufferedResult{statusCode: newResp.StatusCode})
+			}
 			r.registry.releaseSlot(slot)
 			continue
 		}
@@ -964,14 +1031,32 @@ func (r *Router) dialStream(ctx context.Context, req *http.Request, backend *Bac
 // noteFailedAttempt records a failure against the worker that produced it, for
 // the circuit breaker and for LastError.
 //
-// Failover moved the request, so this worker never reaches writeBuffered and its
-// failure would otherwise leave no trace at all — the breaker cannot trip and
-// the dashboard shows it healthy with a blank error. A client hangup is excluded
-// for the same reason it is on every other path: it says nothing about the
-// worker.
+// A request that moved — either direction, either failure mode — leaves one
+// worker that never reaches writeBuffered, and whose failure would otherwise
+// leave no trace at all: the breaker cannot trip and the dashboard shows it
+// healthy with a blank error. Both sides of redispatch call this now, the worker
+// that was left and the worker that was tried and refused. A client hangup is
+// excluded for the same reason it is on every other path: it says nothing about
+// the worker.
+//
+// The verdict is deliberately the SAME one writeBuffered reaches, so a worker's
+// health cannot depend on whether its answer happened to be the one written to
+// the client.
 func (r *Router) noteFailedAttempt(backendID string, res bufferedResult) {
 	if res.netErr != nil {
 		r.registry.setError(backendID, res.netErr.Error())
+		r.registry.noteProxyResult(backendID, false)
+		return
+	}
+	// A 2xx carrying no usable answer is a failure, exactly as writeBuffered
+	// scores it. Without this an escalation target that returned an empty 200 was
+	// recorded as a SUCCESS here — resetting its consecutive-failure run — which
+	// is the laundering writeBuffered was fixed for, reappearing on the path where
+	// the empty answer is never written to anyone. Confined to 2xx so a 429 or a
+	// bodyless 5xx from the streaming path keeps its existing reading.
+	if res.statusCode >= 200 && res.statusCode < 300 && classifyResponse(res.body, false) == responseEmpty {
+		r.registry.setError(backendID, fmt.Sprintf("HTTP %d with no usable answer (%d bytes)",
+			res.statusCode, len(res.body)))
 		r.registry.noteProxyResult(backendID, false)
 		return
 	}

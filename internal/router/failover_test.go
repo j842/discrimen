@@ -1,6 +1,7 @@
 package router
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -269,6 +270,166 @@ func TestEveryRouterChosenBranchIsAuto(t *testing.T) {
 	named := &ChatRequest{Model: "tiny", Messages: req.Messages}
 	if p, err := bare.planRoute(named, 0, false); err == nil && p.auto {
 		t.Errorf("route %q for a client-named model is marked auto", p.route)
+	}
+}
+
+// ── Defect: a failover target that ALSO fails was recorded nowhere ─────────
+//
+// The comment on failover records this being fixed for the worker the request
+// was moved AWAY from. The worker it was moved TO had the same hole, on the
+// other side of the same call: redispatch's reject path released the slot and
+// returned with no noteFailedAttempt, no noteProxyResult, and no error recorded
+// (requestBufferedWithDelays writes setError for a TRANSPORT error only, never
+// for a 5xx status).
+//
+// Measured shape: worker A is wedged, worker B is wedged too. Every request 503s
+// on A, fails over to B, takes a 503 there and returns A's error. A accrues
+// proxyFailures and is ejected after three; B stays at proxyFailures=0 with a
+// blank LastError and renders on /backends as a healthy worker. B only starts
+// being judged once A is gone and it becomes primary.
+func TestFailoverTargetThatAlsoFailsIsRecorded(t *testing.T) {
+	down := func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"CUDA out of memory"}`))
+	}
+	r, d, rec, req := failoverFleet(t, down, down)
+	// Every candidate is exhausted, so the ladder runs; shortened so the test does
+	// not spend 17 seconds proving it.
+	restore := proxyRetryDelays
+	proxyRetryDelays = []time.Duration{time.Millisecond}
+	t.Cleanup(func() { proxyRetryDelays = restore })
+
+	r.dispatchBuffered(rec, req, d)
+
+	target := r.registry.get("second")
+	if target.proxyFailures == 0 {
+		t.Error("the failover target 503'd and accrued nothing: proxyFailures stays 0, so its breaker " +
+			"can never trip however long it stays wedged")
+	}
+	if target.LastError == "" {
+		t.Fatal("the failover target renders on /backends with a blank LastError, which reads as healthy")
+	}
+	if !strings.Contains(target.LastError, "CUDA out of memory") {
+		t.Errorf("LastError = %q, want the upstream's own message", target.LastError)
+	}
+	// The worker the request was moved away from is still recorded too — this
+	// must not have moved the hole rather than closed it.
+	if from := r.registry.get("first"); from.proxyFailures == 0 {
+		t.Error("the worker that was failed over lost its own strike")
+	}
+}
+
+// The streamed path had the identical hole: a re-dial that 503s released the
+// slot and continued, recording nothing against the worker that refused it.
+func TestStreamFailoverTargetThatAlsoFailsIsRecorded(t *testing.T) {
+	down := func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusServiceUnavailable) }
+	r, d, _, req := failoverFleet(t, down, down)
+
+	// What dispatchStreaming hands streamFailover: the first worker answered 503
+	// at the dial, before a single byte reached the client.
+	first := &http.Response{StatusCode: http.StatusServiceUnavailable, Body: http.NoBody}
+	if _, _, moved := r.streamFailover(context.Background(), req, d, first, nil); moved {
+		t.Fatal("test premise wrong: both workers are down, nothing should have moved")
+	}
+
+	target := r.registry.get("second")
+	if target.proxyFailures == 0 {
+		t.Error("the streamed failover target refused the dial and accrued nothing")
+	}
+	if target.LastError == "" {
+		t.Error("the streamed failover target keeps a blank LastError, which reads as healthy on /backends")
+	}
+}
+
+// An empty 200 is a failure by the router's own rule (writeBuffered scores it as
+// one), and noteFailedAttempt has to reach the SAME verdict — otherwise an
+// escalation target that returned nothing was recorded as a success, resetting
+// its consecutive-failure run. That is exactly the laundering writeBuffered was
+// fixed for, on the path where the empty answer is never written to anyone.
+func TestNoteFailedAttemptTreatsAnEmpty200AsAFailure(t *testing.T) {
+	reg := newTestRegistry()
+	reg.upsert(BackendRegistration{ID: "w", URL: "http://w", Model: "m", TTLSeconds: 3600})
+	r := &Router{registry: reg}
+
+	r.noteFailedAttempt("w", bufferedResult{statusCode: http.StatusOK, body: []byte(emptyAnswer)})
+	if b := reg.get("w"); b.proxyFailures != 1 || b.LastError == "" {
+		t.Errorf("an empty 200 scored as a success: proxyFailures=%d LastError=%q", b.proxyFailures, b.LastError)
+	}
+	// A 4xx is the request's problem, not the worker's — unchanged, and the same
+	// reading writeBuffered gives it.
+	r.noteFailedAttempt("w", bufferedResult{statusCode: http.StatusBadRequest, body: []byte(`{"error":"nope"}`)})
+	if b := reg.get("w"); b.proxyFailures != 0 {
+		t.Errorf("a 4xx was charged to the worker: proxyFailures=%d", b.proxyFailures)
+	}
+	// And a 429 from the streaming path, which carries no body, keeps its
+	// existing reading rather than being caught by the emptiness test.
+	r.noteFailedAttempt("w", bufferedResult{statusCode: http.StatusTooManyRequests})
+	if b := reg.get("w"); b.proxyFailures != 0 {
+		t.Errorf("a bodyless 429 was charged to the worker: proxyFailures=%d", b.proxyFailures)
+	}
+}
+
+// ── Defect: redispatch's in-flight increment was not defer-protected ───────
+
+// Every other incActive site in the codebase pairs with a defer. Here the
+// decrement and the slot release sat on ordinary statement paths, so a panic
+// inside requestBufferedWithDelays or accept() left the target permanently +1
+// and its slot permanently consumed. proxyToBackend's own defers do not cover
+// it: they unwind through *d.backend / *d.slot, which have not been swapped yet,
+// so they release the OLD worker a second time.
+//
+// ActiveRequests only ever clamps at zero and never corrects downward, so a
+// max_concurrency:1 worker that takes one such hit looks saturated — and is
+// ranked last — for the rest of the process's life.
+func TestRedispatchReleasesTheTargetOnPanic(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		jsonAnswer(w, "hello")
+	}))
+	t.Cleanup(srv.Close)
+
+	reg := newTestRegistry()
+	reg.upsert(BackendRegistration{ID: "from", URL: srv.URL, Model: "m", TTLSeconds: 3600, MaxConcurrency: 1})
+	reg.upsert(BackendRegistration{ID: "target", URL: srv.URL, Model: "m", TTLSeconds: 3600, MaxConcurrency: 1})
+	r := &Router{cfg: &Config{}, registry: reg, client: &http.Client{}, streamClient: &http.Client{}}
+
+	backend := reg.get("from")
+	slot := make(chan struct{}, 1)
+	escalated := false
+	d := &dispatch{
+		backend: &backend, slot: &slot,
+		body: []byte(`{"messages":[]}`), raw: []byte(`{"messages":[]}`),
+		plan: &routePlan{auto: true, route: "route:outcome:p=0.90,n=8",
+			candidates: []*Backend{reg.get("from"), reg.get("target")}},
+		job: nominalJob(), log: &RequestLog{BackendID: "from"},
+		output: &strings.Builder{}, escalated: &escalated,
+	}
+	req := post("/v1/chat/completions", `{"messages":[{"role":"user","content":"hi"}]}`, "")
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		r.redispatch(req, d, bufferedResult{}, []*Backend{reg.get("target")},
+			func(bufferedResult) bool { panic("deciding whether to accept blew up") }, nil)
+	}()
+	if recovered == nil {
+		t.Fatal("test premise wrong: accept() did not panic")
+	}
+
+	if b := reg.get("target"); b.ActiveRequests != 0 {
+		t.Errorf("target left at active_requests=%d; ActiveRequests never corrects downward, so this "+
+			"worker is ranked as permanently saturated", b.ActiveRequests)
+	}
+	if _, ok := reg.tryAcquireSlot("target"); !ok {
+		t.Error("target's only concurrency slot was consumed by the panic and never returned — no request " +
+			"can ever be dispatched to it again")
+	}
+	// The worker the request came from still holds what it held: ownership never
+	// transferred, so nothing of its accounting may have been unwound.
+	if b := reg.get("from"); b.ActiveRequests != 0 {
+		t.Errorf("the ORIGINAL worker's accounting was disturbed by a failed redispatch: active_requests=%d", b.ActiveRequests)
+	}
+	if *d.backend == nil || (*d.backend).ID != "from" {
+		t.Error("a panicking redispatch swapped the caller's backend anyway")
 	}
 }
 

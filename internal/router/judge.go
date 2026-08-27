@@ -11,16 +11,23 @@ import (
 	"time"
 )
 
-// Background answer judging (LLM-as-judge). A sampled fraction of answers served
-// by a cheaper-than-best backend are graded by the best model in the background;
-// a "bad" verdict raises that difficulty bin's tier bias in the online adapter.
+// Background answer judging (LLM-as-judge). A sampled fraction of served answers
+// is graded in the background by another worker in the fleet; a "bad" verdict
+// raises that difficulty bin's tier bias in the online adapter, and BOTH verdicts
+// are filed in the outcome matrix.
 //
 // This is the quality signal the adapter otherwise lacks: responseInadequate only
 // catches truncated/empty replies, so a fast-but-dumb model that returns a
 // complete-but-wrong answer reads as success and is silently trusted. Grading a
-// sample against the best model closes that loop — and under completion-time
+// sample against a second opinion closes that loop — and under completion-time
 // routing, raising a bin's floor is exactly what kicks a cheap-fast model out of
 // the prompts it keeps getting wrong.
+//
+// It is also the ONLY evidence that will ever cover the traffic actually being
+// served. The question bank is LiveBench maths and code; production is agent
+// loops and chat. Every row the matrix holds about a real prompt got there
+// through recordJudgedOutcome below, which is why "which answers are eligible to
+// be graded" is a routing question and not a housekeeping one — see judgeGrader.
 
 const (
 	judgeMaxConcurrent = 2    // cap background judge calls in flight
@@ -93,10 +100,10 @@ func (b *judgeBudget) charge(tokens int) {
 	b.spent += tokens
 }
 
-// maybeJudge samples a cheaper-than-best answer and, in the background, grades it
-// with the best model, feeding the verdict into the tier adapter. Non-blocking;
-// a no-op unless judging is enabled and a better model than the one that served
-// the request exists.
+// maybeJudge samples a served answer and, in the background, has another worker
+// grade it, feeding the verdict into the tier adapter and the outcome matrix.
+// Non-blocking; a no-op unless judging is enabled and some worker other than the
+// one that served the request is available to look at it.
 // thinking and latencyMS describe the request being graded, and exist so the
 // verdict can be recorded in the outcome matrix against the right (worker, mode)
 // pair. Without the mode a judged result would be filed against whichever mode
@@ -107,7 +114,7 @@ func (r *Router) maybeJudge(messages []Message, stream bool, served *Backend, ro
 	// learns from tier-routed requests, and the outcome matrix, which needs
 	// neither. Requiring the adapter here is what kept the matrix from ever
 	// seeing a judged answer on the path that routes most traffic.
-	if r.judgeSem == nil || r.cfg == nil || r.cfg.JudgeSampleRate <= 0 {
+	if served == nil || r.judgeSem == nil || r.cfg == nil || r.cfg.JudgeSampleRate <= 0 {
 		return
 	}
 	n := uint64(math.Round(1 / r.cfg.JudgeSampleRate))
@@ -117,9 +124,15 @@ func (r *Router) maybeJudge(messages []Message, stream bool, served *Backend, ro
 	if r.judgeCount.Add(1)%n != 0 {
 		return // not in this sample
 	}
-	best, paid := r.judgeGrader(served)
-	if best == nil || best.ID == served.ID || best.Quality <= served.Quality {
-		return // served by (or as good as) the best model — nothing better to grade with
+	grader, paid := r.judgeGrader(served)
+	// The question here is "is there anyone else who can look at this", NOT "was
+	// the served worker beaten by someone". Those were the same question under
+	// the quality scalar and have not been since the outcome matrix became the
+	// routing policy: the test that used to sit here, `best.Quality <= served
+	// .Quality`, is unsatisfiable for the fleet's own best worker and so excluded
+	// it from judging permanently. judgeGrader carries what that cost.
+	if grader == nil || grader.ID == served.ID {
+		return // nobody else in the fleet can offer a second opinion on this answer
 	}
 	if paid && !r.judgePaid.allow() {
 		return // no free model can grade this and the paid allowance is spent
@@ -136,7 +149,7 @@ func (r *Router) maybeJudge(messages []Message, stream bool, served *Backend, ro
 	}
 	go func() {
 		defer func() { <-r.judgeSem }()
-		bad, ok := r.askJudge(best, question, answer)
+		bad, ok := r.askJudge(grader, question, answer)
 		if !ok {
 			return
 		}
@@ -146,9 +159,9 @@ func (r *Router) maybeJudge(messages []Message, stream bool, served *Backend, ro
 		if bad {
 			if score, ok := parseRouteScore(route); ok && r.adapter != nil {
 				r.adapter.observe(score, true)
-				log.Printf("judge: %s answer for d=%.2f graded BAD by %s → raised tier bias", served.ID, score, best.ID)
+				log.Printf("judge: %s answer for d=%.2f graded BAD by %s → raised tier bias", served.ID, score, grader.ID)
 			} else {
-				log.Printf("judge: %s answer graded BAD by %s (route %q)", served.ID, best.ID, route)
+				log.Printf("judge: %s answer graded BAD by %s (route %q)", served.ID, grader.ID, route)
 			}
 		}
 		// BOTH verdicts are recorded. The tier adapter only ever cared about bad
@@ -219,46 +232,118 @@ func parseJudgeVerdict(content string) (bad, ok bool) {
 	return hasBad, true
 }
 
-// judgeGrader picks the model that grades this answer: the best FREE chat
-// backend, falling back to the best paid one only when no free model outranks
-// the worker that served the answer. paid reports which, so the caller knows
-// whether to charge the allowance.
+// judgeGrader picks the model that grades this answer: the strongest eligible
+// chat worker OTHER than the one being graded, free preferred over paid. paid
+// reports which, so the caller knows whether to charge the allowance.
 //
-// This is the one place in P4 where cost leaks into a path nobody asked to pay
-// for. The judge grades a sampled fraction of ordinary traffic, forever, and
-// the moment the best model in the fleet is a metered one that becomes a
-// standing spend on every cheap answer the router serves. The free grader is
-// preferred even when a paid model is better, because a verdict from a model
-// that merely outranks the one being graded is the signal the adapter wants —
-// the best possible grader is a nicety, not the requirement.
+// IT DOES NOT REQUIRE THE GRADER TO OUTRANK THE ANSWERER. That is the substance
+// of this function, not an omission, and it is worth being explicit about why.
+//
+// The old bar was `Quality >`, applied here and again in maybeJudge. It is
+// unsatisfiable for the fleet's own best worker — by definition nothing outranks
+// it — so judgeGrader handed maybeJudge the worker itself and maybeJudge dropped
+// the sample. Since recordJudgedOutcome is the only route by which production
+// traffic reaches the outcome matrix, the best worker accumulated ZERO judged
+// observations, permanently, in BOTH thinking modes. It then had no prediction
+// for a real prompt, fell into the matrix's `unmeasured` band, and ranked behind
+// any cheap worker with a known rate at or above outcomeCorrectFloor. A blind
+// spot on exactly one worker, chosen by a number routing stopped consulting the
+// day the matrix became the policy.
+//
+// Dropping the bar is right on the merits too. Grading is VERIFICATION;
+// answering is GENERATION; the first is the easier task. A model that could not
+// have produced the right answer can still see that a fluent, confident, wrong
+// one does not address the question — which is precisely the failure
+// responseInadequate cannot catch and the judge exists to catch. "Better than
+// the answerer" was never the requirement; it was a proxy for "credible",
+// borrowed from a scalar that no longer ranks anything.
+//
+// And it makes paid grading RARER, not commoner — which matters, because this is
+// the one place cost leaks into a path nobody asked to pay for: the judge grades
+// a sampled fraction of ordinary traffic, forever. Had the old rule simply been
+// relaxed to let the best worker be graded, a fleet whose best worker is free
+// and local would have sent every sample of its BUSIEST worker's traffic to a
+// metered grader, since nothing free outranks it. Here a paid grader is reached
+// only when the served worker is the sole free chat worker registered.
 //
 // eligible() already guarantees Healthy && Certification.Ready && !isExpired;
-// only the embeddings-only skip is still needed here.
+// only the embeddings-only skip and the never-itself rule are needed here.
 func (r *Router) judgeGrader(served *Backend) (grader *Backend, paid bool) {
+	if served == nil || r.registry == nil {
+		return nil, false
+	}
 	var bestFree, bestPaid *Backend
 	for _, b := range r.registry.eligible() {
-		if isEmbeddingsOnly(b) {
+		// Never the worker being graded. A model asked to mark its own answer has
+		// already committed to it once and agrees with itself by construction, so
+		// the verdict carries no information at any price.
+		if b.ID == served.ID || isEmbeddingsOnly(b) {
 			continue
 		}
 		if isFreeBackend(b) {
-			if bestFree == nil || b.Quality > bestFree.Quality {
+			if r.betterGrader(b, bestFree) {
 				bestFree = b
 			}
-		} else if bestPaid == nil || b.Quality > bestPaid.Quality {
+		} else if r.betterGrader(b, bestPaid) {
 			bestPaid = b
 		}
 	}
-	// "Good enough to grade with" is the same bar maybeJudge already applies to
-	// the grader it is handed — better than the worker being graded. It is
-	// re-tested here so that "no free model is good enough" can fall through to a
-	// paid one rather than abandoning the sample.
-	if bestFree != nil && served != nil && bestFree.ID != served.ID && bestFree.Quality > served.Quality {
+	if bestFree != nil {
 		return bestFree, false
 	}
 	if bestPaid != nil {
 		return bestPaid, true
 	}
-	return bestFree, false
+	return nil, false
+}
+
+// betterGrader reports whether candidate should displace best.
+func (r *Router) betterGrader(candidate, best *Backend) bool {
+	if best == nil {
+		return true
+	}
+	cs, bs := r.graderStrength(candidate), r.graderStrength(best)
+	if cs != bs {
+		return cs > bs
+	}
+	// eligible() walks a map, so a tie has to break on something stable. Left to
+	// iteration order, the fleet's grader — and therefore what the matrix learns
+	// from a run of identical requests — would vary from one sample to the next.
+	return candidate.ID < best.ID
+}
+
+// graderStrength ranks a candidate grader on the evidence the router actually
+// holds, as one comparable number.
+//
+// A worker the outcome matrix has MEASURED scores its hit rate, in [0,1]. One it
+// has not scores its registered Quality mapped into [-1,0), so every measured
+// worker outranks every unmeasured one and the retired scalar only ever breaks
+// ties among the unmeasured — a fleet before its first profile has run, which is
+// the one situation where it is still the best number available. Routing does
+// not consult it and neither should this, except there.
+//
+// The NO-THINK rate, whatever mode produced the answer being graded: askJudge
+// sends enable_thinking:false, so it is the no-think model that does the
+// grading. Founding goal 3 treats the two modes as separate models, and reading
+// a mixed-mode score here would rank a grader on a model nobody is about to
+// call. qualityFor carries the same rule for the scalar fallback.
+//
+// Deliberately the OVERALL rate rather than a per-prompt prediction. The matrix
+// can answer "how would this worker do on a prompt like this one", and that is
+// the better question — but predict() needs the prompt's embedding, and
+// maybeJudge is handed the messages, not the classification that carries the
+// vector. Re-embedding here would either double the embedding cost of every
+// sampled request or plant a vector with no observations behind it, which
+// neighboursOf would then count towards outcomeNeighbours while supplying no
+// evidence to anyone. Grader selection is also exactly the "no neighbours to
+// consult" case summary() documents itself as existing for.
+func (r *Router) graderStrength(b *Backend) float64 {
+	if r.outcomes != nil {
+		if rate, n := r.outcomes.summary(b.ID, false); n > 0 {
+			return rate
+		}
+	}
+	return float64(qualityFor(b, true))/100 - 1
 }
 
 // lastUserText returns the text of the most recent user message.

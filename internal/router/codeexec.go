@@ -185,6 +185,19 @@ var codeSandboxFaults = []struct {
 	// test cases decoded to something the grader cannot use. No worker can ever
 	// be scored on it.
 	{marker: "malformed test case ", permanent: true},
+	{marker: "malformed expected output", permanent: true},
+	// Nothing in the answer reached the entry point: the graded function is still
+	// the partial solution's truncated stub, so what ran was the PREFIX, not the
+	// model's text. Ungradeable rather than wrong — the sandbox measured the
+	// question's own scaffolding and learned nothing about the worker.
+	//
+	// Not permanent. This is usually the answer's shape (a bare restatement the
+	// assembler could not place), which the next worker may not repeat; only if
+	// every worker trips it is the QUESTION at fault, and the pass-rate floor
+	// already catches that.
+	// Matched on the tail: the message interpolates "{class}.{func}" mid-string,
+	// so only the part after it is a literal to pin against.
+	{marker: "as the partial solution's truncated stub"},
 }
 
 // codeRunFault reports why a graded run cannot be scored, or nil when the

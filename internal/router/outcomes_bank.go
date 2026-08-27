@@ -424,11 +424,37 @@ func (r *Router) backfillOutcomesFromProfiles(ctx context.Context) error {
 		// worker may be long gone, and keeping its results is the point.
 		hash := s.prof.ModelHash
 		if hash == "" {
-			// Written before the fingerprint was recorded. Falls back to a
-			// per-worker identity rather than guessing which model it was — the
-			// non-sharing direction, so an old profile can never be attributed to
-			// the wrong model.
+			// Written before the fingerprint was recorded, so the identity has to
+			// come from somewhere else — and it has to be the SAME identity a live
+			// query will compute, or the rows are filed at an address nothing ever
+			// asks for.
+			//
+			// That is not hypothetical: this used to fall back to
+			// unfingerprintedModelHash(id, model) unconditionally, and modelHash only
+			// takes that path for a worker with no served id, no parameter count and
+			// no size. Every real worker has at least a served id, so every legacy
+			// profile was recovered into a hash no candidate could match. Measured on
+			// the live fleet after a deploy: 497 observations present, every worker
+			// reporting total=0. The backfill ran, reported success, and rescued
+			// nothing.
+			//
+			// So: ask the registry what this worker hashes to TODAY. Only when it is
+			// gone does the unfingerprinted form apply, and there it is honest — an
+			// absent worker's fingerprint is genuinely unknown, and the row will be
+			// matched only by another worker that is equally unfingerprintable.
 			hash = unfingerprintedModelHash(s.id, s.prof.Model)
+			if live := r.liveBackend(s.id); live != nil {
+				hash = modelHash(live)
+			}
+		}
+		// Filing evidence nothing can look up is the failure this whole mechanism
+		// exists to prevent, so say when it happens rather than counting it as
+		// recovered. A registered worker whose hash disagrees with what it was
+		// profiled under means the fingerprint moved under it.
+		if live := r.liveBackend(s.id); live != nil && modelHash(live) != hash {
+			log.Printf("outcome matrix: %s was profiled under model %s but hashes to %s today — "+
+				"its %d recovered observations will not be consulted until it re-profiles",
+				s.id, hash, modelHash(live), len(s.prof.BenchResults)+len(s.prof.BenchResultsNoThink))
 		}
 		// The profile's own timestamp, not now(): these observations describe what
 		// happened when the profile ran, and dating them now would let a
@@ -455,4 +481,13 @@ func (r *Router) backfillOutcomesFromProfiles(ctx context.Context) error {
 			recovered, workers, unreadable, r.outcomes)
 	}
 	return nil
+}
+
+// liveBackend is the registered worker with this id, or nil — including when
+// there is no registry at all, which is a test driving the backfill directly.
+func (r *Router) liveBackend(id string) *Backend {
+	if r == nil || r.registry == nil {
+		return nil
+	}
+	return r.registry.get(id)
 }

@@ -400,6 +400,8 @@ func (r *Router) profileBackend(b *Backend, model string) (*WorkerProfile, error
 	if p.ContextK > 0 {
 		b.ContextK = p.ContextK
 	}
+	prog := r.progressFor(b.ID)
+	prog.enter(phaseCapacity, 0)
 	capN, capOK := r.capacityProbe(b)
 	// Abort BEFORE the benchmark when the capacity probe already failed: a hung
 	// worker otherwise burns 28 questions × attempts × the request timeout
@@ -413,6 +415,7 @@ func (r *Router) profileBackend(b *Backend, model string) (*WorkerProfile, error
 	// Prefill rate is measured here rather than left to the live EWMA, which only
 	// samples non-thinking requests and so never fills in for a thinking-heavy worker.
 	// A failure is not fatal: routing falls back to the flat TTFT average as before.
+	prog.enter(phasePrefill, 0)
 	if rate, err := r.prefillProbe(b); err != nil {
 		log.Printf("prefill probe failed for %s: %v — routing will price its TTFT from the flat average", b.ID, err)
 	} else {
@@ -428,6 +431,7 @@ func (r *Router) profileBackend(b *Backend, model string) (*WorkerProfile, error
 	if benchConc > 4 {
 		benchConc = 4 // cap concurrency so profiling leaves headroom for live traffic
 	}
+	prog.enter(phaseQuality, len(benchmarkQuestions))
 	quality, qOK, qBreakdown, qFailed, qResults := r.runQualityBenchmark(b, benchConc)
 	r.auditThinkingGate() // log where the reasoning gate disagrees with tier (model-independent, once)
 	// If the worker went unreachable mid-benchmark, the quality number is
@@ -455,6 +459,7 @@ func (r *Router) profileBackend(b *Backend, model string) (*WorkerProfile, error
 	// workers diverge — for the rest the mixed run already asked every question
 	// no-think, so the score is the same number and costs nothing to reuse.
 	if p.Thinking {
+		prog.enter(phaseQualityNT, 0)
 		ntScore, ntOK, ntBreakdown, ntResults := r.runNoThinkQualityBenchmark(b, benchConc, qResults)
 		if ntOK {
 			p.QualityNoThink = ntScore
@@ -515,6 +520,7 @@ func (r *Router) profileBackend(b *Backend, model string) (*WorkerProfile, error
 	// probe whose cost scales with the worker's own claim — a model advertising
 	// 256K spends real minutes in prefill proving it — and because a failure here
 	// must not cost the quality score already earned above.
+	prog.enter(phaseContext, 0)
 	if probe := r.runContextProbe(b, false); probe.AdvertisedTokens > 0 {
 		p.ContextProbe = &probe
 		p.Checks["context_usable"] = Check{OK: true, Message: contextProbeMessage(&probe)}

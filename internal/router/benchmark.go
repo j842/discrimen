@@ -613,6 +613,9 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 		go func(i int) {
 			defer wg.Done()
 			defer func() { <-sem }()
+			prog := r.progressFor(b.ID)
+			prog.begin()
+			defer func() { prog.end(); prog.step() }()
 			q := benchmarkQuestions[i]
 			results[i] = r.benchOne(b, q, q.Tier >= benchHardTier, busy)
 		}(i)
@@ -799,6 +802,7 @@ func (r *Router) runNoThinkQualityBenchmark(b *Backend, concurrency int, mixed [
 			hardIdx = append(hardIdx, i)
 		}
 	}
+	r.progressFor(b.ID).enter(phaseQualityNT, len(hardIdx))
 	rerun := make([]benchOutcome, len(hardIdx))
 	busy := &benchBusyTracker{}
 	sem := make(chan struct{}, concurrency)
@@ -819,6 +823,9 @@ func (r *Router) runNoThinkQualityBenchmark(b *Backend, concurrency int, mixed [
 		go func(j, i int) {
 			defer wg.Done()
 			defer func() { <-sem }()
+			prog := r.progressFor(b.ID)
+			prog.begin()
+			defer func() { prog.end(); prog.step() }()
 			rerun[j] = r.benchOne(b, benchmarkQuestions[i], false, busy)
 		}(j, i)
 	}

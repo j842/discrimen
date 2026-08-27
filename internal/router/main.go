@@ -156,6 +156,9 @@ type Backend struct {
 	// a registration content change as a re-registration, which resets
 	// certification and rebuilds the slot channel.
 	ContextProbe *ContextProbe `json:"context_probe,omitempty"`
+	// ProfileProgress is live only while a cold-start profile is running, and is
+	// attached for display rather than stored. Nil at every other moment.
+	ProfileProgress *ProfileProgressView `json:"profile_progress,omitempty"`
 	// Outcomes is the measured hit rate and per-topic breakdown, attached for
 	// display only. Never persisted and never read by routing: routing queries
 	// the matrix for neighbours of the actual prompt, and compressing that into
@@ -1045,8 +1048,14 @@ func (r *Router) handleBackends(w http.ResponseWriter, req *http.Request) {
 	}
 	pub := publicBackends(r.registry.snapshot())
 	for _, b := range pub {
-		if _, ok := r.profiling.Load(b.ID); ok {
+		if v, ok := r.profiling.Load(b.ID); ok {
 			b.Profiling = true // background cold-start profile still running → values provisional
+			// ...and WHAT it is doing. A profile is the longest thing this router
+			// runs, and publishing only a boolean left "is it stuck?" unanswerable
+			// without reading container logs.
+			if pp, ok := v.(*ProfileProgress); ok {
+				b.ProfileProgress = pp.snapshot()
+			}
 		}
 		// The measured hit rate and its per-topic breakdown, which is what
 		// replaces the quality score on every display surface. Attached here
@@ -3642,7 +3651,8 @@ func (r *Router) certifyBackend(id string) {
 	// old Load-then-Store pair left a multi-second window (two worker HTTP
 	// round-trips wide) where two registrations triggered duplicate concurrent
 	// capacity ramps + benchmarks against the same GPU.
-	if _, busy := r.profiling.LoadOrStore(id, true); busy {
+	progress := newProfileProgress()
+	if _, busy := r.profiling.LoadOrStore(id, progress); busy {
 		return // a certification/profile is already in flight for this worker
 	}
 	var gen int64
@@ -4496,7 +4506,27 @@ func (r *Router) rawCompletion(backend *Backend, payload map[string]any) (map[st
 // timeout, so that deadline alone governs whether an answer arrived in time — the
 // usability bound is a benchmark criterion, independent of the live-proxy
 // BACKEND_TIMEOUT_SECONDS.
+// benchCompletion is one profiling generation.
+//
+// It counts against ActiveRequests like any other. It did not, and the omission
+// showed up two ways: `ask -l` reported s=0/8 on a worker the benchmark was
+// hammering at four concurrent generations, and — the part that actually
+// misroutes — expectedLatency, relayOccupancy and the Concurrency log column all
+// read that same counter, so the fleet's load was understated exactly while a
+// profile was saturating a GPU. Live traffic was then priced as if the worker
+// were idle and sent to it.
+//
+// It does NOT take a slot. Slots are the router's promise about how many
+// requests a worker can serve at once, and the benchmark deliberately runs
+// beside live traffic at a capped concurrency of its own; taking slots would
+// have profiling starve the traffic it is supposed to be improving. Counting
+// without reserving is the honest reading: the worker really is this busy, and
+// the router really has not set that work aside.
 func (r *Router) benchCompletion(ctx context.Context, backend *Backend, payload map[string]any) (map[string]any, error) {
+	if r.registry != nil { // nil only in tests that drive the benchmark directly
+		r.registry.incActive(backend.ID, 1)
+		defer r.registry.incActive(backend.ID, -1)
+	}
 	return r.doCompletion(ctx, r.benchClient, backend, payload)
 }
 

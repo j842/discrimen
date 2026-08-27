@@ -47,10 +47,9 @@ type previewCandidate struct {
 	// and a thinking worker whose no-think score is unmeasured reads zero rather
 	// than inheriting its mixed-mode number (see qualityFor). Reporting
 	// b.Quality here regardless was how the preview came to disagree with the
-	// ranker it exists to explain — rankByDifficulty and qualityFloorPreference
-	// both read qualityFor, so a still-profiling thinking worker previewed as a
-	// q=93 above-bar front-runner on a no-think request that the router itself
-	// scored 0 and put last.
+	// ranker it exists to explain: backendScore reads qualityFor, so a
+	// still-profiling thinking worker previewed as a q=93 front-runner on a
+	// no-think request the router itself scored 0 and put last.
 	Quality int `json:"quality"`
 	// Outcome is what the outcome matrix predicts about this worker for THIS
 	// prompt, which on the live path is the whole basis of the ordering. Nil

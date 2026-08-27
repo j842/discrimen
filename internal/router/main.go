@@ -2526,12 +2526,10 @@ func (p acquirePreference) preferredFree() bool {
 // says nothing about the model a no-think client gets. The old fallback made
 // being unmeasured an advantage — a still-profiling 284B CPU worker inherited
 // its mixed q=93 on no-think requests, outranked every honestly-measured
-// worker (whose real no-think scores it also held the target above, via
-// autoTargetQuality's qmax) and drew all of Atlas's planner traffic onto a
-// 10 tok/s single slot (2026-08-25). Unmeasured now ranks below every
-// measured worker and cannot anchor the target; it is still routable as the
-// below-bar graceful fallback when nothing measured is available — "almost
-// never", not "never".
+// worker and drew all of Atlas's planner traffic onto a 10 tok/s single slot
+// (2026-08-25). Unmeasured now ranks below every measured worker. The tier
+// target that incident also poisoned no longer exists, but the rule still
+// matters: backendScore reads this, and so does the judge's grader choice.
 //
 // A NON-thinking worker keeps reading Quality: it serves the same model in
 // either mode, so the mixed score IS its no-think score — exact, and also
@@ -2549,8 +2547,9 @@ func qualityFor(b *Backend, thinkOff bool) int {
 	return b.Quality
 }
 
-// qualityFloorPreference is the bounded first choice for an ordinary request:
-// the workers at or above the classified tier and, among those, the FREE ones.
+// acquirePreferenceFor is the bounded first choice for an ordinary request: the
+// workers the outcome matrix judged interchangeable on correctness and, among
+// those, the FREE ones.
 //
 // Cost rides INSIDE the quality floor rather than beside it. PLAN.md's rule is
 // "among the workers that clear the quality bar, prefer the free ones, and
@@ -3167,8 +3166,8 @@ func setRouteHeaders(w http.ResponseWriter, backend *Backend, route string, logE
 // the candidate list is walked best-first when the top backend has no free slot,
 // so a burst spreads across the fleet, but there is no bounded grace and the
 // target it returns is DISCARDED. The quality floor described above is applied on
-// the chat path only, where proxyToBackend builds a qualityFloorPreference from
-// the whole plan (fix #2). The chat path does not go through here at all: it
+// the chat path only, where proxyToBackend builds an acquirePreferenceFor from
+// the whole plan. The chat path does not go through here at all: it
 // calls planRoute directly, because it needs the rest of the plan.
 //
 // The request is classified ONCE here; both axes are used: difficulty drives the
@@ -3207,8 +3206,9 @@ type routePlan struct {
 	cl   *classification
 	// able is how many LEADING candidates the outcome matrix judged
 	// interchangeable on correctness. Acquisition may reorder inside that prefix
-	// and must not reorder across it — see qualityFloorPreference. Zero means no
-	// prefix is protected, which is the tier path and the matrix's own fallback.
+	// and must not reorder across it — see acquirePreferenceFor. Zero means no
+	// prefix is protected, which is the matrix's own fallback and the degraded
+	// ranker.
 	able    int
 	job     jobCost
 	tr      thinkingResolution
@@ -3459,12 +3459,11 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 		filtered = trimmed
 	}
 
-	// Auto difficulty routing infers a target quality tier from the prompt, then
-	// lets rankByDifficulty pick the backend that clears it and will finish
-	// soonest. This is the ONLY model-tier mechanism — there are no client-tunable
-	// quality/speed levers. Best-effort: if the classifier is unavailable (no
-	// embeddings worker) or the request carries no messages (a bare /v1/completions
-	// call), fall through to the quality-ranked fallback below.
+	// Classify once, use both axes: difficulty carries the vector the outcome
+	// matrix ranks on, reasoning decides thinking mode. There are no
+	// client-tunable quality or speed levers. Best-effort — if the classifier is
+	// unavailable (no embeddings worker) or the request carries no messages (a
+	// bare /v1/completions call), fall through to the degraded ranker below.
 	// FIRST: the outcome matrix, which answers the routing question directly —
 	// which of these workers got questions like this one right, and which of
 	// those is fastest. No quality score, no difficulty target, nothing compared
@@ -3483,12 +3482,9 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 	// classify() cannot report ok without having written a vector. So whenever
 	// cl != nil this branch returns, and NOTHING BELOW IT RUNS.
 	//
-	// What is left below is therefore dead: targetForFleet, autoTargetQuality and
-	// rankByDifficulty are reachable only from tests. They are kept for now
-	// because deleting them touches difficulty.go's band tables and the arena's
-	// target_quality field, and that is a separate change from removing the
-	// adapter that used to feed them. Do not read their presence as evidence that
-	// a tier path still exists.
+	// The tier ranker that used to sit below has been deleted on the strength of
+	// exactly that argument. What remains below is the DEGRADED ranker, which is a
+	// different thing: it runs when there is no classification to rank on at all.
 	if cl != nil && r.outcomes != nil && len(cl.vec) > 0 {
 		// Self-healing: cheap when already filled (one atomic load), and the only
 		// thing that fills the bank after a warm restart.
@@ -5136,8 +5132,9 @@ func backendScore(b *Backend, thinkOff bool) int {
 // rankBackends sorts candidates best-first and returns the slice. The first
 // element is the single best choice; the remaining order lets pickAndAcquire
 // spill to the next-best backend when the best one has no free slot. This is the
-// fallback ranker for when auto-tiering can't run; the auto path uses
-// rankByDifficulty instead.
+// the DEGRADED ranker, used when there is no classification to rank on — no
+// embeddings worker, or a request with no messages. The live path ranks by the
+// outcome matrix (chooseByOutcome).
 func rankBackends(candidates []*Backend, job jobCost, thinkOff bool) []*Backend {
 	sort.SliceStable(candidates, func(i, j int) bool {
 		a, b := candidates[i], candidates[j]
@@ -5156,7 +5153,7 @@ func rankBackends(candidates []*Backend, job jobCost, thinkOff bool) []*Backend 
 		//      path (the classifier is unavailable), so cost only gets to separate
 		//      workers this ranker already considers interchangeable. Holding a
 		//      request off a paid endpoint entirely is the acquire step's job, not
-		//      this one — see qualityFloorPreference.
+		//      this one — see acquirePreferenceFor.
 		if af, bf := isFreeBackend(a), isFreeBackend(b); af != bf {
 			return af
 		}

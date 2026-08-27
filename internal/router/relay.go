@@ -739,16 +739,35 @@ func (r *Router) refreshRelay(rel Relay) []string {
 // version-skewed upstream whose field meant something else — could write values
 // into this registry that no local code path can produce.
 //
-// max_concurrency is the one with teeth, and it is the second half of a bug whose
-// first half is already fixed. syncSlotsLocked clamps the number it builds a SLOT
-// CHANNEL from, because filling that channel one token at a time under the
-// registry write lock is ~12.6ns each and 1e9 of them stops the router routing for
-// thirteen seconds. That clamp protects the channel and nothing else: b.MaxConcurrency
-// keeps the raw figure, and the RANKER reads that one. queueSlots returns it, so
-// loadPenalty computes min(n, 1e9) == n for the batch share and (n - 1e9)/1e9 <= 0
-// for the queue — every relayed row prices as permanently unloaded and wins every
-// comparison against a local worker that honestly reports being busy. The same
-// figure is then republished by effectiveSlots to anyone relaying through US.
+// max_concurrency is the second half of a bug whose first half is already fixed,
+// and it is worth being precise about which half this is, because the dangerous
+// half is not here. syncSlotsLocked clamps the number it builds a SLOT CHANNEL
+// from: filling that channel one token at a time under the registry write lock is
+// ~12.6ns each, so 1e9 of them stops the router routing for thirteen seconds.
+// That was the outage, and that is fixed.
+//
+// What was left behind is that the clamp protects the channel and nothing else —
+// b.MaxConcurrency keeps whatever the peer said. Three things then read the raw
+// figure, and none of them is the outage:
+//
+//   - effectiveSlots republishes it, so the absurd number propagates to the next
+//     router down the chain rather than stopping at the one that received it.
+//     Each hop re-clamps its own channel and passes the raw figure on again.
+//   - syncSlotsLocked logs its "clamping to" line BEFORE the no-change early
+//     return, and setRelayLoad calls it on every refresh (applyProfileIfGen too,
+//     whenever the two routers' benchmark versions match), so one bad row writes
+//     a log line or two every fifteen seconds, forever.
+//   - isFull reads it, and the dashboard renders it as "active / max" beside
+//     every worker, so the fleet reads as having a billion slots somewhere. The
+//     route preview publishes it as well.
+//
+// What it does NOT do, despite looking as though it should: distort the ranker.
+// queueSlots hands it to loadPenalty, which takes min(n, slots) for the batch
+// share and (n-slots)/slots for the queue — and for any occupancy a real fleet
+// reaches, min(n, 1e9) and min(n, 4096) are the same n and both queues are zero.
+// The clamp buys an honest number and a quiet log, not a routing fix. Said here
+// because the obvious next step, on reading the paragraph above, is to go looking
+// for the mis-ranking, and there isn't one.
 //
 // Clamping rather than dropping the row: a fleet that has gone dark is worse than
 // a fleet priced conservatively, and the same reasoning keeps a failed fetch's rows
@@ -849,7 +868,10 @@ func (r *Router) fetchRelayFleet(rel Relay) (*relayFleetResponse, float64, error
 	return &out, rtt, nil
 }
 
-// applyRelayEntry brings one upstream model into this router's registry.
+// applyRelayEntry brings one upstream WORKER into this router's registry, as its
+// own row. Not one row per model: two upstream endpoints serving the same weights
+// differ in quantisation, card and context window, and a blended row would hide
+// exactly the differences the ranker exists to exploit (see relayModelEntry).
 //
 // The REGISTRATION it upserts is deliberately minimal and deliberately stable:
 // id, url, model, credential, health path. Everything the upstream measures —

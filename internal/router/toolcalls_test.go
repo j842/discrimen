@@ -163,6 +163,55 @@ data: {"choices":[{"delta":{"content":"tail no newline"}}]}`
 	}
 }
 
+// dyingReader delivers its whole payload on the first Read and reports a
+// non-EOF failure in the SAME call — the shape net/http's body reader produces
+// when a chunked stream dies mid-frame, or is cancelled with bytes already
+// buffered. io.Reader explicitly permits it: "Callers should always process the
+// n > 0 bytes returned before considering the error err."
+type dyingReader struct {
+	data []byte
+	err  error
+	done bool
+}
+
+func (d *dyingReader) Read(p []byte) (int, error) {
+	if d.done {
+		return 0, d.err
+	}
+	d.done = true
+	n := copy(p, d.data)
+	return n, d.err
+}
+
+// The guard must not eat bytes that arrived just because the read that carried
+// them also carried the error. It used to: the (n>0, err) branch returned the
+// error straight out of the loop and threw away everything g.feed had just
+// sanitized, so a client watching a stream fail lost the last frames the worker
+// actually managed to send.
+func TestGuardDeliversBytesThatArrivedWithAnError(t *testing.T) {
+	const arrived = `data: {"choices":[{"delta":{"content":"the answer so far"}}]}
+data: {"choices":[{"delta":{"tool_calls":[{"id":"b","type":"function","index":0,"function":{"name":null,"arguments":""}}]}}]}
+`
+	boom := io.ErrUnexpectedEOF
+	backend := &Backend{BackendRegistration: BackendRegistration{ID: "llm-test", Model: "qwen"}}
+	g := newToolCallGuard(&dyingReader{data: []byte(arrived), err: boom}, backend)
+
+	out, err := io.ReadAll(g)
+	if err != boom {
+		t.Fatalf("read error = %v, want the source's %v — the failure must still surface", err, boom)
+	}
+	if !strings.Contains(string(out), "the answer so far") {
+		t.Errorf("content that arrived with the error was dropped: %q", string(out))
+	}
+	// And it is still sanitized on the way past, not merely flushed raw.
+	if g.drops != 1 {
+		t.Errorf("drops = %d, want 1 — the phantom slot must be filtered even on the failing read", g.drops)
+	}
+	if strings.Contains(string(out), "tool_calls") {
+		t.Errorf("nameless slot survived the error path: %q", string(out))
+	}
+}
+
 // A slot rescued by a later name must be kept, not stay dropped.
 func TestGuardKeepsSlotNamedInALaterDelta(t *testing.T) {
 	src := `data: {"choices":[{"delta":{"tool_calls":[{"id":"a","type":"function","index":0,"function":{"name":null,"arguments":""}}]}}]}

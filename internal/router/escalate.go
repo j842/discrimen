@@ -25,7 +25,14 @@ package router
 //
 //   - NON-STREAMED ONLY. Once SSE bytes are on the wire they cannot be recalled,
 //     and buffering a stream to inspect it would destroy the streaming latency
-//     that is the point of streaming. dispatchStreaming is untouched.
+//     that is the point of streaming. This is ESCALATION's boundary and not the
+//     file's: streamFailover below moves a STREAMING request too, and
+//     dispatchStreaming calls it. The two are not in tension, because they are
+//     triggered by different things. Escalation reads an answer, which does not
+//     exist until the stream is over. Failover reacts to a worker that could not
+//     answer at all, which is known at the dial — before a single byte has
+//     reached the client, and therefore inside a window where moving is invisible
+//     to them.
 //   - EMPTY ONLY, not truncated. A length-capped answer hit the CALLER's token
 //     ceiling; a bigger model runs into the same wall and bills twice for it.
 //     See classifyResponse.
@@ -50,15 +57,18 @@ import (
 	"time"
 )
 
-// escalateSlotWait bounds how long an escalation waits for the better worker's
-// slot. Short on purpose: the caller has already paid for one failed generation,
-// so a long queue here turns a repairable request into a timeout. Past it, the
-// original (empty) answer is returned rather than nothing.
+// escalateSlotWait bounds how long a request being MOVED waits for the next
+// worker's slot — every mover uses it, escalation and both failover paths, since
+// the trade is the same one each time. Short on purpose: the caller has already
+// paid for one failed generation, so a long queue here turns a repairable request
+// into a timeout. Past it, whatever the current worker produced is returned
+// rather than nothing.
 var escalateSlotWait = 15 * time.Second
 
-// dispatch is the mutable state of one buffered exchange. backend and slot are
-// pointers because escalation may hand both to a different worker mid-request
-// and proxyToBackend's deferred unwind has to see the swap.
+// dispatch is the mutable state of one exchange, buffered or streamed. backend
+// and slot are pointers because escalation and failover may hand both to a
+// different worker mid-request, and proxyToBackend's deferred unwind reads
+// through them rather than through captured values, so it has to see the swap.
 type dispatch struct {
 	backend   **Backend
 	slot      *chan struct{}
@@ -264,14 +274,20 @@ func (r *Router) affordable(d *dispatch, cands []*Backend, from *Backend) ([]*Ba
 	return fits, true
 }
 
-// redispatch is the MECHANICS of moving a request to another worker, with the
-// policy left to the caller.
+// redispatch is the MECHANICS of moving a BUFFERED request to another worker,
+// with the policy left to the caller.
 //
 // Two callers with different policies share it: escalate() moves a request whose
 // answer came back empty and only commits to something better, while failover()
 // moves one whose worker returned a 5xx and commits to any worker that answers
 // at all. The mechanics are identical and were fiddly enough to be worth having
 // in exactly one place — the ordering below is load-bearing.
+//
+// streamFailover is the third mover and cannot route through here, because the
+// step in the middle is different in kind: it dials and keeps the response open
+// rather than reading one to completion, and it has to inspect the status before
+// committing. It shares the three pieces that ARE the same — nextAffordable,
+// bodyFor and handOver — so the only thing it restates is the dial itself.
 //
 // On success the caller's slot and active-request accounting have ALREADY been
 // moved to the returned worker.

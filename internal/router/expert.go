@@ -85,10 +85,10 @@ func isExpertModel(name string) bool {
 // sessionLockWait's 5s, against qualityFloorWait's 10s and escalateSlotWait's
 // 15s), because it is the only one where waiting costs somebody else's answer:
 // the panel is as slow as its slowest member, so a request held here delays every
-// other member's result as well as its own. A worker that has not freed a slot in five seconds
-// is mid-generation — tens of seconds on this fleet — so waiting longer means
-// waiting out a whole other request, and the ensemble has N-1 other models to
-// hear from in the meantime.
+// other member's result as well as its own. A worker that has not freed a slot in
+// five seconds is mid-generation — tens of seconds on this fleet — so waiting
+// longer means waiting out a whole other request, and the ensemble has N-1 other
+// models to hear from in the meantime.
 var expertSlotWait = 5 * time.Second
 
 // expertMaxParallel caps how many members are in flight at once.

@@ -80,14 +80,13 @@ func TestRelayToleratesUpstreamWithoutWorkerIDs(t *testing.T) {
 // setRelayLoad, neither of which range-checks. So a peer could write numbers into
 // this registry that no local code path can produce.
 //
-// max_concurrency is the one with teeth, and this is the second half of a bug
-// whose first half is already fixed. syncSlotsLocked clamps the number it builds
-// a slot CHANNEL from, because filling that channel under the registry write lock
-// takes ~12.6ns a token and 1e9 of them stops the router routing for thirteen
-// seconds. b.MaxConcurrency keeps the raw figure — and the ranker reads THAT one:
-// queueSlots hands it to loadPenalty, which then computes min(n, 1e9) == n for the
-// batch share and a queue of zero, so the relayed row prices as permanently
-// unloaded and beats every local worker that honestly reports being busy.
+// max_concurrency is the second half of a bug whose first half is already fixed:
+// syncSlotsLocked clamps the number it builds a slot CHANNEL from (1e9 tokens at
+// ~12.6ns each, under the registry write lock, is thirteen seconds of not
+// routing), but b.MaxConcurrency keeps the raw figure. effectiveSlots then
+// republishes it to the next router down, so the number propagates along the
+// whole chain instead of stopping at the router that received it — which is what
+// the second half of this test pins.
 func TestRelayEntryIsClampedToTheRangesItsFieldsAreDefinedOver(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, relayFleetResponse{
@@ -128,14 +127,12 @@ func TestRelayEntryIsClampedToTheRangesItsFieldsAreDefinedOver(t *testing.T) {
 	if b.RemoteActive < 0 {
 		t.Errorf("remote occupancy = %d, want it floored at zero", b.RemoteActive)
 	}
-	// The consequence, not just the field: with an absurd ceiling the ranker
-	// prices no queue at all however busy the row is, so a saturated relayed
-	// worker looks exactly as cheap as an idle one.
-	busy := cloneBackend(b)
-	busy.RemoteActive = 64
-	if loadPenalty(busy) <= loadPenalty(b) {
-		t.Errorf("a relayed worker with 64 requests in flight prices the same as an idle one (%v vs %v) — the ceiling is not bounded",
-			loadPenalty(busy), loadPenalty(b))
+	// And it must not be handed on. Whatever this router accepted is what it
+	// publishes to anyone relaying through IT, so an unclamped figure walks the
+	// whole chain, re-clamping each hop's slot channel and propagating the raw
+	// number again.
+	if got := effectiveSlots(b); got > maxDeclarableConcurrency {
+		t.Errorf("republished max_concurrency = %d — the next router down inherits the same bad number", got)
 	}
 }
 

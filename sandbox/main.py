@@ -168,7 +168,22 @@ def handle_grade(request: dict) -> dict:
         "code": code,
         "prefix": prefix,
         "entry": entry or {},
-        "tests": tests,
+        # INPUTS ONLY. The expected outputs never cross into the jail, because
+        # the jail is one interpreter shared with the submission and anything in
+        # it is three lines of frame walking away:
+        #
+        #     fr = sys._getframe(1)
+        #     while fr:
+        #         if 'expected' in fr.f_locals: return fr.f_locals['expected']
+        #         fr = fr.f_back
+        #
+        # That returned pass:true, 3/3 against deliberately wrong expectations,
+        # and so did the same walk for the whole request payload. Deciding the
+        # verdict out here (see _decide) stops a submission redefining what
+        # correct means; it does nothing about one that simply reads the answer
+        # and hands it back. Stripping is what stops that, and it is why the
+        # child renders only the submission's side of a failure.
+        "tests": [_question_only(case) for case in tests],
         "memory_mb": memory_mb,
         # The CPU limit is the wall budget rounded up, not something separate. A
         # tighter CPU limit would fail a submission that is merely slow before
@@ -188,6 +203,17 @@ def handle_grade(request: dict) -> dict:
     # its absence as "could not grade", not as a wrong answer.
     result["prefix_applied"] = bool(prefix)
     return result
+
+
+def _question_only(case: dict) -> dict:
+    """One test case with its answer removed, ready to send into the jail.
+
+    An allow-list rather than a ``pop("output")``, so a field added to the case
+    format later has to be named here before it can reach a submission. The
+    child needs to know what to feed the code and how to run it, and nothing
+    else — see the comment in handle_grade for what happens when it knows more.
+    """
+    return {"input": case.get("input") or "", "testtype": case.get("testtype") or "functional"}
 
 
 def _assemble(outcome: supervisor.Outcome, requested: int, timeout_ms: int,
@@ -249,17 +275,42 @@ def _decide(cases: list, tests: list) -> None:
     what correct means. So the child reports what the submission RETURNED and the
     verdict is taken here, in a process it never touches.
 
+    This is also where the ``expected`` half of a failure report is RENDERED,
+    and not merely recomputed. The child is never told what the right answer is
+    (see handle_grade), so it has nothing to render — a submission that can read
+    the expected value off its own stack can also return it, which was a
+    perfect score for three lines of frame walking. Every case therefore gets
+    its expected side stamped on here, including the ones that failed with an
+    error, so the report reads the same as it always did.
+
     A case the child could not serialise, or one with no matching test, stays
     failed: an unverifiable answer is not a correct one.
     """
     for case in cases:
-        if case.get("error"):
-            case["pass"] = False
-            continue
+        case.setdefault("expected", "")
         index = case.get("index")
         if not isinstance(index, int) or index < 0 or index >= len(tests):
             case["pass"] = False
             case.setdefault("error", "no test case to verify this result against")
+            case.pop("value", None)
+            continue
+
+        raw_expected = tests[index].get("output") or ""
+        stdout_case = bool(case.get("stdout_case"))
+        try:
+            expected = raw_expected if stdout_case else compare.parse_expected(raw_expected)
+        except compare.TestDataError as exc:
+            # A fault in the QUESTION, not the answer. Reported as an error so the
+            # caller can tell "we could not grade this" from "the model was wrong".
+            case["pass"] = False
+            case["error"] = case.get("error") or f"malformed expected output: {exc}"
+            case.pop("value", None)
+            continue
+        case["expected"] = compare.render(expected)
+
+        if case.get("error"):
+            case["pass"] = False
+            case.pop("value", None)
             continue
         if "value" not in case:
             case["pass"] = False
@@ -270,23 +321,18 @@ def _decide(cases: list, tests: list) -> None:
         except (TypeError, ValueError) as exc:
             case["pass"] = False
             case.setdefault("error", f"unreadable result: {exc}")
+            case.pop("value", None)
             continue
-        raw_expected = tests[index].get("output") or ""
         try:
-            if case.get("stdout_case"):
-                case["pass"] = compare.compare_stdout(raw_expected, got if isinstance(got, str) else str(got))
+            if stdout_case:
+                case["pass"] = compare.compare_stdout(expected, got if isinstance(got, str) else str(got))
             else:
-                case["pass"] = compare.values_equal(compare.parse_expected(raw_expected), got)
-        except compare.TestDataError as exc:
-            # A fault in the QUESTION, not the answer. Reported as an error so the
-            # caller can tell "we could not grade this" from "the model was wrong".
-            case["pass"] = False
-            case["error"] = f"malformed expected output: {exc}"
+                case["pass"] = compare.values_equal(expected, got)
         except RecursionError:
             case["pass"] = False
             case["error"] = "the returned value could not be compared (recursive structure)"
-        # The child's own rendering of both sides is kept for the failure report;
-        # only the verdict is recomputed.
+        # The child's own rendering of what the submission returned is kept for
+        # the failure report; only the verdict is recomputed.
         case.pop("value", None)
 
 

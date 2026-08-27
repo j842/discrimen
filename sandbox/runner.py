@@ -3,9 +3,9 @@ model-generated code, and nothing above it does.
 
 Started by supervisor.py as ``python3 -I -S runner.py grade|decode``, with the
 request on stdin and nothing else — no argv payload (a 3.4 MB private-test blob
-is well past ARG_MAX), no scratch file (the expected answers would then be
-sitting in a directory the submission can read, and a submission that reads its
-own answer key grades as correct).
+is well past ARG_MAX), no scratch file (a submission can read its own working
+directory, and anything about the run left lying in there is something it can
+read about itself).
 
 RESULTS ARE STREAMED, one JSON object per line, and that is a robustness
 decision rather than a stylistic one. A submission that hangs is killed by the
@@ -43,15 +43,40 @@ the ANSWER and not at all against one that redefines what CORRECT MEANS. So this
 process now reports what the submission returned and main.py decides, in an
 address space the submission never touches (see _decide).
 
-The nonce remains a speed bump against a submission spraying JSON at the result
-descriptor, and it is still not a proof — but forging a record now only lets a
-submission lie about what it RETURNED, which the parent then compares against the
-expected value and rejects.
+AND THE ANSWER KEY IS NOT HERE EITHER, which is the half that moving the verdict
+out did NOT fix and which this docstring used to claim it had. Deciding in the
+parent stops a submission redefining correctness; it does nothing about one that
+simply LOOKS UP the right answer and returns it, and the expected outputs used
+to arrive in this process inside the request:
+
+    fr = sys._getframe(1)
+    while fr:                                    # → pass:true, 3/3
+        if 'expected' in fr.f_locals: return fr.f_locals['expected']
+        fr = fr.f_back
+
+Three lines, no knowledge of the question, and a perfect score against
+deliberately wrong expectations — confirmed live, along with the same walk for
+``payload`` and for the raw ``request`` bytes, and with a full forged record set
+emitted through ``sys.modules['__main__'].emit``. Every one of them is a
+capability measurement inflated by a model that emits a test-harness idiom.
+
+So the request the parent sends carries the INPUTS ONLY. Test cases reach this
+process with no ``output`` field at all (main.handle_grade strips them, and
+_strip_answer_key strips them again here in case a future caller does not),
+which is why nothing below this line renders or compares an expected value.
+Frame-walking now finds the questions and never the answers; forging a record
+only lets a submission lie about what it RETURNED, which the parent compares
+against an expected value this process has never seen. The nonce remains a
+speed bump against a submission spraying JSON at the result descriptor.
+
+Do not add the expected value back for a nicer failure report. The parent has
+the test cases and renders both sides itself — see main._decide.
 """
 
 from __future__ import annotations
 
 import base64
+import codecs
 import contextlib
 import io
 import json
@@ -60,6 +85,7 @@ import pickle
 import signal
 import sys
 import traceback
+import types
 import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -198,13 +224,66 @@ class _BinaryBridge(io.RawIOBase):
         return None
 
 
-class FedStdin(io.StringIO):
+class FedStdin(io.TextIOBase):
     """sys.stdin for a stdin-testtype case, with the .buffer a fair number of
-    solutions read instead."""
+    solutions read instead.
+
+    ONE stream, read from ONE cursor, because that is what a real interpreter
+    gives a program and the previous shape did not: .buffer was a property that
+    built a fresh BytesIO over the whole input on every access, so the standard
+    competitive-programming opening
+
+        n = int(input())
+        data = sys.stdin.buffer.read()
+
+    re-read the header it had already consumed. On "3\\n1 2 3\\n" that printed
+    "3 9" instead of "3 6", and it reported error:null — indistinguishable from
+    the model getting the arithmetic wrong. Every solution mixing the text and
+    binary APIs was being graded on doubled input.
+
+    The text side reads through the same BytesIO without reading ahead, so what
+    input() leaves behind is exactly what .buffer.read() returns. CPython's own
+    sys.stdin does read ahead — a TextIOWrapper pulls 8 KB at a time, which is
+    why the idiom above yields b"" there on a small input and the tail of a large
+    one. Matching that quirk would swap one confound for another: the same
+    submission would pass the small cases and fail the big ones, which reads as a
+    wrong answer too. The input here is already entirely in memory, so there is
+    nothing for a read-ahead buffer to win.
+    """
+
+    encoding = "utf-8"
+    errors = "replace"
+
+    def __init__(self, text: str):
+        self._raw = io.BytesIO(text.encode("utf-8"))
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
 
     @property
     def buffer(self):
-        return io.BytesIO(self.getvalue().encode("utf-8"))
+        return self._raw
+
+    def readable(self) -> bool:
+        return True
+
+    def read(self, size: int | None = -1) -> str:
+        if size is None or size < 0:
+            return self._decoder.decode(self._raw.read(), True)
+        # By bytes, not by characters: a character is at least one byte, so
+        # reading `size` bytes can never overshoot `size` characters, and a
+        # multi-byte character split across the boundary is held by the
+        # incremental decoder until the next pass tops it up.
+        out = ""
+        while len(out) < size:
+            chunk = self._raw.read(size - len(out))
+            if not chunk:
+                out += self._decoder.decode(b"", True)
+                break
+            out += self._decoder.decode(chunk)
+        return out
+
+    def readline(self, size: int | None = -1) -> str:
+        raw = self._raw.readline() if size is None or size < 0 else self._raw.readline(size)
+        return self._decoder.decode(raw, not raw)
 
 
 # ── Building the submission's namespace ─────────────────────────────────────
@@ -246,7 +325,47 @@ def load_submission(source: str, namespace: dict) -> str | None:
     return None
 
 
-def resolve_entry(namespace: dict, entry: dict | None):
+def _last_line(code: types.CodeType) -> int:
+    """The highest source line this code object covers, nested defs included.
+
+    The nesting matters: co_lines() on a method reports the line its inner
+    ``def popcount`` sits on and none of that function's body, so a completion
+    whose only contribution is inside a helper the prefix opened would otherwise
+    look like it had contributed nothing.
+    """
+    last = code.co_firstlineno
+    for _start, _end, line in code.co_lines():
+        if line is not None and line > last:
+            last = line
+    for const in code.co_consts:
+        if isinstance(const, types.CodeType):
+            last = max(last, _last_line(const))
+    return last
+
+
+def _only_from_the_prefix(func, prefix_lines: int) -> bool:
+    """Whether this callable's whole body came from the partial solution.
+
+    A completion prompt hands the model a class with one method truncated
+    part-way through, and an answer that restates that method at column 0 leaves
+    the truncated stub in the class with its own copy out at module level. The
+    two have the same name, so a lookup by name grades the stub — which returns
+    None for every case, reporting 0/N with error:null. compare.assemble now
+    re-indents that shape back into the class; this is the second line of
+    defence, so a stub that survives anyway is refused by name rather than
+    graded in silence.
+
+    A COMPLIANT answer is not caught by it. Its ``def`` line does come from the
+    prefix, but its body extends past the prefix's last line, so the code object
+    reaches further than prefix_lines and this is False.
+    """
+    code = getattr(func, "__code__", None)
+    if code is None or prefix_lines <= 0 or code.co_filename != "<submission>":
+        return False
+    return _last_line(code) <= prefix_lines
+
+
+def resolve_entry(namespace: dict, entry: dict | None, prefix_lines: int = 0):
     """Find how to reach the callable a functional case should invoke.
 
     Returns a FACTORY, not the callable: calling it produces a freshly bound
@@ -272,7 +391,22 @@ def resolve_entry(namespace: dict, entry: dict | None):
 
     if cls and isinstance(namespace.get(cls), type) and hasattr(namespace[cls], func):
         holder = namespace[cls]
-        return lambda: getattr(holder(), func)
+        if not _only_from_the_prefix(getattr(holder, func), prefix_lines):
+            return lambda: getattr(holder(), func)
+        # The class is still holding the prefix's truncated stub. If the model
+        # wrote its own copy at module level, bind that to a fresh instance so
+        # the ``self`` it kept in the signature has something to be — grading the
+        # stub instead is the failure that scored a correct answer 0/2.
+        rewritten = namespace.get(func)
+        if (
+            callable(rewritten)
+            and not isinstance(rewritten, type)
+            and not _only_from_the_prefix(rewritten, prefix_lines)
+        ):
+            return lambda: lambda *args, **kwargs: rewritten(holder(), *args, **kwargs)
+        raise LookupError(
+            f"the submission left {cls}.{func} as the partial solution's truncated stub"
+        )
 
     candidate = namespace.get(func)
     if callable(candidate) and not isinstance(candidate, type):
@@ -283,7 +417,7 @@ def resolve_entry(namespace: dict, entry: dict | None):
             continue
         if value.__module__ != "__submission__":
             continue  # a class the preamble imported, not one the submission wrote
-        if hasattr(value, func):
+        if hasattr(value, func) and not _only_from_the_prefix(getattr(value, func), prefix_lines):
             holder = value
             return lambda: getattr(holder(), func)
 
@@ -307,7 +441,7 @@ def run_grade(payload: dict) -> None:
     is what the wall clock is for. Callers who only need the boolean can send
     stop_on_first_failure.
     """
-    source = compare.assemble_source(payload.get("prefix") or "", payload.get("code") or "")
+    source, prefix_lines = compare.assemble(payload.get("prefix") or "", payload.get("code") or "")
     tests = payload.get("tests") or []
     entry = payload.get("entry") or {}
     stop_early = bool(payload.get("stop_on_first_failure"))
@@ -323,7 +457,7 @@ def run_grade(payload: dict) -> None:
     factory = None
     if any((case.get("testtype") or "functional").strip().lower() != "stdin" for case in tests):
         try:
-            factory = resolve_entry(namespace, entry)
+            factory = resolve_entry(namespace, entry, prefix_lines)
         except Exception as exc:  # noqa: BLE001
             # The load error, when there is one, is the cause; the missing entry
             # point is only its symptom.
@@ -357,15 +491,17 @@ def run_grade(payload: dict) -> None:
 
 
 def run_functional_case(factory, case: dict) -> dict:
+    # ``case`` holds an input and a testtype and no expected output — the parent
+    # strips it, so that no frame on this stack has the answer in it while the
+    # submission is running. See the module docstring.
     args = compare.parse_functional_args(case.get("input") or "")
-    expected = compare.parse_expected(case.get("output") or "")
 
     try:
         call_target = factory()
     except (_Deadline, MemoryError):
         raise
     except BaseException as exc:  # noqa: BLE001
-        return _failure(expected, None, f"constructing the entry point: {_describe(exc)}")
+        return _failure(None, f"constructing the entry point: {_describe(exc)}")
 
     sink = CappedStdout()
     try:
@@ -374,17 +510,17 @@ def run_functional_case(factory, case: dict) -> dict:
     except (_Deadline, MemoryError):
         raise
     except BaseException as exc:  # noqa: BLE001 — a submission may raise SystemExit
-        return _failure(expected, None, _describe(exc))
+        return _failure(None, _describe(exc))
 
     # NO VERDICT HERE. The child reports what the submission RETURNED; the
     # parent decides whether it is correct. See _verifiable.
     try:
-        return _verifiable(expected, got, None)
+        return _verifiable(got, None)
     except RecursionError:
         # A submission that returned a self-referential structure. MAX_DEPTH
         # normally catches this first; this is the case where the recursion is
         # in a __eq__ the submission wrote.
-        return _failure(expected, None, "the returned value could not be compared (recursive structure)")
+        return _failure(None, "the returned value could not be compared (recursive structure)")
 
 
 def run_stdin_case(source: str, case: dict) -> dict:
@@ -405,7 +541,6 @@ def run_stdin_case(source: str, case: dict) -> dict:
     in this dataset uses, against a class of hang in the code that exists to
     prevent hangs.
     """
-    expected = case.get("output") or ""
     sink = CappedStdout()
     namespace = build_namespace()
     namespace["__name__"] = "__main__"
@@ -420,21 +555,21 @@ def run_stdin_case(source: str, case: dict) -> dict:
                 # sys.exit(0) at the end of main() is idiomatic and is not a
                 # failure; a non-zero code is the program saying it failed.
                 if exc.code not in (None, 0):
-                    return _failure(expected, sink.value(), f"exited with status {exc.code}")
+                    return _failure(sink.value(), f"exited with status {exc.code}")
     except (_Deadline, MemoryError):
         raise
     except BaseException as exc:  # noqa: BLE001
-        return _failure(expected, sink.value(), _describe(exc))
+        return _failure(sink.value(), _describe(exc))
     finally:
         sys.stdin = saved_stdin
 
     got = sink.value()
     if sink.truncated():
-        return _failure(expected, got, f"stdout exceeded {STDOUT_CAPTURE_LIMIT} bytes")
-    return _verifiable(expected, got, None, stdout=True)
+        return _failure(got, f"stdout exceeded {STDOUT_CAPTURE_LIMIT} bytes")
+    return _verifiable(got, None, stdout=True)
 
 
-def _verifiable(expected, got, error: str | None, stdout: bool = False) -> dict:
+def _verifiable(got, error: str | None, stdout: bool = False) -> dict:
     """One case, reported so the PARENT can decide it.
 
     The verdict deliberately does not come from this process. The harness and the
@@ -451,36 +586,41 @@ def _verifiable(expected, got, error: str | None, stdout: bool = False) -> dict:
     correct means. So the child now emits the raw value and the parent compares,
     outside any namespace a submission can reach.
 
-    ``value`` is JSON so it survives the pipe. A value that will not serialise is
-    reported as unverifiable rather than as a pass: the outputs these questions
-    have are all JSON by construction, so an unserialisable return is not a right
-    answer that we failed to read.
+    No ``expected`` here, for the other half of the same argument: a value this
+    process holds is a value the submission can read off the stack and return.
+    The parent renders both sides of a failure from the test case it kept.
+
+    ``value`` is JSON so it survives the pipe, and it is PLAIN json.dumps — no
+    ``default=str``. The fallback made every object serialisable by printing it,
+    so a submission returning an object whose __str__ happened to spell the
+    expected string scored a pass; the outputs these questions have are all JSON
+    by construction, so a return that will not serialise is not a right answer we
+    failed to read, and reporting it as unverifiable is the honest result.
     """
     record = {
-        "expected": compare.render(expected),
         "got": compare.render(got),
         "error": error,
         "stdout_case": stdout,
     }
     try:
-        record["value"] = json.dumps(got, default=str)
+        record["value"] = json.dumps(got)
     except (TypeError, ValueError, RecursionError) as exc:
         record["error"] = error or f"the returned value could not be serialised: {exc}"
     return record
 
 
-def _failure(expected, got, error: str | None) -> dict:
-    """One failed case, with both sides rendered for a human to read.
+def _failure(got, error: str | None) -> dict:
+    """One failed case, with the submission's side rendered for a human to read.
 
-    Rendered through JSON even for a stdin case, where both sides are already
-    strings and passing them through untouched would be the obvious thing. It is
-    the wrong thing: the failure a stdin case most often has is a trailing
-    newline or a stray space, and untouched text renders those as nothing at
-    all. ``"16\\n"`` against ``"16"`` is a report somebody can act on.
+    Rendered through JSON even for a stdin case, where it is already a string and
+    passing it through untouched would be the obvious thing. It is the wrong
+    thing: the failure a stdin case most often has is a trailing newline or a
+    stray space, and untouched text renders those as nothing at all. ``"16\\n"``
+    against ``"16"`` is a report somebody can act on. The expected side is
+    rendered the same way by the parent, which is the only process that has it.
     """
     return {
         "pass": False,
-        "expected": compare.render(expected),
         "got": compare.render(got),
         "error": error,
     }
@@ -594,6 +734,21 @@ def _as_text(value) -> str:
 # ── Entry point ─────────────────────────────────────────────────────────────
 
 
+def _strip_answer_key(payload: dict) -> None:
+    """Drop every expected output from the request, before anything is executed.
+
+    The parent already sends inputs only, so on the shipped path this finds
+    nothing. It runs anyway because the cost of the caller being wrong about that
+    is not a bad error message: an ``output`` reaching this process is a value
+    sitting in a frame on the submission's own call stack, and three lines of
+    frame walking turn it into a perfect score. Enforcing the contract at the
+    boundary it protects is what stops a future caller reopening it by accident.
+    """
+    for case in payload.get("tests") or []:
+        if isinstance(case, dict):
+            case.pop("output", None)
+
+
 def _on_deadline(signum, _frame):
     name = "cpu limit exceeded" if signum == signal.SIGXCPU else "time limit exceeded"
     raise _Deadline(name)
@@ -616,6 +771,11 @@ def main(argv: list[str]) -> int:
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         emit(t="fatal", error=f"unreadable request: {exc}")
         return 2
+    _strip_answer_key(payload)
+    # The raw bytes are a local of this frame, and this frame is on the stack
+    # for as long as the submission runs — a walk to it reads the whole request
+    # back, stripped payload or not.
+    del request
     _NONCE = str(payload.get("nonce") or "")
 
     drop_to = payload.get("drop_to")

@@ -40,6 +40,7 @@ COMPARISON, and the four decisions in it that are not obvious:
 
 from __future__ import annotations
 
+import ast
 import json
 import math
 import re
@@ -128,16 +129,26 @@ def extract_source(code: str) -> str:
     possible pass. A model that wraps its answer in a code block is answering
     the question; scoring it zero measures its formatting.
     """
-    return assemble_source("", code)
+    return assemble("", code)[0]
 
 
 def assemble_source(prefix: str, code: str) -> str:
-    """The runnable program, given an optional partial solution to continue.
+    """The runnable program only. See assemble for how it is chosen."""
+    return assemble(prefix, code)[0]
 
-    With no prefix this is plain unfencing. With one, the submission is only
-    ever a FRAGMENT — a function body resumed part-way through — and the
-    difference matters more than it looks: a fragment never compiles on its own,
-    so applying the usual "does it compile" gate to the fragment alone rejects
+
+def assemble(prefix: str, code: str) -> tuple[str, int]:
+    """The runnable program, and how many of its leading lines came from the prefix.
+
+    The second number is not decoration. runner.resolve_entry uses it to tell a
+    definition the MODEL wrote from the truncated one the prefix already had,
+    which are otherwise indistinguishable by name. It is 0 whenever the chosen
+    reading does not begin with prefix text.
+
+    With no prefix this is plain unfencing. With one, the submission is usually
+    a FRAGMENT — a function body resumed part-way through — and the difference
+    matters more than it looks: a fragment never compiles on its own, so
+    applying the usual "does it compile" gate to the fragment alone rejects
     every candidate and falls through to returning the raw reply, fences and
     all. Every completion answer would then be a syntax error.
 
@@ -145,70 +156,204 @@ def assemble_source(prefix: str, code: str) -> str:
     actually has to run. That also makes the fenced-block choice meaningful for
     completions: the right block is the one that continues THIS prefix.
     """
-    def joined(body: str) -> str:
-        if not prefix:
-            return body
-        # The task specifies literal appending ("directly appending your code
-        # after the partial code should produce a correct completion"), so the
-        # join must not reindent or strip leading whitespace — the fragment's
-        # own indentation is what places it inside the function. Only the
-        # newline between the two is normalised, since a fenced block arrives
-        # without the prefix's trailing newline.
-        return prefix.rstrip("\n") + "\n" + body.lstrip("\n")
-
     blocks = _FENCE_RE.findall(code)
     # Python-tagged blocks first, then untagged, then everything else — a reply
     # that shows the wrong answer in a ```text block and the real one in
-    # ```python must be graded on the ```python one.
-    #
-    # Within each tag group the LAST block wins, because every string-graded mode
-    # in the router reads the answer the model committed to and that is the one
-    # it wrote last: a reply that drafts a solution, spots the error and posts a
-    # correction was otherwise graded on the draft. The reversal is per group
-    # rather than over the whole list, or it would invert the tag priority above
-    # and prefer a ```text block to a ```python one.
-    def _group(pred):
-        return [body for tag, body in reversed(blocks) if pred(tag.lower())]
-
+    # ```python must be graded on the ```python one. The grouping is what keeps
+    # that priority intact; see _readings for the order WITHIN a group.
     py = ("python", "python3", "py")
-    ordered = _group(lambda t: t in py)
-    ordered += _group(lambda t: t == "")
-    ordered += _group(lambda t: t not in py and t != "")
+    ordered = _readings(blocks, lambda t: t in py)
+    ordered += _readings(blocks, lambda t: t == "")
+    ordered += _readings(blocks, lambda t: t not in py and t != "")
     candidates = [code] + ordered
 
-    # Continuation first, then the reply standing alone. BOTH are accepted, and
-    # that is a deliberate choice about what this benchmark measures.
-    #
-    # A completion prompt asks for the missing portion only. Some models comply
-    # and some restate the whole function, and grading only the continuation
-    # scores the restaters zero while grading only the standalone scores the
-    # compliant ones zero. Either way the task stops measuring whether the model
-    # can solve the problem and starts measuring whether it followed a
-    # formatting instruction — which is exactly the confound that made the two
-    # strongest workers score 0% here and the weakest score highest.
-    #
-    # Accepting whichever interpretation actually runs drops the format axis
-    # entirely. It cannot manufacture a pass: the tests still have to agree with
-    # the reference implementation, and a wrong program fails under both
-    # readings.
-    for cand in candidates:
-        if _compiles(joined(cand)):
-            return joined(cand)
-    if prefix:
+    if not prefix:
         for cand in candidates:
             if _compiles(cand):
-                return cand
-    # Nothing compiled. Return the best-effort join rather than the bare reply,
-    # so a completion still fails as "this program is wrong" with the prefix in
-    # the traceback, not as an unexplained syntax error in a fragment.
-    return joined(ordered[0]) if ordered else joined(code)
+                return cand, 0
+        # Nothing compiled. The best block beats the raw reply, so the failure
+        # reads as "this program is wrong" rather than as a fence in a traceback.
+        return (ordered[0] if ordered else code), 0
+
+    head, member_indent, head_lines = _open_definition(prefix)
+    prefix_lines = prefix.rstrip("\n").count("\n") + 1
+
+    # Four readings of a completion answer, tried in this order, and ALL of them
+    # are accepted. That is a deliberate choice about what this benchmark
+    # measures: a completion prompt asks for the missing portion only, some
+    # models comply and some restate the whole function, and grading only one
+    # interpretation scores the other zero. Either way the task stops measuring
+    # whether the model can solve the problem and starts measuring whether it
+    # followed a formatting instruction — exactly the confound that made the two
+    # strongest workers score 0% here and the weakest score highest.
+    #
+    # Accepting whichever reading actually runs drops the format axis entirely.
+    # It cannot manufacture a pass: the tests still have to agree with the
+    # reference implementation, and a wrong program fails under every reading.
+    for cand in candidates:  # 1. a genuine continuation of the truncated body
+        if _continues(cand, member_indent) and _compiles(join_prefix(prefix, cand)):
+            return join_prefix(prefix, cand), prefix_lines
+    for cand in candidates:  # 2. the truncated method, restated at column 0
+        grafted = _graft(head, head_lines, member_indent, cand)
+        if grafted is not None and _compiles(grafted[0]):
+            return grafted
+    for cand in candidates:  # 3. a whole class or module-level function, shadowing
+        if _compiles(join_prefix(prefix, cand)):
+            return join_prefix(prefix, cand), prefix_lines
+    for cand in candidates:  # 4. the reply standing entirely on its own
+        if _compiles(cand):
+            return cand, 0
+    return join_prefix(prefix, ordered[0] if ordered else code), prefix_lines
 
 
 def join_prefix(prefix: str, body: str) -> str:
-    """Append an already-extracted body to a partial solution."""
+    """Append a body to a partial solution, verbatim.
+
+    The task specifies literal appending ("directly appending your code after
+    the partial code should produce a correct completion"), so the join must not
+    reindent or strip leading whitespace — the fragment's own indentation is
+    what places it inside the function. Only the newline between the two is
+    normalised, since a fenced block arrives without the prefix's trailing one.
+    """
     if not prefix:
         return body
     return prefix.rstrip("\n") + "\n" + body.lstrip("\n")
+
+
+def _readings(blocks: list[tuple[str, str]], pred) -> list[str]:
+    """One tag group's candidates: the whole group joined, then each block alone.
+
+    JOINED FIRST, because a reply's fenced blocks are usually one program cut
+    into pieces rather than a list of alternatives. Taking only the last block
+    made an "Example usage" demo THE submission: a correct answer followed by a
+    ```python block containing ``print(Solution().f(1))`` came back pass:false,
+    cases_run:0, "NameError: name 'Solution' is not defined". Reproduced live. A
+    reply that puts its imports in one block and its class in the next failed
+    the same way, and a model that demonstrates its own answer is not a model
+    that wrote no answer.
+
+    A retracted draft followed by a correction still grades as the correction:
+    two defs of the same name in one module leave the LATER one bound, which is
+    the answer "last block wins" was reaching for — arrived at now by running
+    the model's whole reply instead of by picking one piece of it.
+
+    Then each block alone, latest first, for the replies the join cannot run —
+    a draft whose module level raises before the correction is ever reached.
+    """
+    bodies = [body for tag, body in blocks if pred(tag.lower())]
+    if len(bodies) < 2:
+        return bodies
+    return ["".join(b if b.endswith("\n") else b + "\n" for b in bodies)] + list(reversed(bodies))
+
+
+# A ``def`` line, capturing its indentation. A completion prefix always breaks
+# off inside one — that is what makes it a completion prompt — so this is how
+# far in a genuine continuation of it has to be.
+_DEF_RE = re.compile(r"^([ \t]*)(?:async[ \t]+)?def[ \t]")
+
+
+def _open_definition(prefix: str) -> tuple[str, int, int]:
+    """The prefix up to its last ``def``, that def's indent, and its line count.
+
+    The indent is -1 when the prefix contains no def at all, which makes every
+    candidate count as a continuation and leaves such a prefix grading exactly
+    as it did before.
+    """
+    lines = prefix.split("\n")
+    for index in range(len(lines) - 1, -1, -1):
+        match = _DEF_RE.match(lines[index])
+        if not match:
+            continue
+        start = index
+        # A decorator belongs to the def below it, so cutting between the two
+        # would leave a dangling @lru_cache that cannot compile.
+        while start > 0 and lines[start - 1].lstrip().startswith("@"):
+            start -= 1
+        return "\n".join(lines[:start]), len(match.group(1).expandtabs(8)), start
+    return "", -1, 0
+
+
+def _indent_of(body: str) -> int | None:
+    """The shallowest indentation in a block of code; None if it is all blank."""
+    widths = [
+        len(line) - len(line.lstrip())
+        for line in body.expandtabs(8).split("\n")
+        if line.strip()
+    ]
+    return min(widths) if widths else None
+
+
+def _continues(body: str, def_indent: int) -> bool:
+    """Whether this candidate resumes the prefix's last definition.
+
+    Indentation is the whole test, and it is the one that was missing. A model
+    that answers "complete this method" by restating the method at COLUMN 0
+    produces a join that still compiles — the restatement lands at module level
+    beside the class, and the class keeps the truncated stub the prefix ended on.
+    resolve_entry then grades the stub, which returns None for every case: the
+    run comes back 0/N with error:null, indistinguishable from a wrong answer.
+    That is the shape that scored the fleet's strongest worker 0/50 on
+    coding_completion while its weakest scored 8/50.
+    """
+    if def_indent < 0:
+        return True  # there is no open definition to fall out of
+    indent = _indent_of(body)
+    return indent is None or indent > def_indent
+
+
+def _graft(head: str, head_lines: int, indent: int, body: str) -> tuple[str, int] | None:
+    """The prefix with its truncated definition REPLACED by a restated one.
+
+    For the answer shape _continues rejects: the model wrote the whole method
+    out again at column 0. Appending that leaves it at module level, where it is
+    dead code — and, still carrying ``self``, uncallable on its own — so it is
+    re-indented back into the class body instead and the stub it replaces is
+    dropped. Everything above that def survives: the imports, the class header,
+    any earlier method.
+
+    Replacing rather than appending is what makes it work on a prefix cut
+    mid-block. A prefix ending on ``for i in range(n):`` has an open suite, and
+    a second def appended after it is an IndentationError.
+
+    None when the candidate is not that shape. A restated CLASS, or a restated
+    module-level function, must NOT be re-indented: at column 0 it already
+    shadows the prefix's own, which is the reading that has always worked.
+    """
+    if indent < 0 or not _restates_a_method(body):
+        return None
+    delta = indent - (_indent_of(body) or 0)
+    if delta < 0:
+        return None
+    pad = " " * delta
+    shifted = "\n".join(pad + line if line.strip() else line for line in body.split("\n"))
+    if not head.strip():
+        return shifted, 0
+    return head.rstrip("\n") + "\n" + shifted.lstrip("\n"), head_lines
+
+
+def _restates_a_method(body: str) -> bool:
+    """Whether this candidate is one or more bare METHODS and nothing else.
+
+    Read off the parse tree rather than matched with a regex, because the thing
+    that decides it is the first parameter: a top-level ``def f(self, n)`` only
+    means anything inside a class, while ``def f(n)`` at column 0 is a complete
+    module-level answer and has to be left exactly where the model put it.
+    """
+    try:
+        tree = ast.parse(body)
+    except (SyntaxError, ValueError, MemoryError, RecursionError):
+        return False
+    found = False
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return False
+        args = node.args.posonlyargs + node.args.args
+        if not args or args[0].arg not in ("self", "cls"):
+            return False
+        found = True
+    return found
 
 
 def _compiles(source: str) -> bool:
@@ -293,10 +438,19 @@ def compare_stdout(expected: str, got: str) -> bool:
       and a checker that says otherwise is grading print formatting. The token
       counts must still match, so this cannot rescue an answer with the wrong
       number of values in it.
+
+    The second pass is applied LINE BY LINE, not to the whole output as one bag
+    of tokens. Flattening it passed "1 2 3" against an expected "1\\n2\\n3" — a
+    program that printed one line where three were asked for — because the
+    tolerance pass was reached precisely when the line structure had already
+    failed to match, and then ignored the thing that had just failed.
     """
-    if _normalise_lines(expected) == _normalise_lines(got):
+    left, right = _normalise_lines(expected), _normalise_lines(got)
+    if left == right:
         return True
-    return _tokens_match(expected, got)
+    if len(left) != len(right):
+        return False
+    return all(_tokens_match(a, b) for a, b in zip(left, right))
 
 
 def _normalise_lines(text: str) -> list[str]:
@@ -308,6 +462,7 @@ def _normalise_lines(text: str) -> list[str]:
 
 
 def _tokens_match(expected: str, got: str) -> bool:
+    """One LINE of expected output against one line of actual, token by token."""
     left, right = expected.split(), got.split()
     if len(left) != len(right):
         return False

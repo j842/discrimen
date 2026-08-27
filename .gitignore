@@ -49,3 +49,4 @@ __pycache__/
 # Private coding test blobs: ~250MB of base64(zlib(pickle)) fetched beside
 # pool.json. Reproducible from `discrimen bench fetch`, so not a source artefact.
 internal/router/benchdata/private/
+internal/router/zz*_test.go

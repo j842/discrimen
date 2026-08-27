@@ -620,6 +620,27 @@ func Main() {
 	} else {
 		log.Printf("outcome matrix: %s", router.outcomes)
 	}
+	// Reconstruct observations from profiles already on disk.
+	//
+	// Observations used to be written in exactly one place — the moment a profile
+	// COMPLETED, in this process — so a router that restarted after a
+	// benchmarkVersion bump ran with an empty matrix for the length of a full
+	// fleet re-profile, hours during which every request took the fallback and
+	// routed on speed alone with no correctness input. Measured on the live fleet
+	// mid-deploy: "0 questions, 392 vectors, 0 observations", while a completed
+	// 392-result profile representing 194 minutes of measurement sat unread in the
+	// same database.
+	//
+	// The evidence was never missing, only unreachable: worker_profiles stores
+	// BenchResults in the exact shape observationsFromMixed consumes. This turns
+	// hours of blind routing into a startup read. Best effort, like load() — a
+	// failed backfill costs prediction quality, and refusing to start would take
+	// the fleet down over a cache.
+	if err := router.backfillOutcomesFromProfiles(context.Background()); err != nil {
+		log.Printf("outcome matrix: backfill from stored profiles failed: %v", err)
+	} else {
+		log.Printf("outcome matrix after backfill: %s", router.outcomes)
+	}
 	// Vectors are derived, not stored, so a restart starts with none. Kick the
 	// fill off now rather than waiting for the first request to notice.
 	router.ensureBankVectorsAsync()

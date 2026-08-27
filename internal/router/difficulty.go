@@ -1095,12 +1095,6 @@ type thinkingResolution struct {
 	effort    string // chat_template_kwargs.reasoning_effort to write beside it ("" ⇒ write none)
 	hardThink bool   // hard-require a thinking-capable worker (explicit "on"; may 503)
 	softThink bool   // prefer a thinking-capable worker if any survive (auto reasoning)
-	// autoDecided marks a mode the ROUTER inferred rather than one the caller
-	// asked for. Explicit "off" and classifier-decided "off" are otherwise the
-	// same resolution, and the difference matters: a caller's instruction is not
-	// a hypothesis to test, while the classifier's guess is exactly that. This is
-	// what the draft gate keys on (see dart.go).
-	autoDecided bool
 	// noThink records that this request WILL be served with thinking disabled —
 	// explicit "off", reasoning_effort "none", a kwargs escape hatch pinning it
 	// off, or a direct verdict from the auto classifier. Selection then compares
@@ -1210,9 +1204,9 @@ func (r *Router) resolveThinking(chatReq *ChatRequest, route string, cl *classif
 		return thinkingResolution{}
 	}
 	if r.classifier.wantThinking(cl.reasoning) {
-		return thinkingResolution{patch: true, enable: true, softThink: true, autoDecided: true}
+		return thinkingResolution{patch: true, enable: true, softThink: true}
 	}
-	return thinkingResolution{patch: true, enable: false, noThink: true, autoDecided: true}
+	return thinkingResolution{patch: true, enable: false, noThink: true}
 }
 
 // clientSetKwargThinking reports whether the client pinned a thinking gate at
@@ -1556,18 +1550,4 @@ func envBool(key string, fallback bool) bool {
 	default:
 		return fallback
 	}
-}
-
-// withThinking returns the resolution with the mode forced, keeping everything
-// else. Used when the draft gate DISAGREES: the classifier's guess has just been
-// contradicted by evidence, so the request is re-issued in the other mode.
-func (t thinkingResolution) withThinking(on bool) thinkingResolution {
-	t.patch = true
-	t.enable = on
-	t.noThink = !on
-	t.softThink = on
-	// No longer a guess — it was measured — so it is not eligible for gating a
-	// second time. Without this a retry could re-enter the gate and draft again.
-	t.autoDecided = false
-	return t
 }

@@ -203,3 +203,43 @@ func idsOf(bs []*Backend) []string {
 	}
 	return out
 }
+
+// Escalation, the tier adapter and the judge all used to gate on the route
+// string containing a literal "route:d=". That held only while every auto route
+// produced that one shape — and the moment the outcome matrix began emitting
+// "route:outcome:…", all three silently switched off for the path carrying most
+// traffic. The judge going dark was the worst of it: recordJudgedOutcome lives
+// inside maybeJudge, so the matrix's own feedback loop was open, closing only
+// when the embeddings worker was down and the tier path took over.
+//
+// These pin the structural replacement.
+func TestAutoRouteIsStructuralNotStringSniffed(t *testing.T) {
+	// A matrix route carries no "d=" and must still count as router-chosen.
+	matrix := &routePlan{auto: true, route: "route:outcome:p=0.85,n=12"}
+	if _, ok := parseRouteScore(matrix.route); ok {
+		t.Fatal("test premise wrong: the matrix route parses as a tier score")
+	}
+	if !matrix.auto {
+		t.Error("a matrix route must still be auto — escalation and judging hang off this")
+	}
+
+	// A tier route keeps both properties.
+	tier := &routePlan{auto: true, route: "route:d=0.62,q>=62"}
+	if score, ok := parseRouteScore(tier.route); !ok || score != 0.62 {
+		t.Errorf("tier route score = %.2f ok=%v, want 0.62 true", score, ok)
+	}
+	if !tier.auto {
+		t.Error("a tier route must be auto")
+	}
+
+	// A client-named model is NOT auto however it was ranked: the caller made
+	// the choice, so escalating or judging it second-guesses an instruction.
+	named := &routePlan{auto: false, route: "model:outcome:p=0.85,n=12"}
+	if named.auto {
+		t.Error("a named-model route must not be auto")
+	}
+	// The old string gate agreed on this case, which is why it survived so long.
+	if _, ok := parseRouteScore("model:d=0.62,q>=62"); ok {
+		t.Error("parseRouteScore accepted a named-model route")
+	}
+}

@@ -68,9 +68,6 @@ type dispatch struct {
 	log       *RequestLog
 	output    io.Writer
 	escalated *bool
-	// draft records what the draft gate did, for the request log. Zero when the
-	// gate did not run, which is the ordinary case.
-	draft draftVerdict
 }
 
 // bufferedResult is one completed exchange with a worker, before anything is
@@ -93,42 +90,6 @@ func (res bufferedResult) ok() bool {
 // better worker before replying.
 func (r *Router) dispatchBuffered(w http.ResponseWriter, req *http.Request, d *dispatch) {
 	backend := *d.backend
-
-	// DRAFT GATE. Before generating anything expensive, test the classifier's
-	// guess about whether this prompt needs a scratchpad — by sampling two cheap
-	// no-think answers and seeing whether they land in the same place. Agreement
-	// means the prompt was easy, and one of the drafts is already the answer.
-	//
-	// Declines on everything it should (see draftGate): streamed requests, any
-	// mode the CALLER specified, multiple choice, and when disabled.
-	if v := r.draftGate(req.Context(), backend, d.chatReq, d.tr); v.Ran {
-		d.draft = v
-		if v.Agreed {
-			w.Header().Set("X-LLM-Draft-Gate", fmt.Sprintf("agreed,sim=%.2f,%dms",
-				v.Similarity, v.Elapsed.Milliseconds()))
-			// Served through the ordinary write path so a gated request is shaped,
-			// header-stamped and logged exactly like any other. The usage block
-			// carries what the DRAFTS cost — the caller is billed for the work
-			// their request actually caused, and reporting zero would silently
-			// under-charge every budgeted key.
-			r.writeBuffered(w, req, backend, d, bufferedResult{
-				statusCode: http.StatusOK,
-				header:     http.Header{"Content-Type": []string{"application/json"}},
-				body:       draftAnswerBody(backend.Model, v.Answer, v.PromptTokens, v.CompletionTokens),
-			})
-			return
-		}
-		// DISAGREED — the drafts contradicted each other, which is the evidence
-		// that this prompt is not easy. Force thinking ON regardless of which way
-		// the classifier leaned, and re-patch: the body was built for the mode the
-		// classifier chose, and that decision has just been overturned.
-		w.Header().Set("X-LLM-Draft-Gate", fmt.Sprintf("disagreed,sim=%.2f,%dms",
-			v.Similarity, v.Elapsed.Milliseconds()))
-		d.tr = d.tr.withThinking(true)
-		d.body = patchForwardedBody(d.raw, d.inject, budgetCeiling(backend, d.job),
-			d.tr.forBackend(backend), backend.ServedID)
-		d.body = r.stripLearned(d.body, d.raw, backend.ID)
-	}
 
 	// FIRST attempt with no delay ladder. The ladder exists for a worker that is
 	// briefly loading or saturated, and sleeping is only the right answer when

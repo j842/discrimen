@@ -420,6 +420,15 @@ func fmtProfileDuration(ms int64) string {
 // context — so a brand-new worker becomes routable in seconds. Quality and
 // capacity stay provisional (the declared seed or a conservative default) until
 // profileBackend measures them in the background.
+//
+// The two stop being provisional at different MOMENTS, and the MaxConcurrency=1
+// written here is why that matters. Capacity is published the instant the ramp
+// settles it, part-way through profileBackend and long before the run finishes
+// (see publishCapacity) — because this placeholder prices the worker as serial,
+// and leaving it in place for the length of a quality benchmark spilled live
+// traffic off a worker the profile was itself driving four ways. Quality really
+// does wait for the end of the run, which is the only point at which there is a
+// score to commit.
 func (r *Router) profileQuick(b *Backend, model string) (*WorkerProfile, error) {
 	checks := map[string]Check{}
 	if err := r.chatProbe(b); err != nil {
@@ -596,7 +605,24 @@ func (r *Router) profileBackend(b *Backend, model string) (*WorkerProfile, error
 	// The applyProfileIfGen at the end writes this same number, and syncSlotsLocked
 	// no-ops on an unchanged cap, so the commit stays a commit rather than becoming
 	// a conflict that rebuilds the slot channel under live traffic.
-	r.registry.publishCapacity(b.ID, b.profileGen, capN, capCurve)
+	//
+	// A false return is the SAME abort as the capacity probe failing above, arrived
+	// at from the other direction: the row has been deleted, or re-registered with
+	// new content, since this run took the profiling guard. applyProfileIfGen at the
+	// end applies the identical generation check and drops the whole profile —
+	// "background profile %s finished for a stale registration generation —
+	// discarded" — so everything from here on is measurement that has already been
+	// decided to be unusable. Carrying on spends the quality benchmark to learn it:
+	// 25+ minutes typically, five hours at worst, and on a metered endpoint a real
+	// invoice, for a result that is thrown away on arrival. The new registration is
+	// running its own certification meanwhile, so nothing is lost by stopping.
+	//
+	// This return value was previously ignored, which is what made the early abort
+	// above inconsistent: the two conditions cost the same and only one of them
+	// stopped.
+	if !r.registry.publishCapacity(b.ID, b.profileGen, capN, capCurve) {
+		return nil, r.abort(b, meter, "worker deleted or re-registered during the capacity probe")
+	}
 	// Prefill rate is measured here rather than left to the live EWMA, which only
 	// samples non-thinking requests and so never fills in for a thinking-heavy worker.
 	//
@@ -1428,6 +1454,15 @@ func (r *Registry) applyProfileIfGen(id string, gen int64, p *WorkerProfile) boo
 	// saturated worker. Only a FULL profile carries a measured value
 	// (BenchVersion is set); profileQuick's MaxConcurrency=1 is a provisional
 	// placeholder that must not throttle a fresh worker to serial dispatch.
+	//
+	// This is NO LONGER the first time a cold run's capacity reaches the slot
+	// channel, and the gate below should not be read as though it were. A live
+	// cold profile publishes the ramp's answer the moment it settles, through
+	// publishCapacity, which syncs the slots there and then; by the time the
+	// profile arrives here the cap is usually already correct and syncSlotsLocked
+	// no-ops on it. What still comes through this path is every case with no
+	// mid-run publish behind it: a WARM restart applying a cached profile, a relay
+	// import, and the tests.
 	//
 	// Sync the EFFECTIVE cap rather than the profile's own: on a manual row the
 	// guard above kept the operator's number, and the slot channel has to hold

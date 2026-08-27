@@ -56,9 +56,22 @@ type ContextProbeLevel struct {
 // ContextProbe is what one worker's ladder measured.
 type ContextProbe struct {
 	// UsableTokens is the largest length at which the worker returned the needle
-	// from EVERY probed depth. Zero means it failed the first rung, which is a
-	// real finding and not an error: it means the advertised window is not usable
-	// even at the smallest size tested.
+	// from EVERY probed depth.
+	//
+	// ZERO IS THREE DIFFERENT THINGS, and this field cannot tell them apart on its
+	// own — read it with Levels, which can:
+	//
+	//	no Levels          the advertised window is under the first rung, so there
+	//	                   was nothing to test and the claim stands unrefuted.
+	//	Levels[0] passed
+	//	fewer than Total   a real finding and not an error: the worker answered and
+	//	                   could not retrieve at the smallest size tested.
+	//	Levels[0].Errored  no finding at all: the request never came back, so
+	//	                   nothing about this worker's window has been established.
+	//
+	// The middle and the last used to render identically, which had the check list
+	// declaring a worker unable to hold 4K of context on the strength of a request
+	// that returned a 503. See contextProbeMessage.
 	UsableTokens int `json:"usable_tokens"`
 	// AdvertisedTokens is what the server claimed, for comparison. The gap
 	// between the two is the whole point of this probe.

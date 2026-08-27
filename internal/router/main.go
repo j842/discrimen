@@ -6217,17 +6217,14 @@ func (s *LogStore) init(ctx context.Context) error {
 		// latency this worker measured from one another deployment measured on
 		// different hardware.
 		//
-		// The old table was keyed (qid, backend_id, thinking, source) and its qids
-		// were an FNV of prompt+expect with no match mode and no grader version.
-		// Every row in it is unreachable under the new identity, so it is dropped
-		// rather than migrated: carrying a second, dead key format forever to
-		// preserve rows nothing can look up is worse than re-earning them, and the
-		// bench half is re-earned by the profile run that follows this deploy.
-		`DROP TABLE IF EXISTS observations`,
-		// The vectors go with them. observation_vectors is keyed by qid and holds
-		// only judged rows, whose ids move to the same hash the bank uses — so
-		// every row in it belongs to an observation that no longer exists.
-		`DROP TABLE IF EXISTS observation_vectors`,
+		// The PRE-MODEL-HASH table is dropped by dropLegacyObservations below, NOT
+		// from this list. Putting a DROP here made it run on EVERY startup rather
+		// than once: init() is a plain statement list executed by NewLogStore each
+		// boot, so the permacache was emptied on every restart, and the judged half
+		// — up to maxJudgedQuestions production questions and the vectors persisted
+		// precisely so they would survive — was destroyed with no second copy to
+		// rebuild from. A one-shot migration has to be able to tell that it has
+		// already run.
 		`CREATE TABLE IF NOT EXISTS observations (
 			qid TEXT NOT NULL,
 			model_hash TEXT NOT NULL,
@@ -6248,6 +6245,10 @@ func (s *LogStore) init(ctx context.Context) error {
 			enabled INTEGER NOT NULL DEFAULT 1,
 			updated_at TEXT NOT NULL
 		)`,
+	}
+	// Before the CREATEs, so the new table is created after the old one is gone.
+	if err := s.dropLegacyObservations(ctx); err != nil {
+		return err
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
@@ -7171,4 +7172,64 @@ func ewma(slot *float64, sample, alpha float64) {
 		return
 	}
 	*slot = *slot*(1-alpha) + sample*alpha
+}
+
+// dropLegacyObservations removes the pre-model-hash observation tables, once.
+//
+// The old table was keyed (qid, backend_id, thinking, source) and its qids were an
+// FNV of prompt+expect carrying no match mode and no grader version. Every row in
+// it is unreachable under the content-addressed identity (see identity.go), so it
+// is dropped rather than migrated: carrying a second, dead key format forever to
+// preserve rows nothing can look up is worse than re-earning them.
+//
+// The migration is CONDITIONAL, and that is the whole point of it being a function
+// rather than two statements in init()'s list. That list runs on every startup, so
+// an unconditional DROP is not a migration at all — it is a boot-time wipe. It
+// emptied the permacache on every restart, and took the judged half with it: those
+// rows have no second copy, and the vectors beside them are persisted precisely
+// because a judged question's text is never stored and its vector cannot be
+// re-derived.
+//
+// "Already migrated" is read off the schema itself rather than a version counter:
+// the new table has a model_hash column and the old one does not. A table that is
+// absent entirely is a fresh database and needs nothing.
+func (s *LogStore) dropLegacyObservations(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(observations)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	columns, hasModelHash := 0, false
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var dflt sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			return err
+		}
+		columns++
+		if name == "model_hash" {
+			hasModelHash = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if columns == 0 || hasModelHash {
+		return nil // fresh database, or already on the current schema
+	}
+	log.Printf("outcome matrix: dropping the pre-model-hash observation tables (one-off migration)")
+	for _, stmt := range []string{
+		`DROP TABLE IF EXISTS observations`,
+		// The vectors go with them: observation_vectors is keyed by qid, and every
+		// judged qid moved to the same hash the bank now uses.
+		`DROP TABLE IF EXISTS observation_vectors`,
+	} {
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
 }

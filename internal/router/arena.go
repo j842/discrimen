@@ -122,11 +122,16 @@ func anyToString(vals ...any) string {
 // arenaMatchFor infers the checkAnswer mode when the dataset doesn't declare
 // one: a lone A–E is multiple choice, a bare number is numeric, anything else
 // has to be found in the answer text.
-func arenaMatchFor(expect string, choices []string) string {
+//
+// It reads the EXPECTED ANSWER and nothing else. It used to take the choices
+// list as well, with a `len(choices) > 0 && …` arm above the bare one that
+// returned the same mode on a strict subset of the same inputs — so the list
+// never decided anything, and it should not: a dataset whose answer is "C" is
+// multiple choice whether or not it also ships the options as a field, and
+// plenty of published splits put them in the prompt text and leave the field
+// empty.
+func arenaMatchFor(expect string) string {
 	e := strings.TrimSpace(expect)
-	if len(choices) > 0 && len(e) == 1 && e[0] >= 'A' && e[0] <= 'E' {
-		return "mcq"
-	}
 	if len(e) == 1 && e[0] >= 'A' && e[0] <= 'E' {
 		return "mcq"
 	}
@@ -193,7 +198,7 @@ func arenaLoadDataset(path string) ([]arenaQuestion, error) {
 		}
 		match := strings.TrimSpace(raw.Match)
 		if match == "" {
-			match = arenaMatchFor(expect, choices)
+			match = arenaMatchFor(expect)
 		}
 		out = append(out, arenaQuestion{
 			ID:         id,
@@ -222,7 +227,15 @@ type arenaOutcome struct {
 
 	// Routing decision, from /v1/route-preview — measured separately from the
 	// answer so routing latency is the DECISION cost, not the generation cost.
-	Route          string  `json:"route"`
+	Route string `json:"route"`
+	// WouldServe is the worker the preview says this prompt lands on, and it is
+	// the BASELINE the robustness metric perturbs away from. BackendID below is
+	// not a substitute and using it was the bug: that is the worker acquisition
+	// actually reached, which on a loaded fleet differs from the decision because
+	// the request spilled past a saturated front-runner. Comparing a perturbed
+	// DECISION against a served WORKER reports queueing as classifier
+	// instability.
+	WouldServe     string  `json:"would_serve"`
 	TargetQuality  int     `json:"target_quality"`
 	Difficulty     float64 `json:"difficulty_score"`
 	Reasoning      float64 `json:"reasoning_score"`
@@ -232,7 +245,6 @@ type arenaOutcome struct {
 
 	// Served answer.
 	BackendID string  `json:"backend_id"`
-	Quality   int     `json:"backend_quality"`
 	Seconds   float64 `json:"seconds"`
 	Pass      bool    `json:"pass"`
 	Truncated bool    `json:"truncated"`
@@ -252,11 +264,32 @@ type arenaWorkerResult struct {
 	Errored bool    `json:"errored"`
 }
 
+// arenaPerturbation is where ONE surface-rewritten variant of a prompt would
+// route. Every field here is compared against the unperturbed outcome's, so each
+// one is a decision the router makes and could make differently.
+//
+// THERE IS NO TARGET QUALITY HERE ANY MORE, and its absence is the point. It
+// used to carry previewResponse.TargetQuality and the report printed "same
+// quality tier" from it — but the quality target is set only on the tier path in
+// planRoute, and the outcome matrix supersedes that path wherever it has
+// evidence, which on a deployed router with an embeddings worker is every
+// classified request. So both sides of the comparison were 0, on every question,
+// and the metric printed 100.00% unconditionally. A fabricated number in a
+// report an operator reads to decide whether routing is stable is worse than an
+// absent one: it does not merely fail to inform, it actively answers the
+// question wrongly. Difficulty and the thinking decision are set on every path,
+// so they say something whichever one ran.
 type arenaPerturbation struct {
 	Kind       string  `json:"kind"`
 	WouldServe string  `json:"would_serve"`
-	Target     int     `json:"target_quality"`
 	Difficulty float64 `json:"difficulty_score"`
+	// Classified distinguishes "the classifier scored this at 0.00" from "the
+	// classifier did not run", which are the same float and are not the same
+	// fact. Without it a perturbation the embeddings worker happened to miss
+	// reads as a difficulty score that collapsed to zero — the largest possible
+	// drift — which is an outage reported as classifier instability.
+	Classified bool `json:"classified"`
+	ThinkingOn bool `json:"thinking_on"`
 }
 
 type arenaResults struct {
@@ -492,6 +525,7 @@ func arenaPreview(cfg arenaConfig, prompt string, out *arenaOutcome) {
 		return
 	}
 	out.Route = pv.Route
+	out.WouldServe = pv.WouldServe
 	out.TargetQuality = pv.TargetQuality
 	out.Classified = pv.Classified
 	out.ThinkingOn = pv.Thinking.Enabled
@@ -606,7 +640,12 @@ func arenaRobustness(cfg arenaConfig, q arenaQuestion) []arenaPerturbation {
 		if err != nil || pv == nil {
 			continue
 		}
-		item := arenaPerturbation{Kind: p.kind, WouldServe: pv.WouldServe, Target: pv.TargetQuality}
+		item := arenaPerturbation{
+			Kind:       p.kind,
+			WouldServe: pv.WouldServe,
+			Classified: pv.Classified,
+			ThinkingOn: pv.Thinking.Enabled,
+		}
 		if pv.Difficulty != nil {
 			item.Difficulty = *pv.Difficulty
 		}
@@ -722,9 +761,18 @@ type arenaMetrics struct {
 	unanswerable      int     // no worker got it right — not the router's fault
 
 	// Robustness (zero when -robustness wasn't run).
-	haveRobust  int
-	stableServe int
-	stableTier  int
+	//
+	// haveRobust counts the perturbations that could be COMPARED, not the ones
+	// that were previewed. A variant whose preview failed, or one whose baseline
+	// preview failed, has no decision to hold against anything — counting it in
+	// the denominator would report a router that was briefly unreachable as a
+	// router that changes its mind.
+	haveRobust   int
+	stableServe  int
+	stableThink  int
+	driftPairs   int     // perturbations where BOTH sides were classified
+	driftAbsSum  float64 // sum of |perturbed difficulty − baseline difficulty|
+	unclassified int     // comparable perturbations where one side was not classified
 }
 
 func arenaPrint(res *arenaResults) error {
@@ -799,9 +847,26 @@ func arenaPrint(res *arenaResults) error {
 	}
 
 	if m.haveRobust > 0 {
+		// Every line here compares a PREVIEW of the perturbed prompt against the
+		// PREVIEW of the original, so all of it is the classifier and none of it is
+		// the fleet's load at the moment the answer was generated.
 		fmt.Println("ROBUSTNESS  (perturbed prompt → same routing decision)")
-		fmt.Printf("  same worker         %6.2f%%  (%d/%d)\n", pct(m.stableServe, m.haveRobust), m.stableServe, m.haveRobust)
-		fmt.Printf("  same quality tier   %6.2f%%  (%d/%d)\n\n", pct(m.stableTier, m.haveRobust), m.stableTier, m.haveRobust)
+		fmt.Printf("  same worker         %6.2f%%  (%d/%d comparable perturbations)\n",
+			pct(m.stableServe, m.haveRobust), m.stableServe, m.haveRobust)
+		fmt.Printf("  same thinking mode  %6.2f%%  (%d/%d)\n", pct(m.stableThink, m.haveRobust), m.stableThink, m.haveRobust)
+		if m.driftPairs > 0 {
+			// The continuous form, and the one that moves before the discrete ones
+			// do: a prompt whose difficulty shifts 0.30 under a lowercasing has an
+			// unstable classifier even on the runs where the shift happens not to
+			// cross a band edge and the worker comes out the same.
+			fmt.Printf("  difficulty drift    %6.3f    mean |Δ| over %d classified pairs\n",
+				m.driftAbsSum/float64(m.driftPairs), m.driftPairs)
+		}
+		if m.unclassified > 0 {
+			fmt.Printf("  unclassified        %6d    perturbations where one side was not classified — "+
+				"drift not measurable, and NOT counted as drift\n", m.unclassified)
+		}
+		fmt.Println()
 	}
 
 	if len(byDifficulty) > 0 {
@@ -845,13 +910,35 @@ func arenaAccumulate(buckets []*arenaMetrics, o *arenaOutcome) {
 		}
 	}
 
-	stableServe, stableTier := 0, 0
+	// Robustness verdict for this question: the perturbed DECISIONS against the
+	// unperturbed one, computed once and folded into every bucket.
+	//
+	// Preview against preview, both from /v1/route-preview on the same fleet
+	// seconds apart. It used to compare the perturbed preview against
+	// o.BackendID, the worker that actually served the answer, and those are
+	// different questions: acquisition spills past a worker at its concurrency
+	// limit and may hold briefly for a preferred one, so on a busy fleet the
+	// served worker differs from the decision for reasons that have nothing to do
+	// with the prompt. The metric is named for the classifier and has to be about
+	// the classifier.
+	comparable, stableServe, stableThink := 0, 0, 0
+	driftPairs, driftAbsSum, unclassified := 0, 0.0, 0
 	for _, p := range o.Perturbed {
-		if p.WouldServe != "" && p.WouldServe == o.BackendID {
+		if o.WouldServe == "" || p.WouldServe == "" {
+			continue // no decision on one side; nothing to be stable or unstable about
+		}
+		comparable++
+		if p.WouldServe == o.WouldServe {
 			stableServe++
 		}
-		if p.Target == o.TargetQuality {
-			stableTier++
+		if p.ThinkingOn == o.ThinkingOn {
+			stableThink++
+		}
+		if o.Classified && p.Classified {
+			driftPairs++
+			driftAbsSum += math.Abs(p.Difficulty - o.Difficulty)
+		} else {
+			unclassified++
 		}
 	}
 
@@ -887,10 +974,13 @@ func arenaAccumulate(buckets []*arenaMetrics, o *arenaOutcome) {
 				}
 			}
 		}
-		if len(o.Perturbed) > 0 {
-			b.haveRobust += len(o.Perturbed)
+		if comparable > 0 {
+			b.haveRobust += comparable
 			b.stableServe += stableServe
-			b.stableTier += stableTier
+			b.stableThink += stableThink
+			b.driftPairs += driftPairs
+			b.driftAbsSum += driftAbsSum
+			b.unclassified += unclassified
 		}
 	}
 }

@@ -289,12 +289,21 @@ def _thread_count(status_path: str) -> int:
 
 
 def _set(limit: int, soft: int, hard: int | None = None) -> None:
-    """Lower one rlimit, never above the hard limit we were given.
+    """Set one rlimit, never above the hard limit we were given.
 
-    soft == hard on purpose everywhere it is used below. A soft limit can be
-    raised back to the hard limit by the process that holds it, and the process
-    that holds it here is about to execute somebody else's code — so leaving
-    headroom between the two would make every limit in this file advisory.
+    soft == hard is the DEFAULT, and it is the default for a reason: a soft limit
+    can be raised back to the hard limit by the process that holds it, and the
+    process that holds it here is about to execute somebody else's code — so
+    leaving headroom between the two would make the limit advisory. Passing one
+    argument gets that behaviour, and CORE, FSIZE, NPROC and AS all take it.
+
+    Two call sites pass a hard limit explicitly, and both are deliberate rather
+    than oversights (an earlier version of this docstring claimed there were
+    none). RLIMIT_CPU sets the soft limit a second below the hard one on purpose,
+    so SIGXCPU arrives while the process can still report what happened and the
+    kernel's SIGKILL is only the backstop. RLIMIT_STACK is the one place this
+    RAISES a limit rather than lowering it, so it has nothing to leave headroom
+    for. See apply().
     """
     if hard is None:
         hard = soft

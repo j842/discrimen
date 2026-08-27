@@ -34,16 +34,34 @@ package router
 // Only fetch touches the network, only calibrate touches the fleet, so emit can
 // be re-run freely while tuning the tier shape.
 //
-// WHY THE OUTPUT IS COMMITTED, and not fetched at install time. The question set
-// is part of the profile cache key: LoadWorkerProfile keys on (id, model) and
-// benchmarkVersion, and autoTargetQuality reads scores as one absolute 0–100
-// scale. If the questions could change without the version changing, a
-// worker profiled on Tuesday and one profiled on Thursday would be graded on
-// different sets and then compared on the same 0–100 scale — silently, with
-// every number still looking plausible. Fetching from install-pre.sh or the
-// Dockerfile has exactly that failure mode (and adds an egress dependency to a
-// box that may not have one). Instead the generated file is committed, and a
-// refresh is a reviewed commit that bumps benchmarkVersion alongside it.
+// WHY THE OUTPUT IS COMMITTED, and not fetched at install time. A quality score
+// is a percentage over whatever questions were asked, and autoTargetQuality
+// reads every worker's score as one absolute 0–100 scale — so two workers are
+// only comparable if they sat the same exam. A bank fetched at install time
+// gives one router's workers a different exam from the next router's, and a
+// worker profiled on Tuesday a different one from the same worker's neighbour
+// profiled on Thursday, silently, with every number still looking plausible.
+// Fetching from install-pre.sh or the Dockerfile has exactly that failure mode
+// (and adds an egress dependency to a box that may not have one). Instead the
+// generated file is committed: what the fleet is graded on is a reviewed diff in
+// the source tree.
+//
+// NOT because the question set is part of the profile cache key. It was written
+// that way and it is no longer true. LoadWorkerProfile keys on (id, model) and
+// benchmarkVersion, and benchmarkVersion has stopped tracking the questions —
+// it marks a change to the profiling METHOD (see benchmark.go). What tracks the
+// questions now is each question's own content hash: prompt, expected answer,
+// match mode and grader version (identity.go). Editing a question gives it a new
+// qid and it is asked afresh; leaving one alone means its answers are served
+// from the permacache and never re-earned.
+//
+// So a refresh no longer has a version bump attached to it by necessity, and the
+// hazard the bump was named for did not go away with the mechanism: it moved. A
+// worker's SCORE is only recomputed when that worker re-profiles, and only a
+// benchmarkVersion bump makes the whole fleet do that, so a refresh landed
+// without one leaves the fleet holding scores from the old bank until each
+// worker next re-profiles for its own reasons. See benchUsage for the recipe
+// that says so.
 
 import (
 	"encoding/json"
@@ -387,15 +405,28 @@ func benchUsage() {
   bench calibrate -router URL     Grade the pool against every ready backend
   bench emit [-sandbox URL]       Select items and write benchmark_data_live.go
 
-Quarterly refresh. Each one is a benchmarkVersion bump and therefore a full
-fleet re-benchmark, so monthly is not worth it for a set that only turns over
-every six months:
+Quarterly refresh. Monthly is not worth it for a set that only turns over every
+six months, and calibrate costs hours of fleet time:
 
   go run . bench fetch
   go run . bench calibrate -router http://localhost:8585 -token "$ROUTER_ADMIN_KEY"
   go run . bench emit
-  # then bump benchmarkVersion, drop the replaced tiers from benchmark_data.go,
-  # and commit the generated file in the SAME commit as the version bump.
+  # then drop the replaced tiers from benchmark_data.go and commit that in the
+  # SAME commit as the generated file.
+
+benchmarkVersion is NOT part of that recipe any more, and this text used to say
+it was. It no longer means "the question set changed" — it marks a change to the
+profiling METHOD (benchmark.go), and a question's identity is now its own content
+hash (identity.go), so a refresh cannot make a cached answer be reused for a
+question it was not given. Nothing needs invalidating for correctness.
+
+What a bump still buys is one exam for everybody. A worker holding a current
+cached profile is never re-benchmarked, so after a refresh it keeps the score it
+earned on the old bank while a newly registered worker earns one on the new bank
+— and both are read on the same absolute 0-100 scale. Bump if that mixture
+matters to you; it is cheap now, because re-profiling pays generations only for
+the questions this refresh actually changed and serves the rest from the
+permacache. It still parks every worker at provisional quality while it runs.
 `)
 }
 

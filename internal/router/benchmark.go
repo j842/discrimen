@@ -120,6 +120,14 @@ import (
 // measured formatting, not knowledge. Strict grading is unchanged — nobody's full
 // credit moved — loose only ADDS credit, and the tally keeps the formatting cost
 // visible per worker.
+// v40: the token ceiling stops being a binding constraint. Routing cares whether
+// a worker answers correctly in reasonable TIME, and time is already bounded by
+// benchAnswerDeadline; a second ceiling in tokens measured nothing on top of it.
+// At 16384 the two were nearly the same constraint — that is ~6 minutes at ~45
+// tok/s, where most of this fleet sits — so the cap did no independent work
+// while still failing questions on the workers fast enough to reach it
+// (llm-6000pro recorded 29 truncations). Now 32768, clamped per worker to what
+// its context window can actually hold.
 // v39: GRADING correctness. Four confirmed defects, each of which changed scores
 // silently — a mis-graded question is indistinguishable from a wrong answer:
 //
@@ -153,7 +161,7 @@ import (
 // FRAGMENTS continuing a partial solution shown in the prompt), which had scored the two
 // strongest workers 0% on that task while the weakest scored highest. See
 // benchAnswerDeadline and poolCode.Prefix.
-const benchmarkVersion = 39
+const benchmarkVersion = 40
 
 // benchmarkQ is one graded question in the cold-start quality benchmark. The
 // question set lives in benchmark_data.go.
@@ -272,8 +280,24 @@ var (
 // doesn't let a weak model catch a strong one, or the fleet re-saturates at q≈9–10 and
 // the quality range difficulty-routing needs collapses (see benchmark_data.go).
 const (
-	benchMaxTokens      = 1024  // token ceiling per thinking-off answer (short trap/recall replies)
-	benchThinkMaxTokens = 16384 // token ceiling per thinking-on answer — hard reasoning needs headroom (8192 truncated some tier-7/8 questions)
+	benchMaxTokens = 1024 // token ceiling for an easy-tier answer (short trap/recall replies)
+	// benchThinkMaxTokens is the ceiling for a HARD question, and it is set to a
+	// value the answer deadline reaches first on most of this fleet — i.e. it is
+	// deliberately not the binding constraint.
+	//
+	// v40: 16384 -> 32768. A token cap measures nothing routing cares about; the
+	// product question is "will this worker answer correctly in reasonable TIME",
+	// and time is already bounded by benchAnswerDeadline. Two ceilings meant a
+	// question could fail for hitting either, and at 16384 the two were nearly
+	// the same constraint — 16384 tokens is ~6 minutes at ~45 tok/s, which is
+	// where most of the fleet sits, so the cap was doing no independent work
+	// while still producing truncation failures on the workers fast enough to
+	// reach it (llm-6000pro recorded 29). Raised until the deadline binds for
+	// anything slower than ~91 tok/s, which is every local worker.
+	//
+	// A submission still generating at 32768 tokens is looping rather than
+	// reasoning, so truncation there remains a genuine failure.
+	benchThinkMaxTokens = 32768
 
 	// benchHardTier is the difficulty at and above which a question is graded
 	// THINKING-ON (and below which, thinking-off) — the same boundary the router's
@@ -387,7 +411,7 @@ type benchOutcome struct {
 // main benchmark does — a second copy of the request/grading logic would drift.
 func (r *Router) benchOne(b *Backend, q benchmarkQ, think bool, busy *benchBusyTracker) benchOutcome {
 	res := benchOutcome{tier: q.Tier}
-	prompt, maxTokens := benchRequestFor(q, think)
+	prompt, maxTokens := benchRequestFor(q, think, usableContextTokens(b))
 	// Greedy decoding (temperature 0): a graded benchmark must be
 	// deterministic, so the same (model, question) returns the same answer on
 	// every run and two identical models on different hosts score identically.
@@ -1950,7 +1974,7 @@ func benchMagnitude(m string) string {
 // mode a verbose reply fools. A question calibrated under different conditions
 // than it is graded under is calibrated for nothing, which the calibration file
 // asserts in a comment while doing the opposite.
-func benchRequestFor(q benchmarkQ, think bool) (prompt string, maxTokens int) {
+func benchRequestFor(q benchmarkQ, think bool, ctxTokens int) (prompt string, maxTokens int) {
 	prompt = q.Prompt
 	// Only NUMERIC grading is fooled by a verbose reasoned reply (an intermediate
 	// or a trailing restatement gets read as the answer), so make the worker
@@ -1972,6 +1996,21 @@ func benchRequestFor(q benchmarkQ, think bool) (prompt string, maxTokens int) {
 	if q.Tier >= benchHardTier {
 		maxTokens = benchThinkMaxTokens
 	}
+	// Never ask for more room than the worker has. A 32K ceiling exceeds the
+	// whole context window of several workers here (llm-cpu-gemma is 32K
+	// including the prompt), and a server handed a max_tokens it cannot honour
+	// either errors — turning a gradeable question into a transport failure — or
+	// silently clamps, which is fine but means the ceiling was never real. The
+	// deadline still binds long before this does on a slow worker.
+	if ctxTokens > 0 {
+		room := ctxTokens - benchPromptTokenEstimate(prompt) - benchAnswerReserve
+		if room < benchMinAnswerTokens {
+			room = benchMinAnswerTokens
+		}
+		if room < maxTokens {
+			maxTokens = room
+		}
+	}
 	if !think {
 		prompt += " /no_think" // belt-and-suspenders with the kwarg (matches chatProbe)
 	}
@@ -1989,3 +2028,21 @@ func benchQuestionHash(q benchmarkQ) uint64 {
 	_, _ = h.Write([]byte(q.Expect))
 	return h.Sum64()
 }
+
+const (
+	// benchAnswerReserve is slack between the prompt and the answer ceiling, for
+	// the chat template's own tokens and for the difference between a character
+	// estimate and the worker's real tokenizer.
+	benchAnswerReserve = 512
+	// benchMinAnswerTokens is the floor the context clamp will not go below. A
+	// worker whose window cannot hold even this much answer for this prompt is
+	// going to fail the question either way, and the failure should read as a
+	// wrong answer rather than as a request the server rejects.
+	benchMinAnswerTokens = 256
+)
+
+// benchPromptTokenEstimate approximates a prompt's token count. ~4 characters
+// per token, the same approximation used everywhere else in the router that has
+// no tokenizer; it only has to be good enough to keep the answer ceiling inside
+// the context window, and benchAnswerReserve absorbs the error.
+func benchPromptTokenEstimate(prompt string) int { return len(prompt)/4 + 1 }

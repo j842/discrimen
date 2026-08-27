@@ -321,7 +321,7 @@ func TestTruncatedProfileSamplesTiersRepresentatively(t *testing.T) {
 // on a prompt production never sends.
 func TestPromptConstructionIsShared(t *testing.T) {
 	q := benchmarkQ{Tier: benchHardTier, Match: "numeric", Prompt: "How many cows?", Expect: "16"}
-	prompt, budget := benchRequestFor(q, true)
+	prompt, budget := benchRequestFor(q, true, 0)
 	if !strings.Contains(prompt, "Give the number only") {
 		t.Errorf("numeric prompt lost its format instruction: %q", prompt)
 	}
@@ -330,14 +330,46 @@ func TestPromptConstructionIsShared(t *testing.T) {
 	}
 	// The budget is a property of the QUESTION, not the mode: the two quality
 	// scores must differ only in thinking, or QualityNoThink measures the budget.
-	_, offBudget := benchRequestFor(q, false)
+	_, offBudget := benchRequestFor(q, false, 0)
 	if offBudget != budget {
 		t.Errorf("no-think budget %d != thinking budget %d — the two scores would differ in two variables",
 			offBudget, budget)
 	}
 	// An easy-tier question keeps the short budget in both modes.
 	easy := benchmarkQ{Tier: 1, Match: "contains", Prompt: "Hello?", Expect: "hi"}
-	if _, b := benchRequestFor(easy, true); b != benchMaxTokens {
+	if _, b := benchRequestFor(easy, true, 0); b != benchMaxTokens {
 		t.Errorf("easy-tier budget = %d, want %d", b, benchMaxTokens)
+	}
+}
+
+// The answer ceiling must never exceed the worker's own context window: a server
+// handed a max_tokens it cannot honour either errors — turning a gradeable
+// question into a transport failure — or silently clamps, in which case the
+// ceiling was never real. Several workers here have a 32K window, which is the
+// whole hard-tier ceiling.
+func TestAnswerCeilingFitsTheContextWindow(t *testing.T) {
+	q := benchmarkQ{Tier: benchHardTier, Match: "contains", Prompt: "short question", Expect: "x"}
+	// 32K window: ceiling must come down to leave room for prompt + slack.
+	_, budget := benchRequestFor(q, true, 32*1024)
+	if budget >= 32*1024 {
+		t.Errorf("ceiling %d does not fit a 32K window", budget)
+	}
+	if budget <= 0 {
+		t.Errorf("ceiling %d is unusable", budget)
+	}
+	// A large window leaves the nominal ceiling intact.
+	if _, big := benchRequestFor(q, true, 256*1024); big != benchThinkMaxTokens {
+		t.Errorf("ceiling %d with a 256K window, want the nominal %d", big, benchThinkMaxTokens)
+	}
+	// Unknown window (0) must not clamp to zero — that would ask for no answer.
+	if _, unknown := benchRequestFor(q, true, 0); unknown != benchThinkMaxTokens {
+		t.Errorf("ceiling %d with an unknown window, want the nominal %d", unknown, benchThinkMaxTokens)
+	}
+	// A window too small for the prompt still asks for a usable answer rather
+	// than a negative or zero ceiling.
+	long := benchmarkQ{Tier: benchHardTier, Match: "contains", Expect: "x",
+		Prompt: strings.Repeat("word ", 2000)}
+	if _, tiny := benchRequestFor(long, true, 2048); tiny < benchMinAnswerTokens {
+		t.Errorf("ceiling %d for an oversized prompt, want at least %d", tiny, benchMinAnswerTokens)
 	}
 }

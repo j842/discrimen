@@ -254,7 +254,10 @@ func benchGradeOne(routerURL, token, backendID, sandboxURL string, q poolQuestio
 	// results), so every candidate is graded at the hard-tier budget, which is
 	// where the whole pool is destined.
 	bq := benchmarkQ{Tier: benchHardTier, Prompt: q.Prompt, Expect: q.Expect, Match: q.Match}
-	prompt, maxTokens := benchRequestFor(bq, true)
+	// 0: calibration talks to the ROUTER, which picks the worker, so there is no
+	// single context window to clamp against. The router's own max_tokens
+	// handling and the answer deadline bound the request.
+	prompt, maxTokens := benchRequestFor(bq, true, 0)
 	payload := map[string]any{
 		"model":                "default",
 		"stream":               false,

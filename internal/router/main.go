@@ -290,9 +290,14 @@ type Registry struct {
 	// Per-backend concurrency slot channels, indexed by backend ID. A backend
 	// with max_concurrency=N has a channel of capacity N pre-filled with N
 	// tokens; callers acquire one via tryAcquireSlot before dispatching and put
-	// it back with releaseSlot. Backends with no declared cap have no entry,
-	// in which case tryAcquireSlot returns a nil slot that is always available
-	// and releaseSlot is a no-op (unbounded).
+	// it back with releaseSlot. A REGISTERED backend with no declared cap has no
+	// entry, in which case tryAcquireSlot returns a nil slot that is always
+	// available and releaseSlot is a no-op (unbounded).
+	//
+	// An absent entry is not enough on its own to mean "uncapped", because
+	// remove() and upsert()'s uncapped branch delete the entry too — so
+	// tryAcquireSlot checks the backends map first and refuses a worker that has
+	// gone away rather than reading it as infinite capacity. See tryAcquireSlot.
 	slots   map[string]chan struct{}
 	slotCap map[string]int
 }
@@ -815,9 +820,15 @@ const (
 	adaptLRDown  = 0.01
 	adaptBins    = 10
 
-	// judgeSampleRate is the fraction of cheaper-than-best answers the best model
-	// grades in the background. This is the signal that makes a fast-but-dim
+	// judgeSampleRate is the fraction of SERVED answers graded in the background
+	// by another worker in the fleet. This is the signal that makes a fast-but-dim
 	// worker safe to route to, so it is on whenever auto-routing is.
+	//
+	// Every served answer is eligible, and the grader is chosen per PROMPT rather
+	// than being the fleet's best model (see judgeGrader). It used to be "the
+	// fraction of cheaper-than-best answers, graded by the best model", which was
+	// gated on the retired Quality scalar and meant the strongest worker was never
+	// graded at all — see Config.JudgeSampleRate.
 	judgeSampleRate = 0.2
 
 	// capacityProbeMax caps the concurrency ramp during profiling. A declared
@@ -844,9 +855,14 @@ const (
 // path, which re-dispatches them to a better model, so a budget too small to
 // think in gets diagnosed as inadequate quality.
 //
-// It also matches benchThinkMaxTokens: at 4096 ordinary traffic was getting a
-// quarter of the budget this router's own benchmark requires before it will
-// judge a model competent.
+// It was also chosen to MATCH benchThinkMaxTokens, which was 16384 at the time:
+// at 4096 ordinary traffic was getting a quarter of the budget this router's own
+// benchmark requires before it will judge a model competent. The two have since
+// parted company — benchThinkMaxTokens went to 32768 so that the answer DEADLINE
+// binds a graded question rather than a token ceiling (see benchmark.go, v40) —
+// so ordinary traffic now gets half the benchmark's budget rather than all of it.
+// That is a deliberate difference and not drift: a benchmark question may run to
+// its deadline, while a client that declared no budget at all should not.
 //
 // The trade, from the same measurement: this does not fix a true runaway. It
 // converts the chains that would have concluded between 4k and 16k into
@@ -2069,8 +2085,9 @@ func setBackendCredential(proxyReq *http.Request, backend *Backend) {
 }
 
 // genCharsPerToken is the chars-per-token divisor the budgeting fallbacks use.
-// The same 4.8 sseStats.genTokens applies to a streamed generation, so the
-// buffered and streamed estimates cannot drift apart.
+// It is the same 4.8 sseStats.genTokens applies to a streamed generation, so the
+// buffered and streamed estimates agree — the two are separate literals, so
+// change them together (capture.go).
 const genCharsPerToken = 4.8
 
 // estimateGenTokens turns a reply's size in bytes into a generated-token
@@ -2319,13 +2336,6 @@ func (r *Router) proxyPassthrough(w http.ResponseWriter, req *http.Request, iden
 	}
 }
 
-// logSlotUnavailable records the 503 we return when no candidate backend had a
-// free slot before the deadline. Attributed to the primary (best-ranked)
-// candidate for context.
-//
-// It takes the caller for the same reason the success path does: a relayed
-// request's prompt must not reach the log store on the failure path either, and
-// a redaction that only covered the requests that worked would be no redaction.
 // clientIP is the address a request came in from, for the usage graph and for
 // the caller line on a log row.
 //
@@ -2379,6 +2389,14 @@ func parseHost(addr string) string {
 	return addr
 }
 
+// logSlotUnavailable records the 503 we return when no candidate backend had a
+// free slot before the deadline. Attributed to the primary (best-ranked)
+// candidate for context.
+//
+// It takes the caller for the same reason the success path does: a relayed
+// request's prompt must not reach the log store on the failure path either, and
+// a redaction that only covered the requests that worked would be no redaction.
+//
 // from is the caller's address, threaded in because this is the one place a
 // request is logged without the *http.Request still being in scope.
 func (r *Router) logSlotUnavailable(ident *identity, from string, primary *Backend, route string, stream bool, input []byte, start time.Time, cause error) {
@@ -2555,6 +2573,27 @@ type acquirePreference struct {
 	why string
 }
 
+// The rung labels `why` carries. Constants rather than bare literals because the
+// labels are READ in another function — proxyToBackend picks which "missed"
+// story to tell from them — and a literal compared against a literal written
+// somewhere else is exactly how the cost line came to notice only one of the two
+// free-preferring rungs.
+const (
+	prefLocalFree    = "local-free"
+	prefFreeFirst    = "free-first"
+	prefQualityFloor = "quality-floor"
+	prefSessionLock  = "session-lock"
+)
+
+// preferredFree reports whether this preference was holding out for a worker
+// that costs nothing, so that landing elsewhere spent money the router was
+// trying not to spend. Both free-preferring rungs count; prefQualityFloor does
+// not, because there every above-bar worker was metered from the start and no
+// amount of waiting would have found a free one.
+func (p acquirePreference) preferredFree() bool {
+	return p.why == prefLocalFree || p.why == prefFreeFirst
+}
+
 // qualityFor is the quality score to judge b by for a request served in the
 // given thinking mode. A no-think request reads the no-think benchmark score —
 // the model that client actually talks to.
@@ -2610,6 +2649,7 @@ func qualityFor(b *Backend, thinkOff bool) int {
 // unclassified request, or the fallback ranker) makes the tier test vacuous and
 // leaves free-first on its own, which is what "prefer the free ones" means when
 // there is no bar to clear.
+//
 // able bounds the cost/locality ladder to the leading candidates the outcome
 // matrix judged interchangeable on correctness. Zero means unbounded, which is
 // the tier path and the matrix's own fallback — neither has a correctness
@@ -2657,13 +2697,13 @@ func qualityFloorPreference(candidates []*Backend, target int, thinkOff bool, ab
 		// competing for those same slots. Remote completion times are therefore
 		// systematically optimistic, and ranking on them alone over-picks remote.
 		// This corrects a biased estimator, not an operator's preference.
-		{"local-free", func(b *Backend) bool { return free(b) && !isRelayRow(b) }},
+		{prefLocalFree, func(b *Backend) bool { return free(b) && !isRelayRow(b) }},
 		// Costs nothing, anywhere. Reached when every local worker above the bar
 		// is loaded — an idle remote worker beats waiting on a busy local one.
-		{"free-first", free},
+		{prefFreeFirst, free},
 		// Clears the bar at any price. Reached when the only above-bar workers
 		// left are metered.
-		{"quality-floor", aboveBar},
+		{prefQualityFloor, aboveBar},
 	}
 	// Keep the rungs that actually decide something: an empty set selects
 	// nothing, and one equal to the whole candidate list is not a preference.
@@ -2694,7 +2734,7 @@ func sessionLockPreference(incumbent string) acquirePreference {
 	return acquirePreference{
 		keep: func(b *Backend) bool { return b.ID == incumbent },
 		wait: sessionLockWait,
-		why:  "session-lock",
+		why:  prefSessionLock,
 	}
 }
 
@@ -2862,7 +2902,7 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 	// was classified to need; this records that we couldn't honour it within the
 	// grace and served elsewhere.
 	if missedPref {
-		if pref.why == "session-lock" {
+		if pref.why == prefSessionLock {
 			log.Printf("session lock: %s tool loop moved off incumbent=%s to backend=%s after %s grace — no incumbent slot freed",
 				route, plan.session.incumbent, backend.ID, sessionLockWait)
 		} else {
@@ -2870,7 +2910,16 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 			// off the preference: one missed floor can be a tier downgrade, a spill
 			// onto a paid endpoint, or both, and a slot that frees during the
 			// handover can make it neither.
-			if pref.why == "free-first" && !isFreeBackend(backend) {
+			//
+			// EITHER free-preferring rung counts. This tested "free-first" alone,
+			// which is the rung reached only when there is no free LOCAL worker to
+			// hold out for — so on the ordinary fleet, local workers that cost
+			// nothing beside a metered endpoint, the top rung is "local-free" and
+			// the one spill that actually spends money was the one nothing said a
+			// word about. "quality-floor" is deliberately still excluded: there,
+			// every above-bar worker was metered from the start, so landing on one
+			// is not a cost the router could have avoided by waiting.
+			if pref.preferredFree() && !isFreeBackend(backend) {
 				log.Printf("cost: %s served on PAID backend=%s (in %g / out %g per Mtok) after %s grace — no free worker above the bar freed a slot",
 					route, backend.ID, backend.InputPricePerMtok, backend.OutputPricePerMtok, qualityFloorWait)
 			}
@@ -3121,9 +3170,11 @@ func (r *Router) dispatchStreaming(w http.ResponseWriter, req *http.Request, d *
 			resp.Body.Close()
 		}
 		backend, resp, err = other, newResp, nil
+		// Keep the local mirror of what was actually sent. The URL is NOT
+		// re-derived: streamFailover has already dialled the new worker, and a
+		// second copy of the address nothing reads is a value computed and thrown
+		// away.
 		body = d.body
-		upstreamURL = upstreamChatURL(backend)
-		_ = upstreamURL // re-derived for clarity; the dial has already happened
 		w.Header().Set("X-LLM-Failover", fmt.Sprintf("%s->%s", logEntry.BackendID, backend.ID))
 		logEntry.BackendID = backend.ID
 		logEntry.BackendModel = backend.Model
@@ -3218,19 +3269,24 @@ func setRouteHeaders(w http.ResponseWriter, backend *Backend, route string, logE
 	w.Header().Set("X-LLM-Speed-Score", strconv.Itoa(logEntry.SpeedScore))
 }
 
-// selectBackends returns the eligible backends that satisfy the request's hard
-// context/feature requirements, ranked best-first, alongside the prompt's
-// classification (nil when classification was unavailable or the request had no
-// messages) so the caller can thread it into the body patch without
-// re-classifying, and the auto-difficulty target QUALITY FLOOR (0 ⇒ no floor —
-// the fallback/feature paths and any non-auto request). The caller
-// (pickAndAcquireWithFloor) spills down the list when the top backend has no free
-// slot, so a burst spreads across the fleet instead of queueing on one backend;
-// a non-zero target additionally makes it wait BRIEFLY for an above-target worker
-// before spilling below the floor (fix #2). Model-tier selection is always
-// automatic (difficulty-based) — there are no client quality/speed overrides;
-// capability hints (thinking, required_features, min_context_k) only hard-filter,
-// they never pick a tier.
+// selectBackends is the narrow view of planRoute: the eligible backends that
+// satisfy the request's hard context/feature requirements, ranked best-first,
+// alongside the prompt's classification (nil when classification was unavailable
+// or the request had no messages) so the caller can thread it into the body patch
+// without re-classifying, and the auto-difficulty target QUALITY FLOOR (0 ⇒ no
+// floor — the fallback/feature paths and any non-auto request). Model-tier
+// selection is always automatic (difficulty-based) — there are no client
+// quality/speed overrides; capability hints (thinking, required_features,
+// min_context_k) only hard-filter, they never pick a tier.
+//
+// Its one production caller is /v1/completions, which forwards the body verbatim
+// through proxyPassthrough and therefore takes the plain pickAndAcquire spill —
+// the candidate list is walked best-first when the top backend has no free slot,
+// so a burst spreads across the fleet, but there is no bounded grace and the
+// target it returns is DISCARDED. The quality floor described above is applied on
+// the chat path only, where proxyToBackend builds a qualityFloorPreference from
+// the whole plan (fix #2). The chat path does not go through here at all: it
+// calls planRoute directly, because it needs the rest of the plan.
 //
 // The request is classified ONCE here; both axes are used: difficulty drives the
 // quality tier, and reasoning drives the thinking decision — which now also gates
@@ -3238,6 +3294,7 @@ func setRouteHeaders(w http.ResponseWriter, backend *Backend, route string, logE
 // thinking-capable worker (soft for auto, hard for explicit "on"), so the
 // enable_thinking we later forward lands on a worker that can act on it instead of
 // being a no-op on a non-thinking model.
+//
 // budget is how long the caller is still willing to wait (0 = unknown); when
 // known, workers that cannot finish the job inside it are filtered out first.
 func (r *Router) selectBackends(req *ChatRequest, budget time.Duration) ([]*Backend, string, *classification, int, error) {
@@ -3701,7 +3758,7 @@ const profileRetryDelay = 2 * time.Minute
 // for before it stops trying.
 //
 // There has to be a limit, and it has to be small. An abort is not free: the
-// benchmark set is 130 questions, runQualityBenchmark only gives up after
+// benchmark set is ~400 questions, runQualityBenchmark only gives up after
 // wg.Wait(), and a metered endpoint that sustains 429s under the benchmark's
 // concurrency fails the same way every time — so an unbounded retry is an
 // unbounded bill, spent on measurements that are discarded the moment they
@@ -3872,10 +3929,15 @@ func (r *Router) certifyBackend(id string) {
 			// results — only the hard tiers re-run, thinking-off — so the worker
 			// keeps serving on its certified values throughout. This is the
 			// deliberate alternative to bumping benchmarkVersion, which would
-			// re-run the FULL suite on every worker in the fleet and park each at
-			// provisional quality to learn one new number. Too long in the guard
-			// for the certification path (minutes, not the seconds the other
-			// backfills cost), hence the ownership handoff, same as cold start.
+			// re-profile every worker in the fleet and park each at a provisional
+			// quality to learn one new number. (The permacache has since made a bump
+			// much cheaper — a thinking-on question this model has already answered
+			// is served from cache rather than re-asked, see benchOne — but it does
+			// not make one free here: the no-think verdicts are exactly the ones no
+			// model has ever been asked for, so they are the half that would still
+			// have to be generated.) Too long in the guard for the certification
+			// path (minutes, not the seconds the other backfills cost), hence the
+			// ownership handoff, same as cold start.
 			if needsNoThinkBackfill(prof) {
 				owned = false // guard ownership moves to the background backfill
 				go func() {
@@ -4118,24 +4180,6 @@ func (r *Router) speedProbe(backend *Backend) (float64, int64, error) {
 // fleet rather than the ~5 minutes an 8k prompt would.
 const prefillProbeTokens = 1024
 
-// backfillCachedProfile fills in measurements that a cached profile predates.
-//
-// A profile is only re-measured when benchmarkVersion changes, so a probe added
-// WITHOUT a version bump never runs on an already-profiled fleet. That is exactly what
-// happened to the prefill probe: it shipped, every worker stayed certified from its
-// cached profile, and 5 of 7 never acquired a prefill rate — including both 284B
-// workers, the ones whose TTFT is most sensitive to prompt length and the reason the
-// probe was written. Bumping benchmarkVersion is the wrong instrument: it discards the
-// quality benchmark too and costs ~14 min/worker to recover a 1-second probe.
-//
-// ANY future addition to WorkerProfile needs a clause here, or it inherits the same
-// silent failure — shipped, cached over, never measured.
-//
-// There is a SECOND class of staleness with the same cure: a field that can change on
-// the WORKER between restarts without changing the (id, model) cache key. Context is
-// the known one — CTX_SIZE is a deployment choice, not a property of the model — and
-// it is handled below. Anything else that a service.env edit can move belongs here
-// too, provided it is cheap enough to re-measure unconditionally.
 // speedProbeVersion is bumped when the DECODE measurement itself changes, so
 // cached profiles re-measure their BaselineTPS on load without paying for a full
 // BenchVersion re-profile.
@@ -4147,6 +4191,32 @@ const prefillProbeTokens = 1024
 //	    fleet's spec-decode workers at ~40% of their real decode rate
 const speedProbeVersion = 3
 
+// backfillCachedProfile fills in measurements that a cached profile predates.
+//
+// A profile is only re-measured when benchmarkVersion changes, so a probe added
+// WITHOUT a version bump never runs on an already-profiled fleet. That is exactly what
+// happened to the prefill probe: it shipped, every worker stayed certified from its
+// cached profile, and 5 of 7 never acquired a prefill rate — including both 284B
+// workers, the ones whose TTFT is most sensitive to prompt length and the reason the
+// probe was written. Bumping benchmarkVersion is still the wrong instrument: it takes
+// EVERY worker in the fleet back through a cold profile and parks each at a
+// provisional quality, to recover a one-second probe on the few that lack it.
+//
+// It is no longer the cliff it was, and the reason is worth knowing before reading
+// the rest of this: since the permacache, a re-profile does not re-earn the graded
+// answers. Every question this model has already answered, graded this way, is
+// served from cache (see benchOne and identity.go), so a bump costs the capability,
+// speed, capacity and context probes rather than hours of grading. What it still
+// costs is the fleet-wide disruption, which is why the clauses below exist.
+//
+// ANY future addition to WorkerProfile needs a clause here, or it inherits the same
+// silent failure — shipped, cached over, never measured.
+//
+// There is a SECOND class of staleness with the same cure: a field that can change on
+// the WORKER between restarts without changing the (id, model) cache key. Context is
+// the known one — CTX_SIZE is a deployment choice, not a property of the model — and
+// it is handled below. Anything else that a service.env edit can move belongs here
+// too, provided it is cheap enough to re-measure unconditionally.
 func (r *Router) backfillCachedProfile(id string, backend *Backend, prof *WorkerProfile) {
 	if prof.SpeedVersion < speedProbeVersion {
 		if tps, ttft, err := r.speedProbe(backend); err != nil {
@@ -4265,22 +4335,6 @@ func (r *Router) backfillCachedProfile(id string, backend *Backend, prof *Worker
 	log.Printf("worker %s: backfilled prefill rate %.0f tok/s into its cached profile", id, rate)
 }
 
-// prefillProbe measures how fast a worker turns prompt tokens into a first token, by
-// sending a prompt of KNOWN length with a 1-token budget and timing the call.
-//
-// The live EWMA cannot fill this gap on its own. observe() only records a prefill
-// sample from NON-thinking requests — TTFT is not comparable across engines otherwise,
-// because vLLM buffers reasoning into TTFT while llama.cpp streams it — so a worker the
-// router mostly sends thinking traffic to never accumulates one, and prefillSeconds()
-// falls back to a flat TTFT average that ignores prompt length entirely. Measured on
-// llm-naples-deepseek-284B-q4: the router priced its time-to-first-token at 978ms while
-// a 4116-token prompt really took 178s, a 140x underestimate, so it kept sending long
-// prompts to the one worker in the fleet that could not serve them.
-//
-// Thinking is disabled here precisely so the number IS comparable across engines. The
-// single generated token is included in the elapsed time, which slightly understates
-// the rate (~6% on a fast GPU worker, well under 1% on a CPU one) — erring toward
-// pessimism, the safe direction for a latency estimate.
 // prefillProbeSamples is how many times prefillProbe measures before believing a
 // number. One sample is not enough, and the failure is not hypothetical: on
 // 2026-08-08 llm-a750-Granite4.1-8B was probed while a CPU worker on the SAME host
@@ -4326,8 +4380,24 @@ func init() {
 // one run cannot collide with the samples of the next.
 func nextProbeSalt() uint32 { return probeSalt.Add(prefillProbeSamples) }
 
-// prefillProbe measures prefill rate, taking the best of prefillProbeSamples runs.
-// Returns the last error only if EVERY sample failed.
+// prefillProbe measures how fast a worker turns prompt tokens into a first token, by
+// sending a prompt of KNOWN length with a 1-token budget and timing the call. It takes
+// the best of prefillProbeSamples runs, and returns the last error only if EVERY
+// sample failed.
+//
+// The live EWMA cannot fill this gap on its own. observe() only records a prefill
+// sample from NON-thinking requests — TTFT is not comparable across engines otherwise,
+// because vLLM buffers reasoning into TTFT while llama.cpp streams it — so a worker the
+// router mostly sends thinking traffic to never accumulates one, and prefillSeconds()
+// falls back to a flat TTFT average that ignores prompt length entirely. Measured on
+// llm-naples-deepseek-284B-q4: the router priced its time-to-first-token at 978ms while
+// a 4116-token prompt really took 178s, a 140x underestimate, so it kept sending long
+// prompts to the one worker in the fleet that could not serve them.
+//
+// Thinking is disabled here precisely so the number IS comparable across engines. The
+// single generated token is included in the elapsed time, which slightly understates
+// the rate (~6% on a fast GPU worker, well under 1% on a CPU one) — erring toward
+// pessimism, the safe direction for a latency estimate.
 func (r *Router) prefillProbe(backend *Backend) (float64, error) {
 	best, lastErr := 0.0, error(nil)
 	base := nextProbeSalt()
@@ -5229,9 +5299,16 @@ func rankBackends(candidates []*Backend, job jobCost, thinkOff bool) []*Backend 
 	return candidates
 }
 
-// speedScore returns a stable score derived from the backend's declared
-// baseline_tps (set during registration, not dynamic), scaled to the SAME 0-100
-// range as Quality so the two are commensurable in backendScore.
+// speedScore returns a stable score derived from the backend's baseline_tps,
+// scaled to the SAME 0-100 range as Quality so the two are commensurable in
+// backendScore.
+//
+// "Stable" means profile-time, not registration-time: on a beacon row
+// BaselineTPS is whatever the speed probe MEASURED (applyProfileIfGen overwrites
+// the declared value, and a cached profile re-measures it when speedProbeVersion
+// moves); only an operator-entered manual row keeps the number a human typed.
+// Either way it does not move with load — that is ObservedTPS, the live EWMA,
+// which ranking reads separately through expectedLatency.
 //
 // It was bucketed 1-10 back when quality was also 1-10. Quality is now a 0-100
 // benchmark percentage, which left speed contributing ~3% of backendScore — and
@@ -5923,11 +6000,7 @@ func (r *Registry) observe(id string, ttft, decodeWindow time.Duration, tokens, 
 	if decodeSampleRefTokens > 0 {
 		alpha *= math.Min(1, float64(tokens)/float64(decodeSampleRefTokens))
 	}
-	if b.ObservedTPS == 0 {
-		b.ObservedTPS = decodeTPS
-	} else {
-		b.ObservedTPS = b.ObservedTPS*(1-alpha) + decodeTPS*alpha
-	}
+	ewma(&b.ObservedTPS, decodeTPS, alpha)
 	// The same two samples again, kept per mode. Nothing here assumes the modes
 	// agree; if they turn out to, the two EWMAs simply converge and cost nothing.
 	// The generated-length EWMA uses a fixed weight rather than the
@@ -5957,19 +6030,11 @@ func (r *Registry) observe(id string, ttft, decodeWindow time.Duration, tokens, 
 			return
 		}
 	}
-	ms := float64(ttft.Milliseconds())
-	if b.ObservedTTFTMillis == 0 {
-		b.ObservedTTFTMillis = ms
-	} else {
-		b.ObservedTTFTMillis = b.ObservedTTFTMillis*0.7 + ms*0.3
-	}
+	// Fixed 0.3 for both, unlike the tokens-weighted alpha above: a prefill sample
+	// is one prompt, and there is no "how much of it did we observe" to weight by.
+	ewma(&b.ObservedTTFTMillis, float64(ttft.Milliseconds()), 0.3)
 	if promptTokens >= minPrefillTokens {
-		prefillTPS := float64(promptTokens) / ttft.Seconds()
-		if b.ObservedPrefillTPS == 0 {
-			b.ObservedPrefillTPS = prefillTPS
-		} else {
-			b.ObservedPrefillTPS = b.ObservedPrefillTPS*0.7 + prefillTPS*0.3
-		}
+		ewma(&b.ObservedPrefillTPS, float64(promptTokens)/ttft.Seconds(), 0.3)
 	}
 }
 
@@ -6201,15 +6266,11 @@ func (s *LogStore) init(ctx context.Context) error {
 			value TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		)`,
-		// Upstream routers this one may relay through (see relay.go). The name is
-		// stored already lowercased (see relayKey), so the primary key is the
-		// lookup key. api_key is sealed with the same box that protects a backend's
-		// credential; the backends this relay expands into are DERIVED and are not
-		// persisted anywhere — the refresh loop rebuilds them from this row.
-		// One graded answer per (question, worker, thinking mode, source). REPLACE
+		// One graded answer per (question, model, thinking mode, source). REPLACE
 		// on that key, so a re-profile supersedes its predecessor rather than
-		// accumulating beside it — a worker's history would otherwise drag its
+		// accumulating beside it — a model's history would otherwise drag its
 		// current estimate. See outcomes.go.
+		//
 		// Keyed by MODEL, not by worker. A graded answer is evidence about the
 		// weights that produced it, so it outlives the box: decommission a worker
 		// and its results stay, deploy the same model elsewhere and the profile is
@@ -6238,6 +6299,11 @@ func (s *LogStore) init(ctx context.Context) error {
 			PRIMARY KEY (qid, model_hash, thinking, source)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_observations_model ON observations (model_hash)`,
+		// Upstream routers this one may relay through (see relay.go). The name is
+		// stored already lowercased (see relayKey), so the primary key is the
+		// lookup key. api_key is sealed with the same box that protects a backend's
+		// credential; the backends this relay expands into are DERIVED and are not
+		// persisted anywhere — the refresh loop rebuilds them from this row.
 		`CREATE TABLE IF NOT EXISTS router_relays (
 			name TEXT PRIMARY KEY,
 			url TEXT NOT NULL,
@@ -6274,9 +6340,6 @@ func (s *LogStore) init(ctx context.Context) error {
 		// this build for twelve hours. That is the honest rendering; the
 		// alternative of hiding those rows would make a busy router look idle.
 		`ALTER TABLE request_logs ADD COLUMN client_ip TEXT NOT NULL DEFAULT ''`,
-		// Whether a key belongs to a downstream router rather than a client
-		// (see relay.go). Every key issued before relays existed is not one, and
-		// 0 is what the default gives them.
 		// Timing-model columns. Existing rows keep their defaults and there is
 		// nothing to backfill them from: token counts were parsed and dropped,
 		// and TTFT, thinking mode and concurrency were never recorded at all. A
@@ -6289,6 +6352,9 @@ func (s *LogStore) init(ctx context.Context) error {
 		`ALTER TABLE request_logs ADD COLUMN ttft_ms INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE request_logs ADD COLUMN thinking INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE request_logs ADD COLUMN concurrency INTEGER NOT NULL DEFAULT 0`,
+		// Whether a key belongs to a downstream router rather than a client
+		// (see relay.go). Every key issued before relays existed is not one, and
+		// 0 is what the default gives them.
 		`ALTER TABLE api_keys ADD COLUMN relay INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -6864,14 +6930,18 @@ func publicBackends(backends []*Backend) []*Backend {
 	return out
 }
 
-// readSSEStream accumulates a streamed completion's content and reasoning text
-// separately (both dialects' reasoning field names — see extract.go).
-// firstChunk fires on the first non-empty delta of EITHER kind: for a thinking
-// model the reasoning tokens ARE the first generated output, and stamping TTFT
-// only on content would fold the whole reasoning phase into first-token latency.
-// readSSEStream drains a streamed completion. tokens prefers the stream's
-// usage.completion_tokens (sent when the request asked for
-// stream_options.include_usage), falling back to counting non-empty deltas.
+// readSSEStream drains a streamed completion, accumulating its content and
+// reasoning text separately (both dialects' reasoning field names — see
+// extract.go).
+//
+// firstChunk fires on EVERY non-empty delta of EITHER kind, and the caller
+// latches the first (see speedProbe). Either kind, because for a thinking model
+// the reasoning tokens ARE the first generated output, and stamping TTFT only on
+// content would fold the whole reasoning phase into first-token latency.
+//
+// tokens prefers the stream's usage.completion_tokens (sent when the request
+// asked for stream_options.include_usage), falling back to counting non-empty
+// deltas.
 //
 // The fallback is a COUNT only for engines that emit one token per delta.
 // Speculative decoding breaks that: vLLM with MTP packs each accepted
@@ -6958,7 +7028,8 @@ func mapBool(ok bool, yes string, no string) string {
 }
 
 // countSSETokens counts actual generated tokens from a captured SSE stream.
-// Each "data: {...}" line with a non-empty content delta represents one token.
+// Each "data: {...}" line with a non-empty content OR reasoning delta represents
+// one token — see the loop body for why reasoning has to count too.
 func countSSETokens(data []byte) int {
 	tokens := 0
 	for _, line := range bytes.Split(data, []byte("\n")) {

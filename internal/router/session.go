@@ -178,9 +178,16 @@ func inToolLoop(msgs []Message) bool {
 
 // ── Tracker ─────────────────────────────────────────────────────────────────
 
+// sessionEntry is what the tracker keeps about one conversation: who served its
+// last turn, and when. There was a turns counter beside them, incremented on
+// every remember() and read by nothing — not by resolve, not by the discount, not
+// by /health's size(), not by the dashboard. Removed rather than published,
+// because the question it looks like it answers ("is this a long conversation?")
+// is already answered better by the thing the discount actually scales with: the
+// prompt this turn carries. A ten-turn conversation of one-word replies is not
+// the case stickiness exists for; a two-turn one with a 40k agent prompt is.
 type sessionEntry struct {
 	backendID string
-	turns     int
 	lastSeen  time.Time
 }
 
@@ -232,11 +239,7 @@ func (t *sessionTracker) remember(key uint64, backendID string) {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	e := t.m[key]
-	e.backendID = backendID
-	e.turns++
-	e.lastSeen = time.Now()
-	t.m[key] = e
+	t.m[key] = sessionEntry{backendID: backendID, lastSeen: time.Now()}
 	if len(t.m) > t.max {
 		t.evictLocked()
 	}

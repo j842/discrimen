@@ -58,6 +58,9 @@ type toolCallGuard struct {
 	out     []byte // sanitized bytes awaiting Read
 	partial []byte // trailing line fragment, not yet terminated
 	eof     bool
+	// failed is the source's error, held until the sanitized bytes already read
+	// off it have been handed on. See Read.
+	failed error
 
 	remap map[int]int // upstream slot index -> emitted index (allocated on first name)
 	next  int         // next emitted index
@@ -85,6 +88,11 @@ func (g *toolCallGuard) Read(p []byte) (int, error) {
 	// refuse than to rely on a layer that can be turned off.
 	idle := 0
 	for len(g.out) == 0 {
+		// A held error is reported only once there is nothing left to hand on —
+		// see the assignment below for why it is held rather than returned.
+		if g.failed != nil {
+			return 0, g.failed
+		}
 		if g.eof {
 			if len(g.partial) > 0 { // unterminated tail: forward verbatim
 				g.out, g.partial = g.partial, nil
@@ -102,10 +110,26 @@ func (g *toolCallGuard) Read(p []byte) (int, error) {
 			}
 		}
 		if err != nil {
-			if err != io.EOF {
-				return 0, err
+			if err == io.EOF {
+				g.eof = true
+			} else {
+				// HELD, not returned. io.Reader permits a source to return bytes and
+				// an error together ("Callers should always process the n > 0 bytes
+				// returned before considering the error"), and net/http's body reader
+				// does exactly that — a chunked stream that dies mid-frame, or one
+				// cancelled while data was already buffered, delivers its last read as
+				// (n>0, err). This used to `return 0, err` straight out of the loop,
+				// discarding whatever g.feed had just sanitized into g.out: up to one
+				// read's worth of COMPLETE, already-checked SSE frames that really did
+				// arrive were dropped, so the client saw less of the partial answer
+				// than the worker managed to send before failing. The guard's whole
+				// contract is that it is never the reason a stream loses something.
+				//
+				// Holding it costs one more Read from the caller and changes nothing
+				// else: the error is still the first thing returned once g.out drains,
+				// and copyStreaming still reports it as a mid-stream failure.
+				g.failed = err
 			}
-			g.eof = true
 		}
 	}
 	n := copy(p, g.out)

@@ -421,8 +421,17 @@ type difficultyClassifier struct {
 }
 
 func newDifficultyClassifier(cfg *Config, embed func(context.Context, []string) ([][]float64, error)) *difficultyClassifier {
-	// Empty bands → automatic, fleet-derived tiers (see autoTargetQuality). An
-	// explicit ROUTER_DIFFICULTY_QUALITY_BANDS is an optional override.
+	// Empty bands → automatic, fleet-derived tiers (see autoTargetQuality), which
+	// is now the ONLY production path: loadConfig hard-wires DifficultyBands to ""
+	// and ROUTER_DIFFICULTY_QUALITY_BANDS no longer reaches it (docs/upgrading.md
+	// records the removal). A hand-set band table is a claim about which endpoint is
+	// good enough for which prompt, and that claim is the measurement the router
+	// already makes.
+	//
+	// The band path is kept rather than deleted because it is what the auto path is
+	// checked AGAINST: bandQuality and parseDifficultyBands are exercised by tests
+	// that need a fixed, hand-written difficulty→quality mapping to assert the
+	// classifier's scores against without a live fleet to derive one from.
 	bands := parseDifficultyBands(cfg.DifficultyBands)
 	temp := cfg.DifficultyTemp
 	if temp <= 0 {

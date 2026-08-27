@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -86,6 +87,82 @@ func TestAbortedProfileRecordsWhatItSpent(t *testing.T) {
 	}
 	if _, still := r.profileMeters.Load("metered"); still {
 		t.Error("the profile meter outlived the aborted run")
+	}
+}
+
+// countingWorker answers every probe and every benchmark question, and counts the
+// completions it was asked for — which is how a test can tell "the run stopped
+// after the capacity ramp" from "the run went on to ask the whole bank".
+func countingWorker(t *testing.T, asked *atomic.Int64) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == http.MethodGet {
+			http.NotFound(w, req)
+			return
+		}
+		asked.Add(1)
+		body, _ := io.ReadAll(req.Body)
+		if bytes.Contains(body, []byte(`"tools"`)) || bytes.Contains(body, []byte(`"response_format"`)) {
+			http.Error(w, `{"error":{"message":"unsupported"}}`, http.StatusBadRequest)
+			return
+		}
+		usage := `"usage":{"prompt_tokens":100,"completion_tokens":8,"total_tokens":108}`
+		if bytes.Contains(body, []byte(`"stream":true`)) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok ok ok ok\"}}]}\n\n")
+			fmt.Fprintf(w, "data: {\"choices\":[],%s}\n\n", usage)
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			return
+		}
+		fmt.Fprintf(w, `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],%s}`, usage)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// A profile measured against a registration generation that has already moved on
+// is discarded WHOLE by applyProfileIfGen when it finally returns — "background
+// profile %s finished for a stale registration generation — discarded". The
+// capacity publish learns that at the top of the run and used to throw the answer
+// away, so the run carried on into the quality benchmark: 25+ minutes typically,
+// five hours at worst, and on a metered endpoint a real invoice, all of it spent
+// producing a result already decided to be unusable. It is the same waste the
+// capacity-probe abort a few lines above exists to prevent, from the other
+// direction.
+func TestProfileStopsWhenTheRegistrationMovedOnUnderIt(t *testing.T) {
+	old := capacityProbeRetryDelay
+	capacityProbeRetryDelay = 0 // the abort is what's under test, not the wait
+	defer func() { capacityProbeRetryDelay = old }()
+
+	var asked atomic.Int64
+	srv := countingWorker(t, &asked)
+	r, b := profileCostRouter(t, srv, 3, 15)
+
+	// The worker re-registered (or was deleted) while this run held the profiling
+	// guard: the clone in hand names a generation the registry has left behind.
+	b.profileGen++
+
+	prof, err := r.profileBackend(b, "m")
+	if prof != nil || err == nil {
+		t.Fatalf("a profile for a stale generation was returned rather than abandoned: profile=%+v err=%v", prof, err)
+	}
+	var aborted *abortedProfile
+	if !errors.As(err, &aborted) {
+		t.Fatalf("the stop does not carry what it spent: %v", err)
+	}
+	if !strings.Contains(err.Error(), "re-registered") {
+		t.Errorf("the abort does not say why it stopped: %q", err.Error())
+	}
+
+	// The point of stopping: the question bank was never asked. The quick probes
+	// and the capacity ramp are a couple of dozen requests between them, so
+	// anything approaching the bank's size means the benchmark ran anyway.
+	if got := asked.Load(); got >= int64(len(benchmarkQuestions)) {
+		t.Errorf("the run asked %d completions of a %d-question bank — it went on benchmarking a profile that cannot be applied",
+			got, len(benchmarkQuestions))
+	}
+	if _, still := r.profileMeters.Load("metered"); still {
+		t.Error("the profile meter outlived the abandoned run")
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -67,6 +68,99 @@ func TestRelayToleratesUpstreamWithoutWorkerIDs(t *testing.T) {
 	r.refreshRelays()
 	if got := len(r.relayRowIDs("up")); got != 1 {
 		t.Fatalf("registered %d rows, want 1 — an id-less upstream must still relay", got)
+	}
+}
+
+// ── Defect: the relay import went round every range check ──────────────────
+//
+// normalizeRegistration refuses a registration whose quality is outside 0..100
+// or whose max_concurrency is above maxDeclarableConcurrency. The relay path
+// never showed it those fields: applyRelayEntry registers id/url/model/credential
+// only and applies everything measured afterwards, through applyProfileIfGen and
+// setRelayLoad, neither of which range-checks. So a peer could write numbers into
+// this registry that no local code path can produce.
+//
+// max_concurrency is the second half of a bug whose first half is already fixed:
+// syncSlotsLocked clamps the number it builds a slot CHANNEL from (1e9 tokens at
+// ~12.6ns each, under the registry write lock, is thirteen seconds of not
+// routing), but b.MaxConcurrency keeps the raw figure. effectiveSlots then
+// republishes it to the next router down, so the number propagates along the
+// whole chain instead of stopping at the router that received it — which is what
+// the second half of this test pins.
+func TestRelayEntryIsClampedToTheRangesItsFieldsAreDefinedOver(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, relayFleetResponse{
+			RouterID: "r-skewed", BenchVersion: benchmarkVersion,
+			Models: []relayModelEntry{{
+				ID: "w", Model: "m", BenchVersion: benchmarkVersion,
+				Features: []string{"chat"}, BaselineTPS: 100,
+				// A units error, a version skew, or a field that meant something
+				// else on the other side of the wire. None of them is a claim
+				// about a worker that this router can act on.
+				Quality:        100_000,
+				QualityNoThink: -5,
+				MaxConcurrency: 1_000_000_000,
+				ActiveRequests: -3,
+			}},
+		})
+	}))
+	defer upstream.Close()
+
+	r := adminRouter(t)
+	r.relays.put(Relay{Name: "up", URL: upstream.URL, Enabled: true})
+	r.refreshRelays()
+
+	b := r.registry.get(relayBackendID("up", "w"))
+	if b == nil {
+		t.Fatalf("row was not registered; rows: %v", r.relayRowIDs(""))
+	}
+	if b.Quality > benchmarkQualityScale || b.Quality < 0 {
+		t.Errorf("quality = %d, want it inside 0..%d — the scale normalizeRegistration enforces on every other path",
+			b.Quality, benchmarkQualityScale)
+	}
+	if b.QualityNoThink < 0 {
+		t.Errorf("quality_nothink = %d, want 0 (\"not measured\") rather than a negative score", b.QualityNoThink)
+	}
+	if b.MaxConcurrency > maxDeclarableConcurrency || b.MaxConcurrency < 0 {
+		t.Errorf("max_concurrency = %d, want it inside 0..%d", b.MaxConcurrency, maxDeclarableConcurrency)
+	}
+	if b.RemoteActive < 0 {
+		t.Errorf("remote occupancy = %d, want it floored at zero", b.RemoteActive)
+	}
+	// And it must not be handed on. Whatever this router accepted is what it
+	// publishes to anyone relaying through IT, so an unclamped figure walks the
+	// whole chain, re-clamping each hop's slot channel and propagating the raw
+	// number again.
+	if got := effectiveSlots(b); got > maxDeclarableConcurrency {
+		t.Errorf("republished max_concurrency = %d — the next router down inherits the same bad number", got)
+	}
+}
+
+// A rate or a latency below zero is not a slow worker, it is a broken field, and
+// zero is the value every consumer already reads as "not measured": liveTPS falls
+// through to the next source, prefillSeconds takes the fleet constant.
+func TestSanitizeRelayEntryFloorsNegativeMeasurements(t *testing.T) {
+	got := sanitizeRelayEntry("up", relayModelEntry{
+		ID: "w", Model: "m",
+		BaselineTPS: -100, ObservedTPS: -1, PrefillTPS: -2800,
+		TTFTMillis: -250, ContextK: -128,
+	})
+	if got.BaselineTPS != 0 || got.ObservedTPS != 0 || got.PrefillTPS != 0 {
+		t.Errorf("negative rates survived: %+v", got)
+	}
+	if got.TTFTMillis != 0 || got.ContextK != 0 {
+		t.Errorf("negative latency/context survived: ttft=%d ctx=%d", got.TTFTMillis, got.ContextK)
+	}
+	// An ordinary entry passes through byte for byte: this validates a domain, it
+	// does not second-guess a measurement.
+	ordinary := relayModelEntry{
+		ID: "w", Model: "m", Quality: 82, QualityNoThink: 71, BenchVersion: benchmarkVersion,
+		ContextK: 116, Features: []string{"chat"}, Thinking: true,
+		BaselineTPS: 108, ObservedTPS: 96, PrefillTPS: 2816, TTFTMillis: 250,
+		MaxConcurrency: 4, ActiveRequests: 1,
+	}
+	if out := sanitizeRelayEntry("up", ordinary); !reflect.DeepEqual(out, ordinary) {
+		t.Errorf("an in-range entry was altered:\n got %+v\nwant %+v", out, ordinary)
 	}
 }
 

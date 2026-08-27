@@ -2,18 +2,28 @@ package router
 
 // What a cold-start profile is doing, while it does it.
 //
-// A profile is the longest thing this router ever runs — hours on a slow worker,
-// and every worker at once after a benchmarkVersion bump — and until now the
-// only thing it published was a boolean. `ask -l` said "profiling" and nothing
-// else, so the operator's questions ("is it stuck?", "how much longer?", "is it
-// actually doing anything?") had no answer short of reading container logs.
+// A profile is the longest thing this router ever runs — hours on a slow worker
+// meeting a model for the first time — and until now the only thing it published
+// was a boolean. `ask -l` said "profiling" and nothing else, so the operator's
+// questions ("is it stuck?", "how much longer?", "is it actually doing
+// anything?") had no answer short of reading container logs.
+//
+// A benchmarkVersion bump still starts one of these on every worker at once, but
+// that is no longer the fleet-wide outage it was, and the phases below are why an
+// operator can now SEE the difference. Graded answers are content-addressed and
+// permanently cached — by the model's hash and by the question plus the version
+// of the code that grades it, neither of which a bench version enters (see
+// identity.go). So a post-bump re-profile spends its time in the cheap phases,
+// capabilities and capacity and context, and the quality phase races through on
+// cache hits, asking only questions that are genuinely new or whose grader
+// changed. A worker sitting in `quality` for hours after a bump is now a signal
+// rather than the expected state.
 //
 // The phases are deliberately named after what a person would recognise rather
 // than after the functions that run them, because the audience for this is
 // somebody watching a fleet come up, not somebody reading profile.go.
 
 import (
-	"fmt"
 	"sync/atomic"
 	"time"
 )
@@ -120,7 +130,13 @@ func (p *ProfileProgress) snapshot() *ProfileProgressView {
 // makes an operator stop believing the later, accurate ones.
 const profileETAMinSamples = 8
 
-// ProfileProgressView is the serialisable form.
+// ProfileProgressView is the serialisable form, and the ONLY form: this is
+// published as JSON on /backends and rendered by whatever is reading it (the
+// dashboard, `ask -l`, scripts/profile-worker.sh), none of which is Go in this
+// module. A String() method and its compactDuration helper shipped alongside it
+// in the same commit, described as "the one-line form for a terminal", and were
+// never called from anywhere — no caller, no test, no implicit %v on any type
+// that holds one. They are gone; the terminal that needed them formats the JSON.
 type ProfileProgressView struct {
 	Phase       string `json:"phase"`
 	Done        int    `json:"done,omitempty"`
@@ -128,38 +144,6 @@ type ProfileProgressView struct {
 	InFlight    int    `json:"in_flight"`
 	ElapsedMS   int64  `json:"elapsed_ms"`
 	RemainingMS int64  `json:"remaining_ms,omitempty"`
-}
-
-// String is the one-line form for a terminal.
-func (v *ProfileProgressView) String() string {
-	if v == nil {
-		return ""
-	}
-	out := v.Phase
-	if v.Total > 0 {
-		out += fmt.Sprintf(" %d/%d", v.Done, v.Total)
-	}
-	if v.InFlight > 0 {
-		out += fmt.Sprintf(" (%d in flight)", v.InFlight)
-	}
-	out += " " + compactDuration(time.Duration(v.ElapsedMS)*time.Millisecond)
-	if v.RemainingMS > 0 {
-		out += fmt.Sprintf(", ~%s left", compactDuration(time.Duration(v.RemainingMS)*time.Millisecond))
-	}
-	return out
-}
-
-// compactDuration renders a duration the way a person reads one off a progress
-// line: minutes and hours, never "1h2m3.456s".
-func compactDuration(d time.Duration) string {
-	switch {
-	case d < time.Minute:
-		return fmt.Sprintf("%ds", int(d.Seconds()))
-	case d < time.Hour:
-		return fmt.Sprintf("%dm", int(d.Minutes()))
-	default:
-		return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
-	}
 }
 
 // progressFor is the live tracker for a worker being profiled, or nil.

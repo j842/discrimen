@@ -2,13 +2,25 @@ package router
 
 // Filling the outcome matrix — from the question bank, and from real traffic.
 //
-// The matrix is useless until it has rows, and there are exactly two sources.
-// Profiling contributes graded answers to bank questions, which is dense and
-// exact but drawn from LiveBench's distribution rather than this fleet's. The
-// background judge contributes graded answers to REAL prompts, which is sparse
-// and noisier but is the only evidence that will ever cover the traffic actually
-// being served. Both land in the same table, tagged, so the second can be
-// weighted down without being thrown away.
+// The matrix is useless until it has rows, and there are exactly two sources of
+// them. Profiling contributes graded answers to bank questions, which is dense
+// and exact but drawn from LiveBench's distribution rather than this fleet's.
+// The background judge contributes graded answers to REAL prompts, which is
+// sparse and noisier but is the only evidence that will ever cover the traffic
+// actually being served. Both land in the same table, tagged, so the second can
+// be weighted down without being thrown away.
+//
+// THREE routes in, from those two sources. A profile that finishes in this
+// process writes its results directly (profile.go calls the observationsFrom
+// pair below); the judge writes one row per sampled request; and at startup
+// backfillOutcomesFromProfiles reconstructs the first kind from profiles already
+// on disk, which is not a third source but the same evidence recovered from the
+// table it was also written to. Rows are filed under the MODEL that answered —
+// see identity.go — so none of the three is tied to the worker that carried it.
+//
+// Also here, because they are the bank's other half rather than the matrix's:
+// the question vectors that make a row reachable at all, and the display views
+// an operator reads on /backends.
 
 import (
 	"context"
@@ -32,6 +44,19 @@ import (
 // routing decision needs to know — the matrix predicts "will be correct AND will
 // complete", and a worker that cannot finish has failed the second half.
 func observationsFrom(hash, backendID string, results []BenchResult, thinking bool, at time.Time) []Observation {
+	return observationsWith(hash, backendID, results, at, func(BenchResult) bool { return thinking })
+}
+
+// observationsWith is the conversion both callers share, with the one thing they
+// disagree about — where the thinking mode comes from — passed in.
+//
+// The two were separate copies of the same fifteen lines, differing in that
+// single expression. That is worth unifying precisely because of what the
+// duplication cost once already: the skipped/errored rule and the
+// question-resolution rule are the same rule for both passes, and a fix applied
+// to one copy is a fix missing from the other for as long as nobody notices.
+func observationsWith(hash, backendID string, results []BenchResult, at time.Time,
+	thinkingOf func(BenchResult) bool) []Observation {
 	byPrompt := bankQIDByPrompt()
 	out := make([]Observation, 0, len(results))
 	for _, r := range results {
@@ -46,7 +71,7 @@ func observationsFrom(hash, backendID string, results []BenchResult, thinking bo
 			QID:       qid,
 			ModelHash: hash,
 			Backend:   backendID,
-			Thinking:  thinking,
+			Thinking:  thinkingOf(r),
 			Correct:   r.Pass,
 			LatencyMS: r.LatencyMS,
 			Source:    obsSourceBench,
@@ -60,10 +85,18 @@ func observationsFrom(hash, backendID string, results []BenchResult, thinking bo
 //
 // Lazy and incremental: embedding is a network call to the embeddings worker,
 // and doing it at startup would make the router's boot depend on that worker
-// being up. Questions are embedded once and the vectors kept in memory —
-// re-derived on restart rather than persisted, because they are a pure function
-// of the question text and the embedding model, and persisting them would mean
-// detecting when the embedding model changed.
+// being up. Questions are embedded once and the vectors kept in memory,
+// re-derived on restart rather than persisted — the question text is COMPILED
+// INTO THE BINARY, so re-deriving costs one batched round trip and storing would
+// only duplicate it.
+//
+// That reasoning does not extend to a judged production question, whose text is
+// stored nowhere and cannot be re-derived at all, so those vectors ARE persisted
+// (see setJudgedVector). Two policies for two cases, which is also why the
+// matrix has to survive an embedder swap rather than assume one cannot happen:
+// setVector drops every vector of a retired width the moment one of the new
+// width arrives, in memory and on disk, and the first thing to arrive after a
+// swap is the bank fill below.
 func (r *Router) ensureBankVectors(ctx context.Context) error {
 	if r.outcomes == nil {
 		return nil
@@ -115,12 +148,12 @@ func (r *Router) ensureBankVectors(ctx context.Context) error {
 // Truncated to the classifier's own cap so a long question and a long prompt are
 // treated the same way, and because the embedding model has a 512-token window
 // regardless: past that the tail is invisible on both sides.
+//
+// The truncation is truncateForEmbed's, and shared with it rather than repeated:
+// a bank question and a judged production question have to be cut at the same
+// point or the two halves of the matrix would sit in subtly different places.
 func benchEmbedText(q benchmarkQ) string {
-	p := q.Prompt
-	if len(p) > benchEmbedMaxChars {
-		p = p[:benchEmbedMaxChars]
-	}
-	return p
+	return truncateForEmbed(q.Prompt)
 }
 
 const benchEmbedMaxChars = 2000
@@ -188,8 +221,17 @@ func truncateForEmbed(s string) string {
 }
 
 const (
-	// judgedEmbedTimeout bounds the extra embedding call. Short: this runs on a
-	// background sample, and a slow embeddings worker must not pile up goroutines.
+	// judgedEmbedTimeout bounds recordJudgedOutcome as a whole — the extra
+	// embedding call and the writes after it share the one deadline. Short:
+	// this runs on a background sample, and a slow embeddings worker must not
+	// pile up goroutines.
+	//
+	// Sharing it is a known rough edge rather than a design: an embedding that
+	// returns just inside the deadline leaves almost none of it for the insert,
+	// so a verdict can be graded, embedded, and then dropped by a context that
+	// expired between the two. The window is small (the writes are two statements
+	// against a local SQLite file) and the failure is logged, so it is recorded
+	// here rather than papered over with a second timeout nobody would tune.
 	judgedEmbedTimeout = 10 * time.Second
 	// maxJudgedQuestions bounds how many production questions the matrix keeps.
 	// Production traffic is unbounded and the matrix is scanned linearly on every
@@ -215,8 +257,14 @@ func (r *Router) bankTopicOf(qid string) string {
 	return r.bankTopics[qid]
 }
 
-// outcomeSummaryFor is the display view of one worker, in the mode routing would
-// use for a request with no thinking preference.
+// outcomeSummaryFor is the display view shown against one worker, in the mode
+// routing would use for a request with no thinking preference.
+//
+// It is the record of the worker's MODEL, looked up by modelHash(b) like every
+// other read. So two workers serving the same weights show the same numbers —
+// which is the honest rendering, since the evidence is about the weights — and
+// a worker deployed today against a model already profiled elsewhere shows a
+// full record immediately rather than an empty one.
 func (r *Router) outcomeSummaryFor(b *Backend, thinking bool) *OutcomeSummary {
 	if r.outcomes == nil {
 		return nil
@@ -228,11 +276,11 @@ func (r *Router) outcomeSummaryFor(b *Backend, thinking bool) *OutcomeSummary {
 // ensureBankVectorsAsync fills the bank's embeddings in the background if they
 // are missing, at most one attempt at a time.
 //
-// WHY THIS EXISTS AT ALL. The vectors are deliberately not persisted — they are
-// a pure function of the question text and the embedding model, and storing them
-// would mean detecting when that model changed. But the only thing deriving them
-// was a cold-start profile, and a warm restart loads a cached profile and never
-// profiles. So after any restart the matrix held observations with NO vectors,
+// WHY THIS EXISTS AT ALL. Bank vectors are deliberately not persisted — the
+// question text is compiled in, so a restart re-derives them in one batch (see
+// ensureBankVectors). But the only thing deriving them was a cold-start profile,
+// and a warm restart loads a cached profile and never profiles. So after any
+// restart the matrix held observations with NO vectors,
 // every neighbour lookup found nothing, and the entire prediction path was dead
 // while reporting healthy — routing silently fell back to overall hit rate and
 // speed for the process lifetime.
@@ -275,28 +323,8 @@ const bankVectorFillTimeout = 2 * time.Minute
 // observationsFrom drops skipped and errored entries and the two slices are not
 // aligned.
 func observationsFromMixed(hash, backendID string, results []BenchResult, at time.Time) []Observation {
-	byPrompt := bankQIDByPrompt()
-	out := make([]Observation, 0, len(results))
-	for _, r := range results {
-		if r.Skipped || r.Errored {
-			continue
-		}
-		qid, ok := byPrompt[strings.TrimSpace(r.Prompt)]
-		if !ok {
-			continue // the question left the bank, or its grading changed
-		}
-		out = append(out, Observation{
-			QID:       qid,
-			ModelHash: hash,
-			Backend:   backendID,
-			Thinking:  r.Tier >= benchHardTier,
-			Correct:   r.Pass,
-			LatencyMS: r.LatencyMS,
-			Source:    obsSourceBench,
-			At:        at,
-		})
-	}
-	return out
+	return observationsWith(hash, backendID, results, at,
+		func(r BenchResult) bool { return r.Tier >= benchHardTier })
 }
 
 // backfillOutcomesFromProfiles rebuilds the matrix from profiles already on disk.
@@ -314,9 +342,19 @@ func observationsFromMixed(hash, backendID string, results []BenchResult, at tim
 // route:outcome:unknown,fallback-speed, while one worker held a complete
 // 392-result profile contributing nothing.
 //
-// It is what makes a benchmarkVersion bump survivable rather than a fleet-wide
-// outage of the routing evidence base, and what makes a profile written by an
-// older binary visible at all.
+// WHAT IT IS FOR NOW, which is not what it was written for. It was written
+// because a benchmarkVersion bump emptied the matrix and left the fleet routing
+// blind for a full re-profile; content-addressed identity removed that entirely,
+// since a bump no longer touches a single observation — qids carry the question
+// and its grader, not a fleet-wide integer, so the rows survive the bump and the
+// permacache answers most of the re-profile from them. See identity.go.
+//
+// What is left is every OTHER way the observations table ends up behind the
+// profiles beside it: a table recreated by a migration, a profile written by a
+// binary that predates the table, a database restored from a backup taken before
+// the matrix existed, or a router whose last run never completed a profile. In
+// all of them worker_profiles holds the evidence and the matrix does not, and
+// this is the read that reunites them.
 //
 // Idempotent, and safe beside the live writers:
 //

@@ -25,7 +25,14 @@ package router
 //
 //   - NON-STREAMED ONLY. Once SSE bytes are on the wire they cannot be recalled,
 //     and buffering a stream to inspect it would destroy the streaming latency
-//     that is the point of streaming. dispatchStreaming is untouched.
+//     that is the point of streaming. This is ESCALATION's boundary and not the
+//     file's: streamFailover below moves a STREAMING request too, and
+//     dispatchStreaming calls it. The two are not in tension, because they are
+//     triggered by different things. Escalation reads an answer, which does not
+//     exist until the stream is over. Failover reacts to a worker that could not
+//     answer at all, which is known at the dial — before a single byte has
+//     reached the client, and therefore inside a window where moving is invisible
+//     to them.
 //   - EMPTY ONLY, not truncated. A length-capped answer hit the CALLER's token
 //     ceiling; a bigger model runs into the same wall and bills twice for it.
 //     See classifyResponse.
@@ -50,15 +57,18 @@ import (
 	"time"
 )
 
-// escalateSlotWait bounds how long an escalation waits for the better worker's
-// slot. Short on purpose: the caller has already paid for one failed generation,
-// so a long queue here turns a repairable request into a timeout. Past it, the
-// original (empty) answer is returned rather than nothing.
+// escalateSlotWait bounds how long a request being MOVED waits for the next
+// worker's slot — every mover uses it, escalation and both failover paths, since
+// the trade is the same one each time. Short on purpose: the caller has already
+// paid for one failed generation, so a long queue here turns a repairable request
+// into a timeout. Past it, whatever the current worker produced is returned
+// rather than nothing.
 var escalateSlotWait = 15 * time.Second
 
-// dispatch is the mutable state of one buffered exchange. backend and slot are
-// pointers because escalation may hand both to a different worker mid-request
-// and proxyToBackend's deferred unwind has to see the swap.
+// dispatch is the mutable state of one exchange, buffered or streamed. backend
+// and slot are pointers because escalation and failover may hand both to a
+// different worker mid-request, and proxyToBackend's deferred unwind reads
+// through them rather than through captured values, so it has to see the swap.
 type dispatch struct {
 	backend   **Backend
 	slot      *chan struct{}
@@ -210,21 +220,12 @@ func (r *Router) escalate(req *http.Request, d *dispatch, orig bufferedResult) (
 	if d.plan.session.locked() {
 		return nil, orig, false
 	}
-	from := *d.backend
-	// The plan minus the worker that just came back empty — the identical call
-	// failover makes, so the same request cannot be handed to two different
-	// rankers depending on HOW its worker failed.
-	better := nextCandidates(d.plan, map[string]bool{from.ID: true})
-	if len(better) == 0 {
-		return nil, orig, false
-	}
-	// A caller that declared how long it will wait has already spent part of that
-	// budget on the failed generation. Only escalate onto a worker that can still
-	// finish inside what's left — otherwise the repair turns a bad answer into no
-	// answer, which is the trade deadlineFilter exists to refuse.
-	if fits, ok := r.affordable(d, better, from); ok {
-		better = fits
-	} else {
+	// The plan minus the worker that just came back empty, narrowed to what the
+	// caller's remaining budget can still afford — the identical call failover
+	// makes, so the same request cannot be handed to two different rankers
+	// depending on HOW its worker failed.
+	better, ok := r.nextAffordable(d, map[string]bool{(*d.backend).ID: true})
+	if !ok {
 		return nil, orig, false
 	}
 	// An escalation is only worth a second generation if the replacement is
@@ -232,6 +233,27 @@ func (r *Router) escalate(req *http.Request, d *dispatch, orig bufferedResult) (
 	return r.redispatch(req, d, orig, better, func(res bufferedResult) bool {
 		return res.ok() && classifyResponse(res.body, false) != responseEmpty
 	}, nil)
+}
+
+// nextAffordable is the ONE way a request finds out where it may go next: the
+// plan's candidates minus the workers already tried, narrowed to the ones that
+// can still finish inside whatever remains of the caller's declared budget.
+// ok=false means there is nowhere left, either because the plan is exhausted or
+// because nothing on it fits the budget — the caller's cue to stop moving.
+//
+// All three movers ask it: escalate (empty answer), failover (5xx, buffered) and
+// streamFailover (5xx, pre-first-byte). They had three copies of the same six
+// lines, which is one copy too many for something whose whole contract is that
+// the same request cannot be handed to two different rankers depending on HOW
+// its worker failed. The three differ in POLICY — what counts as a failure, how
+// many hops are allowed, what an acceptable replacement is — and must not differ
+// in which worker is next.
+func (r *Router) nextAffordable(d *dispatch, tried map[string]bool) ([]*Backend, bool) {
+	cands := nextCandidates(d.plan, tried)
+	if len(cands) == 0 {
+		return nil, false
+	}
+	return r.affordable(d, cands, *d.backend)
 }
 
 // affordable narrows candidates to those that can still finish inside whatever
@@ -252,14 +274,20 @@ func (r *Router) affordable(d *dispatch, cands []*Backend, from *Backend) ([]*Ba
 	return fits, true
 }
 
-// redispatch is the MECHANICS of moving a request to another worker, with the
-// policy left to the caller.
+// redispatch is the MECHANICS of moving a BUFFERED request to another worker,
+// with the policy left to the caller.
 //
 // Two callers with different policies share it: escalate() moves a request whose
 // answer came back empty and only commits to something better, while failover()
 // moves one whose worker returned a 5xx and commits to any worker that answers
 // at all. The mechanics are identical and were fiddly enough to be worth having
 // in exactly one place — the ordering below is load-bearing.
+//
+// streamFailover is the third mover and cannot route through here, because the
+// step in the middle is different in kind: it dials and keeps the response open
+// rather than reading one to completion, and it has to inspect the status before
+// committing. It shares the three pieces that ARE the same — nextAffordable,
+// bodyFor and handOver — so the only thing it restates is the dial itself.
 //
 // On success the caller's slot and active-request accounting have ALREADY been
 // moved to the returned worker.
@@ -304,12 +332,7 @@ func (r *Router) redispatch(req *http.Request, d *dispatch, orig bufferedResult,
 		r.registry.releaseSlot(slot)
 	}()
 
-	// Re-patch from the CLIENT's body, not the already-patched one: the previous
-	// worker's context ceiling may have clamped max_tokens, and inheriting that
-	// clamp would hand the new worker a budget shaped by a worker it is replacing.
-	// The served-model rewrite differs per worker too.
-	body := patchForwardedBody(d.raw, d.inject, budgetCeiling(target, d.job), d.tr.forBackend(target), target.ServedID)
-	body = r.stripLearned(body, d.raw, target.ID)
+	body := r.bodyFor(d, target)
 
 	// No delay ladder on the first attempt against a fresh worker: the point of
 	// moving is that this one has not just failed.
@@ -335,16 +358,51 @@ func (r *Router) redispatch(req *http.Request, d *dispatch, orig bufferedResult,
 	}
 
 	// Commit: hand the caller's slot/active accounting over to the new worker so
-	// proxyToBackend's deferred unwind releases the right one. The order is
-	// load-bearing and unchanged; committed is set first so the guard above stands
-	// down before the handover it is guarding starts.
+	// proxyToBackend's deferred unwind releases the right one. committed is set
+	// first so the guard above stands down before the handover it is guarding
+	// starts.
 	committed = true
-	r.registry.incActive(from.ID, -1)
+	d.handOver(r, target, slot, body)
+	return target, res, true
+}
+
+// bodyFor is the body to send this dispatch's request to another worker.
+//
+// Re-patched from the CLIENT's body, not the already-patched one: the previous
+// worker's context ceiling may have clamped max_tokens, and inheriting that clamp
+// would hand the new worker a budget shaped by a worker it is replacing. The
+// served-model rewrite and the thinking dialect differ per worker too, and the
+// learned-rejection strip is per worker by definition.
+//
+// Shared by redispatch and streamFailover, which had identical copies. A body
+// built one way on the buffered path and another on the streaming path is a
+// difference nothing would catch until a worker answered a request shaped for
+// somebody else.
+func (r *Router) bodyFor(d *dispatch, target *Backend) []byte {
+	body := patchForwardedBody(d.raw, d.inject, budgetCeiling(target, d.job), d.tr.forBackend(target), target.ServedID)
+	return r.stripLearned(body, d.raw, target.ID)
+}
+
+// handOver moves the caller's slot and active-request accounting from the worker
+// this dispatch currently names to target, which the caller must ALREADY hold a
+// slot and an incActive on.
+//
+// The order is load-bearing, which is why it lives in one place rather than two:
+// the new slot is taken before the old one is given back (a saturated fleet
+// cannot leave the request holding nothing), and *d.backend / *d.slot are written
+// last so proxyToBackend's deferred unwind — which reads through those pointers
+// rather than through captured values — releases the worker that actually served.
+//
+// It does NOT take target's active count itself, deliberately. redispatch takes
+// it at acquisition under a defer that gives it back on every exit path including
+// a panic, and streamFailover takes it on the line above the call; folding it in
+// here would force redispatch to drop that guard.
+func (d *dispatch) handOver(r *Router, target *Backend, slot chan struct{}, body []byte) {
+	r.registry.incActive((*d.backend).ID, -1)
 	r.registry.releaseSlot(*d.slot)
 	*d.backend = target
 	*d.slot = slot
 	d.body = body
-	return target, res, true
 }
 
 // nextCandidates is the request's candidates minus the workers already tried,
@@ -818,13 +876,8 @@ func (r *Router) failover(req *http.Request, d *dispatch, res bufferedResult, tr
 	}
 	current := res
 	for hop := 0; hop < maxFailoverHops; hop++ {
-		cands := nextCandidates(d.plan, tried)
-		if len(cands) == 0 {
-			break
-		}
-		if fits, ok := r.affordable(d, cands, *d.backend); ok {
-			cands = fits
-		} else {
+		cands, ok := r.nextAffordable(d, tried)
+		if !ok {
 			break
 		}
 		from := (*d.backend).ID
@@ -951,11 +1004,7 @@ func (r *Router) streamFailover(ctx context.Context, req *http.Request, d *dispa
 
 	tried := map[string]bool{(*d.backend).ID: true}
 	for hop := 0; hop < maxFailoverHops; hop++ {
-		cands := nextCandidates(d.plan, tried)
-		if len(cands) == 0 {
-			return nil, nil, false
-		}
-		fits, ok := r.affordable(d, cands, *d.backend)
+		fits, ok := r.nextAffordable(d, tried)
 		if !ok {
 			return nil, nil, false
 		}
@@ -969,8 +1018,7 @@ func (r *Router) streamFailover(ctx context.Context, req *http.Request, d *dispa
 		// Only the worker actually contacted is retired, for the same reason as
 		// the buffered path: marking the whole slate strands healthy workers.
 		tried[target.ID] = true
-		body := patchForwardedBody(d.raw, d.inject, budgetCeiling(target, d.job), d.tr.forBackend(target), target.ServedID)
-		body = r.stripLearned(body, d.raw, target.ID)
+		body := r.bodyFor(d, target)
 
 		newResp, dialErr2 := r.dialStream(ctx, req, target, body)
 		if dialErr2 != nil || newResp.StatusCode >= 500 || newResp.StatusCode == http.StatusTooManyRequests {
@@ -998,14 +1046,13 @@ func (r *Router) streamFailover(ctx context.Context, req *http.Request, d *dispa
 		} else if resp != nil {
 			r.noteFailedAttempt(from.ID, bufferedResult{statusCode: resp.StatusCode})
 		}
-		// Commit, in the same order redispatch uses: the new slot is already held,
-		// so releasing the old one cannot leave this request holding nothing.
+		// Commit, through the same handover redispatch uses: the new slot is
+		// already held, so releasing the old one cannot leave this request holding
+		// nothing. The target's active count is taken here rather than at
+		// acquisition — the window between the two is one dial, and unlike
+		// redispatch there is no accept() to run inside it.
 		r.registry.incActive(target.ID, 1)
-		r.registry.incActive(from.ID, -1)
-		r.registry.releaseSlot(*d.slot)
-		*d.backend = target
-		*d.slot = slot
-		d.body = body
+		d.handOver(r, target, slot, body)
 		log.Printf("failover(stream): %s failed at the dial for %s → re-dialled on %s (hop %d)",
 			from.ID, d.plan.route, target.ID, hop+1)
 		return target, newResp, true

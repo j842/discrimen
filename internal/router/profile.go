@@ -24,6 +24,17 @@ type WorkerProfile struct {
 	// ModelHash is WHICH MODEL this profile measured, recorded so the results
 	// outlive the worker: a decommissioned box leaves its evidence behind, and
 	// the same weights deployed elsewhere inherit it. See modelHash.
+	//
+	// A profile CACHED before this field existed carries "", and it too gets no
+	// clause in backfillCachedProfile — for a different reason from CapacityCurve,
+	// and a stronger one. There is nothing to re-measure: the identity of a run
+	// that already happened is not a property of the endpoint today, and asking a
+	// live worker for its fingerprint would attribute an old profile's answers to
+	// whatever is serving that id NOW. The empty value is handled where it is read
+	// instead — backfillOutcomesFromProfiles falls back to unfingerprintedModelHash
+	// (see outcomes_bank.go), which is the non-sharing direction: an undated,
+	// unfingerprinted profile keeps its own per-worker identity and can never be
+	// credited to the wrong model.
 	ModelHash string `json:"model_hash,omitempty"`
 	Quality   int    `json:"quality"`
 	// QualityNoThink is the same weighted benchmark scored with thinking
@@ -52,13 +63,19 @@ type WorkerProfile struct {
 	// the question the integer cannot answer and the curve can.
 	//
 	// A profile CACHED before this field existed carries none, and nothing
-	// backfills it — the clause belongs in backfillCachedProfile, whose own comment
-	// says every new WorkerProfile field needs one or it inherits the prefill
-	// probe's silent staleness (shipped, cached over, never measured). The
-	// consequence here is bounded rather than silent: an absent curve prices as
+	// backfills it. That is now a DECIDED omission rather than an outstanding one:
+	// backfillCachedProfile — whose own comment says every new WorkerProfile field
+	// needs a clause there or it inherits the prefill probe's silent staleness
+	// (shipped, cached over, never measured) — states the exception in full. Re-
+	// deriving a curve means re-running the concurrency ramp, which fires up to
+	// CapacityProbeMax simultaneous generations at a worker already serving live
+	// traffic; that is the most disruptive probe there is, and nothing like the
+	// one-GET cost that makes the context re-read unconditional there.
+	//
+	// The staleness is bounded rather than silent: an absent curve prices as
 	// α = 1, the neutral default, so an already-profiled fleet keeps exactly the
-	// load model it has today until each worker's next cold profile. It still wants
-	// that clause.
+	// load model it had before the curve existed — never priced WRONGLY, only
+	// un-refined — and each worker acquires one at its next cold profile.
 	CapacityCurve []CapacityLevel `json:"capacity_curve,omitempty"`
 	BaselineTPS   float64         `json:"baseline_tps"`
 	TTFTMillis    int64           `json:"ttft_millis"`
@@ -68,11 +85,23 @@ type WorkerProfile struct {
 	// on the same ~4k prompt), so a flat TTFT average misprices long prompts badly.
 	PrefillTPS float64 `json:"prefill_tps,omitempty"`
 	// SpeedVersion is the version of the DECODE measurement BaselineTPS was taken
-	// with. Separate from BenchVersion because the two have wildly different
+	// with. Separate from BenchVersion because the two have different
 	// re-measurement costs: correcting how decode is counted is one 64-token
-	// generation per worker, while a BenchVersion bump re-runs the whole quality
-	// suite on every worker in the fleet and parks each at a provisional quality
-	// until it finishes. A speed-probe correction should not cost that.
+	// generation per worker, while a BenchVersion bump invalidates every cached
+	// profile in the fleet at once and parks each worker at a provisional quality
+	// until its re-profile finishes. A speed-probe correction should not cost that.
+	//
+	// What that bump costs has DROPPED sharply, and it is worth being precise about
+	// why, because the old figure (hours per worker, the whole fleet at once) is
+	// still the one people carry. The re-profile re-runs the pass over every
+	// question, but a bench version is not part of a question's identity: benchOne
+	// looks each one up in the permacache by qid — prompt, expected answer, match
+	// mode and GRADER version — against this model's hash, and a hit skips the
+	// generation entirely (see identity.go and cachedVerdict). So a bump that adds
+	// questions or changes the scoring re-asks only what is genuinely new; the cheap
+	// probes at the front of profileBackend, the capacity ramp and the context
+	// ladder, are what actually get re-run. It is the questions that made a bump
+	// expensive, and they no longer are.
 	SpeedVersion int      `json:"speed_version,omitempty"`
 	Features     []string `json:"features"`
 	Thinking     bool     `json:"thinking"`
@@ -111,12 +140,16 @@ type WorkerProfile struct {
 	// terrible one must not render the same. serveBenchmark omits the no-think
 	// half of the category breakdown rather than sending zeroes.
 	//
-	// NOT POPULATED YET: runNoThinkQualityBenchmark discards its per-question
-	// outcomes, so this is empty on every profile written today. Filling it is a
-	// four-line change in benchmark.go — return the `outcomes` slice it already
-	// builds, as []BenchResult — which is owned by another workstream at the time
-	// of writing. Nothing here breaks in the meantime; the breakdown degrades to
-	// thinking-on only.
+	// POPULATED, from one of two places, and full-length either way. On a THINKING
+	// worker it is the second pass's own record: runNoThinkQualityBenchmark re-asks
+	// only the hard tiers, then rebuilds a full-length slice by carrying the mixed
+	// pass's easy-tier rows across verbatim — those were already asked thinking-off,
+	// so they ARE no-think results. On a worker with no thinking mode there is no
+	// second pass at all, and BenchResults is copied here as-is for the same reason:
+	// every answer it gave was a no-think answer.
+	//
+	// The alignment is what makes it safe for the category breakdown to zip this
+	// against BenchResults and read both modes of one question off the same index.
 	BenchResultsNoThink []BenchResult    `json:"bench_results_nothink,omitempty"`
 	Checks              map[string]Check `json:"checks,omitempty"`
 	MeasuredAt          time.Time        `json:"measured_at"`
@@ -203,7 +236,7 @@ func concurrencyAlpha(curve []CapacityLevel) float64 {
 	if sxx <= 0 {
 		return 1
 	}
-	return math.Max(0, math.Min(1, sxy/sxx))
+	return clamp01(sxy / sxx)
 }
 
 // minMeasuredAlpha keeps a measured exponent distinguishable from an unmeasured
@@ -387,6 +420,15 @@ func fmtProfileDuration(ms int64) string {
 // context — so a brand-new worker becomes routable in seconds. Quality and
 // capacity stay provisional (the declared seed or a conservative default) until
 // profileBackend measures them in the background.
+//
+// The two stop being provisional at different MOMENTS, and the MaxConcurrency=1
+// written here is why that matters. Capacity is published the instant the ramp
+// settles it, part-way through profileBackend and long before the run finishes
+// (see publishCapacity) — because this placeholder prices the worker as serial,
+// and leaving it in place for the length of a quality benchmark spilled live
+// traffic off a worker the profile was itself driving four ways. Quality really
+// does wait for the end of the run, which is the only point at which there is a
+// score to commit.
 func (r *Router) profileQuick(b *Backend, model string) (*WorkerProfile, error) {
 	checks := map[string]Check{}
 	if err := r.chatProbe(b); err != nil {
@@ -396,23 +438,31 @@ func (r *Router) profileQuick(b *Backend, model string) (*WorkerProfile, error) 
 	features := []string{"chat"}
 
 	incomplete := false
-	if err, inconclusive := r.capabilityProbe(func() error { return r.jsonProbe(b) }); err == nil {
-		features = append(features, "json")
-		checks["json"] = Check{OK: true}
-	} else if inconclusive {
-		incomplete = true
-		checks["json"] = Check{Message: "inconclusive (probe errored, will re-probe): " + err.Error()}
-	} else {
-		checks["json"] = Check{Message: err.Error()}
-	}
-	if err, inconclusive := r.capabilityProbe(func() error { return r.toolProbe(b) }); err == nil {
-		features = append(features, "tools")
-		checks["tools"] = Check{OK: true}
-	} else if inconclusive {
-		incomplete = true
-		checks["tools"] = Check{Message: "inconclusive (probe errored, will re-probe): " + err.Error()}
-	} else {
-		checks["tools"] = Check{Message: err.Error()}
+	// json and tools are the two capabilities settled by an error-returning probe,
+	// and they were settled by two byte-identical eleven-line blocks differing only
+	// in the probe called and the name written down. Identical handling wants to be
+	// one piece of code: the three-way verdict (supported / definitively refused /
+	// never got an answer) is the same for both, and the third arm — the one that
+	// must set Incomplete so the profile is not CACHED as a measurement it never
+	// took — is precisely the arm nobody notices is missing from a copy.
+	for _, capability := range []struct {
+		name  string
+		probe func() error
+	}{
+		{"json", func() error { return r.jsonProbe(b) }},
+		{"tools", func() error { return r.toolProbe(b) }},
+	} {
+		err, inconclusive := r.capabilityProbe(capability.probe)
+		switch {
+		case err == nil:
+			features = append(features, capability.name)
+			checks[capability.name] = Check{OK: true}
+		case inconclusive:
+			incomplete = true
+			checks[capability.name] = Check{Message: "inconclusive (probe errored, will re-probe): " + err.Error()}
+		default:
+			checks[capability.name] = Check{Message: err.Error()}
+		}
 	}
 	thinking, dialect, thinkInconclusive := r.thinkingProbe(b)
 	switch {
@@ -555,13 +605,39 @@ func (r *Router) profileBackend(b *Backend, model string) (*WorkerProfile, error
 	// The applyProfileIfGen at the end writes this same number, and syncSlotsLocked
 	// no-ops on an unchanged cap, so the commit stays a commit rather than becoming
 	// a conflict that rebuilds the slot channel under live traffic.
-	r.registry.publishCapacity(b.ID, b.profileGen, capN, capCurve)
+	//
+	// A false return is the SAME abort as the capacity probe failing above, arrived
+	// at from the other direction: the row has been deleted, or re-registered with
+	// new content, since this run took the profiling guard. applyProfileIfGen at the
+	// end applies the identical generation check and drops the whole profile —
+	// "background profile %s finished for a stale registration generation —
+	// discarded" — so everything from here on is measurement that has already been
+	// decided to be unusable. Carrying on spends the quality benchmark to learn it:
+	// 25+ minutes typically, five hours at worst, and on a metered endpoint a real
+	// invoice, for a result that is thrown away on arrival. The new registration is
+	// running its own certification meanwhile, so nothing is lost by stopping.
+	//
+	// This return value was previously ignored, which is what made the early abort
+	// above inconsistent: the two conditions cost the same and only one of them
+	// stopped.
+	if !r.registry.publishCapacity(b.ID, b.profileGen, capN, capCurve) {
+		return nil, r.abort(b, meter, "worker deleted or re-registered during the capacity probe")
+	}
 	// Prefill rate is measured here rather than left to the live EWMA, which only
 	// samples non-thinking requests and so never fills in for a thinking-heavy worker.
-	// A failure is not fatal: routing falls back to the flat TTFT average as before.
+	//
+	// A failure is not fatal, and what it costs is now smaller than it was. It used
+	// to drop the worker onto a FLAT TTFT average that ignored prompt length
+	// altogether — total blindness to the dominant term of a long-context request,
+	// not merely a coarse estimate of it. prefillSeconds no longer has such a
+	// branch: an unmeasured worker falls through to the context ladder's own
+	// per-rung rate if the ladder ran, and failing that to fallbackPrefillTPS, a
+	// fleet constant that is wrong for every worker but wrong by a bounded factor
+	// and still scales with the prompt. So this probe now buys accuracy rather than
+	// the difference between an estimate and none.
 	prog.enter(phasePrefill, 0)
 	if rate, err := r.prefillProbe(b); err != nil {
-		log.Printf("prefill probe failed for %s: %v — routing will price its TTFT from the flat average", b.ID, err)
+		log.Printf("prefill probe failed for %s: %v — routing will price its prefill from the context ladder or the fleet constant", b.ID, err)
 	} else {
 		p.PrefillTPS = rate
 		p.Checks["prefill"] = Check{OK: true, Message: fmt.Sprintf("%.0f tok/s on a %d-token prompt", rate, prefillProbeTokens)}
@@ -668,7 +744,10 @@ func (r *Router) profileBackend(b *Backend, model string) (*WorkerProfile, error
 	prog.enter(phaseContext, 0)
 	if probe := r.runContextProbe(b, false); probe.AdvertisedTokens > 0 {
 		p.ContextProbe = &probe
-		p.Checks["context_usable"] = Check{OK: true, Message: contextProbeMessage(&probe)}
+		// OK from the ladder rather than from the fact that it ran: a probe that
+		// errored, and a worker that could not retrieve at the smallest size tested,
+		// are both failures and used to render with a tick. See contextProbeOK.
+		p.Checks["context_usable"] = Check{OK: contextProbeOK(&probe), Message: contextProbeMessage(&probe)}
 	}
 	p.MeasuredAt = time.Now()
 	p.ProfileMillis = time.Since(start).Milliseconds()
@@ -778,13 +857,29 @@ func (r *Router) thinkingProbe(b *Backend) (thinking bool, dialect string, incon
 	return false, thinkingDialectNone, false
 }
 
+// The transient-retry discipline every capability probe shares: a probe that
+// errors is retried this many times, spaced by this delay, and only a SUCCESS or
+// a definitive 4xx rejection settles it. The distinction is the point — a
+// capability that never got a verdict marks the profile Incomplete rather than
+// being cached as absent (the 2026-07-06 thinking incident's stickiness half) —
+// and the numbers were written out separately at each of the three ladders that
+// implement it, which is how two of them could drift apart without anyone
+// noticing they were meant to agree.
+//
+// The delay is what makes the ladders slow to test, so it is a package var for
+// the same reason capacityProbeRetryDelay and slotMaxWait are: a test that has to
+// spend six real seconds proving a retry works is a test nobody runs.
+const capabilityProbeAttempts = 3
+
+var capabilityProbeRetryDelay = 2 * time.Second
+
 // thinkingProbeOnce runs one dialect's probe under the same transient-retry
 // discipline as capabilityProbe. settled=false means no verdict at all: every
 // attempt hit a transient error.
 func (r *Router) thinkingProbeOnce(b *Backend, payload map[string]any) (thinking, settled bool) {
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < capabilityProbeAttempts; attempt++ {
 		if attempt > 0 {
-			time.Sleep(2 * time.Second)
+			time.Sleep(capabilityProbeRetryDelay)
 		}
 		raw, err := r.rawCompletion(b, payload)
 		if err != nil {
@@ -807,9 +902,9 @@ func (r *Router) thinkingProbeOnce(b *Backend, payload map[string]any) (thinking
 // retries were exhausted on transient errors only — the capability is UNKNOWN,
 // not absent, and the profile must not be cached as if it were measured.
 func (r *Router) capabilityProbe(probe func() error) (err error, inconclusive bool) {
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < capabilityProbeAttempts; attempt++ {
 		if attempt > 0 {
-			time.Sleep(2 * time.Second)
+			time.Sleep(capabilityProbeRetryDelay)
 		}
 		err = probe()
 		if err == nil || isClientReject(err) {
@@ -1326,8 +1421,13 @@ func (r *Registry) applyProfileIfGen(id string, gen int64, p *WorkerProfile) boo
 	}
 	// Seed the prefill EWMA from the probe, but never overwrite a live one — same rule
 	// as ObservedTPS. Without this seed a worker that mostly serves thinking traffic
-	// never gets a prefill rate at all (observe() skips those samples) and every long
-	// prompt is priced at the flat TTFT average.
+	// never gets a prefill rate at all (observe() skips those samples), and every long
+	// prompt on it is priced from the next-best source prefillSeconds can find: the
+	// context ladder's per-rung rate, or failing that the fleet-wide
+	// fallbackPrefillTPS. Both scale with the prompt, so the cost of missing this
+	// seed is a less accurate rate rather than the flat, length-blind TTFT average it
+	// used to be — but this is still the only figure measured on THIS worker at
+	// length, and it is the one to prefer.
 	if p.PrefillTPS > 0 && b.ObservedPrefillTPS == 0 {
 		b.ObservedPrefillTPS = p.PrefillTPS
 	}
@@ -1354,6 +1454,15 @@ func (r *Registry) applyProfileIfGen(id string, gen int64, p *WorkerProfile) boo
 	// saturated worker. Only a FULL profile carries a measured value
 	// (BenchVersion is set); profileQuick's MaxConcurrency=1 is a provisional
 	// placeholder that must not throttle a fresh worker to serial dispatch.
+	//
+	// This is NO LONGER the first time a cold run's capacity reaches the slot
+	// channel, and the gate below should not be read as though it were. A live
+	// cold profile publishes the ramp's answer the moment it settles, through
+	// publishCapacity, which syncs the slots there and then; by the time the
+	// profile arrives here the cap is usually already correct and syncSlotsLocked
+	// no-ops on it. What still comes through this path is every case with no
+	// mid-run publish behind it: a WARM restart applying a cached profile, a relay
+	// import, and the tests.
 	//
 	// Sync the EFFECTIVE cap rather than the profile's own: on a manual row the
 	// guard above kept the operator's number, and the slot channel has to hold

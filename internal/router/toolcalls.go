@@ -31,6 +31,7 @@ package router
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"strconv"
@@ -73,6 +74,16 @@ func newToolCallGuard(src io.Reader, backend *Backend) *toolCallGuard {
 }
 
 func (g *toolCallGuard) Read(p []byte) (int, error) {
+	// idle counts consecutive reads that returned nothing AND no error. The
+	// io.Reader contract discourages (0, nil) but permits it, and this loop only
+	// exits on bytes or an error — so a source that returns it forever spins a
+	// core with no progress and no way out. The idle watchdog upstream normally
+	// bounds that, because a spinning guard emits no bytes and therefore never
+	// calls progress(); but the watchdog is optional
+	// (BACKEND_IDLE_TIMEOUT_SECONDS=0 disables it) and streamClient has no
+	// client-level timeout, so with both off the spin is unbounded. Cheaper to
+	// refuse than to rely on a layer that can be turned off.
+	idle := 0
 	for len(g.out) == 0 {
 		if g.eof {
 			if len(g.partial) > 0 { // unterminated tail: forward verbatim
@@ -84,6 +95,11 @@ func (g *toolCallGuard) Read(p []byte) (int, error) {
 		n, err := g.src.Read(g.scratch)
 		if n > 0 {
 			g.feed(g.scratch[:n])
+			idle = 0
+		} else if err == nil {
+			if idle++; idle > maxIdleReads {
+				return 0, errStalledStream
+			}
 		}
 		if err != nil {
 			if err != io.EOF {
@@ -279,3 +295,14 @@ func indexOf(v any) int {
 	}
 	return 0
 }
+
+// maxIdleReads is how many consecutive empty-but-not-failed reads the guard
+// tolerates before declaring the stream stalled. Generous: a legitimate source
+// returning (0, nil) even once is unusual, and this only has to be small enough
+// that the spin cannot outlive the request.
+const maxIdleReads = 1000
+
+// errStalledStream ends a stream whose source is returning nothing and reporting
+// no error. Surfaced as a mid-stream failure, which is what it is — the client
+// gets an SSE error frame rather than a connection that never closes.
+var errStalledStream = errors.New("upstream returned no bytes and no error")

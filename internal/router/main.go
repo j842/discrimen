@@ -5799,6 +5799,22 @@ func (s *LogStore) init(ctx context.Context) error {
 		// lookup key. api_key is sealed with the same box that protects a backend's
 		// credential; the backends this relay expands into are DERIVED and are not
 		// persisted anywhere — the refresh loop rebuilds them from this row.
+		// One graded answer per (question, worker, thinking mode, source). REPLACE
+		// on that key, so a re-profile supersedes its predecessor rather than
+		// accumulating beside it — a worker's history would otherwise drag its
+		// current estimate. See outcomes.go.
+		`CREATE TABLE IF NOT EXISTS observations (
+			qid TEXT NOT NULL,
+			backend_id TEXT NOT NULL,
+			thinking INTEGER NOT NULL,
+			correct INTEGER NOT NULL,
+			latency_ms INTEGER NOT NULL DEFAULT 0,
+			output_tokens INTEGER NOT NULL DEFAULT 0,
+			source TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			PRIMARY KEY (qid, backend_id, thinking, source)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_observations_backend ON observations (backend_id)`,
 		`CREATE TABLE IF NOT EXISTS router_relays (
 			name TEXT PRIMARY KEY,
 			url TEXT NOT NULL,

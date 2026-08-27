@@ -66,7 +66,14 @@ type Config struct {
 	// Auto thinking (Phase 3a). When requirements.thinking is absent/"auto",
 	// deduce whether the prompt needs reasoning and inject
 	// chat_template_kwargs.enable_thinking accordingly.
-	AutoThinking       bool
+	AutoThinking bool
+	// DraftGating replaces the reasoning classifier's GUESS about whether a
+	// prompt needs thinking with an experiment: sample two cheap no-think drafts
+	// and, if they agree, serve one. Off by default — it changes what a request
+	// costs (two short generations instead of one long one when it fires, and
+	// two wasted ones when it does not), so it is a deliberate trade rather than
+	// a default. See dart.go.
+	DraftGating        bool
 	ReasoningThreshold float64 // reasoning score ≥ this → enable thinking
 
 	// Online tier adapter (self-improving). Learns an upward score bias per
@@ -864,6 +871,10 @@ func loadConfig() *Config {
 
 		AutoThinking:       auto,
 		ReasoningThreshold: reasoningThreshold,
+		// Default OFF. It is a cost trade, not a strict improvement: two short
+		// generations replace one long one when the drafts agree, and are wasted
+		// on top of it when they do not.
+		DraftGating: envBool("ROUTER_DRAFT_GATING", false),
 
 		AdaptOnline:  auto,
 		AdaptMaxBias: adaptMaxBias,

@@ -211,10 +211,16 @@ func TestChooseFastestAmongCorrect(t *testing.T) {
 	if got[0].ID != "fast-good" {
 		t.Errorf("picked %q, want fast-good — fastest among those predicted correct (reason %q)", got[0].ID, reason)
 	}
-	for _, b := range got {
-		if b.ID == "fast-bad" {
-			t.Error("a worker predicted to be WRONG survived the filter, despite being fastest")
-		}
+	// The predicted-wrong worker is ranked LAST, not removed. Removing it would
+	// leave failover and escalation with nowhere to go at exactly the moment the
+	// chosen worker fails — and an unmeasured worker is not a bad one either.
+	if len(got) != len(cands) {
+		t.Errorf("%d candidates in, %d out — the list must be reordered, not narrowed",
+			len(cands), len(got))
+	}
+	if got[len(got)-1].ID != "fast-bad" {
+		t.Errorf("last candidate is %q, want fast-bad ranked last despite being fastest",
+			got[len(got)-1].ID)
 	}
 }
 
@@ -400,5 +406,32 @@ func TestPruneJudgedKeepsBankQuestions(t *testing.T) {
 	}
 	if keptOldest {
 		t.Error("the oldest judged question survived")
+	}
+}
+
+// Ranking, not filtering, is what keeps failover viable. A single measured
+// worker used to reduce a whole fleet to one candidate.
+func TestChooseNeverNarrowsTheCandidateList(t *testing.T) {
+	m := newTestMatrix(t)
+	ctx := context.Background()
+	m.setVector("q1", vec(1, 0))
+	m.setVector("q2", vec(0.99, 0.14))
+	_ = m.record(ctx, []Observation{
+		obs("q1", "measured", true, true, 100, obsSourceBench),
+		obs("q2", "measured", true, true, 100, obsSourceBench),
+	})
+	cands := []*Backend{testBackend("measured", 100), testBackend("fresh-a", 50), testBackend("fresh-b", 50)}
+	got, _ := m.chooseByOutcome(cands, vec(1, 0.05), true, jobCost{outputTokens: 200, mode: thinkingOn})
+	if len(got) != 3 {
+		t.Fatalf("3 candidates in, %d out — unmeasured workers were evicted rather than ranked", len(got))
+	}
+	if got[0].ID != "measured" {
+		t.Errorf("first is %q, want the measured worker", got[0].ID)
+	}
+	// Same for the fallback path, where nothing is measured at all.
+	empty := newTestMatrix(t)
+	all, _ := empty.chooseByOutcome(cands, vec(1, 0), true, jobCost{outputTokens: 200, mode: thinkingOn})
+	if len(all) != 3 {
+		t.Errorf("fallback returned %d of 3 candidates", len(all))
 	}
 }

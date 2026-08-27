@@ -227,3 +227,42 @@ func (r *Router) outcomeSummaryFor(backendID string, thinking bool) *OutcomeSumm
 	s := r.outcomes.summarise(backendID, thinking, r.bankTopicOf)
 	return &s
 }
+
+// ensureBankVectorsAsync fills the bank's embeddings in the background if they
+// are missing, at most one attempt at a time.
+//
+// WHY THIS EXISTS AT ALL. The vectors are deliberately not persisted — they are
+// a pure function of the question text and the embedding model, and storing them
+// would mean detecting when that model changed. But the only thing deriving them
+// was a cold-start profile, and a warm restart loads a cached profile and never
+// profiles. So after any restart the matrix held observations with NO vectors,
+// every neighbour lookup found nothing, and the entire prediction path was dead
+// while reporting healthy — routing silently fell back to overall hit rate and
+// speed for the process lifetime.
+//
+// Background rather than inline because filling needs the embeddings worker, and
+// a request must not wait on it. Retried on failure rather than latched, because
+// that worker is exactly the sort of thing that is down when the router starts.
+func (r *Router) ensureBankVectorsAsync() {
+	if r.outcomes == nil || r.bankVecsReady.Load() {
+		return
+	}
+	if !r.bankVecsFilling.CompareAndSwap(false, true) {
+		return // an attempt is already in flight
+	}
+	go func() {
+		defer r.bankVecsFilling.Store(false)
+		ctx, cancel := context.WithTimeout(context.Background(), bankVectorFillTimeout)
+		defer cancel()
+		if err := r.ensureBankVectors(ctx); err != nil {
+			log.Printf("outcome matrix: bank embedding failed, predictions fall back until it succeeds: %v", err)
+			return
+		}
+		r.bankVecsReady.Store(true)
+	}()
+}
+
+// bankVectorFillTimeout bounds one filling attempt. Generous: it is a few
+// hundred short texts against a local embedder, and a partial fill is worse than
+// a slow one — half a bank means half the neighbours.
+const bankVectorFillTimeout = 2 * time.Minute

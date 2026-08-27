@@ -466,26 +466,52 @@ func (m *outcomeMatrix) chooseByOutcome(cands []*Backend, vec []float64, thinkin
 	// among them take the fastest. This is the whole routing policy — there is no
 	// quality target and nothing compared against one.
 	if known > 0 {
-		var able []outcomeChoice
+		// RANK, never evict. Every candidate stays in the returned list; the matrix
+		// decides only the ORDER.
+		//
+		// Filtering was the first shape of this and it was wrong twice over. A
+		// worker with no prediction is not a bad worker, it is an unmeasured one,
+		// so dropping it removed every newly registered worker from everything.
+		// And this list is what failover and escalation move ALONG — shrinking it
+		// leaves them nowhere to go at exactly the moment the chosen worker has
+		// failed. Measured before the fix: one worker with two judged observations
+		// reduced a three-worker fleet to one candidate.
+		//
+		// Three bands, best first:
+		//
+		//	predicted correct  by speed — the routing goal, stated directly
+		//	unmeasured         by speed, behind anything known to be right
+		//	predicted wrong    by predicted correctness, best of a bad lot
+		//
+		// The last band sorts on ACCURACY rather than speed because a request that
+		// reaches it is one the fleet is not good at, and a fast wrong answer helps
+		// nobody.
+		var able, unmeasured, unable []outcomeChoice
 		for _, c := range choices {
-			if c.Pred.known() && c.Pred.Correct >= outcomeCorrectFloor {
+			switch {
+			case !c.Pred.known():
+				unmeasured = append(unmeasured, c)
+			case c.Pred.Correct >= outcomeCorrectFloor:
 				able = append(able, c)
+			default:
+				unable = append(unable, c)
 			}
 		}
-		if len(able) > 0 {
-			sortBySeconds(able)
-			return backendsOf(able), fmt.Sprintf("outcome:p=%.2f,n=%d", able[0].Pred.Correct, able[0].Pred.Observations)
+		sortBySeconds(able)
+		sortBySeconds(unmeasured)
+		sort.SliceStable(unable, func(i, j int) bool { return unable[i].Pred.Correct > unable[j].Pred.Correct })
+		ordered := make([]outcomeChoice, 0, len(choices))
+		ordered = append(ordered, able...)
+		ordered = append(ordered, unmeasured...)
+		ordered = append(ordered, unable...)
+		switch {
+		case len(able) > 0:
+			return backendsOf(ordered), fmt.Sprintf("outcome:p=%.2f,n=%d", able[0].Pred.Correct, able[0].Pred.Observations)
+		case len(unmeasured) > 0:
+			return backendsOf(ordered), "outcome:none-above-floor,unmeasured-first"
+		default:
+			return backendsOf(ordered), fmt.Sprintf("outcome:best-effort,p=%.2f", unable[0].Pred.Correct)
 		}
-		// Nothing clears the floor: the fleet is not good at this. Take the most
-		// likely to be right rather than the fastest — spending longer is the only
-		// lever left, and returning a fast wrong answer helps nobody.
-		sort.SliceStable(choices, func(i, j int) bool {
-			if choices[i].Pred.known() != choices[j].Pred.known() {
-				return choices[i].Pred.known()
-			}
-			return choices[i].Pred.Correct > choices[j].Pred.Correct
-		})
-		return backendsOf(choices), fmt.Sprintf("outcome:best-effort,p=%.2f", choices[0].Pred.Correct)
 	}
 
 	// FALLBACK: nothing similar has been profiled, which is the common case for
@@ -505,17 +531,25 @@ func (m *outcomeMatrix) chooseByOutcome(cands []*Backend, vec []float64, thinkin
 			best = rate
 		}
 	}
-	var eligible []outcomeChoice
+	// Same rule as above: rank, do not narrow. Workers within the margin of the
+	// best overall hit rate go first, fastest among them — "best overall, leaning
+	// speed" — and everything else follows in accuracy order rather than being
+	// dropped, so failover still has somewhere to go.
+	var eligible, rest []outcomeChoice
 	for _, c := range choices {
 		if rates[c.Backend.ID] >= best-outcomeSpeedMargin {
 			eligible = append(eligible, c)
+		} else {
+			rest = append(rest, c)
 		}
 	}
-	if len(eligible) == 0 {
-		eligible = choices
-	}
 	sortBySeconds(eligible)
-	return backendsOf(eligible), fmt.Sprintf("outcome:unknown,fallback-speed,q=%.2f", rates[eligible[0].Backend.ID])
+	sort.SliceStable(rest, func(i, j int) bool { return rates[rest[i].Backend.ID] > rates[rest[j].Backend.ID] })
+	ordered := append(eligible, rest...)
+	if len(ordered) == 0 {
+		return nil, "no candidates"
+	}
+	return backendsOf(ordered), fmt.Sprintf("outcome:unknown,fallback-speed,q=%.2f", rates[ordered[0].Backend.ID])
 }
 
 // outcomeSeconds predicts wall clock for one worker, preferring what it actually

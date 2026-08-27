@@ -612,6 +612,9 @@ func Main() {
 	} else {
 		log.Printf("outcome matrix: %s", router.outcomes)
 	}
+	// Vectors are derived, not stored, so a restart starts with none. Kick the
+	// fill off now rather than waiting for the first request to notice.
+	router.ensureBankVectorsAsync()
 	// Before anything is served: generate the credentials the operator did not
 	// supply and print them once. An empty ROUTER_CLIENT_TOKENS used to mean no
 	// client authentication at all, which is right on a trusted LAN and wrong for
@@ -706,12 +709,17 @@ type Router struct {
 	// breakdown cannot disagree about what counts as coding.
 	bankTopics    map[string]string
 	bankTopicOnce sync.Once
-	judgeSem      chan struct{}   // bounds concurrent background judge calls; nil unless judging enabled
-	judgeCount    atomic.Uint64   // sample counter for background answer judging
-	judgePaid     judgeBudget     // rolling token allowance for grading with a PAID model (see judge.go)
-	profiling     sync.Map        // worker ids with a cold-start profile in flight (de-dups overlapping profiles)
-	gateAudited   atomic.Bool     // set once the thinking-gate-vs-tier audit has logged (model-independent)
-	sessions      *sessionTracker // conversation → worker affinity; nil disables stickiness (see session.go)
+	// bankVecsReady/bankVecsFilling guard the background embedding of the question
+	// bank. Not a sync.Once: the embeddings worker may be down at startup, and a
+	// latched Once would leave the matrix dead for the process lifetime.
+	bankVecsReady   atomic.Bool
+	bankVecsFilling atomic.Bool
+	judgeSem        chan struct{}   // bounds concurrent background judge calls; nil unless judging enabled
+	judgeCount      atomic.Uint64   // sample counter for background answer judging
+	judgePaid       judgeBudget     // rolling token allowance for grading with a PAID model (see judge.go)
+	profiling       sync.Map        // worker ids with a cold-start profile in flight (de-dups overlapping profiles)
+	gateAudited     atomic.Bool     // set once the thinking-gate-vs-tier audit has logged (model-independent)
+	sessions        *sessionTracker // conversation → worker affinity; nil disables stickiness (see session.go)
 
 	// profileMeters holds a *profileMeter per worker id for the span of that
 	// worker's profiling run, so what the run consumed can be totalled onto the
@@ -3399,6 +3407,9 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 	// evidence, and declines (leaving the tier path in place) where it does not,
 	// so the two can run side by side until the tier machinery is removed.
 	if cl != nil && r.outcomes != nil && len(cl.vec) > 0 {
+		// Self-healing: cheap when already filled (one atomic load), and the only
+		// thing that fills the bank after a warm restart.
+		r.ensureBankVectorsAsync()
 		if ordered, reason := r.outcomes.chooseByOutcome(filtered, cl.vec, !tr.noThink, job); len(ordered) > 0 {
 			return &routePlan{
 				candidates: ordered,

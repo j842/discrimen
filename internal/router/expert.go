@@ -34,11 +34,17 @@ package router
 //     member's reasoning trace, runs with thinking forced off, and has any
 //     reasoning field removed from what it produces.
 //
-// What an ensemble must NOT do is teach the router anything. Its route string is
-// "expert", which parseRouteScore does not recognise, so neither the online tier
-// adapter nor the background judge sees it as a tier the router chose — because
-// it isn't one, and a bin biased by an ensemble's outcome would be biased by
-// N models' work for a decision about one.
+// What an ensemble must NOT do is teach the router anything, and it is kept out
+// of both learners three times over. serveExpert owns the whole response and
+// never goes through proxyToBackend, so the deferred goroutine that feeds the
+// adapter and the judge is not on this path at all. An expert plan carries
+// auto=false, which is the flag the JUDGE is gated on since it stopped sniffing
+// the route string. And the route string is "expert", which parseRouteScore does
+// not recognise, so the ADAPTER — which still needs a numeric difficulty score
+// and therefore still parses it — has nothing to observe against. All three say
+// the same thing: an ensemble is not a tier the router chose, and a bin biased by
+// an ensemble's outcome would be biased by N models' work for a decision about
+// one.
 //
 // The name is the router's, held the same way "default" and a group name are:
 // no group may be created with it, and a worker that registers a model called
@@ -75,11 +81,11 @@ func isExpertModel(name string) bool {
 // expertSlotWait is how long ONE member waits for its own worker's slot before
 // the panel gives up on it.
 //
-// Short on purpose, and shorter than every other grace in the router
-// (qualityFloorWait 10s, sessionLockWait 5s, escalateSlotWait 15s), because it
-// is the only one where waiting costs somebody else's answer: the panel is as
-// slow as its slowest member, so a request held here delays every other member's
-// result as well as its own. A worker that has not freed a slot in five seconds
+// Short on purpose, and no longer than any other grace in the router (level with
+// sessionLockWait's 5s, against qualityFloorWait's 10s and escalateSlotWait's
+// 15s), because it is the only one where waiting costs somebody else's answer:
+// the panel is as slow as its slowest member, so a request held here delays every
+// other member's result as well as its own. A worker that has not freed a slot in five seconds
 // is mid-generation — tens of seconds on this fleet — so waiting longer means
 // waiting out a whole other request, and the ensemble has N-1 other models to
 // hear from in the meantime.
@@ -204,10 +210,24 @@ func expertMembers(candidates []*Backend, job jobCost) []*Backend {
 // pickSynthesiser is the highest MEASURED quality worker that can still fit the
 // synthesis prompt, or nil when none can.
 //
-// Quality is the fleet's own benchmark result, not a declared number, which is
-// the same source the background judge picks its grader from. Ties are broken by
-// the ordinary ranking, so two workers of equal measured quality are separated
-// by which will finish first rather than by map order.
+// Quality is the fleet's own benchmark result, not a declared number. It is NO
+// LONGER the same source the background judge picks its grader from: judgeGrader
+// now ranks on graderStrength, which reads the outcome matrix — the hit rate on
+// prompts LIKE THIS ONE where the request carries an embedding, the worker's
+// overall rate otherwise — and falls back to the benchmark scalar only for a
+// fleet nothing has been observed on yet.
+//
+// The divergence is not an oversight, but it is not a settled decision either.
+// The judge is choosing a grader for one specific answer and holds a vector for
+// the prompt, computed for routing and passed down. Synthesis has N answers and
+// one conversation, and no equivalent "which of these is the right question to
+// ask about" — so the fleet-wide benchmark is still the only ordering over
+// workers available here that is not a guess. Anyone wiring the matrix in should
+// know they are answering a question this function has not been asked yet, not
+// fixing an inconsistency.
+//
+// Ties are broken by the ordinary ranking, so two workers of equal measured
+// quality are separated by which will finish first rather than by map order.
 //
 // A member may be the synthesiser; that is fine. It reads its own answer beside
 // the others without knowing which was its, and the alternative — excluding it —

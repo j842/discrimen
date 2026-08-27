@@ -129,6 +129,94 @@ func TestContextProbeMessage(t *testing.T) {
 	}
 }
 
+// "The probe never got an answer" and "the worker answered wrongly" are opposite
+// findings, and the ladder stops on either. Rendering them the same way is how
+// this line came to name a worker as unable to hold 4K of context on the strength
+// of a request that returned a 503 — a confident diagnosis of something it had
+// learned nothing about, which is worse for the operator than silence.
+func TestContextProbeMessageSeparatesAnErrorFromAFailure(t *testing.T) {
+	errored := &ContextProbe{
+		AdvertisedTokens: 128 * 1024,
+		Levels:           []ContextProbeLevel{{Tokens: 4096, Total: 3, Errored: true}},
+	}
+	msg := contextProbeMessage(errored)
+	if strings.Contains(msg, "FAILED") {
+		t.Errorf("a probe that ERRORED at the first rung is reported as a retrieval failure: %q", msg)
+	}
+	if !strings.Contains(msg, "errored") {
+		t.Errorf("the message does not say the probe errored: %q", msg)
+	}
+	if !strings.Contains(msg, "UNMEASURED") {
+		t.Errorf("an errored ladder establishes nothing and must say so: %q", msg)
+	}
+
+	// A genuine miss at the same rung must still read as the finding it is.
+	missed := &ContextProbe{
+		AdvertisedTokens: 128 * 1024,
+		Levels:           []ContextProbeLevel{{Tokens: 4096, Passed: 1, Total: 3}},
+	}
+	if got := contextProbeMessage(missed); !strings.Contains(got, "FAILED") {
+		t.Errorf("failing the smallest rung is a real finding and must still be stated: %q", got)
+	}
+
+	// Errored PARTWAY UP is the same bug one rung along: 4K passed and 8K never
+	// answered, so 4K is a lower bound exactly like a budget truncation — not the
+	// measured ceiling the default branch would have called it.
+	partial := &ContextProbe{
+		AdvertisedTokens: 128 * 1024,
+		UsableTokens:     4096,
+		Levels: []ContextProbeLevel{
+			{Tokens: 4096, Passed: 3, Total: 3},
+			{Tokens: 8192, Total: 3, Errored: true},
+		},
+	}
+	got := contextProbeMessage(partial)
+	if !strings.Contains(got, "at least") {
+		t.Errorf("a ladder abandoned on an error is a LOWER BOUND and must say so: %q", got)
+	}
+	if strings.Contains(got, "ADVERTISED — routing uses the measured figure") {
+		t.Errorf("an unmeasured ceiling is reported as a measured advertised-vs-actual gap: %q", got)
+	}
+}
+
+// The glyph is the part that gets read. A tick beside "retrieval FAILED" or
+// beside a probe that never ran tells the operator the opposite of the message
+// next to it.
+func TestContextProbeOK(t *testing.T) {
+	cases := []struct {
+		name string
+		p    *ContextProbe
+		want bool
+	}{
+		{"not probed at all", nil, false},
+		{"errored at the first rung",
+			&ContextProbe{AdvertisedTokens: 128 * 1024,
+				Levels: []ContextProbeLevel{{Tokens: 4096, Total: 3, Errored: true}}}, false},
+		{"retrieval failed at the first rung",
+			&ContextProbe{AdvertisedTokens: 128 * 1024,
+				Levels: []ContextProbeLevel{{Tokens: 4096, Passed: 1, Total: 3}}}, false},
+		{"window under the first rung, nothing to test",
+			&ContextProbe{AdvertisedTokens: 2048}, true},
+		{"measured, far under the claim — a finding, not a fault",
+			&ContextProbe{AdvertisedTokens: 256 * 1024, UsableTokens: 32 * 1024,
+				Levels: []ContextProbeLevel{{Tokens: 32768, Passed: 3, Total: 3}}}, true},
+		{"measured, ladder truncated on its time budget",
+			&ContextProbe{AdvertisedTokens: 256 * 1024, UsableTokens: 16 * 1024, Truncated: true,
+				Levels: []ContextProbeLevel{{Tokens: 16384, Passed: 3, Total: 3}}}, true},
+		{"errored after establishing a lower bound",
+			&ContextProbe{AdvertisedTokens: 128 * 1024, UsableTokens: 4096,
+				Levels: []ContextProbeLevel{
+					{Tokens: 4096, Passed: 3, Total: 3},
+					{Tokens: 8192, Total: 3, Errored: true},
+				}}, false},
+	}
+	for _, c := range cases {
+		if got := contextProbeOK(c.p); got != c.want {
+			t.Errorf("%s: contextProbeOK = %v, want %v (message: %q)", c.name, got, c.want, contextProbeMessage(c.p))
+		}
+	}
+}
+
 func TestMedianInt64(t *testing.T) {
 	if got := medianInt64(nil); got != 0 {
 		t.Errorf("empty median = %d, want 0", got)

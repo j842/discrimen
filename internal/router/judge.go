@@ -105,9 +105,13 @@ func (b *judgeBudget) charge(tokens int) {
 // Non-blocking; a no-op unless judging is enabled and some worker other than the
 // one that served the request is available to look at it.
 // thinking and latencyMS describe the request being graded, and exist so the
-// verdict can be recorded in the outcome matrix against the right (worker, mode)
-// pair. Without the mode a judged result would be filed against whichever mode
-// the matrix happened to be queried for, which is the one thing goal 3 forbids.
+// verdict can be recorded in the outcome matrix against the right (model, mode)
+// pair. MODEL, not worker: recordJudgedOutcome files the row under
+// modelHash(served), because that is what routing looks a candidate up by — a
+// judged row keyed on a worker id would be stored, counted, and never consulted.
+// The worker id rides along as provenance only. Without the mode a judged result
+// would be filed against whichever mode the matrix happened to be queried for,
+// which is the one thing goal 3 forbids.
 func (r *Router) maybeJudge(messages []Message, stream bool, served *Backend, route, output string, thinking bool, latencyMS int64, vec []float64) {
 	// The adapter is NO LONGER required. Judging serves two consumers now: the
 	// tier adapter, which needs a numeric difficulty score and therefore only

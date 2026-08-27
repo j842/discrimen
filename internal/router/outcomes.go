@@ -22,8 +22,14 @@ package router
 //	new worker is a new set of rows here, and existing rows do not move.
 //
 //	Adding questions does not invalidate profiles. New questions are new rows.
-//	Only a change to the GRADER invalidates, and since the raw answers are kept
-//	that is a re-grade rather than a re-run.
+//	NOTHING invalidates a row, in fact — see identity.go. A change to the GRADER
+//	gives its questions new qids, so those questions are asked again and every
+//	other question in the bank still hits the permacache; the superseded rows are
+//	not wrong, just never looked up. That is a re-run of the questions whose
+//	grading changed, and nothing else. (It is not a re-GRADE: the row keeps the
+//	verdict, not the answer text, so an old answer cannot be re-scored by the new
+//	grader. The profile's BenchResult.Got holds a tail-truncated copy for the
+//	operator to read, and nothing grades from it.)
 //
 //	Questions every worker passes, or every worker fails, are USEFUL. The old
 //	selection dropped them for carrying no information about the fleet's spread.
@@ -68,12 +74,22 @@ type Observation struct {
 	Backend  string
 	Thinking bool
 	Correct  bool
-	// LatencyMS and OutputTokens describe what the answer COST. Kept beside
-	// correctness rather than in a separate table because the routing decision
-	// needs both together — the fastest worker that will be right — and joining
-	// them later would mean matching on (question, worker, mode) anyway.
-	LatencyMS    int64
-	OutputTokens int
+	// LatencyMS is what the answer COST. Kept beside correctness rather than in a
+	// separate table because the routing decision needs both together — the
+	// fastest worker that will be right — and joining them later would mean
+	// matching on (question, model, mode) anyway.
+	//
+	// There was an OutputTokens field beside it, carried through the struct,
+	// persist() and load() and read by nothing: no producer ever set it, so every
+	// row held a zero that the comment here described as a cost signal. Removed
+	// rather than wired up, because the term routing wants from an answer's
+	// length is already derived from this one — outcomeLengthShape turns the
+	// median latency into "questions like this run N times longer on this
+	// worker", at the rate the profile was taken at, so a token count would be a
+	// second and less direct route to the same number. The output_tokens COLUMN
+	// stays where it is: it defaults to 0, dropping a column in SQLite is a table
+	// rebuild, and nothing reads or writes it either way.
+	LatencyMS int64
 	// Source distinguishes evidence graded against a known answer from evidence
 	// graded by a model. Stored rather than merged so the two can be weighted
 	// differently: exact-match grading is right or wrong, an LLM judge is
@@ -186,11 +202,12 @@ type prediction struct {
 	// is weaker", and weighting the ESTIMATE turned out to be a no-op (see
 	// obsJudgeWeight).
 	//
-	// Zero is a truthful default rather than a not-computed sentinel: a caller
-	// that builds a prediction without tracking the split — predictExcluding in
-	// the validation harness does — gates as if every neighbour were bench
-	// evidence, which is the permissive direction and correct for a harness whose
-	// ground truth is bench rows anyway.
+	// Every producer sets it, and there is exactly one producer now: predictFrom.
+	// The validation harness used to build a prediction of its own without
+	// tracking the split, so its known() gated as if every neighbour were bench
+	// evidence — the permissive direction, and a quiet reason its coverage figure
+	// did not describe the gate routing actually applies. It shares predictFrom
+	// now, so the two cannot differ again.
 	Judged int
 	// MedianLatencyMS is what this worker took on those neighbours. Distinct from
 	// the live throughput estimate: that answers "how fast is this worker now",
@@ -255,13 +272,21 @@ type outcomeMatrix struct {
 	// failure retries rather than disabling judged-vector persistence for the
 	// process lifetime.
 	vecTableReady atomic.Bool
-	// fullScans counts walks of the WHOLE observation map. It exists for a test,
-	// because this exact shape has now regressed twice: predict once rescanned
-	// every vector per candidate (13ms per routed request on a 7-worker fleet),
-	// and the fallback below then did the same thing by calling summary() per
-	// candidate. A comment asking the next author to remember did not hold; a
-	// counter a test can assert on does.
+	// fullScans counts walks of the WHOLE observation map, and vecScans counts
+	// walks of the whole VECTOR map. They exist for tests, because this exact
+	// shape has now regressed twice: predict once rescanned every vector per
+	// candidate (13ms per routed request on a 7-worker fleet, all of it added
+	// latency and growing with the judged cache), and the fallback below then did
+	// the same thing by calling summary() per candidate. A comment asking the next
+	// author to remember did not hold; a counter a test can assert on does.
+	//
+	// TWO counters because there are two maps and only one of them was pinned.
+	// fullScans on its own cannot see the ORIGINAL regression: the per-candidate
+	// scan that cost 13ms was in neighboursOf, over m.vecs, and it never touched
+	// the observation map at all. A future predict()-per-candidate would have
+	// reinstated the measured fault while the existing counter read 1.
 	fullScans atomic.Uint64
+	vecScans  atomic.Uint64
 }
 
 func newOutcomeMatrix(db *sql.DB) *outcomeMatrix {
@@ -338,11 +363,18 @@ func (m *outcomeMatrix) hasVector(qid string) bool {
 
 // record adds observations and persists them.
 //
-// Replaces any earlier observation for the same (question, worker, mode) from
-// the same source: a re-profile supersedes the previous one rather than
-// accumulating alongside it, or a worker's history would drag its current
-// estimate. Judged observations do NOT supersede bench ones, and vice versa —
-// they are different evidence about different traffic.
+// Replaces any earlier observation for the same (question, MODEL, mode) from the
+// same source: a re-profile supersedes the previous one rather than accumulating
+// alongside it, or a model's history would drag its current estimate. Judged
+// observations do NOT supersede bench ones, and vice versa — they are different
+// evidence about different traffic.
+//
+// The key is the model hash and not the worker, which is the same key the
+// observations table declares as its PRIMARY KEY, and the two have to stay in
+// step or the in-memory map and the file would disagree about what a re-profile
+// replaced. It also means the same weights on two hosts hold ONE row per
+// question: the second deployment supersedes the first rather than voting twice,
+// and Backend records which of them measured the row that survived.
 func (m *outcomeMatrix) record(ctx context.Context, obs []Observation) error {
 	if len(obs) == 0 {
 		return nil
@@ -364,7 +396,8 @@ func (m *outcomeMatrix) record(ctx context.Context, obs []Observation) error {
 
 // recordIfNewer is record for evidence being RECONSTRUCTED rather than measured:
 // it files an observation only when nothing at least as fresh already covers the
-// same (question, worker, mode, source), and reports how many it filed.
+// same (question, MODEL, mode, source), and reports how many it filed. Same key
+// as record — see there.
 //
 // record supersedes unconditionally, which is right for a profile that has just
 // finished — it is by definition the current truth. It is wrong for
@@ -439,6 +472,7 @@ func (m *outcomeMatrix) neighboursOf(vec []float64) ([]neighbour, bool) {
 		return nil, false
 	}
 	q := normalize(vec)
+	m.vecScans.Add(1)
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	// dot() truncates to the shorter slice, so a vector from a DIFFERENT
@@ -452,30 +486,77 @@ func (m *outcomeMatrix) neighboursOf(vec []float64) ([]neighbour, bool) {
 	if len(m.vecs) > 0 && !m.dimensionMatchesLocked(len(q)) {
 		return nil, false
 	}
-	var out []neighbour
-	for qid, v := range m.vecs {
-		if sim := dot(q, v); sim >= outcomeMinSimilarity {
-			out = append(out, neighbour{qid, sim})
-		}
-	}
+	out := nearestNeighbours(m.vecs, q, nil)
 	if len(out) == 0 {
 		return nil, false
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].sim > out[j].sim })
-	if len(out) > outcomeNeighbours {
-		out = out[:outcomeNeighbours]
 	}
 	return out, true
 }
 
-// predictFromLocked scores one worker against already-found neighbours. The
+// nearestNeighbours is the selection itself: every question whose vector clears
+// the admission floor, keeping the closest outcomeNeighbours of them. `include`
+// may be nil, which admits every question in the map.
+//
+// Free-standing, and over a plain map rather than the matrix, so the validation
+// harness can run the SAME selection routing runs while restricting it to the
+// questions its holdout allows. It kept a second copy of this loop until now,
+// which is exactly how it drifted into scoring on a different field from the
+// routing path and measuring a predictor nothing uses.
+//
+// q must already be normalised and every vector in vecs must be in the same
+// space as it. neighboursOf is what enforces both on the routing path; the
+// harness gets them for free, since it works from one snapshot of one map.
+//
+// TIES BREAK ON QID, and that is not cosmetic. Map iteration order is random, so
+// with more than outcomeNeighbours questions at the same similarity — which is
+// what a bank of near-duplicate templated questions looks like — an unordered
+// truncation kept a DIFFERENT twelve on each call. The same prompt against
+// unchanged evidence could then predict differently from one request to the
+// next, and a route that cannot be reproduced cannot be explained to the
+// operator reading X-Llm-Route.
+func nearestNeighbours(vecs map[string][]float64, q []float64, include func(qid string) bool) []neighbour {
+	var out []neighbour
+	for qid, v := range vecs {
+		if include != nil && !include(qid) {
+			continue
+		}
+		if sim := dot(q, v); sim >= outcomeMinSimilarity {
+			out = append(out, neighbour{qid, sim})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].sim != out[j].sim {
+			return out[i].sim > out[j].sim
+		}
+		return out[i].qid < out[j].qid
+	})
+	if len(out) > outcomeNeighbours {
+		out = out[:outcomeNeighbours]
+	}
+	return out
+}
+
+// predictFromLocked scores one MODEL against already-found neighbours. The
 // caller holds the read lock.
 func (m *outcomeMatrix) predictFromLocked(neighbours []neighbour, model string, thinking bool) prediction {
+	return predictFrom(m.obs, neighbours, model, thinking)
+}
+
+// predictFrom is the scoring itself, over a plain observation map.
+//
+// Split out for the same reason as nearestNeighbours: the validation harness
+// needs to score against a snapshot rather than against the live matrix, and
+// while it kept its own copy of this loop the two disagreed about what
+// identifies a worker. This one filters on the MODEL HASH, which is the field
+// every write path sets and the only field the routing path looks up by; the
+// harness's copy filtered on Backend, so a model deployed on two hosts had its
+// evidence split in the report and nowhere else.
+func predictFrom(obs map[string][]Observation, neighbours []neighbour, model string, thinking bool) prediction {
 	var weighted, total, simSum float64
 	used, judged := 0, 0
 	var latencies []int64
 	for _, n := range neighbours {
-		for _, o := range m.obs[n.qid] {
+		for _, o := range obs[n.qid] {
 			if o.ModelHash != model || o.Thinking != thinking {
 				continue
 			}
@@ -517,39 +598,13 @@ func (m *outcomeMatrix) predictFromLocked(neighbours []neighbour, model string, 
 	}
 }
 
-// summary is the display-only headline for one worker: its overall hit rate
-// across the whole bank. Explicitly NOT a routing input — routing queries
-// neighbours — but a number an operator can eyeball, and the thing `ask -l` and
-// the dashboard show in place of the retired quality score.
-func (m *outcomeMatrix) summary(model string, thinking bool) (rate float64, n int) {
-	m.fullScans.Add(1)
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	correct := 0
-	for _, list := range m.obs {
-		for _, o := range list {
-			if o.ModelHash != model || o.Thinking != thinking || o.Source != obsSourceBench {
-				continue
-			}
-			n++
-			if o.Correct {
-				correct++
-			}
-		}
-	}
-	if n == 0 {
-		return 0, 0
-	}
-	return float64(correct) / float64(n), n
-}
-
-// bankTally is one worker's overall bank record, for the fallback ordering.
+// bankTally is one MODEL's overall bank record, for the fallback ordering.
 type bankTally struct {
 	correct int
 	total   int
 }
 
-// rate is the overall hit rate, or the fleet-neutral 0.5 for a worker never
+// rate is the overall hit rate, or the fleet-neutral 0.5 for a model never
 // profiled in this mode. Zero would read as "reliably wrong" and exclude a newly
 // registered worker from everything.
 func (t bankTally) rate() float64 {
@@ -559,16 +614,22 @@ func (t bankTally) rate() float64 {
 	return float64(t.correct) / float64(t.total)
 }
 
-// bankRates is summary() for EVERY worker at once, in one pass.
+// bankTallies is the one walk of the observation map that both overall-hit-rate
+// callers are built from: the whole map, bench rows only, tallied per MODEL
+// HASH. `only` restricts the tally to a single model; empty means every model.
 //
-// The fallback called summary() per candidate, and summary walks the entire
-// observation map — 392 bank rows plus up to maxJudgedQuestions judged ones —
-// taking the read lock each time. Seven workers meant seven full scans per
-// routed request, which is the same shape, on the same hot path, that
-// neighboursOf was split out of predict to remove (measured at 13ms per request;
-// see the comment there). Splitting it the same way is the same answer for a
-// seventh of the work.
-func (m *outcomeMatrix) bankRates(thinking bool) map[string]bankTally {
+// ONE walker rather than two, because there were two doing the identical thing
+// and they are exactly the pair that caused the measured regression. The
+// fallback called summary() per candidate — a full walk of 392 bank rows plus up
+// to maxJudgedQuestions judged ones, taking the read lock each time, seven times
+// on a seven-worker fleet — which is the same shape, on the same hot path, that
+// neighboursOf was split out of predict to remove at 13ms a request. Splitting
+// it was the fix; sharing one implementation is what stops the two drifting
+// apart again, since a filter added to one of them can no longer miss the other.
+//
+// It stays a single pass whatever `only` says: filtering inside the walk cannot
+// turn one scan into several, which is the property fullScans exists to hold.
+func (m *outcomeMatrix) bankTallies(thinking bool, only string) map[string]bankTally {
 	m.fullScans.Add(1)
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -576,6 +637,9 @@ func (m *outcomeMatrix) bankRates(thinking bool) map[string]bankTally {
 	for _, list := range m.obs {
 		for _, o := range list {
 			if o.Thinking != thinking || o.Source != obsSourceBench {
+				continue
+			}
+			if only != "" && o.ModelHash != only {
 				continue
 			}
 			t := out[o.ModelHash]
@@ -589,6 +653,35 @@ func (m *outcomeMatrix) bankRates(thinking bool) map[string]bankTally {
 	return out
 }
 
+// summary is the display-only headline for one MODEL: its overall hit rate
+// across the whole bank, and how many answers that rests on.
+//
+// Explicitly NOT a routing input — routing queries neighbours. Its one live
+// caller is graderStrength, which needs a single comparable number for a worker
+// the matrix has no neighbours for, and which documents itself as falling back
+// to exactly this. The per-worker view an operator reads on /backends is
+// summarise(), not this: that one carries the topic breakdown, the judged count
+// and the median, and a headline compressed out of it would be the same mistake
+// the retired quality scalar made.
+//
+// Zero observations reports (0, 0) rather than bankTally.rate's fleet-neutral
+// 0.5: the caller distinguishes "measured at zero" from "not measured" on n, and
+// the 0.5 exists for the ordering in the fallback, where an unmeasured worker
+// must not be excluded.
+func (m *outcomeMatrix) summary(model string, thinking bool) (rate float64, n int) {
+	t := m.bankTallies(thinking, model)[model]
+	if t.total == 0 {
+		return 0, 0
+	}
+	return float64(t.correct) / float64(t.total), t.total
+}
+
+// bankRates is summary() for EVERY model at once, in one pass — what the
+// fallback ranks candidates on. See bankTallies.
+func (m *outcomeMatrix) bankRates(thinking bool) map[string]bankTally {
+	return m.bankTallies(thinking, "")
+}
+
 // ── persistence ────────────────────────────────────────────────────────────
 
 func (m *outcomeMatrix) persist(ctx context.Context, obs []Observation) error {
@@ -600,16 +693,19 @@ func (m *outcomeMatrix) persist(ctx context.Context, obs []Observation) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	// output_tokens is left out on purpose and not by omission: nothing has ever
+	// set it, the column defaults to 0, and naming it here would only restate the
+	// default. See Observation.LatencyMS.
 	stmt, err := tx.PrepareContext(ctx, `INSERT OR REPLACE INTO observations
-		(qid, model_hash, backend_id, thinking, correct, latency_ms, output_tokens, source, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		(qid, model_hash, backend_id, thinking, correct, latency_ms, source, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 	for _, o := range obs {
 		if _, err := stmt.ExecContext(ctx, o.QID, o.ModelHash, o.Backend, boolInt(o.Thinking), boolInt(o.Correct),
-			o.LatencyMS, o.OutputTokens, o.Source, o.At.UTC().Format(time.RFC3339Nano)); err != nil {
+			o.LatencyMS, o.Source, o.At.UTC().Format(time.RFC3339Nano)); err != nil {
 			return err
 		}
 	}
@@ -765,7 +861,7 @@ func (m *outcomeMatrix) load(ctx context.Context) error {
 		return nil
 	}
 	rows, err := m.db.QueryContext(ctx, `SELECT qid, model_hash, backend_id, thinking, correct, latency_ms,
-		output_tokens, source, created_at FROM observations`)
+		source, created_at FROM observations`)
 	if err != nil {
 		return err
 	}
@@ -776,7 +872,7 @@ func (m *outcomeMatrix) load(ctx context.Context) error {
 		var thinking, correct int
 		var at string
 		if err := rows.Scan(&o.QID, &o.ModelHash, &o.Backend, &thinking, &correct, &o.LatencyMS,
-			&o.OutputTokens, &o.Source, &at); err != nil {
+			&o.Source, &at); err != nil {
 			return err
 		}
 		o.Thinking, o.Correct = thinking == 1, correct == 1
@@ -800,9 +896,11 @@ func (m *outcomeMatrix) load(ctx context.Context) error {
 		log.Printf("outcome matrix: restoring judged vectors failed, they stay unqueryable until re-judged: %v", err)
 		vecs = nil
 	}
-	// Vectors whose observations are gone (pruneJudged ran, or a worker was
-	// forgotten) are dropped rather than restored: they would count against the
-	// dimension majority and be scanned on every request for nothing.
+	// Vectors whose observations are gone — pruneJudged dropped the question, or
+	// the observations table was recreated under it — are dropped rather than
+	// restored: they would count against the dimension majority and be scanned on
+	// every request for nothing. Removing a WORKER is not one of the cases: a
+	// deleted worker keeps its results, because they are filed under the model.
 	for qid := range vecs {
 		if len(loaded[qid]) == 0 {
 			delete(vecs, qid)
@@ -829,8 +927,15 @@ func (m *outcomeMatrix) String() string {
 	return fmt.Sprintf("%d questions, %d vectors, %d observations", len(m.obs), len(m.vecs), n)
 }
 
-// backendsWithEvidence lists the workers the matrix knows anything about, for
-// diagnostics.
+// backendsWithEvidence lists the MODEL IDENTITIES the matrix knows anything
+// about, for diagnostics — not worker ids, which is what it returned before
+// results were filed under the model.
+//
+// They are opaque hashes, and deliberately so: the point of the identity is that
+// it survives the worker, so there is no worker to name for a model whose only
+// deployment has been decommissioned. What an operator gets from this is the
+// COUNT and whether a freshly-deployed model's hash has appeared yet; mapping a
+// hash back to a live worker is modelHash(b) on /backends.
 func (m *outcomeMatrix) backendsWithEvidence() []string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -1383,10 +1488,13 @@ type BackendOutcomes struct {
 	NoThink  *OutcomeSummary `json:"nothink,omitempty"`
 }
 
-// dimensionMatches reports whether a query vector is in the same space as the
-// stored ones. Sampled rather than checked exhaustively: every vector is written
-// by the same embedder in one pass, so one is representative, and this runs on
-// the routing path.
+// dimensionMatchesLocked reports whether a query vector is in the same space as
+// the stored ones. Sampled rather than checked exhaustively: setVector drops the
+// whole map the moment a vector of a new width arrives, so the map holds ONE
+// width at a time and any member of it is representative — and this runs on the
+// routing path, where an exhaustive check would be a second full scan. The
+// caller holds the lock; setVector holds the write one, since it acts on the
+// answer.
 func (m *outcomeMatrix) dimensionMatchesLocked(n int) bool {
 	for _, v := range m.vecs {
 		return len(v) == n

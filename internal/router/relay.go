@@ -284,13 +284,20 @@ func (r *Router) handleRelayFleet(w http.ResponseWriter, req *http.Request) {
 	})
 }
 
-// relayFleetFor renders the eligible fleet as one entry per model, restricted to
-// what this credential may reach.
+// relayFleetFor renders the eligible fleet as one entry per WORKER, restricted
+// to what this credential may reach.
 //
-// The restriction runs through allowsBackend, and the published spelling comes
-// from relayModelName. Both follow from the same requirement: every name in this
-// response has to be one the downstream can send back and have accepted, by a
-// key that gates discovery and traffic through two different tests.
+// The restriction runs through allowsBackend, and what is published as the
+// address is the worker's own id. Both follow from the same requirement: every
+// name in this response has to be one the downstream can send back and have
+// accepted, by a key that gates discovery and traffic through two different
+// tests. Discovery runs through allowsBackend, which asks what a worker answers
+// to; the traffic path compares the spelling the client sent to the allow-list
+// literally. There used to be a relayModelName here that resolved that by
+// publishing the allow-list's OWN spelling; it went when the id became the
+// address, and mayNameWorker closes the same gap from the other side — a key
+// that may be SERVED BY a worker may also NAME it. See
+// TestRelayPublishedIDSurvivesTheTrafficGate.
 func relayFleetFor(ident *identity, backends []*Backend) []relayModelEntry {
 	out := make([]relayModelEntry, 0, len(backends))
 	for _, b := range backends {
@@ -322,9 +329,25 @@ func relayFleetFor(ident *identity, backends []*Backend) []relayModelEntry {
 
 // effectiveSlots is what one endpoint contributes to a pool's concurrency. An
 // endpoint that declared no ceiling is not infinite capacity — it is capacity
-// nobody measured — so it counts as the same nominal figure the ranker already
-// assumes for it (see uncappedNominalSlots), rather than as zero, which would
-// make a whole uncapped fleet report a pool of none.
+// nobody measured — so it counts as uncappedNominalSlots rather than as zero,
+// which would make a whole uncapped fleet report a pool of none.
+//
+// This USED to be "the same nominal figure the ranker already assumes for it",
+// and for most rows it still is. It is no longer true across the board:
+// queueSlots now returns 0 — no queue priced at all — for a row that is manual
+// AND non-local, i.e. a hosted API somebody entered by hand and deliberately
+// left the ceiling blank on, because charging a provider fronting thousands of
+// customers a queue penalty off THIS router's four in-flight requests pushed
+// traffic off a fast paid endpoint under mild local load.
+//
+// The divergence is deliberate rather than an oversight to reconcile. queueSlots
+// answers "how long will this request wait here", where "nobody has told us and
+// nobody sensibly could" is honestly answered by pricing no wait. This answers
+// "how many requests may the downstream have in flight against this row", where
+// the same silence cannot be answered by "as many as you like": the downstream
+// builds a slot channel from this number (setRelayLoad → syncSlotsLocked), and
+// a nil channel there means unbounded dispatch across a WAN at one upstream
+// worker. Four is a bound the downstream can hold and the upstream can survive.
 func effectiveSlots(b *Backend) int {
 	if b.MaxConcurrency > 0 {
 		return b.MaxConcurrency
@@ -689,9 +712,103 @@ func (r *Router) refreshRelay(rel Relay) []string {
 		}
 		id := relayBackendID(rel.Name, entry.ID)
 		ids = append(ids, id)
-		r.applyRelayEntry(rel, id, entry, fleet.BenchVersion)
+		r.applyRelayEntry(rel, id, sanitizeRelayEntry(rel.Name, entry), fleet.BenchVersion)
 	}
 	return ids
+}
+
+// sanitizeRelayEntry brings one upstream worker's numbers back inside the ranges
+// this router's own fields are defined over, before anything downstream of here
+// believes them.
+//
+// This is NOT a retreat from the trust statement at the top of the file. A relay
+// is a router you run and its MEASUREMENTS are adopted sight unseen: a peer that
+// says quality 78 is believed, and that is the whole point of importing a profile
+// instead of re-running 130 questions on somebody else's GPUs. What is checked
+// here is narrower and different in kind — that the numbers are inside the domain
+// the fields have everywhere else in this binary. "Quality 78" is a claim. "Quality
+// 100000" is not a claim about anything; it is a units error, a version skew, or a
+// field that meant something else on the other side of the wire.
+//
+// The registration path already enforces exactly these ranges, and refuses the row
+// outright when they are broken (normalizeRegistration: "quality must be 0..100",
+// "max_concurrency %d exceeds the %d maximum"). The relay path went round it:
+// applyRelayEntry builds a registration carrying only id/url/model/credential and
+// applies every measured field afterwards through applyProfileIfGen and
+// setRelayLoad, neither of which range-checks. So an upstream — or, far likelier, a
+// version-skewed upstream whose field meant something else — could write values
+// into this registry that no local code path can produce.
+//
+// max_concurrency is the one with teeth, and it is the second half of a bug whose
+// first half is already fixed. syncSlotsLocked clamps the number it builds a SLOT
+// CHANNEL from, because filling that channel one token at a time under the
+// registry write lock is ~12.6ns each and 1e9 of them stops the router routing for
+// thirteen seconds. That clamp protects the channel and nothing else: b.MaxConcurrency
+// keeps the raw figure, and the RANKER reads that one. queueSlots returns it, so
+// loadPenalty computes min(n, 1e9) == n for the batch share and (n - 1e9)/1e9 <= 0
+// for the queue — every relayed row prices as permanently unloaded and wins every
+// comparison against a local worker that honestly reports being busy. The same
+// figure is then republished by effectiveSlots to anyone relaying through US.
+//
+// Clamping rather than dropping the row: a fleet that has gone dark is worse than
+// a fleet priced conservatively, and the same reasoning keeps a failed fetch's rows
+// in place a few lines above. Silent when the numbers are ordinary, which is
+// always; a clamp that fires is logged once per refresh because it means the two
+// routers disagree about what a field means, and that is worth finding out about.
+func sanitizeRelayEntry(relay string, e relayModelEntry) relayModelEntry {
+	clampInt := func(field string, v, lo, hi int) int {
+		if v < lo || v > hi {
+			log.Printf("relay %s: worker %s reported %s=%d, outside the %d..%d this router defines it over — clamped",
+				relay, e.ID, field, v, lo, hi)
+			if v < lo {
+				return lo
+			}
+			return hi
+		}
+		return v
+	}
+	// The benchmark's own 0-100 scale, the same bound normalizeRegistration
+	// enforces. Zero already means "not measured upstream" to qualityFor, so a
+	// negative collapsing to it says the true thing.
+	e.Quality = clampInt("quality", e.Quality, 0, benchmarkQualityScale)
+	e.QualityNoThink = clampInt("quality_nothink", e.QualityNoThink, 0, benchmarkQualityScale)
+	e.MaxConcurrency = clampInt("max_concurrency", e.MaxConcurrency, 0, maxDeclarableConcurrency)
+	// Floored but NOT capped, unlike the ceiling above. Occupancy is a count of
+	// what is happening rather than a declaration about what may, and an uncapped
+	// provider row upstream really can hold more requests at once than any slot
+	// channel would be built for; capping it would under-report a genuinely
+	// saturated upstream, which is the one direction occupancy must not err in.
+	// setRelayLoad floors it again — doing it here as well means the entry is
+	// coherent before it is split across two consumers rather than after.
+	if e.ActiveRequests < 0 {
+		log.Printf("relay %s: worker %s reported active_requests=%d — read as idle", relay, e.ID, e.ActiveRequests)
+		e.ActiveRequests = 0
+	}
+	// A negative rate or latency is not a slow worker, it is a broken field.
+	// Zeroing reads as "not measured", which every consumer already handles:
+	// liveTPS falls through, prefillSeconds takes the fleet constant.
+	e.BaselineTPS = clampNonNegative(relay, e.ID, "baseline_tps", e.BaselineTPS)
+	e.ObservedTPS = clampNonNegative(relay, e.ID, "observed_tps", e.ObservedTPS)
+	e.PrefillTPS = clampNonNegative(relay, e.ID, "observed_prefill_tps", e.PrefillTPS)
+	if e.TTFTMillis < 0 {
+		log.Printf("relay %s: worker %s reported ttft_ms=%d — treated as unmeasured", relay, e.ID, e.TTFTMillis)
+		e.TTFTMillis = 0
+	}
+	if e.ContextK < 0 {
+		log.Printf("relay %s: worker %s reported context_k=%d — treated as undeclared", relay, e.ID, e.ContextK)
+		e.ContextK = 0
+	}
+	return e
+}
+
+// clampNonNegative floors one imported rate at zero — "not measured" — and says
+// so when it fires.
+func clampNonNegative(relay, id, field string, v float64) float64 {
+	if v < 0 {
+		log.Printf("relay %s: worker %s reported %s=%v — treated as unmeasured", relay, id, field, v)
+		return 0
+	}
+	return v
 }
 
 // fetchRelayFleet is one GET /relay/fleet, timed.

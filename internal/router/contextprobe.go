@@ -297,22 +297,78 @@ func usableContextTokens(b *Backend) int {
 	return advertised
 }
 
+// erroredRung reports the length of the rung the ladder ABANDONED, and whether
+// it stopped for that reason at all.
+//
+// runContextProbe breaks on `level.Errored || level.Passed < level.Total`, which
+// merges two findings that are not the same kind of thing. A rung that came back
+// WRONG is a measurement: the worker answered, and it could not retrieve the fact
+// at that length. A rung that ERRORED is the absence of one: the request never
+// produced an answer to grade — a 5xx, a transport failure, a prompt the endpoint
+// rejected outright, or benchAnswerDeadline expiring on a worker whose prefill at
+// that length is slower than the ladder is willing to wait for.
+//
+// Only the last rung can carry it, because either verdict ends the climb, so this
+// looks at exactly one entry rather than scanning.
+//
+// Truncated cannot be set at the same time: the budget check breaks BEFORE
+// probing, so the rung it gives up on is never appended.
+func (p *ContextProbe) erroredRung() (tokens int, errored bool) {
+	if p == nil || len(p.Levels) == 0 {
+		return 0, false
+	}
+	last := p.Levels[len(p.Levels)-1]
+	if !last.Errored {
+		return 0, false
+	}
+	return last.Tokens, true
+}
+
 // contextProbeMessage renders a ladder for the per-probe check list, which is
 // what puts the advertised-versus-measured gap in front of an operator.
+//
+// FOUR OUTCOMES, NOT TWO, and the distinctions are the whole value of the line:
+//
+//	not probed   no ladder ran at all (nil) — the check is absent from a worker
+//	             still on its quick profile, and routing believes the claim.
+//	too small    the advertised window is under the first rung, so there was
+//	             nothing to test and the claim stands unrefuted.
+//	measured     the worker answered at every depth up to some length and then
+//	             either missed the needle or ran out of window. This is the only
+//	             outcome where the figure is a CEILING.
+//	unmeasured   the climb stopped on an error or on the time budget, so the
+//	             figure is a LOWER BOUND and the ceiling is unknown.
+//
+// The last two used to render identically, which is how this line came to state a
+// confident wrong diagnosis about a worker it had learned nothing about: a probe
+// that 503'd on its first request reported "128K advertised, but retrieval FAILED
+// at 4K — the smallest size tested", naming the worker as one that cannot hold
+// four thousand tokens on the strength of an answer it never received. An
+// operator reading that has been told the opposite of the truth, which is worse
+// than being told nothing — the honest rendering of an errored ladder is that the
+// window is still unknown.
 func contextProbeMessage(p *ContextProbe) string {
 	if p == nil {
 		return "not probed"
 	}
 	adv := p.AdvertisedTokens / 1024
+	errAt, errored := p.erroredRung()
 	if p.UsableTokens == 0 {
-		if len(p.Levels) == 0 {
+		switch {
+		case len(p.Levels) == 0:
 			return fmt.Sprintf("%dK advertised, too small to probe", adv)
+		case errored:
+			return fmt.Sprintf("%dK advertised, still UNMEASURED — the probe errored at %dK, the smallest size tested",
+				adv, errAt/1024)
 		}
 		return fmt.Sprintf("%dK advertised, but retrieval FAILED at %dK — the smallest size tested",
 			adv, p.Levels[0].Tokens/1024)
 	}
 	use := p.UsableTokens / 1024
 	switch {
+	case errored:
+		return fmt.Sprintf("at least %dK usable of %dK advertised (the probe errored at %dK, so the ceiling is unmeasured)",
+			use, adv, errAt/1024)
 	case p.Truncated:
 		return fmt.Sprintf("at least %dK usable of %dK advertised (ladder hit its time budget)", use, adv)
 	case p.UsableTokens*2+contextProbeReserve > p.AdvertisedTokens:
@@ -320,4 +376,34 @@ func contextProbeMessage(p *ContextProbe) string {
 	default:
 		return fmt.Sprintf("%dK usable of %dK ADVERTISED — routing uses the measured figure", use, adv)
 	}
+}
+
+// contextProbeOK is the pass/fail half of the same check — the glyph an operator
+// scans before they read anything, and the one scripts/profile-worker.sh renders
+// as ✓ or ✗.
+//
+// It was hard-wired to true, so a worker that failed retrieval at the smallest
+// size tested, and one whose probe never got an answer at all, both showed a tick
+// beside a message saying so. The tick is the part that gets read.
+//
+// A ladder that measured a window is a pass even when that window is far under
+// the claim: nothing is broken, the gap is stated in the message, and routing is
+// already using the smaller figure (see usableContextTokens). What fails is the
+// worker that could not retrieve at the first rung — a real capability finding,
+// reported exactly like "thinking: not detected" — and the probe that errored,
+// where the honest verdict is that the check did not complete.
+func contextProbeOK(p *ContextProbe) bool {
+	if p == nil {
+		return false
+	}
+	if _, errored := p.erroredRung(); errored {
+		return false
+	}
+	if p.UsableTokens == 0 {
+		// Nothing was tested (the window is under the first rung), so there is
+		// nothing to have failed. A ladder that DID run and returned no usable
+		// length has failed.
+		return len(p.Levels) == 0
+	}
+	return true
 }

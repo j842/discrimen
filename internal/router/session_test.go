@@ -97,12 +97,15 @@ func TestSessionTrackerLifecycle(t *testing.T) {
 	}
 	tr.remember(42, "big")
 	e, ok := tr.lookup(42)
-	if !ok || e.backendID != "big" || e.turns != 1 {
+	if !ok || e.backendID != "big" {
 		t.Fatalf("remember/lookup wrong: %+v ok=%v", e, ok)
 	}
-	tr.remember(42, "big")
-	if e, _ := tr.lookup(42); e.turns != 2 {
-		t.Fatalf("turn count not incremented: %+v", e)
+	// A later turn moving to another worker replaces the incumbent rather than
+	// accumulating beside it: the discount is a claim about where the prefix is
+	// cached NOW, and the worker that served two turns ago no longer holds it.
+	tr.remember(42, "small")
+	if e, _ := tr.lookup(42); e.backendID != "small" {
+		t.Fatalf("incumbent not replaced by the worker that served the latest turn: %+v", e)
 	}
 	// A zero key is the "no session" sentinel and must never be stored.
 	tr.remember(0, "big")

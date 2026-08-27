@@ -95,9 +95,6 @@ func TestRoutePreviewMatchesTheRealDecision(t *testing.T) {
 	if pv.WouldServe != plan.candidates[0].ID {
 		t.Fatalf("preview would_serve %q != real first candidate %q", pv.WouldServe, plan.candidates[0].ID)
 	}
-	if pv.TargetQuality != plan.target {
-		t.Fatalf("preview target %d != real target %d", pv.TargetQuality, plan.target)
-	}
 	if !pv.Classified || pv.Difficulty == nil || pv.Reasoning == nil {
 		t.Fatalf("hard prompt should be classified on both axes: %+v", pv)
 	}
@@ -261,10 +258,10 @@ func TestRoutePreviewGivesAClientTheDecisionWithoutTheFleet(t *testing.T) {
 	if pv.Job.PromptTokens == 0 {
 		t.Error("the job's own size must survive")
 	}
-	// The tier and the thinking mode too, on a prompt that earns both.
+	// The thinking mode too, on a prompt that earns it.
 	_, hard := postPreview(t, r, `{"model":"default","messages":[{"role":"user","content":"prove a hard theorem"}]}`)
-	if hard.TargetQuality == 0 || !hard.Thinking.Enabled || hard.Thinking.Source != "auto" {
-		t.Errorf("a client lost the tier or the thinking mode: target=%d thinking=%+v", hard.TargetQuality, hard.Thinking)
+	if !hard.Thinking.Enabled || hard.Thinking.Source != "auto" {
+		t.Errorf("a client lost the thinking mode: %+v", hard.Thinking)
 	}
 
 	// The same request from an admin still gets the full picture, which is what
@@ -407,83 +404,21 @@ func TestRoutePreviewAcceptsAWorkerIDTheAllowListCovers(t *testing.T) {
 	}
 }
 
-// ── The quality bar, where there is one ─────────────────────────────────────
+// ── What the preview says about the ordering ────────────────────────────────
 
-// above_bar must be the ranker's own test. rankByDifficulty and
-// qualityFloorPreference both read qualityFor, which for a NO-THINK request on a
-// thinking worker with no measured no-think score is 0 — never the mixed-mode
-// number, because that score was earned with reasoning on (a 284B worker
-// inheriting its mixed q=93 that way drew all of Atlas's planner traffic onto a
-// 10 tok/s slot on 2026-08-25). The preview read b.Quality instead, so it
-// reported the still-unmeasured worker as an above-bar front-runner on precisely
-// the request the router scored 0 and ranked last.
-func TestRoutePreviewAboveBarUsesTheRankedQuality(t *testing.T) {
-	reg := newTestRegistry()
-	readyBackend(reg, "plain", 55, 200, 4)                 // non-thinking: q=55 in either mode
-	readyThinkingBackend(reg, "thinker", 95, 140, 4, true) // thinking: q=95, no-think score unmeasured
-	r := &Router{
-		cfg: &Config{
-			DefaultMaxTokens: 4096, AutoDifficulty: true, AutoThinking: true,
-			DifficultyTemp: 0.10, ReasoningThreshold: 0.35,
-			DifficultyTimeout: time.Second, DifficultyCacheSize: 16, DifficultyMaxChars: 4000,
-		},
-		registry:   reg,
-		classifier: testClassifierAuto(fakeEmbed),
-		sessions:   newSessionTracker(time.Hour, 16),
-		logs:       newTestLogStore(t),
-	}
-	issueKey(t, r, adminSecret, apiKey{Role: roleAdmin, Name: "preview admin"})
-
-	_, pv := postPreviewAs(t, r,
-		`{"model":"default","requirements":{"thinking":"off"},`+
-			`"messages":[{"role":"user","content":"prove a hard theorem"}]}`, adminSecret)
-	if pv.TargetQuality <= 0 {
-		t.Skipf("no quality bar in play (target=%d); above_bar is correctly absent", pv.TargetQuality)
-	}
-	var found bool
-	for _, c := range pv.Candidates {
-		if c.ID != "thinker" {
-			continue
-		}
-		found = true
-		if c.Quality != 0 {
-			t.Errorf("thinker previewed at q=%d on a no-think request; qualityFor reads 0 for an unmeasured no-think score", c.Quality)
-		}
-		if c.AboveBar == nil {
-			t.Fatalf("a target of %d is a bar, so above_bar must be reported", pv.TargetQuality)
-		}
-		if *c.AboveBar {
-			t.Errorf("thinker reported above a q>=%d bar on a no-think request the ranker scores it 0 for", pv.TargetQuality)
-		}
-	}
-	if !found {
-		t.Fatalf("thinker missing from the candidate list: %+v", pv.Candidates)
-	}
-}
-
-// With no bar there is nothing for above_bar to report, and reporting a vacuous
-// true for every worker on every request is how the field came to mean nothing.
-// The matrix path always carries target 0, so this is the live shape.
-func TestRoutePreviewOmitsAboveBarWithoutATarget(t *testing.T) {
+// The tier ranker's quality bar is gone, and with it target_quality and
+// above_bar. What replaces them on every live request is the matrix's own
+// prediction, carried per candidate — so the preview has to show THAT, or the one
+// tool for explaining a route explains a ranker that no longer exists.
+func TestRoutePreviewCarriesTheMatrixPrediction(t *testing.T) {
 	r := previewAdminRouter(t)
+	r.outcomes = newOutcomeMatrix(nil)
 	body := `{"model":"default","messages":[{"role":"user","content":"prove a hard theorem"}]}`
 	_, pv := postPreviewAs(t, r, body, adminSecret)
-	if pv.TargetQuality != 0 {
-		// previewRouter has no matrix, so the tier path runs and a bar exists.
-		// Re-run through a router that does, which is the deployed shape.
-		r.outcomes = newOutcomeMatrix(nil)
-		_, pv = postPreviewAs(t, r, body, adminSecret)
-	}
-	if pv.TargetQuality != 0 {
-		t.Fatalf("the outcome matrix path must carry no quality target, got %d", pv.TargetQuality)
-	}
 	if len(pv.Candidates) == 0 {
 		t.Fatalf("admin preview lost its candidates")
 	}
 	for _, c := range pv.Candidates {
-		if c.AboveBar != nil {
-			t.Errorf("%s reports above_bar=%v with no bar to clear", c.ID, *c.AboveBar)
-		}
 		if c.Outcome == nil {
 			t.Errorf("%s carries no outcome-matrix prediction, which is what ordered it", c.ID)
 			continue

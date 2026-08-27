@@ -158,7 +158,7 @@ func TestArenaEndToEnd(t *testing.T) {
 	if easy.DecisionMillis <= 0 {
 		t.Fatal("routing latency should be measured via the preview endpoint")
 	}
-	if !strings.HasPrefix(easy.Route, "route:d=") {
+	if !strings.HasPrefix(easy.Route, "route") {
 		t.Fatalf("route not recorded from the preview: %q", easy.Route)
 	}
 

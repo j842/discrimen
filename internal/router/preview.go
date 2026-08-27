@@ -52,13 +52,6 @@ type previewCandidate struct {
 	// q=93 above-bar front-runner on a no-think request that the router itself
 	// scored 0 and put last.
 	Quality int `json:"quality"`
-	// AboveBar is present ONLY when there is a bar: a quality target of zero
-	// makes the test vacuous, and reporting a vacuous true for every worker on
-	// every request is worse than reporting nothing, because it reads as a
-	// judgement that was made. The matrix path (the live one) always carries
-	// target 0 — see previewResponse.TargetQuality — so in practice this field
-	// appears only on the difficulty-tier fallback.
-	AboveBar *bool `json:"above_bar,omitempty"`
 	// Outcome is what the outcome matrix predicts about this worker for THIS
 	// prompt, which on the live path is the whole basis of the ordering. Nil
 	// when there is no matrix, no classification, or no embedding to query it
@@ -150,23 +143,16 @@ type previewOutcome struct {
 }
 
 type previewResponse struct {
-	Route      string   `json:"route"`
-	WouldServe string   `json:"would_serve"`
-	Difficulty *float64 `json:"difficulty,omitempty"`
-	Reasoning  *float64 `json:"reasoning,omitempty"`
-	// TargetQuality is the difficulty-tier ranker's quality floor, and is 0 on
-	// every route the outcome matrix decides — which is every classified route
-	// on a deployed router, because the matrix is constructed unconditionally
-	// and ranks rather than declines. It is kept, and kept unconditional, because
-	// `discrimen arena` reads it off this struct; read a 0 as "no quality floor
-	// was in play", not as "the floor was zero".
-	TargetQuality int             `json:"target_quality"`
-	Classified    bool            `json:"classified"`
-	Thinking      previewThinking `json:"thinking"`
-	Job           previewJob      `json:"job"`
-	Session       previewSession  `json:"session"`
-	Group         *previewGroup   `json:"group,omitempty"`
-	Expert        *previewExpert  `json:"expert,omitempty"`
+	Route      string          `json:"route"`
+	WouldServe string          `json:"would_serve"`
+	Difficulty *float64        `json:"difficulty,omitempty"`
+	Reasoning  *float64        `json:"reasoning,omitempty"`
+	Classified bool            `json:"classified"`
+	Thinking   previewThinking `json:"thinking"`
+	Job        previewJob      `json:"job"`
+	Session    previewSession  `json:"session"`
+	Group      *previewGroup   `json:"group,omitempty"`
+	Expert     *previewExpert  `json:"expert,omitempty"`
 	// Able is how many of the leading Candidates the matrix judged
 	// interchangeable on correctness. Acquisition may reorder within that prefix
 	// — preferring a free local worker over a paid remote one — and must not
@@ -345,8 +331,7 @@ func (r *Router) handleRoutePreview(w http.ResponseWriter, req *http.Request) {
 // view: the same decision, without the worker-by-worker inventory behind it.
 func (r *Router) renderPreview(chatReq *ChatRequest, plan *routePlan, budget time.Duration, full bool) previewResponse {
 	resp := previewResponse{
-		Route:         plan.route,
-		TargetQuality: plan.target,
+		Route: plan.route,
 		Thinking: previewThinking{
 			Enabled: plan.tr.enable,
 			Source:  thinkingSource(chatReq, plan),
@@ -447,19 +432,13 @@ func (r *Router) renderPreview(chatReq *ChatRequest, plan *routePlan, budget tim
 			if tps := liveTPS(b); tps > 0 {
 				decode = float64(plan.job.outputTokens) / tps
 			}
-			// Quality and above_bar both read qualityFor rather than b.Quality, so
-			// the preview reports the number the ranker used. See previewCandidate.
+			// qualityFor rather than b.Quality, so a no-think request reports the
+			// no-think score. See previewCandidate.
 			quality := qualityFor(b, plan.tr.noThink)
-			var aboveBar *bool
-			if plan.target > 0 {
-				clears := quality >= plan.target
-				aboveBar = &clears
-			}
 			resp.Candidates = append(resp.Candidates, previewCandidate{
 				ID:              b.ID,
 				Model:           b.Model,
 				Quality:         quality,
-				AboveBar:        aboveBar,
 				Outcome:         explain(b),
 				ExpectedSeconds: round3(expectedLatency(b, plan.job)),
 				PrefillSeconds:  round3(prefill),
@@ -489,28 +468,21 @@ func (r *Router) renderPreview(chatReq *ChatRequest, plan *routePlan, budget tim
 	// The ranked head is only the FIRST choice: acquisition spills past a
 	// saturated front-runner, and a bounded preference may hold the request
 	// briefly for a preferred worker first. Say which preference is in play so the
-	// preview isn't read as a promise. Read from qualityFloorPreference rather
-	// than re-derived, for the same reason the whole preview shares planRoute.
-	pref := qualityFloorPreference(plan.candidates, plan.target, plan.tr.noThink, plan.able)
-	// What the cost/locality ladder is allowed to range over. On the tier path
-	// that is the quality bar; on the matrix path there is no bar (target is 0)
-	// and the bound is the able band instead — the leading run the matrix judged
-	// interchangeable on correctness. Saying only "at q>=0", or saying nothing,
-	// is how the note came to describe an unbounded ladder: without the band,
-	// "prefers a free LOCAL worker" reads as a licence to prefer the cheapest
-	// local worker in the whole ranked list, which is precisely the behaviour
-	// the able parameter was added to stop.
+	// preview isn't read as a promise. Read from acquirePreferenceFor rather than
+	// re-derived, for the same reason the whole preview shares planRoute.
+	pref := acquirePreferenceFor(plan.candidates, plan.able)
+	// What the ladder is allowed to range over: the able band, the leading run the
+	// matrix judged interchangeable on correctness. Saying nothing is how this note
+	// came to describe an unbounded ladder — "prefers a free LOCAL worker" reads as
+	// a licence to range over the whole list, which is what the band exists to stop.
 	bound := ""
-	switch {
-	case plan.target > 0:
-		bound = fmt.Sprintf(" at q>=%d", plan.target)
-	case plan.able > 0 && plan.able < len(plan.candidates):
+	if plan.able > 0 && plan.able < len(plan.candidates) {
 		bound = fmt.Sprintf(" from the %d worker(s) the outcome matrix predicts will get this right", plan.able)
 	}
 	switch {
 	case plan.session.locked():
 		resp.Notes = append(resp.Notes, fmt.Sprintf(
-			"tool loop open — acquisition waits up to %s for incumbent %q before spilling (the session lock outranks the quality floor)",
+			"tool loop open — acquisition waits up to %s for incumbent %q before spilling (the session lock outranks the cost ladder)",
 			sessionLockWait, plan.session.incumbent))
 	case pref.why == "local-free":
 		resp.Notes = append(resp.Notes, fmt.Sprintf(
@@ -520,10 +492,6 @@ func (r *Router) renderPreview(chatReq *ChatRequest, plan *routePlan, budget tim
 		resp.Notes = append(resp.Notes, fmt.Sprintf(
 			"acquisition waits up to %s for a free worker%s before spilling to a paid endpoint",
 			qualityFloorWait, bound))
-	case pref.why == "quality-floor":
-		resp.Notes = append(resp.Notes, fmt.Sprintf(
-			"acquisition waits up to %s for a worker at q>=%d before serving below the floor",
-			qualityFloorWait, plan.target))
 	}
 	if resp.WouldServe != "" && isFull(plan.candidates[0]) {
 		resp.Notes = append(resp.Notes, fmt.Sprintf(

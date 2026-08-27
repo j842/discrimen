@@ -18,7 +18,7 @@ func TestAcquisitionDoesNotPreferAcrossTheCorrectnessBand(t *testing.T) {
 	// lower band: one candidate is interchangeable-on-correctness, not two.
 	candidates := []*Backend{paid, local}
 
-	pref := qualityFloorPreference(candidates, 0, false, 1)
+	pref := acquirePreferenceFor(candidates, 1)
 	if pref.keep == nil {
 		t.Fatal("no preference at all — the ladder found nothing to prefer")
 	}
@@ -38,7 +38,7 @@ func TestAcquisitionDoesNotPreferAcrossTheCorrectnessBand(t *testing.T) {
 	// With no band declared — the tier path, and the matrix's own fallback, both
 	// of which have no correctness judgement to protect — the cost/locality ladder
 	// applies across the whole list exactly as before.
-	pref = qualityFloorPreference(candidates, 0, false, 0)
+	pref = acquirePreferenceFor(candidates, 0)
 	kept = filterCandidates(candidates, pref.keep)
 	if len(kept) != 1 || kept[0].ID != "local-cpu" {
 		t.Fatalf("unbounded: preferred %v (why=%q), want local-cpu — the free/local ladder "+
@@ -53,7 +53,7 @@ func TestAFullBandStillPrefersWithinItself(t *testing.T) {
 	paid, local := bandFixture()
 	candidates := []*Backend{paid, local}
 
-	pref := qualityFloorPreference(candidates, 0, false, len(candidates))
+	pref := acquirePreferenceFor(candidates, len(candidates))
 	kept := filterCandidates(candidates, pref.keep)
 	if len(kept) != 1 || kept[0].ID != "local-cpu" {
 		t.Fatalf("all-in-one-band: preferred %v, want local-cpu", idsOf(kept))

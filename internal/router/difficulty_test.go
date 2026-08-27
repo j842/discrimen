@@ -66,7 +66,6 @@ func containsAnySubstr(s string, subs ...string) bool {
 
 func testClassifier(embed func(context.Context, []string) ([][]float64, error)) *difficultyClassifier {
 	return newDifficultyClassifier(&Config{
-		DifficultyBands:     defaultDifficultyBands,
 		DifficultyTemp:      0.10,
 		ReasoningThreshold:  0.35,
 		DifficultyTimeout:   time.Second,
@@ -91,34 +90,6 @@ func userReq(content string) *ChatRequest {
 	return &ChatRequest{
 		MaxTokens: 256,
 		Messages:  []Message{{Role: "user", Content: content}},
-	}
-}
-
-func TestParseDifficultyBands(t *testing.T) {
-	bands := parseDifficultyBands("0.70:7, 0.40:2 ,1.0:9")
-	if len(bands) != 3 {
-		t.Fatalf("want 3 bands, got %d: %+v", len(bands), bands)
-	}
-	if bands[0].upTo != 0.40 || bands[0].quality != 2 || bands[2].upTo != 1.0 {
-		t.Fatalf("bands not sorted/parsed correctly: %+v", bands)
-	}
-	if got := parseDifficultyBands("junk,0.5:x,,0.5:3"); len(got) != 1 || got[0].quality != 3 {
-		t.Fatalf("garbage handling wrong: %+v", got)
-	}
-}
-
-func TestBandQuality(t *testing.T) {
-	c := testClassifier(fakeEmbed)
-	cases := []struct {
-		score float64
-		want  int
-	}{
-		{0.0, 2}, {0.40, 2}, {0.41, 7}, {0.70, 7}, {0.71, 9}, {1.0, 9}, {1.5, 9},
-	}
-	for _, tc := range cases {
-		if got := c.bandQuality(tc.score); got != tc.want {
-			t.Errorf("bandQuality(%.2f)=%d, want %d", tc.score, got, tc.want)
-		}
 	}
 }
 
@@ -150,19 +121,25 @@ func TestClassifierScoreAndCache(t *testing.T) {
 	}
 	c := testClassifier(embed)
 
-	hardQ, hardScore, ok := c.targetQuality(userReq("prove the four colour theorem"))
-	if !ok || hardScore <= 0.5 || hardQ != 9 {
-		t.Fatalf("hard prompt: ok=%v score=%.3f q=%d (want ok, >0.5, 9)", ok, hardScore, hardQ)
+	// Asserted on the SCORE, not on a quality band. The band mapping went with
+	// the tier ranker; the score itself is still live — it is what decides
+	// thinking mode, and its vector is what the outcome matrix ranks on.
+	hard, ok := c.classify(userReq("prove the four colour theorem"))
+	if !ok || hard.difficulty <= 0.5 {
+		t.Fatalf("hard prompt: ok=%v score=%.3f (want ok, >0.5)", ok, hard.difficulty)
 	}
-	easyQ, easyScore, ok := c.targetQuality(userReq("say hello"))
-	if !ok || easyScore >= 0.5 || easyQ != 2 {
-		t.Fatalf("easy prompt: ok=%v score=%.3f q=%d (want ok, <0.5, 2)", ok, easyScore, easyQ)
+	if len(hard.vec) == 0 {
+		t.Fatal("a successful classification carried no vector — the matrix has nothing to rank on")
+	}
+	easy, ok := c.classify(userReq("say hello"))
+	if !ok || easy.difficulty >= 0.5 {
+		t.Fatalf("easy prompt: ok=%v score=%.3f (want ok, <0.5)", ok, easy.difficulty)
 	}
 	if calls != 3 {
 		t.Fatalf("embedder called %d times, want 3 (1 bootstrap + 2 prompts)", calls)
 	}
 	// A seen prompt is served from cache (no new embed call); both axes cached.
-	if _, _, ok := c.targetQuality(userReq("say hello")); !ok || calls != 3 {
+	if _, ok := c.classify(userReq("say hello")); !ok || calls != 3 {
 		t.Fatalf("cache miss: ok=%v calls=%d (want ok, still 3)", ok, calls)
 	}
 }
@@ -171,7 +148,7 @@ func TestClassifierFallbackOnEmbedError(t *testing.T) {
 	c := testClassifier(func(context.Context, []string) ([][]float64, error) {
 		return nil, errors.New("embeddings down")
 	})
-	if _, _, ok := c.targetQuality(userReq("anything")); ok {
+	if _, ok := c.classify(userReq("anything")); ok {
 		t.Fatal("classification must report ok=false when the embedder fails")
 	}
 	if _, ok := c.classify(&ChatRequest{Messages: []Message{{Role: "user", Content: ""}}}); ok {
@@ -302,15 +279,18 @@ func TestReasoningClassification(t *testing.T) {
 	if !ok || cl.reasoning >= 0.5 || c.wantThinking(cl.reasoning) {
 		t.Fatalf("direct prompt: ok=%v reasoning=%.3f (want <0.5 + no thinking)", ok, cl.reasoning)
 	}
-	// Long-but-shallow → high tier BUT no reasoning.
+	// The two axes are INDEPENDENT, which is the whole reason there are two. A
+	// long shallow job is hard work and needs no reasoning; a short tricky one is
+	// the reverse. Asserted on the difficulty score directly now that the band
+	// mapping has gone with the tier ranker — difficulty still decides thinking's
+	// companion signal and still carries the vector routing ranks on.
 	cl, _ = c.classify(userReq("summarise this very long quarterly report in detail"))
-	if c.bandQuality(cl.difficulty) < 7 || c.wantThinking(cl.reasoning) {
-		t.Fatalf("long-shallow: want high tier + no thinking, got q=%d reasoning=%.3f", c.bandQuality(cl.difficulty), cl.reasoning)
+	if cl.difficulty <= 0.5 || c.wantThinking(cl.reasoning) {
+		t.Fatalf("long-shallow: want high difficulty + no thinking, got d=%.3f reasoning=%.3f", cl.difficulty, cl.reasoning)
 	}
-	// Short-but-tricky → low tier BUT needs reasoning.
 	cl, _ = c.classify(userReq("solve this logic puzzle"))
-	if c.bandQuality(cl.difficulty) > 2 || !c.wantThinking(cl.reasoning) {
-		t.Fatalf("short-tricky: want low tier + thinking, got q=%d reasoning=%.3f", c.bandQuality(cl.difficulty), cl.reasoning)
+	if cl.difficulty >= 0.5 || !c.wantThinking(cl.reasoning) {
+		t.Fatalf("short-tricky: want low difficulty + thinking, got d=%.3f reasoning=%.3f", cl.difficulty, cl.reasoning)
 	}
 }
 
@@ -416,32 +396,6 @@ func mkBackend(id string, quality, tps, maxConc, active int) *Backend {
 	}
 }
 
-func TestRankByDifficulty(t *testing.T) {
-	tiny := mkBackend("tiny", 2, 60, 2, 0)
-	mid := mkBackend("mid", 7, 25, 2, 0)
-	gem := mkBackend("gem", 7, 6, 4, 0)
-	big := mkBackend("big", 10, 140, 6, 0)
-
-	// Easy: every backend clears q>=2, so the one that FINISHES SOONEST wins —
-	// the fastest (big), not the cheapest. (Completion-time ranking.)
-	if got := rankByDifficulty([]*Backend{tiny, mid, gem, big}, 2, nominalJob(), false); got[0].ID != "big" {
-		t.Fatalf("easy idle: want fastest sufficient (big), got %s", got[0].ID)
-	}
-	// Hard: only big clears q>=9.
-	if got := rankByDifficulty([]*Backend{tiny, mid, gem, big}, 9, nominalJob(), false); got[0].ID != "big" {
-		t.Fatalf("hard: want big, got %s", got[0].ID)
-	}
-	// Among equal-quality (q7) candidates the faster one wins.
-	if got := rankByDifficulty([]*Backend{gem, mid}, 7, nominalJob(), false); got[0].ID != "mid" {
-		t.Fatalf("q7 tie: want faster (mid), got %s", got[0].ID)
-	}
-	// Spill: when the fast big is full, the fastest backend with a free slot wins.
-	fullBig := mkBackend("big", 10, 140, 6, 6) // active==cap → full
-	if got := rankByDifficulty([]*Backend{fullBig, mid, tiny}, 2, nominalJob(), false); got[0].ID != "tiny" {
-		t.Fatalf("big full: want fastest free slot (tiny), got %s", got[0].ID)
-	}
-}
-
 func readyBackend(reg *Registry, id string, quality, tps, maxConc int) {
 	reg.upsert(BackendRegistration{
 		ID: id, URL: "http://" + id, Model: "default", Quality: quality,
@@ -461,44 +415,6 @@ func readyThinkingBackend(reg *Registry, id string, quality, tps, maxConc int, t
 		Thinking: thinking, Features: []string{"chat"},
 	})
 	reg.finishCertification(id, true, map[string]Check{}, float64(tps), 10, "")
-}
-
-func TestSelectBackendsAutoDifficulty(t *testing.T) {
-	reg := newTestRegistry()
-	readyBackend(reg, "tiny", 2, 200, 2)
-	readyBackend(reg, "big", 10, 140, 6)
-	cfg := &Config{
-		DefaultMaxTokens: 4096, AutoDifficulty: true,
-		DifficultyBands: defaultDifficultyBands, DifficultyTemp: 0.10,
-		DifficultyTimeout: time.Second, DifficultyCacheSize: 16, DifficultyMaxChars: 4000,
-	}
-	r := &Router{cfg: cfg, registry: reg, classifier: testClassifier(fakeEmbed)}
-
-	cands, route, _, _, err := r.selectBackends(userReq("say hello"), 0)
-	if err != nil || cands[0].ID != "tiny" {
-		t.Fatalf("easy auto-route: got %v err=%v, want tiny first", ids(cands), err)
-	}
-	if !strings.HasPrefix(route, "route:d=") {
-		t.Fatalf("difficulty route hint missing: %q", route)
-	}
-	if cands, _, _, _, _ := r.selectBackends(userReq("prove a hard theorem"), 0); cands[0].ID != "big" {
-		t.Fatalf("hard auto-route: got %v, want big first", ids(cands))
-	}
-
-	// A capability hint (thinking) must NOT suppress difficulty routing — there are
-	// no quality/speed overrides any more, so every request auto-tiers.
-	req2 := userReq("say hello")
-	req2.Requirements = &Requirements{Thinking: "off"}
-	cands, route, _, _, _ = r.selectBackends(req2, 0)
-	if cands[0].ID != "tiny" || !strings.HasPrefix(route, "route:d=") {
-		t.Fatalf("orthogonal thinking hint must keep auto-difficulty: first=%s route=%q", cands[0].ID, route)
-	}
-
-	// AutoDifficulty disabled → default ranking regardless of prompt.
-	r.cfg.AutoDifficulty = false
-	if cands, route, _, _, _ := r.selectBackends(userReq("say hello"), 0); cands[0].ID != "big" || route != "route" {
-		t.Fatalf("disabled auto-difficulty should use default ranking: first=%s route=%q", cands[0].ID, route)
-	}
 }
 
 // TestAutoReasoningGatesSelection is the core of fix #1: a LOW-difficulty but
@@ -528,7 +444,7 @@ func TestAutoReasoningGatesSelection(t *testing.T) {
 	readyThinkingBackend(reg, "slow-think", 2, 20, 4, true)
 	r := newRouter(reg)
 
-	cands, route, _, _, err := r.selectBackends(trickyLowDiff, 0)
+	cands, route, _, err := r.selectBackends(trickyLowDiff, 0)
 	if err != nil {
 		t.Fatalf("auto-reasoning select errored: %v", err)
 	}
@@ -542,8 +458,8 @@ func TestAutoReasoningGatesSelection(t *testing.T) {
 			t.Fatalf("auto soft-think filter leaked a non-thinking worker: %v", ids(cands))
 		}
 	}
-	if !strings.HasPrefix(route, "route:d=") {
-		t.Fatalf("difficulty route hint missing: %q", route)
+	if !strings.HasPrefix(route, "route") {
+		t.Fatalf("an auto route must report as router-chosen: %q", route)
 	}
 
 	// Fallback: NO thinking-capable worker. Auto-thinking must NOT 503 — it falls
@@ -551,7 +467,7 @@ func TestAutoReasoningGatesSelection(t *testing.T) {
 	regNoThink := newTestRegistry()
 	readyThinkingBackend(regNoThink, "fast-nothink", 2, 200, 4, false)
 	readyThinkingBackend(regNoThink, "mid-nothink", 5, 80, 4, false)
-	cands, _, _, _, err = newRouter(regNoThink).selectBackends(trickyLowDiff, 0)
+	cands, _, _, err = newRouter(regNoThink).selectBackends(trickyLowDiff, 0)
 	if err != nil {
 		t.Fatalf("auto-thinking must never 503 when no thinking worker exists: %v", err)
 	}
@@ -563,35 +479,8 @@ func TestAutoReasoningGatesSelection(t *testing.T) {
 	// 503s when no thinking-capable worker exists (a user demand, not steering).
 	hardOn := userReq("solve this logic puzzle")
 	hardOn.Requirements = &Requirements{Thinking: "on"}
-	if _, _, _, _, err := newRouter(regNoThink).selectBackends(hardOn, 0); err == nil {
+	if _, _, _, err := newRouter(regNoThink).selectBackends(hardOn, 0); err == nil {
 		t.Fatal("explicit thinking:\"on\" with no thinking worker must 503 (hard filter)")
-	}
-}
-
-func TestAutoTargetQuality(t *testing.T) {
-	// Realistic measured qualities (benchmark percentages), not tiers.
-	fleet := []*Backend{mkBackend("a", 40, 0, 0, 0), mkBackend("b", 71, 0, 0, 0), mkBackend("c", 82, 0, 0, 0)}
-	if q := autoTargetQuality(fleet, 0.0, false); q != 0 {
-		t.Fatalf("score 0 → %d, want 0 (no bar)", q)
-	}
-	if q := autoTargetQuality(fleet, 0.65, false); q != 65 {
-		t.Fatalf("score .65 → %d, want 65 (absolute scale)", q)
-	}
-	if q := autoTargetQuality(fleet, 1.0, false); q != 82 {
-		t.Fatalf("score 1 → %d, want 82 (clamped to best available)", q)
-	}
-	if q := autoTargetQuality([]*Backend{mkBackend("x", 50, 0, 0, 0)}, 0.9, false); q != 50 {
-		t.Fatalf("single worker → %d, want 50 (clamped)", q)
-	}
-
-	// The regression this mapping exists to prevent: registering a slower,
-	// higher-quality worker must not raise the bar for a question that the
-	// existing fleet was already clearing — the bar belongs to the question.
-	// Under the old fleet-range mapping this went from 67 to 74 the moment
-	// the 93 registered, silently excluding the 82.
-	withGenius := append(append([]*Backend{}, fleet...), mkBackend("genius", 93, 0, 0, 0))
-	if before, after := autoTargetQuality(fleet, 0.65, false), autoTargetQuality(withGenius, 0.65, false); before != after {
-		t.Fatalf("adding a high-quality worker moved the bar: %d → %d", before, after)
 	}
 }
 
@@ -626,38 +515,13 @@ func TestUnmeasuredNoThinkQuality(t *testing.T) {
 		t.Fatalf("non-thinking worker read %d on no-think, want 60 (its mixed score IS the no-think score)", q)
 	}
 
-	// The clamp anchors to the best MEASURED no-think ability: 45, not the
-	// unmeasured worker's mixed 93 — else the bar strands above every worker
-	// whose no-think quality is actually known.
-	if q := autoTargetQuality([]*Backend{measured, unmeasured}, 0.66, true); q != 45 {
-		t.Fatalf("no-think target %d, want 45 (anchored to measured scores only)", q)
-	}
-
-	// Ranking on a no-think job: the measured worker leads at any target; the
-	// unmeasured one stays routable as the below-bar last resort, not excluded.
-	got := rankByDifficulty([]*Backend{unmeasured, measured}, 66, nominalJob(), true)
-	if len(got) != 2 || got[0].ID != "gpu" {
-		t.Fatalf("no-think ranking = %v, want measured gpu first with unmeasured cpu as last resort", ids(got))
-	}
-}
-
-// TestAutoBandsSelection: with no configured bands the router derives tiers from
-// the registered fleet — no ROUTER_DIFFICULTY_QUALITY_BANDS needed.
-func TestAutoBandsSelection(t *testing.T) {
-	reg := newTestRegistry()
-	readyBackend(reg, "tiny", 2, 200, 2)
-	readyBackend(reg, "big", 10, 140, 6)
-	r := &Router{
-		cfg:        &Config{DefaultMaxTokens: 4096, AutoDifficulty: true},
-		registry:   reg,
-		classifier: testClassifierAuto(fakeEmbed),
-	}
-	cands, route, _, _, err := r.selectBackends(userReq("say hello"), 0)
-	if err != nil || cands[0].ID != "tiny" || !strings.HasPrefix(route, "route:d=") {
-		t.Fatalf("easy auto-band: got %v route=%q err=%v, want tiny", ids(cands), route, err)
-	}
-	if cands, _, _, _, _ := r.selectBackends(userReq("prove a hard theorem"), 0); cands[0].ID != "big" {
-		t.Fatalf("hard auto-band: got %v, want big", ids(cands))
+	// backendScore is the degraded ranker — what runs when there is no matrix and
+	// no classifier — and it reads qualityFor, so the mode separation above has to
+	// hold there too: an unmeasured no-think score must not let a worker outrank
+	// one whose no-think ability is actually known.
+	if backendScore(unmeasured, true) >= backendScore(measured, true) {
+		t.Fatalf("unmeasured no-think (%d) outranks measured (%d) in the fallback ranker",
+			backendScore(unmeasured, true), backendScore(measured, true))
 	}
 }
 
@@ -998,7 +862,7 @@ func TestSelectBackendsExcludesEmbeddingsWorker(t *testing.T) {
 	reg.finishCertification("emb", true, map[string]Check{}, 0, 0, "")
 	r := &Router{cfg: &Config{DefaultMaxTokens: 4096}, registry: reg}
 
-	cands, _, _, _, err := r.selectBackends(userReq("hello"), 0)
+	cands, _, _, err := r.selectBackends(userReq("hello"), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1099,7 +963,7 @@ func TestThinkingJobPrefersGPU(t *testing.T) {
 
 	// The failing request: ~4k tokens of system prompt + tool schemas, thinking on.
 	job := jobCost{promptTokens: 4000, outputTokens: latencyEstThinkTokens}
-	got := rankByDifficulty([]*Backend{cpu, gpu}, 87, job, false)
+	got := rankPanel([]*Backend{cpu, gpu}, job)
 	if got[0].ID != "llm-6000pro" {
 		t.Fatalf("thinking agent turn should go to the GPU, got %s (gpu=%.1fs cpu=%.1fs)",
 			got[0].ID, expectedLatency(gpu, job), expectedLatency(cpu, job))
@@ -1180,7 +1044,7 @@ func TestSelectBackendsHonoursNamedModel(t *testing.T) {
 	// still load-balances instead of collapsing onto one worker.
 	req := userReq("hello")
 	req.Model = "gemma.gguf"
-	cands, route, _, _, err := r.selectBackends(req, 0)
+	cands, route, _, err := r.selectBackends(req, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1200,7 +1064,7 @@ func TestSelectBackendsHonoursNamedModel(t *testing.T) {
 
 	// By worker id: the other spelling /v1/models publishes (owned_by).
 	req.Model = "deepseek"
-	cands, _, _, _, err = r.selectBackends(req, 0)
+	cands, _, _, err = r.selectBackends(req, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1210,7 +1074,7 @@ func TestSelectBackendsHonoursNamedModel(t *testing.T) {
 
 	// Unknown: a 404, not a 503 — a harness can act on "you don't have that".
 	req.Model = "gpt-5"
-	if _, _, _, _, err = r.selectBackends(req, 0); err == nil {
+	if _, _, _, err = r.selectBackends(req, 0); err == nil {
 		t.Fatal("an unknown model must be an error")
 	} else if !errors.As(err, &unknownModelError{}) {
 		t.Fatalf("unknown model must surface as unknownModelError (⇒404), got %T: %v", err, err)
@@ -1226,7 +1090,7 @@ func TestSelectBackendsGuestDefaultIsUnchanged(t *testing.T) {
 	// What every clabtree guest sends.
 	req := userReq("hello")
 	req.Model = "default"
-	cands, route, _, _, err := r.selectBackends(req, 0)
+	cands, route, _, err := r.selectBackends(req, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1250,7 +1114,7 @@ func TestClientCeilingDoesNotFilterTheFleet(t *testing.T) {
 
 	req := userReq("say hi")
 	req.MaxTokens = 131072 // pi's default ceiling
-	cands, _, _, _, err := r.selectBackends(req, 0)
+	cands, _, _, err := r.selectBackends(req, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1260,7 +1124,7 @@ func TestClientCeilingDoesNotFilterTheFleet(t *testing.T) {
 
 	// A prompt that genuinely needs the context still filters on it.
 	big := &ChatRequest{MaxTokens: 4096, Messages: []Message{{Role: "user", Content: strings.Repeat("x", 200*1024*3)}}}
-	cands, _, _, _, err = r.selectBackends(big, 0)
+	cands, _, _, err = r.selectBackends(big, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

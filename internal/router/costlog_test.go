@@ -115,7 +115,7 @@ func TestCostLineFiresWhenLocalFreeSpillsToPaid(t *testing.T) {
 	r := costSpillRouter(t)
 
 	// The preference the request will be given, and the rung it starts on.
-	pref := qualityFloorPreference(r.registry.eligible(), 0, false, 0)
+	pref := acquirePreferenceFor(r.registry.eligible(), 0)
 	if pref.why != "local-free" {
 		t.Fatalf("this test needs the local-free rung, got %q", pref.why)
 	}

@@ -1890,7 +1890,7 @@ func (r *Router) handleCompletions(w http.ResponseWriter, req *http.Request) {
 	if !r.enforceKeyLimits(w, ident, requestedModel(chatReq)) {
 		return
 	}
-	candidates, route, _, _, err := r.selectBackends(chatReq, callerBudget(req, chatReq))
+	candidates, route, _, err := r.selectBackends(chatReq, callerBudget(req, chatReq))
 	if err != nil {
 		writeUnavailable(w, r.retryAfterUnavailable(), err.Error())
 		return
@@ -2594,17 +2594,18 @@ func qualityFor(b *Backend, thinkOff bool) int {
 // and blind to the upstream's own clients, so ranking on remote completion times
 // alone over-picks remote. That corrects a biased estimator. It just must not
 // reach across a correctness boundary to do it.
-func qualityFloorPreference(candidates []*Backend, target int, thinkOff bool, able int) acquirePreference {
-	inBand := func(b *Backend) bool { return true }
+func acquirePreferenceFor(candidates []*Backend, able int) acquirePreference {
+	// The quality-target arm is gone with the tier ranker that set it. It read
+	// `target <= 0 || qualityFor(b, thinkOff) >= target` and target was always 0
+	// on the matrix path, so it admitted everything; what actually bounds the
+	// ladder is the matrix's own correctness band.
+	aboveBar := func(b *Backend) bool { return true }
 	if able > 0 && able < len(candidates) {
 		ids := make(map[string]bool, able)
 		for _, b := range candidates[:able] {
 			ids[b.ID] = true
 		}
-		inBand = func(b *Backend) bool { return ids[b.ID] }
-	}
-	aboveBar := func(b *Backend) bool {
-		return inBand(b) && (target <= 0 || qualityFor(b, thinkOff) >= target)
+		aboveBar = func(b *Backend) bool { return ids[b.ID] }
 	}
 	free := func(b *Backend) bool { return aboveBar(b) && isFreeBackend(b) }
 	ladder := []struct {
@@ -2659,14 +2660,6 @@ func sessionLockPreference(incumbent string) acquirePreference {
 		wait: sessionLockWait,
 		why:  prefSessionLock,
 	}
-}
-
-// pickAndAcquireWithFloor is pickAndAcquire under the quality-floor preference.
-// Retained as the named entry point for the floor policy (and its tests).
-func (r *Router) pickAndAcquireWithFloor(ctx context.Context, candidates []*Backend, target int, thinkOff bool) (*Backend, chan struct{}, bool, error) {
-	// able=0: this is the tier-path entry point, which has a numeric bar rather
-	// than a matrix band to protect.
-	return r.pickAndAcquirePreferred(ctx, candidates, qualityFloorPreference(candidates, target, thinkOff, 0))
 }
 
 // pickAndAcquirePreferred is pickAndAcquire plus a bounded first-choice set.
@@ -2743,7 +2736,7 @@ func (r *Router) pickAndAcquirePreferred(ctx context.Context, candidates []*Back
 // above-target worker before spilling below it (fix #2). The pinned/debug callers
 // pass a bare plan, so their behaviour is unchanged.
 func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident *identity, plan *routePlan, body []byte, chatReq *ChatRequest) {
-	candidates, route, target := plan.candidates, plan.route, plan.target
+	candidates, route := plan.candidates, plan.route
 	if len(candidates) == 0 {
 		writeUnavailable(w, r.retryAfterUnavailable(), "no backend available")
 		return
@@ -2792,7 +2785,7 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 	// is open the session lock wins instead — handing a tool result to a model that
 	// never emitted the matching tool call breaks the loop outright, which is worse
 	// than serving that turn a tier low.
-	pref := qualityFloorPreference(candidates, target, tr.noThink, plan.able)
+	pref := acquirePreferenceFor(candidates, plan.able)
 	if plan.session.locked() {
 		pref = sessionLockPreference(plan.session.incumbent)
 	}
@@ -2839,17 +2832,10 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 			// hold out for — so on the ordinary fleet, local workers that cost
 			// nothing beside a metered endpoint, the top rung is "local-free" and
 			// the one spill that actually spends money was the one nothing said a
-			// word about. "quality-floor" is deliberately still excluded: there,
-			// every above-bar worker was metered from the start, so landing on one
-			// is not a cost the router could have avoided by waiting.
+			// word about.
 			if pref.preferredFree() && !isFreeBackend(backend) {
 				log.Printf("cost: %s served on PAID backend=%s (in %g / out %g per Mtok) after %s grace — no free worker above the bar freed a slot",
 					route, backend.ID, backend.InputPricePerMtok, backend.OutputPricePerMtok, qualityFloorWait)
-			}
-			if target > 0 && qualityFor(backend, tr.noThink) < target {
-				w.Header().Set("X-LLM-Quality-Floor", "downgraded")
-				log.Printf("quality floor: %s served below target q>=%d on backend=%s (q=%d) after %s grace — no above-bar slot freed",
-					route, target, backend.ID, qualityFor(backend, tr.noThink), qualityFloorWait)
 			}
 		}
 	}
@@ -3194,12 +3180,12 @@ func setRouteHeaders(w http.ResponseWriter, backend *Backend, route string, logE
 //
 // budget is how long the caller is still willing to wait (0 = unknown); when
 // known, workers that cannot finish the job inside it are filtered out first.
-func (r *Router) selectBackends(req *ChatRequest, budget time.Duration) ([]*Backend, string, *classification, int, error) {
+func (r *Router) selectBackends(req *ChatRequest, budget time.Duration) ([]*Backend, string, *classification, error) {
 	plan, err := r.planRoute(req, budget, false)
 	if err != nil {
-		return nil, "", nil, 0, err
+		return nil, "", nil, err
 	}
-	return plan.candidates, plan.route, plan.cl, plan.target, nil
+	return plan.candidates, plan.route, plan.cl, nil
 }
 
 // routePlan is everything selection decided about one request. selectBackends
@@ -3224,7 +3210,6 @@ type routePlan struct {
 	// and must not reorder across it — see qualityFloorPreference. Zero means no
 	// prefix is protected, which is the tier path and the matrix's own fallback.
 	able    int
-	target  int
 	job     jobCost
 	tr      thinkingResolution
 	session sessionRoute
@@ -3528,36 +3513,17 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 		}
 	}
 
-	if cl != nil && r.cfg.AutoDifficulty {
-		target := r.classifier.targetForFleet(filtered, cl.difficulty, tr.noThink)
-		// target is surfaced as the quality floor so the acquire step prefers to
-		// wait BRIEFLY for an above-target worker before spilling below it (fix #2);
-		// routing too cheap is the quality-risky direction.
-		//
-		// A client-named model reports as "model:…" rather than "route:…" so an
-		// operator reading a log or a header can tell a decision the ROUTER made
-		// from one a harness made for it. Nothing branches on the spelling any
-		// more — the judge is gated on plan.auto — but the distinction is still
-		// the first thing you want when a route looks wrong.
-		return &routePlan{
-			candidates: rankByDifficulty(filtered, target, job, tr.noThink),
-			auto:       wantModel == "",
-			route:      fmt.Sprintf("%s:d=%.2f,q>=%d", routeKind(wantModel), cl.difficulty, target),
-			cl:         cl,
-			target:     target,
-			job:        job,
-			tr:         tr,
-			session:    sess,
-			group:      gr,
-			expert:     expert,
-			rejected:   rejected,
-		}, nil
-	}
-
-	// Fallback when auto-tiering can't run: rank by quality, with speed and
-	// current load breaking ties. No hard filter — every eligible backend stays a
-	// candidate, so the request is always served. target=0 ⇒ no quality floor
-	// (everyone is above-bar), so the acquire step behaves exactly as before.
+	// Reached when the matrix could not run at all: no classifier, or a
+	// classification that produced no vector — which in practice means the
+	// embeddings worker is down. Rank by measured quality with speed and current
+	// load breaking ties (backendScore), and hard-filter nothing, so the request
+	// is always served by somebody.
+	//
+	// This is the ONLY fallback now. The difficulty-tier ranker that used to sit
+	// between here and the matrix is gone: it scored a prompt to a quality target
+	// and ranked the fleet against it, and nothing reached it — the matrix branch
+	// above returns for every classified request, and an unclassified one has no
+	// difficulty score to tier by.
 	return &routePlan{
 		candidates: rankBackends(filtered, job, tr.noThink),
 		// The ROUTER still chose this worker — the classifier being unavailable

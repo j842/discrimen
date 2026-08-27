@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -229,7 +228,7 @@ func TestSessionStickinessLosesToAMuchFasterWorker(t *testing.T) {
 		ObservedTPS:         120, ObservedPrefillTPS: 6000,
 	}
 	job := jobCost{promptTokens: 4000, outputTokens: 1500}.withIncumbent("cpu")
-	got := rankByDifficulty([]*Backend{slowIncumbent, fastRival}, 50, job, false)
+	got := rankPanel([]*Backend{slowIncumbent, fastRival}, job)
 	if got[0].ID != "gpu" {
 		t.Fatalf("affinity must not pin a conversation to a far slower worker: got %s (cpu=%.1fs gpu=%.1fs)",
 			got[0].ID, expectedLatency(slowIncumbent, job), expectedLatency(fastRival, job))
@@ -241,7 +240,7 @@ func TestSessionStickinessLosesToAMuchFasterWorker(t *testing.T) {
 		ObservedTPS:         120, ObservedPrefillTPS: 6000,
 	}
 	stickyJob := jobCost{promptTokens: 4000, outputTokens: 1500}.withIncumbent("gpu2")
-	if got := rankByDifficulty([]*Backend{fastRival, twin}, 50, stickyJob, false); got[0].ID != "gpu2" {
+	if got := rankPanel([]*Backend{fastRival, twin}, stickyJob); got[0].ID != "gpu2" {
 		t.Fatalf("between equals the incumbent should win, got %s", got[0].ID)
 	}
 }
@@ -273,8 +272,7 @@ func TestSelectBackendsPrefersIncumbent(t *testing.T) {
 	readyBackend(reg, "alpha", 60, 100, 4)
 	readyBackend(reg, "beta", 60, 100, 4)
 	cfg := &Config{
-		DefaultMaxTokens: 4096, AutoDifficulty: true,
-		DifficultyBands: defaultDifficultyBands, DifficultyTemp: 0.10,
+		DefaultMaxTokens: 4096, AutoDifficulty: true, DifficultyTemp: 0.10,
 		DifficultyTimeout: time.Second, DifficultyCacheSize: 16, DifficultyMaxChars: 4000,
 	}
 	r := &Router{cfg: cfg, registry: reg, classifier: testClassifier(fakeEmbed),
@@ -303,89 +301,6 @@ func TestSelectBackendsPrefersIncumbent(t *testing.T) {
 	}
 	if got := plan2.session.outcome("beta"); got != "stay" {
 		t.Fatalf("outcome should be stay, got %q", got)
-	}
-}
-
-// The question people actually ask about affinity: if turn 2 is HARDER, does the
-// conversation get upgraded or does stickiness pin it to turn 1's model?
-//
-// It upgrades. The quality bar is sort key 2 in rankByDifficulty and the prefill
-// discount only reaches sort key 4, so the discount can reorder workers WITHIN a
-// tier but can never hold a below-bar incumbent ahead of one that clears the bar.
-func TestSessionAffinityYieldsToAHarderTurn(t *testing.T) {
-	reg := newTestRegistry()
-	// A fast-but-weak worker that wins the easy race, and a slower strong one.
-	readyBackend(reg, "cheap", 40, 400, 4)
-	readyBackend(reg, "good", 90, 60, 4)
-	cfg := &Config{
-		DefaultMaxTokens: 4096, AutoDifficulty: true,
-		DifficultyTemp: 0.10, DifficultyTimeout: time.Second,
-		DifficultyCacheSize: 16, DifficultyMaxChars: 4000,
-	}
-	r := &Router{cfg: cfg, registry: reg, classifier: testClassifierAuto(fakeEmbed),
-		sessions: newSessionTracker(time.Hour, 64)}
-
-	// Turn 1: easy. Everyone clears a near-zero bar, so the fastest wins.
-	first := convo(sys("agent"), usr("say hello"))
-	plan1, err := r.planRoute(first, 0, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if plan1.candidates[0].ID != "cheap" {
-		t.Fatalf("easy turn should take the fast worker, got %s (target q>=%d)", plan1.candidates[0].ID, plan1.target)
-	}
-	r.sessions.remember(plan1.session.key, "cheap")
-
-	// Turn 2: hard, same conversation. The incumbent is now BELOW the bar.
-	second := convo(sys("agent"), usr("say hello"), asst("hi"), usr("prove a hard theorem"))
-	plan2, err := r.planRoute(second, 0, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if plan2.session.incumbent != "cheap" {
-		t.Fatalf("affinity should still recognise the conversation, got %q", plan2.session.incumbent)
-	}
-	if plan2.target <= 40 {
-		t.Fatalf("a hard turn should raise the bar above the incumbent's quality, got q>=%d", plan2.target)
-	}
-	if plan2.candidates[0].ID != "good" {
-		t.Fatalf("a harder turn must escalate past the incumbent: got %s (target q>=%d, cheap q=40)",
-			plan2.candidates[0].ID, plan2.target)
-	}
-	if got := plan2.session.outcome("good"); got != "switch" {
-		t.Fatalf("the move should be reported as a switch, got %q", got)
-	}
-
-	// Turn 3: easy again, and the incumbent is now "good". Both clear the easy bar,
-	// so the completion-time race resumes and the 6.7x faster worker takes it back.
-	// Affinity is a DISCOUNT, not a lease: it scales with the prefill it saves, and
-	// a one-line follow-up has almost no prefill to save.
-	r.sessions.remember(plan2.session.key, "good")
-	third := convo(sys("agent"), usr("say hello"), asst("hi"), usr("prove a hard theorem"), asst("done"), usr("say hello again"))
-	plan3, err := r.planRoute(third, 0, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if plan3.candidates[0].ID != "cheap" {
-		t.Fatalf("a short easy turn should go back to the much faster worker, got %s", plan3.candidates[0].ID)
-	}
-
-	// ...but give the same easy turn a LONG conversation to re-prefill and affinity
-	// starts to pay for itself, because that is the cost it is actually modelling.
-	bulk := strings.Repeat("previous conversation context. ", 4000)
-	long := convo(sys("agent"), usr("say hello"), asst(bulk), usr("say hello again"))
-	longPlan, err := r.planRoute(long, 0, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if longPlan.session.incumbent != "good" {
-		t.Fatalf("same conversation, so the incumbent should still be good, got %q", longPlan.session.incumbent)
-	}
-	withAffinity := expectedLatency(reg.get("good"), longPlan.job)
-	withoutAffinity := expectedLatency(reg.get("good"), longPlan.job.withIncumbent(""))
-	if withAffinity >= withoutAffinity {
-		t.Fatalf("a long conversation should measurably favour the incumbent: %.2fs vs %.2fs",
-			withAffinity, withoutAffinity)
 	}
 }
 

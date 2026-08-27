@@ -54,6 +54,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -190,7 +191,7 @@ func expertEntry(fleetFeatures []string) map[string]any {
 // asked here rather than re-invented. target 0: an ensemble has no quality bar
 // to clear, since it is asking everyone.
 func expertMembers(candidates []*Backend, job jobCost) []*Backend {
-	ranked := rankByDifficulty(append([]*Backend(nil), candidates...), 0, job, false)
+	ranked := rankPanel(append([]*Backend(nil), candidates...), job)
 	seen := map[string]bool{}
 	members := make([]*Backend, 0, len(ranked))
 	for _, b := range ranked {
@@ -244,7 +245,7 @@ func pickSynthesiser(candidates []*Backend, neededContext int, job jobCost) *Bac
 		}
 	}
 	tied := filterCandidates(fits, func(b *Backend) bool { return b.Quality == best })
-	return rankByDifficulty(tied, 0, job, false)[0]
+	return rankPanel(tied, job)[0]
 }
 
 // ── Dispatch ────────────────────────────────────────────────────────────────
@@ -1118,4 +1119,49 @@ func (t *usageTally) add(b *Backend, used usageCount, job jobCost) {
 		t.paid = true
 		t.cost += tokenCost(b, charge.prompt, charge.completion)
 	}
+}
+
+// rankPanel orders workers for the ensemble: available first, then free, then
+// whichever finishes soonest.
+//
+// This was rankByDifficulty, the tier ranker, shared with a routing path that no
+// longer exists. Both surviving callers already passed target = 0, which made its
+// quality-bar steps vacuous — every worker clears a bar of zero — so what is left
+// here is what those calls were actually getting, written out. No quality score is
+// read at all now, which also settles a question the old signature raised: it took
+// a thinkOff flag and both callers hardcoded false, so a no-think ensemble was
+// ranked on mixed-mode scores.
+//
+// Sorts in place and returns the same slice, so callers that must not disturb the
+// plan's ordering copy first.
+func rankPanel(candidates []*Backend, job jobCost) []*Backend {
+	sort.SliceStable(candidates, func(i, j int) bool {
+		a, b := candidates[i], candidates[j]
+		// 1. A worker with a free slot beats one without. Spilling is still the
+		//    acquire step's job; this is only the order it tries them in.
+		if af, bf := isFull(a), isFull(b); af != bf {
+			return !af
+		}
+		// 2. Free before metered. An ensemble asks N workers for one answer, so it
+		//    is the router's most expensive route by construction — the one place
+		//    cost most deserves a say.
+		if af, bf := isFreeBackend(a), isFreeBackend(b); af != bf {
+			return af
+		}
+		// 3. Whichever will FINISH FIRST for this job, from live prefill/decode
+		//    rates and queue occupancy. A slow worker loses on latency by itself,
+		//    with no speed cutoff to tune, and a busy fast one sheds to idle ones.
+		if la, lb := expectedLatency(a, job), expectedLatency(b, job); la != lb {
+			return la < lb
+		}
+		// 4. Exact tie → keep the conversation where it is. Only reachable when the
+		//    completion-time estimate cannot separate them at all (neither has a
+		//    measured prefill rate yet), where staying is free and switching costs a
+		//    cold prefix.
+		if ai, bi := sessionIncumbent(a, job), sessionIncumbent(b, job); ai != bi {
+			return ai
+		}
+		return a.ID < b.ID
+	})
+	return candidates
 }

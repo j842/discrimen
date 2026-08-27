@@ -224,8 +224,7 @@ func TestArenaRobustnessDoesNotFabricateStabilityFromAnUnsetTier(t *testing.T) {
 	var m arenaMetrics
 	arenaAccumulate([]*arenaMetrics{&m}, &arenaOutcome{
 		Question:   arenaQuestion{Prompt: "q"},
-		WouldServe: "big", BackendID: "big", ThinkingOn: true, Classified: true, Difficulty: 0.80,
-		TargetQuality: 0, // the outcome-matrix path: no quality floor is set at all
+		WouldServe: "big", BackendID: "big", ThinkingOn: true, Classified: true, Difficulty: 0.80, // the outcome-matrix path: no quality floor is set at all
 		Perturbed: []arenaPerturbation{
 			{Kind: "lowercase", WouldServe: "tiny", ThinkingOn: false, Classified: true, Difficulty: 0.20},
 			{Kind: "polite", WouldServe: "tiny", ThinkingOn: false, Classified: true, Difficulty: 0.15},

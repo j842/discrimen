@@ -60,59 +60,6 @@ func TestResolveThinkingNoThink(t *testing.T) {
 	}
 }
 
-func TestRankByDifficultyReadsModeQuality(t *testing.T) {
-	// The MoE outranks the dense worker in thinking mode and collapses below
-	// the bar without it; the dense worker is the same model either way.
-	moe := mkBackend("moe", 84, 100, 2, 0)
-	moe.QualityNoThink = 40
-	dense := mkBackend("dense", 70, 100, 2, 0)
-	dense.QualityNoThink = 70
-
-	// Target 80: in thinking mode only the MoE clears it; in no-think mode
-	// neither does, and the below-bar order is closest-quality-first — which is
-	// the dense worker once the MoE is read at its collapsed score.
-	got := rankByDifficulty([]*Backend{dense, moe}, 80, jobCost{}, false)
-	if got[0].ID != "moe" {
-		t.Fatalf("thinking-mode request: only the MoE clears q>=80, got %s first", got[0].ID)
-	}
-	got = rankByDifficulty([]*Backend{moe, dense}, 80, jobCost{}, true)
-	if got[0].ID != "dense" {
-		t.Fatalf("no-think request must rank the collapsed MoE below the dense worker, got %s first", got[0].ID)
-	}
-}
-
-func TestAutoTargetQualityClampsPerMode(t *testing.T) {
-	moe := mkBackend("moe", 84, 100, 2, 0)
-	moe.QualityNoThink = 40
-	fleet := []*Backend{moe}
-	if q := autoTargetQuality(fleet, 0.9, false); q != 84 {
-		t.Fatalf("thinking clamp: got %d, want 84", q)
-	}
-	// A no-think request cannot be barred above the best no-think ability —
-	// otherwise a hard bar set by the thinking-mode fleet strands it above
-	// every worker's real ability in the mode it will be served in.
-	if q := autoTargetQuality(fleet, 0.9, true); q != 40 {
-		t.Fatalf("no-think clamp: got %d, want 40", q)
-	}
-}
-
-func TestQualityFloorPreferenceReadsModeQuality(t *testing.T) {
-	moe := mkBackend("moe", 84, 100, 2, 0)
-	moe.QualityNoThink = 40
-	dense := mkBackend("dense", 70, 100, 2, 0)
-	dense.QualityNoThink = 70
-	pref := qualityFloorPreference([]*Backend{moe, dense}, 60, true, 0)
-	if pref.keep == nil {
-		t.Fatal("expected a bounded preference (one worker above the no-think bar)")
-	}
-	if pref.keep(moe) {
-		t.Fatal("the collapsed MoE must not be in the above-bar set for a no-think request")
-	}
-	if !pref.keep(dense) {
-		t.Fatal("the dense worker clears the no-think bar and must be preferred")
-	}
-}
-
 func TestWorkerProfileNoThinkJSONCompat(t *testing.T) {
 	// A profile persisted before the field existed must load with zero (→
 	// qualityFor falls back), and a new profile must round-trip both scores.

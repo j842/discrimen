@@ -236,7 +236,6 @@ type arenaOutcome struct {
 	// DECISION against a served WORKER reports queueing as classifier
 	// instability.
 	WouldServe     string  `json:"would_serve"`
-	TargetQuality  int     `json:"target_quality"`
 	Difficulty     float64 `json:"difficulty_score"`
 	Reasoning      float64 `json:"reasoning_score"`
 	ThinkingOn     bool    `json:"thinking_on"`
@@ -269,7 +268,7 @@ type arenaWorkerResult struct {
 // one is a decision the router makes and could make differently.
 //
 // THERE IS NO TARGET QUALITY HERE ANY MORE, and its absence is the point. It
-// used to carry previewResponse.TargetQuality and the report printed "same
+// used to carry the tier ranker's quality target and the report printed "same
 // quality tier" from it — but the quality target is set only on the tier path in
 // planRoute, and the outcome matrix supersedes that path wherever it has
 // evidence, which on a deployed router with an embeddings worker is every
@@ -526,7 +525,6 @@ func arenaPreview(cfg arenaConfig, prompt string, out *arenaOutcome) {
 	}
 	out.Route = pv.Route
 	out.WouldServe = pv.WouldServe
-	out.TargetQuality = pv.TargetQuality
 	out.Classified = pv.Classified
 	out.ThinkingOn = pv.Thinking.Enabled
 	if pv.Difficulty != nil {

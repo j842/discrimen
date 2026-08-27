@@ -193,7 +193,13 @@ func escalationRouter(t *testing.T, cheapBody, goodBody string, cheapHits, goodH
 		id      string
 		url     string
 		quality int
-	}{{"cheap", cheap.URL, 30}, {"good", good.URL, 90}} {
+		// Scores chosen so the EMPTY-answering worker ranks first. Escalation used
+		// to find "something better" by quality; it now walks the plan's own
+		// ordering, and with no matrix in this harness that ordering comes from
+		// backendScore, which reads measured quality. The names describe each
+		// worker's ROLE here — "cheap" answers first and badly, "good" repairs it
+		// — not their scores.
+	}{{"cheap", cheap.URL, 90}, {"good", good.URL, 30}} {
 		reg.upsert(BackendRegistration{
 			ID: w.id, URL: w.url, Model: "default", Quality: w.quality,
 			BaselineTPS: 100, MaxConcurrency: 2, TTLSeconds: 3600, Features: []string{"chat"},
@@ -202,8 +208,7 @@ func escalationRouter(t *testing.T, cheapBody, goodBody string, cheapHits, goodH
 	}
 
 	cfg := &Config{
-		DefaultMaxTokens: 4096, AutoDifficulty: true, EscalateInline: true,
-		DifficultyBands: defaultDifficultyBands, DifficultyTemp: 0.10,
+		DefaultMaxTokens: 4096, AutoDifficulty: true, EscalateInline: true, DifficultyTemp: 0.10,
 		DifficultyTimeout: time.Second, DifficultyCacheSize: 16, DifficultyMaxChars: 4000,
 	}
 	dir := t.TempDir()

@@ -654,7 +654,7 @@ func TestQualityFloorCascadesRatherThanFallingOffTheEnd(t *testing.T) {
 	}
 
 	candidates := []*Backend{local9, relayed8, weak2}
-	pref := qualityFloorPreference(candidates, 7, false)
+	pref := qualityFloorPreference(candidates, 7, false, 0)
 	if pref.why != "local-free" {
 		t.Fatalf("top rung = %q, want local-free", pref.why)
 	}
@@ -705,7 +705,7 @@ func TestQualityFloorPreferenceTiers(t *testing.T) {
 		{"local costs money, relayed does not", []*Backend{paid9, relayed9}, 7, "free-first"},
 	}
 	for _, c := range cases {
-		pref := qualityFloorPreference(c.candidates, c.target, false)
+		pref := qualityFloorPreference(c.candidates, c.target, false, 0)
 		if pref.why != c.why {
 			t.Errorf("%s: preference = %q, want %q", c.name, pref.why, c.why)
 		}

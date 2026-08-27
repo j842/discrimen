@@ -318,7 +318,7 @@ func (r *Router) renderPreview(chatReq *ChatRequest, plan *routePlan, budget tim
 	// briefly for a preferred worker first. Say which preference is in play so the
 	// preview isn't read as a promise. Read from qualityFloorPreference rather
 	// than re-derived, for the same reason the whole preview shares planRoute.
-	pref := qualityFloorPreference(plan.candidates, plan.target, plan.tr.noThink)
+	pref := qualityFloorPreference(plan.candidates, plan.target, plan.tr.noThink, plan.able)
 	switch {
 	case plan.session.locked():
 		resp.Notes = append(resp.Notes, fmt.Sprintf(

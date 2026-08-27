@@ -928,9 +928,19 @@ var outcomeExploreTick atomic.Uint64
 // Returns the ordered candidates and a short reason for the route header, so a
 // decision can be read back afterwards — including, importantly, whether the
 // matrix actually knew anything, fell back, or was exploring.
-func (m *outcomeMatrix) chooseByOutcome(cands []*Backend, vec []float64, thinking bool, job jobCost) ([]*Backend, string) {
+// The third return value is how many LEADING candidates the matrix considers
+// interchangeable on correctness — the `able` band. It exists because the
+// ordering this function returns is a complete policy decision, and the
+// acquisition step downstream used to re-sort the whole list by cost and
+// locality, which silently promoted workers the matrix had predicted WRONG above
+// ones it had predicted right. Acquisition may reorder within the prefix (where
+// the matrix is genuinely indifferent) and must not reorder across it.
+//
+// Zero means "no band is authoritative" — the fallback, where nothing has been
+// measured and there is no correctness judgement to protect.
+func (m *outcomeMatrix) chooseByOutcome(cands []*Backend, vec []float64, thinking bool, job jobCost) ([]*Backend, string, int) {
 	if len(cands) == 0 {
-		return nil, "no candidates"
+		return nil, "no candidates", 0
 	}
 	// ONE neighbour scan for the whole request, then a cheap intersect per
 	// candidate — the neighbours are a property of the prompt, not of the worker.
@@ -1012,7 +1022,10 @@ func (m *outcomeMatrix) chooseByOutcome(cands []*Backend, vec []float64, thinkin
 				}
 			}
 			ordered = append([]outcomeChoice{promoted}, rest...)
-			return backendsOf(ordered), fmt.Sprintf("outcome:explore,1in%d", outcomeExploreEvery)
+			// An exploration deliberately puts an UNMEASURED worker first, so no
+			// prefix is authoritative: letting acquisition prefer a cheap local
+			// worker here would quietly undo the exploration it was told to make.
+			return backendsOf(ordered), fmt.Sprintf("outcome:explore,1in%d", outcomeExploreEvery), 0
 		}
 		switch {
 		case len(able) > 0:
@@ -1022,12 +1035,12 @@ func (m *outcomeMatrix) chooseByOutcome(cands []*Backend, vec []float64, thinkin
 			// neighbour or a dozen weak ones, and it is the second number that
 			// decides whether the first one survives band admission.
 			return backendsOf(ordered), fmt.Sprintf("outcome:p=%.2f,n=%d,sup=%.1f",
-				able[0].Pred.Correct, able[0].Pred.Observations, able[0].Pred.Support)
+				able[0].Pred.Correct, able[0].Pred.Observations, able[0].Pred.Support), len(able)
 		case len(unmeasured) > 0:
-			return backendsOf(ordered), "outcome:none-above-floor,unmeasured-first"
+			return backendsOf(ordered), "outcome:none-above-floor,unmeasured-first", 0
 		default:
 			return backendsOf(ordered), fmt.Sprintf("outcome:best-effort,p=%.2f,sup=%.1f",
-				unable[0].Pred.Correct, unable[0].Pred.Support)
+				unable[0].Pred.Correct, unable[0].Pred.Support), 0
 		}
 	}
 
@@ -1068,9 +1081,10 @@ func (m *outcomeMatrix) chooseByOutcome(cands []*Backend, vec []float64, thinkin
 	sort.SliceStable(rest, func(i, j int) bool { return rates[rest[i].Backend.ID] > rates[rest[j].Backend.ID] })
 	ordered := append(eligible, rest...)
 	if len(ordered) == 0 {
-		return nil, "no candidates"
+		return nil, "no candidates", 0
 	}
-	return backendsOf(ordered), fmt.Sprintf("outcome:unknown,fallback-speed,q=%.2f", rates[ordered[0].Backend.ID])
+	// The fallback has measured nothing about this prompt, so it protects nothing.
+	return backendsOf(ordered), fmt.Sprintf("outcome:unknown,fallback-speed,q=%.2f", rates[ordered[0].Backend.ID]), 0
 }
 
 // outcomeSeconds predicts wall clock for one worker on this job.

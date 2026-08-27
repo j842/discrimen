@@ -2607,8 +2607,39 @@ func qualityFor(b *Backend, thinkOff bool) int {
 // unclassified request, or the fallback ranker) makes the tier test vacuous and
 // leaves free-first on its own, which is what "prefer the free ones" means when
 // there is no bar to clear.
-func qualityFloorPreference(candidates []*Backend, target int, thinkOff bool) acquirePreference {
-	aboveBar := func(b *Backend) bool { return target <= 0 || qualityFor(b, thinkOff) >= target }
+// able bounds the cost/locality ladder to the leading candidates the outcome
+// matrix judged interchangeable on correctness. Zero means unbounded, which is
+// the tier path and the matrix's own fallback — neither has a correctness
+// judgement to protect.
+//
+// Bounding it is the whole point. The matrix plan carries target == 0, so
+// `aboveBar` was vacuously true for EVERY candidate and the ladder collapsed to
+// "cheapest local worker first" applied across the entire ranked list —
+// including the band the matrix had predicted WRONG. A fleet of one local CPU
+// worker and one strong paid endpoint served every hard prompt on the CPU
+// worker, for as long as it had a free slot, however confident the matrix was
+// that it would get the answer wrong. That is exactly the scoping the tier
+// ranker called deliberate ("below the bar the router has already missed the
+// quality it wanted, and buying a worse answer to save money there is not a
+// trade anyone asked for"), dropped in the migration.
+//
+// Inside the band the ladder is still right, and for a reason unrelated to cost:
+// a local queue depth is exact and live while a relayed one is up to 15s stale
+// and blind to the upstream's own clients, so ranking on remote completion times
+// alone over-picks remote. That corrects a biased estimator. It just must not
+// reach across a correctness boundary to do it.
+func qualityFloorPreference(candidates []*Backend, target int, thinkOff bool, able int) acquirePreference {
+	inBand := func(b *Backend) bool { return true }
+	if able > 0 && able < len(candidates) {
+		ids := make(map[string]bool, able)
+		for _, b := range candidates[:able] {
+			ids[b.ID] = true
+		}
+		inBand = func(b *Backend) bool { return ids[b.ID] }
+	}
+	aboveBar := func(b *Backend) bool {
+		return inBand(b) && (target <= 0 || qualityFor(b, thinkOff) >= target)
+	}
 	free := func(b *Backend) bool { return aboveBar(b) && isFreeBackend(b) }
 	ladder := []struct {
 		why  string
@@ -2667,7 +2698,9 @@ func sessionLockPreference(incumbent string) acquirePreference {
 // pickAndAcquireWithFloor is pickAndAcquire under the quality-floor preference.
 // Retained as the named entry point for the floor policy (and its tests).
 func (r *Router) pickAndAcquireWithFloor(ctx context.Context, candidates []*Backend, target int, thinkOff bool) (*Backend, chan struct{}, bool, error) {
-	return r.pickAndAcquirePreferred(ctx, candidates, qualityFloorPreference(candidates, target, thinkOff))
+	// able=0: this is the tier-path entry point, which has a numeric bar rather
+	// than a matrix band to protect.
+	return r.pickAndAcquirePreferred(ctx, candidates, qualityFloorPreference(candidates, target, thinkOff, 0))
 }
 
 // pickAndAcquirePreferred is pickAndAcquire plus a bounded first-choice set.
@@ -2793,7 +2826,7 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 	// is open the session lock wins instead — handing a tool result to a model that
 	// never emitted the matching tool call breaks the loop outright, which is worse
 	// than serving that turn a tier low.
-	pref := qualityFloorPreference(candidates, target, tr.noThink)
+	pref := qualityFloorPreference(candidates, target, tr.noThink, plan.able)
 	if plan.session.locked() {
 		pref = sessionLockPreference(plan.session.incumbent)
 	}
@@ -3227,8 +3260,13 @@ type routePlan struct {
 	// outcome matrix started emitting "route:outcome:…" all three silently
 	// switched off, taking the judge (and therefore the matrix's own feedback
 	// loop) with them. A field cannot drift out of sync with a format string.
-	auto    bool
-	cl      *classification
+	auto bool
+	cl   *classification
+	// able is how many LEADING candidates the outcome matrix judged
+	// interchangeable on correctness. Acquisition may reorder inside that prefix
+	// and must not reorder across it — see qualityFloorPreference. Zero means no
+	// prefix is protected, which is the tier path and the matrix's own fallback.
+	able    int
 	target  int
 	job     jobCost
 	tr      thinkingResolution
@@ -3495,7 +3533,7 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 		// Self-healing: cheap when already filled (one atomic load), and the only
 		// thing that fills the bank after a warm restart.
 		r.ensureBankVectorsAsync()
-		if ordered, reason := r.outcomes.chooseByOutcome(filtered, cl.vec, !tr.noThink, job); len(ordered) > 0 {
+		if ordered, reason, able := r.outcomes.chooseByOutcome(filtered, cl.vec, !tr.noThink, job); len(ordered) > 0 {
 			return &routePlan{
 				candidates: ordered,
 				// A client-named model is never "auto" however it was ranked: the
@@ -3510,6 +3548,7 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 				group:    gr,
 				expert:   expert,
 				rejected: rejected,
+				able:     able,
 			}, nil
 		}
 	}

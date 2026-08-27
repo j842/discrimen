@@ -214,7 +214,7 @@ func TestChooseFastestAmongCorrect(t *testing.T) {
 		obs("q2", "fast-bad", true, false, 100, obsSourceBench),
 	})
 	cands := []*Backend{testBackend("slow-good", 10), testBackend("fast-good", 100), testBackend("fast-bad", 500)}
-	got, reason := m.chooseByOutcome(cands, vec(1, 0.05), true, jobCost{outputTokens: 200, mode: thinkingOn})
+	got, reason, _ := m.chooseByOutcome(cands, vec(1, 0.05), true, jobCost{outputTokens: 200, mode: thinkingOn})
 	if len(got) == 0 {
 		t.Fatal("no candidates returned")
 	}
@@ -246,7 +246,7 @@ func TestFallbackWhenNothingSimilarIsKnown(t *testing.T) {
 	})
 	// A prompt orthogonal to everything profiled.
 	cands := []*Backend{testBackend("strong", 10), testBackend("weak", 500)}
-	got, reason := m.chooseByOutcome(cands, vec(0, 0, 1), true, jobCost{outputTokens: 200, mode: thinkingOn})
+	got, reason, _ := m.chooseByOutcome(cands, vec(0, 0, 1), true, jobCost{outputTokens: 200, mode: thinkingOn})
 	if len(got) == 0 {
 		t.Fatal("fallback returned nothing — an unfamiliar prompt must still route")
 	}
@@ -285,7 +285,7 @@ func TestFallbackPrefersSpeedAmongComparableWorkers(t *testing.T) {
 	// An orthogonal prompt, so the matrix has no usable neighbours and the
 	// fallback decides.
 	cands := []*Backend{testBackend("slow", 10), testBackend("quick", 400)}
-	got, reason := m.chooseByOutcome(cands, vec(0, 0, 1), true, jobCost{outputTokens: 200, mode: thinkingOn})
+	got, reason, _ := m.chooseByOutcome(cands, vec(0, 0, 1), true, jobCost{outputTokens: 200, mode: thinkingOn})
 	if !strings.Contains(reason, "fallback") {
 		t.Fatalf("expected the fallback path, got reason %q", reason)
 	}
@@ -309,7 +309,7 @@ func TestNoCandidateClearsTheFloor(t *testing.T) {
 		obs("q2", "b", true, false, 100, obsSourceBench), // 0.0
 	})
 	cands := []*Backend{testBackend("a", 50), testBackend("b", 500)}
-	got, reason := m.chooseByOutcome(cands, vec(1, 0.05), true, jobCost{outputTokens: 200, mode: thinkingOn})
+	got, reason, _ := m.chooseByOutcome(cands, vec(1, 0.05), true, jobCost{outputTokens: 200, mode: thinkingOn})
 	if len(got) == 0 {
 		t.Fatal("returned nothing; a hard prompt must still route somewhere")
 	}
@@ -432,7 +432,7 @@ func TestChooseNeverNarrowsTheCandidateList(t *testing.T) {
 		obs("q2", "measured", true, true, 100, obsSourceBench),
 	})
 	cands := []*Backend{testBackend("measured", 100), testBackend("fresh-a", 50), testBackend("fresh-b", 50)}
-	got, _ := m.chooseByOutcome(cands, vec(1, 0.05), true, jobCost{outputTokens: 200, mode: thinkingOn})
+	got, _, _ := m.chooseByOutcome(cands, vec(1, 0.05), true, jobCost{outputTokens: 200, mode: thinkingOn})
 	if len(got) != 3 {
 		t.Fatalf("3 candidates in, %d out — unmeasured workers were evicted rather than ranked", len(got))
 	}
@@ -441,7 +441,7 @@ func TestChooseNeverNarrowsTheCandidateList(t *testing.T) {
 	}
 	// Same for the fallback path, where nothing is measured at all.
 	empty := newTestMatrix(t)
-	all, _ := empty.chooseByOutcome(cands, vec(1, 0), true, jobCost{outputTokens: 200, mode: thinkingOn})
+	all, _, _ := empty.chooseByOutcome(cands, vec(1, 0), true, jobCost{outputTokens: 200, mode: thinkingOn})
 	if len(all) != 3 {
 		t.Errorf("fallback returned %d of 3 candidates", len(all))
 	}
@@ -766,7 +766,7 @@ func TestAbleBandWeighsCorrectnessNotJustSpeed(t *testing.T) {
 	// A 3% speed edge to the marginal worker, which under a pure speed sort was
 	// all it took.
 	cands := []*Backend{testBackend("accurate", 100), testBackend("marginal", 103)}
-	got, reason := m.chooseByOutcome(cands, vec(1, 0.01), true, jobCost{outputTokens: 200, mode: thinkingOn})
+	got, reason, _ := m.chooseByOutcome(cands, vec(1, 0.01), true, jobCost{outputTokens: 200, mode: thinkingOn})
 	if len(got) == 0 {
 		t.Fatal("no candidates returned")
 	}
@@ -788,7 +788,7 @@ func TestAbleBandWeighsCorrectnessNotJustSpeed(t *testing.T) {
 	if err := m2.record(ctx, tied); err != nil {
 		t.Fatalf("record: %v", err)
 	}
-	got2, reason2 := m2.chooseByOutcome([]*Backend{testBackend("slower", 10), testBackend("quicker", 400)},
+	got2, reason2, _ := m2.chooseByOutcome([]*Backend{testBackend("slower", 10), testBackend("quicker", 400)},
 		vec(1, 0.01), true, jobCost{outputTokens: 200, mode: thinkingOn})
 	if got2[0].ID != "quicker" {
 		t.Errorf("picked %q; within %.0f%% on predicted correctness the FASTER worker must win (reason %q)",
@@ -980,7 +980,7 @@ func TestRouteReasonReportsSupport(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("record: %v", err)
 	}
-	_, reason := m.chooseByOutcome([]*Backend{testBackend("w", 100)}, vec(1, 0.01), true,
+	_, reason, _ := m.chooseByOutcome([]*Backend{testBackend("w", 100)}, vec(1, 0.01), true,
 		jobCost{outputTokens: 200, mode: thinkingOn})
 	if !strings.Contains(reason, "sup=") {
 		t.Errorf("route reason %q does not report the support behind the prediction", reason)
@@ -1011,7 +1011,7 @@ func TestFallbackScansTheMatrixOnce(t *testing.T) {
 	}
 	// A prompt orthogonal to everything profiled, so the fallback decides.
 	m.fullScans.Store(0)
-	got, reason := m.chooseByOutcome(cands, vec(0, 0, 1), true, jobCost{outputTokens: 200, mode: thinkingOn})
+	got, reason, _ := m.chooseByOutcome(cands, vec(0, 0, 1), true, jobCost{outputTokens: 200, mode: thinkingOn})
 	if !strings.Contains(reason, "fallback") {
 		t.Fatalf("expected the fallback path, got reason %q", reason)
 	}
@@ -1050,7 +1050,7 @@ func TestExplorationOccasionallyTriesAnUnmeasuredWorker(t *testing.T) {
 	explored := 0
 	reasons := map[string]int{}
 	for i := 0; i < rounds; i++ {
-		got, reason := m.chooseByOutcome(cands, vec(1, 0.01), true, jobCost{outputTokens: 200, mode: thinkingOn})
+		got, reason, _ := m.chooseByOutcome(cands, vec(1, 0.01), true, jobCost{outputTokens: 200, mode: thinkingOn})
 		if len(got) != 2 {
 			t.Fatalf("round %d returned %d candidates", i, len(got))
 		}
@@ -1091,7 +1091,7 @@ func TestExplorationDoesNothingWithoutAnUnmeasuredCandidate(t *testing.T) {
 	}
 	cands := []*Backend{testBackend("a", 10), testBackend("b", 500)}
 	for i := 0; i < outcomeExploreEvery*2; i++ {
-		got, reason := m.chooseByOutcome(cands, vec(1, 0.01), true, jobCost{outputTokens: 200, mode: thinkingOn})
+		got, reason, _ := m.chooseByOutcome(cands, vec(1, 0.01), true, jobCost{outputTokens: 200, mode: thinkingOn})
 		if strings.Contains(reason, "explore") {
 			t.Fatalf("round %d explored with every candidate already measured (%q)", i, reason)
 		}

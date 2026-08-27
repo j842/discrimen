@@ -101,7 +101,7 @@ func TestQualityFloorPreferenceReadsModeQuality(t *testing.T) {
 	moe.QualityNoThink = 40
 	dense := mkBackend("dense", 70, 100, 2, 0)
 	dense.QualityNoThink = 70
-	pref := qualityFloorPreference([]*Backend{moe, dense}, 60, true)
+	pref := qualityFloorPreference([]*Backend{moe, dense}, 60, true, 0)
 	if pref.keep == nil {
 		t.Fatal("expected a bounded preference (one worker above the no-think bar)")
 	}

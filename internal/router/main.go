@@ -2987,7 +2987,7 @@ func (r *Router) dispatchStreaming(w http.ResponseWriter, req *http.Request, d *
 	// written yet. A worker that answers the dial with a 503 has told us it
 	// cannot serve this request, which is a routing failure exactly as it is on
 	// the buffered path, and the client is none the wiser if we ask someone else.
-	if other, newResp, moved := r.streamFailover(req, d, resp, err); moved {
+	if other, newResp, moved := r.streamFailover(ctx, req, d, resp, err); moved {
 		if resp != nil {
 			resp.Body.Close()
 		}
@@ -3005,7 +3005,6 @@ func (r *Router) dispatchStreaming(w http.ResponseWriter, req *http.Request, d *
 		if s := d.plan.session.outcome(backend.ID); s != "" {
 			w.Header().Set("X-LLM-Session", s)
 		}
-		defer resp.Body.Close()
 	}
 	if err != nil {
 		// A client hangup surfaces here as context-canceled (ctx inherits

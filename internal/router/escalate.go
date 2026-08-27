@@ -198,7 +198,7 @@ func (r *Router) escalate(req *http.Request, d *dispatch, orig bufferedResult) (
 	// BETTER, so a result that is merely non-empty does not commit.
 	return r.redispatch(req, d, orig, better, func(res bufferedResult) bool {
 		return res.ok() && classifyResponse(res.body, false) != responseEmpty
-	})
+	}, nil)
 }
 
 // affordable narrows candidates to those that can still finish inside whatever
@@ -231,7 +231,7 @@ func (r *Router) affordable(d *dispatch, cands []*Backend, from *Backend) ([]*Ba
 // On success the caller's slot and active-request accounting have ALREADY been
 // moved to the returned worker.
 func (r *Router) redispatch(req *http.Request, d *dispatch, orig bufferedResult,
-	candidates []*Backend, accept func(bufferedResult) bool) (*Backend, bufferedResult, bool) {
+	candidates []*Backend, accept func(bufferedResult) bool, tried map[string]bool) (*Backend, bufferedResult, bool) {
 	from := *d.backend
 	// Take the new worker's slot BEFORE giving up the current one, so a saturated
 	// fleet cannot leave this request holding nothing. Bounded: past the grace,
@@ -241,7 +241,13 @@ func (r *Router) redispatch(req *http.Request, d *dispatch, orig bufferedResult,
 	target, slot, _, err := r.pickAndAcquirePreferred(ctx, candidates, acquirePreference{})
 	if err != nil {
 		log.Printf("redispatch: no slot on an alternative within %s — keeping %s", escalateSlotWait, from.ID)
+		// Nothing was contacted, so nothing has been ruled out. Retiring the whole
+		// slate here is what stranded healthy workers behind a saturated one.
 		return nil, orig, false
+	}
+	// Exactly one candidate has now had its chance.
+	if tried != nil {
+		tried[target.ID] = true
 	}
 
 	// Re-patch from the CLIENT's body, not the already-patched one: the previous
@@ -741,18 +747,27 @@ func (r *Router) failover(req *http.Request, d *dispatch, res bufferedResult, tr
 		from := (*d.backend).ID
 		// Accept anything that ANSWERS. An empty reply is escalate()'s business
 		// and is handled after this returns; here the bar is simply "responded".
-		// Marked BEFORE the attempt, not after: redispatch picks one of these
-		// internally, and a candidate that has been offered has had its chance
-		// whether or not a slot was free for it.
-		for _, b := range cands {
-			tried[b.ID] = true
-		}
+		// Mark only the worker redispatch ACTUALLY tried. Marking the whole slate
+		// stranded healthy workers: redispatch attempts exactly one of the
+		// candidates it is handed, so marking all of them retired the rest
+		// unexamined. Measured with three workers (two down, one healthy): the
+		// healthy one was never contacted and the client got a 503 while it sat
+		// idle. It also made maxFailoverHops dead — the second hop always found
+		// nothing left — and then dropped through to the 17-second ladder on the
+		// original broken worker, the exact pathology failover exists to avoid.
 		target, next, ok := r.redispatch(req, d, current, cands, func(rr bufferedResult) bool {
 			return rr.ok()
-		})
+		}, tried)
 		if !ok {
 			continue
 		}
+		// The worker that failed must still be judged for it. Only the worker that
+		// ANSWERS reaches writeBuffered, so before failover existed a 5xx was
+		// recorded there — and afterwards it was recorded nowhere. Measured: 20
+		// consecutive 503s, all failed over, left proxyFailures=0, Healthy=true
+		// and an empty LastError, so the breaker could never trip while one other
+		// candidate was up and /backends showed a wedged worker as healthy.
+		r.noteFailedAttempt(from, current)
 		log.Printf("failover: %s returned %s for %s → re-served by %s (hop %d)",
 			from, describeFailure(current), d.plan.route, target.ID, hop+1)
 		return target, next, true
@@ -831,7 +846,13 @@ const upstreamSnippetMax = 200
 //
 // Returns moved=false and leaves the caller's response untouched in every case
 // where it does not apply, so the ordinary path is unchanged.
-func (r *Router) streamFailover(req *http.Request, d *dispatch, resp *http.Response, dialErr error) (*Backend, *http.Response, bool) {
+// ctx is the caller's IDLE-WATCHDOG context, not req.Context(). The re-dial must
+// use it or the replacement stream is unwatched: the watchdog cancels ctx, and a
+// body dialled on req.Context() is not attached to it, so a silently hung
+// replacement pins its slot until the CLIENT disconnects — which is precisely
+// the failure the watchdog exists to prevent. Measured at a 200ms idle timeout:
+// the control returned in 200ms, the failed-over stream was still blocked at 3s.
+func (r *Router) streamFailover(ctx context.Context, req *http.Request, d *dispatch, resp *http.Response, dialErr error) (*Backend, *http.Response, bool) {
 	if !d.plan.auto || d.plan.session.locked() {
 		return nil, nil, false
 	}
@@ -855,26 +876,32 @@ func (r *Router) streamFailover(req *http.Request, d *dispatch, resp *http.Respo
 		if !ok {
 			return nil, nil, false
 		}
-		for _, b := range fits {
-			tried[b.ID] = true
-		}
 		from := *d.backend
-		ctx, cancel := context.WithTimeout(req.Context(), escalateSlotWait)
-		target, slot, _, err := r.pickAndAcquirePreferred(ctx, fits, acquirePreference{})
+		slotCtx, cancel := context.WithTimeout(ctx, escalateSlotWait)
+		target, slot, _, err := r.pickAndAcquirePreferred(slotCtx, fits, acquirePreference{})
 		cancel()
 		if err != nil {
 			continue
 		}
+		// Only the worker actually contacted is retired, for the same reason as
+		// the buffered path: marking the whole slate strands healthy workers.
+		tried[target.ID] = true
 		body := patchForwardedBody(d.raw, d.inject, budgetCeiling(target, d.job), d.tr.forBackend(target), target.ServedID)
 		body = r.stripLearned(body, d.raw, target.ID)
 
-		newResp, dialErr2 := r.dialStream(req, target, body)
+		newResp, dialErr2 := r.dialStream(ctx, req, target, body)
 		if dialErr2 != nil || newResp.StatusCode >= 500 || newResp.StatusCode == http.StatusTooManyRequests {
 			if newResp != nil {
 				newResp.Body.Close()
 			}
 			r.registry.releaseSlot(slot)
 			continue
+		}
+		// The failed worker is still judged for its failure — see noteFailedAttempt.
+		if dialErr != nil {
+			r.noteFailedAttempt(from.ID, bufferedResult{netErr: dialErr})
+		} else if resp != nil {
+			r.noteFailedAttempt(from.ID, bufferedResult{statusCode: resp.StatusCode})
 		}
 		// Commit, in the same order redispatch uses: the new slot is already held,
 		// so releasing the old one cannot leave this request holding nothing.
@@ -893,8 +920,10 @@ func (r *Router) streamFailover(req *http.Request, d *dispatch, resp *http.Respo
 
 // dialStream opens one upstream streaming request without pumping it, so the
 // status can be inspected before anything is committed to the client.
-func (r *Router) dialStream(req *http.Request, backend *Backend, body []byte) (*http.Response, error) {
-	proxyReq, err := http.NewRequestWithContext(req.Context(), http.MethodPost, upstreamChatURL(backend), bytes.NewReader(body))
+func (r *Router) dialStream(ctx context.Context, req *http.Request, backend *Backend, body []byte) (*http.Response, error) {
+	// ctx, never req.Context(): the reply this opens is pumped under the idle
+	// watchdog, and a body bound to the wrong context is not cancellable by it.
+	proxyReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamChatURL(backend), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -902,4 +931,24 @@ func (r *Router) dialStream(req *http.Request, backend *Backend, body []byte) (*
 	setBackendCredential(proxyReq, backend)
 	r.stampRelayChain(proxyReq, req, backend)
 	return r.streamClient.Do(proxyReq)
+}
+
+// noteFailedAttempt records a failure against the worker that produced it, for
+// the circuit breaker and for LastError.
+//
+// Failover moved the request, so this worker never reaches writeBuffered and its
+// failure would otherwise leave no trace at all — the breaker cannot trip and
+// the dashboard shows it healthy with a blank error. A client hangup is excluded
+// for the same reason it is on every other path: it says nothing about the
+// worker.
+func (r *Router) noteFailedAttempt(backendID string, res bufferedResult) {
+	if res.netErr != nil {
+		r.registry.setError(backendID, res.netErr.Error())
+		r.registry.noteProxyResult(backendID, false)
+		return
+	}
+	if res.statusCode >= 500 {
+		r.registry.setError(backendID, upstreamErrorSnippet(res.statusCode, res.body))
+	}
+	r.registry.noteProxyResult(backendID, res.statusCode < 500)
 }

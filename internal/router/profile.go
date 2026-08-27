@@ -453,8 +453,16 @@ func (r *Router) profileBackend(b *Backend, model string) (*WorkerProfile, error
 		// mixed score — see qualityFor); not worth aborting a profile the
 		// main benchmark already earned.
 	} else {
+		// A worker with no thinking mode answers everything thinking-off, so its
+		// two scores are the same number. Its RESULTS are likewise no-think
+		// results, and they have to be recorded as such: without this,
+		// BenchResultsNoThink stayed empty and every observation was filed under
+		// Thinking=true — the evidence of a worker that cannot think, filed as
+		// evidence about thinking. Routing then queried the no-think bucket, found
+		// nothing, and reported the worker unmeasured in the only mode it has.
 		p.QualityNoThink = quality
 		p.QualityNoThinkDetail = qBreakdown
+		p.BenchResultsNoThink = qResults
 	}
 	// Feed the outcome matrix. This is what routing will query — per question,
 	// not per worker — so it is recorded from the SAME results the score above
@@ -466,7 +474,11 @@ func (r *Router) profileBackend(b *Backend, model string) (*WorkerProfile, error
 	// hours. The rows are re-created by the next profile.
 	if r.outcomes != nil {
 		at := time.Now().UTC()
-		rows := observationsFrom(b.ID, p.BenchResults, true, at)
+		// The MIXED pass asks easy tiers thinking-off and hard tiers thinking-on
+		// (benchOne gates on benchHardTier), so publishing all of it as
+		// Thinking=true files a dozen no-think answers as thinking evidence. Each
+		// result is recorded in the mode it was actually asked in.
+		rows := observationsFromMixed(b.ID, p.BenchResults, at)
 		rows = append(rows, observationsFrom(b.ID, p.BenchResultsNoThink, false, at)...)
 		if err := r.outcomes.record(context.Background(), rows); err != nil {
 			log.Printf("outcome matrix: recording %s failed: %v", b.ID, err)

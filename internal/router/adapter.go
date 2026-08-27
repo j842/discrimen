@@ -188,11 +188,19 @@ func classifyResponse(body []byte, streamed bool) inadequacy {
 			} `json:"message"`
 		} `json:"choices"`
 	}
-	if json.Unmarshal(body, &r) == nil && len(r.Choices) > 0 {
-		msg := r.Choices[0].Message
-		if len(msg.ToolCalls) == 0 && strings.TrimSpace(msg.Content+msg.ReasoningContent+msg.Reasoning) == "" {
-			return responseEmpty
-		}
+	// A body that does not parse into a usable completion is EMPTY, not OK. The
+	// guard used to be `Unmarshal == nil && len(Choices) > 0`, so everything that
+	// failed either test fell through to responseOK — measured: zero bytes,
+	// truncated JSON, an HTML error page, `{"choices":[]}` and `{"error":{…}}`
+	// all classified as a good answer. Escalation therefore never fired on them,
+	// and writeBuffered scored them a SUCCESS, resetting the consecutive-failure
+	// run so the breaker could never trip on this shape.
+	if err := json.Unmarshal(body, &r); err != nil || len(r.Choices) == 0 {
+		return responseEmpty
+	}
+	msg := r.Choices[0].Message
+	if len(msg.ToolCalls) == 0 && strings.TrimSpace(msg.Content+msg.ReasoningContent+msg.Reasoning) == "" {
+		return responseEmpty
 	}
 	if truncated {
 		return responseTruncated

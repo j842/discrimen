@@ -3,6 +3,7 @@ package router
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // Adversarial grading suite.
@@ -372,4 +373,98 @@ func TestAnswerCeilingFitsTheContextWindow(t *testing.T) {
 	if _, tiny := benchRequestFor(long, true, 2048); tiny < benchMinAnswerTokens {
 		t.Errorf("ceiling %d for an oversized prompt, want at least %d", tiny, benchMinAnswerTokens)
 	}
+}
+
+// The benchmark must write the thinking gate in the spelling each endpoint was
+// MEASURED to honour, exactly as production does. It used to hardcode
+// chat_template_kwargs — a vLLM/llama.cpp extension — so on every relay row and
+// every strict provider NEITHER pass switched anything: both ran in the
+// template's default mode, and Quality and QualityNoThink came back as the same
+// number measured twice in one mode. That is the two-score design failing at its
+// root.
+func TestBenchmarkUsesTheMeasuredThinkingDialect(t *testing.T) {
+	effort := &Backend{}
+	effort.ThinkingDialect = thinkingDialectEffort
+	on := map[string]any{}
+	applyBenchThinking(on, effort, true)
+	if _, ok := on["chat_template_kwargs"]; ok {
+		t.Error("a reasoning_effort endpoint was sent chat_template_kwargs")
+	}
+	if on["reasoning_effort"] == nil || on["reasoning_effort"] == "none" {
+		t.Errorf("thinking-on wrote reasoning_effort=%v", on["reasoning_effort"])
+	}
+	off := map[string]any{}
+	applyBenchThinking(off, effort, false)
+	if off["reasoning_effort"] != "none" {
+		t.Errorf("thinking-off wrote reasoning_effort=%v, want none", off["reasoning_effort"])
+	}
+
+	// The kwargs dialect, and an unprobed worker, both get the spelling the
+	// fleet has always spoken.
+	kwargs := &Backend{}
+	kwargs.ThinkingDialect = thinkingDialectKwargs
+	unprobed := &Backend{}
+	for _, b := range []*Backend{kwargs, unprobed} {
+		p := map[string]any{}
+		applyBenchThinking(p, b, true)
+		kw, ok := p["chat_template_kwargs"].(map[string]bool)
+		if !ok || !kw["enable_thinking"] {
+			t.Errorf("dialect %q did not get enable_thinking: %v", b.ThinkingDialect, p)
+		}
+		if _, has := p["reasoning_effort"]; has {
+			t.Errorf("dialect %q was sent reasoning_effort", b.ThinkingDialect)
+		}
+	}
+
+	// An endpoint measured to honour NEITHER gate is sent neither. Writing one
+	// buys a field a strict endpoint can reject, in exchange for nothing.
+	none := &Backend{}
+	none.ThinkingDialect = thinkingDialectNone
+	p := map[string]any{}
+	applyBenchThinking(p, none, true)
+	if len(p) != 0 {
+		t.Errorf("a no-gate endpoint was sent %v", p)
+	}
+}
+
+// A worker with no thinking mode must have its results recorded as NO-THINK
+// evidence. They used to be filed under Thinking=true — the evidence of a worker
+// that cannot think, filed as evidence about thinking — so routing queried the
+// no-think bucket, found nothing, and reported it unmeasured in the only mode it
+// has.
+func TestMixedPassRecordsEachResultInItsOwnMode(t *testing.T) {
+	results := []BenchResult{
+		{Tier: 1, Prompt: "easy", Expect: "a", Pass: true},             // asked thinking-OFF
+		{Tier: benchHardTier, Prompt: "hard", Expect: "b", Pass: true}, // asked thinking-ON
+		{Tier: 12, Prompt: "harder", Expect: "c", Pass: false},         // asked thinking-ON
+		{Tier: 2, Prompt: "skipped", Expect: "d", Skipped: true},       // never asked
+	}
+	rows := observationsFromMixed("w", results, time.Unix(0, 0))
+	if len(rows) != 3 {
+		t.Fatalf("got %d observations, want 3 (the skipped one contributes nothing)", len(rows))
+	}
+	byPrompt := map[string]bool{}
+	for i, r := range results {
+		if r.Skipped {
+			continue
+		}
+		_ = i
+		byPrompt[r.Prompt] = r.Tier >= benchHardTier
+	}
+	for _, o := range rows {
+		want := byPrompt[promptOfQID(results, o.QID)]
+		if o.Thinking != want {
+			t.Errorf("observation recorded Thinking=%v, want %v — the mixed pass asks easy "+
+				"tiers thinking-off and hard tiers thinking-on", o.Thinking, want)
+		}
+	}
+}
+
+func promptOfQID(results []BenchResult, qid string) string {
+	for _, r := range results {
+		if benchQuestionQID(r.Prompt, r.Expect) == qid {
+			return r.Prompt
+		}
+	}
+	return ""
 }

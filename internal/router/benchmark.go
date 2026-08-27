@@ -120,6 +120,16 @@ import (
 // measured formatting, not knowledge. Strict grading is unchanged — nobody's full
 // credit moved — loose only ADDS credit, and the tally keeps the formatting cost
 // visible per worker.
+// v41: three grading and profiling corrections, each of which changed scores.
+// An ERRORED question no longer counts in the denominator — it used to be a zero
+// over a one, arithmetically identical to a wrong answer, so an unreachable
+// sandbox scored a perfect worker at 75 with ok=true. The thinking gate is now
+// written in the dialect each endpoint was MEASURED to honour rather than a
+// hardcoded chat_template_kwargs, which on every relay row and strict provider
+// meant neither pass switched anything and both scores were the same mode
+// measured twice. And the mixed pass records each result in the mode it was
+// actually asked in, instead of publishing its thinking-off easy tiers as
+// thinking evidence.
 // v40: the token ceiling stops being a binding constraint. Routing cares whether
 // a worker answers correctly in reasonable TIME, and time is already bounded by
 // benchAnswerDeadline; a second ceiling in tokens measured nothing on top of it.
@@ -161,7 +171,7 @@ import (
 // FRAGMENTS continuing a partial solution shown in the prompt), which had scored the two
 // strongest workers 0% on that task while the weakest scored highest. See
 // benchAnswerDeadline and poolCode.Prefix.
-const benchmarkVersion = 40
+const benchmarkVersion = 41
 
 // benchmarkQ is one graded question in the cold-start quality benchmark. The
 // question set lives in benchmark_data.go.
@@ -428,13 +438,22 @@ func (r *Router) benchOne(b *Backend, q benchmarkQ, think bool, busy *benchBusyT
 	// rare near-tie in the logits, but the sampling noise — the dominant
 	// source — is gone.)
 	payload := map[string]any{
-		"model":                probeModel(b),
-		"stream":               false,
-		"max_tokens":           maxTokens,
-		"temperature":          0,
-		"chat_template_kwargs": map[string]bool{"enable_thinking": think},
-		"messages":             []map[string]string{{"role": "user", "content": prompt}},
+		"model":       probeModel(b),
+		"stream":      false,
+		"max_tokens":  maxTokens,
+		"temperature": 0,
+		"messages":    []map[string]string{{"role": "user", "content": prompt}},
 	}
+	// The thinking gate in the spelling this endpoint was MEASURED to honour, not
+	// a hardcoded one. Production does exactly this (patchForwardedBody), and the
+	// benchmark did not: it always wrote chat_template_kwargs, which is a vLLM
+	// and llama.cpp extension. Every relay row speaks reasoning_effort, as does
+	// any strict provider — so on those workers NEITHER pass switched anything,
+	// both ran in whatever mode the template defaults to, and Quality and
+	// QualityNoThink came back as the same number measured twice in one mode.
+	// That is the two-score design failing at its root, and it reproduces the
+	// exact regression the design exists to prevent.
+	applyBenchThinking(payload, b, think)
 	// Two failure modes are graded differently. A request that exceeds the
 	// per-question usability deadline (benchAnswerDeadline) is a SPEED fail —
 	// too slow to be usable is a quality fail for this question, not a transport
@@ -2074,3 +2093,31 @@ const (
 // no tokenizer; it only has to be good enough to keep the answer ceiling inside
 // the context window, and benchAnswerReserve absorbs the error.
 func benchPromptTokenEstimate(prompt string) int { return len(prompt)/4 + 1 }
+
+// applyBenchThinking writes the thinking gate into a benchmark payload using the
+// dialect measured for this worker.
+//
+// Deliberately mirrors patchForwardedBody's switch rather than sharing it: that
+// operates on a caller's raw JSON body and has to merge with whatever the client
+// already sent, while this builds a payload the router owns outright. Sharing
+// would mean marshalling a map to bytes and back on every graded question. What
+// must not drift is the DECISION — which spelling for which dialect — so the
+// cases are kept in the same order with the same reasoning.
+func applyBenchThinking(payload map[string]any, b *Backend, think bool) {
+	switch b.ThinkingDialect {
+	case thinkingDialectEffort:
+		if think {
+			payload["reasoning_effort"] = "medium"
+		} else {
+			payload["reasoning_effort"] = "none"
+		}
+	case thinkingDialectNone:
+		// Measured: neither gate does anything on this endpoint. Writing one buys
+		// a field a strict endpoint can reject, in exchange for nothing — and the
+		// two scores will legitimately agree, which is the truth about it.
+	default:
+		// Unknown — never probed, or a profile cached before the dialect was —
+		// so use the spelling the fleet has always spoken.
+		payload["chat_template_kwargs"] = map[string]bool{"enable_thinking": think}
+	}
+}

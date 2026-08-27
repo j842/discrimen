@@ -438,7 +438,16 @@ func (r *Router) writeBuffered(w http.ResponseWriter, req *http.Request, backend
 		writeJSON(w, http.StatusBadGateway, validationError{Message: res.netErr.Error()})
 		return
 	}
-	r.registry.noteProxyResult(backend.ID, res.statusCode < 500)
+	// Health is judged on the ANSWER, not just the status line. A worker
+	// returning a zero-byte or unparseable 200 was scored a success, which reset
+	// its consecutive-failure run — so a worker two strikes from ejection could
+	// launder itself clean by failing in this particular way, forever.
+	empty := classifyResponse(res.body, false) == responseEmpty
+	r.registry.noteProxyResult(backend.ID, res.statusCode < 500 && !empty)
+	if empty && res.statusCode < 500 {
+		r.registry.setError(backend.ID, fmt.Sprintf("HTTP %d with no usable answer (%d bytes)",
+			res.statusCode, len(res.body)))
+	}
 	// A 5xx that reaches the client has survived failover, so record WHY on the
 	// worker: /backends otherwise shows a failing worker with an empty LastError,
 	// which reads as healthy. The body's first line is usually the whole story

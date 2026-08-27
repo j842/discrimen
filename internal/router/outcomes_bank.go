@@ -266,3 +266,32 @@ func (r *Router) ensureBankVectorsAsync() {
 // hundred short texts against a local embedder, and a partial fill is worse than
 // a slow one — half a bank means half the neighbours.
 const bankVectorFillTimeout = 2 * time.Minute
+
+// observationsFromMixed converts the MIXED profiling pass, where the thinking
+// mode is a property of each question rather than of the pass.
+//
+// benchOne asks easy tiers thinking-off and hard tiers thinking-on (it gates on
+// benchHardTier), so recording the whole pass as Thinking=true files every
+// easy-tier answer as evidence about a mode it was never asked in. The mode is
+// therefore taken from the result, not from the caller — and it is read off the
+// BenchResult rather than by indexing back into benchmarkQuestions, because
+// observationsFrom drops skipped and errored entries and the two slices are not
+// aligned.
+func observationsFromMixed(backendID string, results []BenchResult, at time.Time) []Observation {
+	out := make([]Observation, 0, len(results))
+	for _, r := range results {
+		if r.Skipped || r.Errored {
+			continue
+		}
+		out = append(out, Observation{
+			QID:       benchQuestionQID(r.Prompt, r.Expect),
+			Backend:   backendID,
+			Thinking:  r.Tier >= benchHardTier,
+			Correct:   r.Pass,
+			LatencyMS: r.LatencyMS,
+			Source:    obsSourceBench,
+			At:        at,
+		})
+	}
+	return out
+}

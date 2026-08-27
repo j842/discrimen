@@ -819,6 +819,16 @@
     // spread evenly — it tends to land on one category.
     function benchScoreCell(score, absentNote) {
       if (!score) return td([el('span', {class: 'muted', title: absentNote || ''}, ['not stored'])]);
+      // Nothing measured is not a score of zero. `percent` is 100*passed/total,
+      // so a category whose every question errored or was skipped leaves an int
+      // zero value here — and rendering that as "0%" is the strengths map
+      // reporting an outage as total incompetence, which is the exact failure
+      // the denominator rule was changed to prevent.
+      if (!score.total) {
+        return td([el('span', {class: 'muted', title:
+          'No question in this category was successfully graded — every one was skipped by the ' +
+          'profile budget or errored. This is NOT a score of zero.'}, ['n/a'])]);
+      }
       const cell = td([el('span', {}, [score.percent + '%'])]);
       const detail = score.strict + ' / ' + score.total +
         (score.loose ? ' · ' + score.loose + ' loose' : '');
@@ -856,7 +866,7 @@
       (data.categories || []).forEach(row => {
         const tr = el('tr', {});
         const nameTd = td([el('span', {title: BENCH_CATEGORY_NOTE[row.category] || ''}, [row.category])]);
-        nameTd.appendChild(el('div', {class: 'muted'}, [row.think.total + ' questions']));
+        nameTd.appendChild(el('div', {class: 'muted'}, [benchCoverageNote(row.think)]));
         tr.appendChild(nameTd);
         tr.appendChild(benchScoreCell(row.think));
         tr.appendChild(benchScoreCell(stored ? row.nothink : null, absent));
@@ -868,6 +878,21 @@
       table.appendChild(body);
       return table;
     }
+    // How much of a category was actually MEASURED, not just how big it is.
+    //
+    // `total` counts the questions the score was computed over — skipped and
+    // errored ones are excluded from it, because a question a worker never
+    // answered is not evidence of weakness. That makes the bare count misleading
+    // on its own: "coding 50%" over 2 of 15 questions and over 15 of 15 rendered
+    // identically, and a category that errored outright rendered a confident 0%.
+    function benchCoverageNote(s) {
+      if (!s) return '';
+      const measured = s.total || 0;
+      const asked = measured + (s.skipped || 0) + (s.errored || 0);
+      if (asked === measured) return measured + ' questions';
+      return measured + ' of ' + asked + ' measured';
+    }
+
     // The difficulty axis, kept but folded away. 60% on maths reads very
     // differently when every miss is in the frontier tiers than when they start
     // at tier 4, and that is the question the tier line was always answering.

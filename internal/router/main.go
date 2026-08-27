@@ -4870,6 +4870,21 @@ func normalizeRegistration(reg *BackendRegistration) error {
 	if reg.MaxConcurrency < 0 {
 		reg.MaxConcurrency = 0
 	}
+	// An upper bound as well as a lower one. syncSlotsLocked fills the slot channel
+	// one token at a time while holding the registry's WRITE lock, and the element
+	// type is empty struct{} — so there is no memory pressure to stop a large cap,
+	// only time: ~12.6ns a token, i.e. 1.3s at 1e8 and 13s at 1e9. For that whole
+	// time every eligible(), snapshot(), get(), tryAcquireSlot() and health-loop
+	// write blocks, and the router stops routing entirely.
+	//
+	// The number does not have to be malicious to be wrong: a units mistake, a
+	// version-skewed relay reporting a fleet-wide total, or a corrupted provider row
+	// all land here, and anything holding the worker token can send one.
+	// maxDeclarableConcurrency is far above any real worker while keeping the fill
+	// imperceptible.
+	if reg.MaxConcurrency > maxDeclarableConcurrency {
+		return fmt.Errorf("max_concurrency %d exceeds the %d maximum", reg.MaxConcurrency, maxDeclarableConcurrency)
+	}
 	reg.Features = normalizeFeatures(reg.Features)
 	// Defaults a registration that predates P2 must land on: local, beacon, free.
 	normalizeProviderFields(reg)
@@ -5252,10 +5267,26 @@ func registrationsEqual(a, b BackendRegistration) bool {
 	return errA == nil && errB == nil && bytes.Equal(aj, bj)
 }
 
+// maxDeclarableConcurrency bounds any capacity the router will build a slot
+// channel for. Two orders of magnitude above the largest real worker, and small
+// enough that filling the channel under the write lock is imperceptible.
+const maxDeclarableConcurrency = 4096
+
 // syncSlotsLocked (re)creates the slot channel when the concurrency cap
 // changes. Callers hold r.mu. In-flight requests keep references to the old
 // channel and release into it harmlessly (see releaseSlot).
+//
+// The cap is clamped here as well as at registration because the relay and
+// provider paths reach this function without passing through
+// normalizeRegistration — a peer router's /relay/fleet row and an operator-edited
+// provider both arrive with a number this process did not choose. The fill loop
+// runs under the write lock, so an absurd cap is an availability bug, not just a
+// silly one.
 func (r *Registry) syncSlotsLocked(id string, cap int) {
+	if cap > maxDeclarableConcurrency {
+		log.Printf("registry: %s declared max_concurrency %d, clamping to %d", id, cap, maxDeclarableConcurrency)
+		cap = maxDeclarableConcurrency
+	}
 	if cap <= 0 || r.slotCap[id] == cap {
 		return
 	}

@@ -293,15 +293,58 @@ func medianInt64(xs []int64) int64 {
 	return s[len(s)/2]
 }
 
+// ladderRanOutOfRoom reports that the climb ended because the NEXT rung would
+// not have fit inside the advertised window — not because anything failed at
+// the top. The claim above the last proven rung was never tested, and therefore
+// never refuted.
+//
+// This is the ordinary outcome for a power-of-two window, and it used to halve
+// every one of them. The rungs double from 4096, and runContextProbe breaks when
+// `size+contextProbeReserve > advertised`; for a 256K claim the last rung that
+// fits is 128K, because 256K+1K exceeds 256K. UsableTokens therefore settles at
+// exactly half the window on every worker whose claim is a power of two — which
+// is every large one — and routing read that as a measured ceiling. A 256K
+// worker was hard-filtered out of anything over 128K on the strength of a rung
+// the ladder declined to attempt.
+//
+// The arithmetic distinguishes it from a real edge on its own, with no need to
+// record why the loop stopped (which also keeps every profile already cached in
+// worker_profiles readable): a rung that FAILED, or one that ERRORED, had to fit
+// to have run at all, so `last*2+reserve <= advertised` holds and this is false.
+// A ladder abandoned on its time budget is the same — the room check passes
+// before the budget check, so the rung it gave up on also fit. Only running out
+// of room leaves the last proven rung more than half the claim.
+func ladderRanOutOfRoom(p *ContextProbe) bool {
+	if p == nil || p.UsableTokens <= 0 {
+		return false
+	}
+	// Without a recorded claim there is no ladder to reason about — every
+	// comparison against zero would read as "ran out of room" and hand back the
+	// advertised window on the strength of nothing. A probe that predates the
+	// field, or one stored malformed, keeps the old conservative reading.
+	if p.AdvertisedTokens <= 0 {
+		return false
+	}
+	return p.UsableTokens*2+contextProbeReserve > p.AdvertisedTokens
+}
+
 // usableContextTokens is the window ROUTING should believe: the measured figure
-// when there is one, and the advertised one otherwise.
+// when the ladder actually measured a ceiling, and the advertised one otherwise.
 //
 // Never larger than advertised — a probe cannot license exceeding the server's
 // configured window — and never zero merely because no probe has run, since
 // that would hard-filter an unprobed worker out of everything.
+//
+// A ladder that merely ran out of room refuted nothing, so it does not lower the
+// window either. Believing it does not weaken the check this probe exists for: a
+// model that loses the needle at 64K of a 256K claim still fails a rung, and that
+// verdict is still what routing uses.
 func usableContextTokens(b *Backend) int {
 	advertised := b.ContextK * 1024
 	if b.ContextProbe == nil || b.ContextProbe.UsableTokens <= 0 {
+		return advertised
+	}
+	if ladderRanOutOfRoom(b.ContextProbe) {
 		return advertised
 	}
 	if b.ContextProbe.UsableTokens < advertised {
@@ -384,8 +427,11 @@ func contextProbeMessage(p *ContextProbe) string {
 			use, adv, errAt/1024)
 	case p.Truncated:
 		return fmt.Sprintf("at least %dK usable of %dK advertised (ladder hit its time budget)", use, adv)
-	case p.UsableTokens*2+contextProbeReserve > p.AdvertisedTokens:
-		return fmt.Sprintf("%dK usable, consistent with %dK advertised", use, adv)
+	case ladderRanOutOfRoom(p):
+		// The same predicate routing uses, deliberately: this message said
+		// "consistent with" while usableContextTokens was capping the worker at the
+		// number beside it. Reading the two together was the only way to see it.
+		return fmt.Sprintf("%dK proven of %dK advertised, ladder ran out of rungs — routing uses the claim", use, adv)
 	default:
 		return fmt.Sprintf("%dK usable of %dK ADVERTISED — routing uses the measured figure", use, adv)
 	}

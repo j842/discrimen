@@ -266,8 +266,11 @@ func groupEntries(groups []Group, servable []*Backend, fleetFeatures []string) [
 				} else {
 					features = intersectFeatures(features, b.Features)
 				}
-				if b.ContextK > 0 && (ctxK == 0 || b.ContextK < ctxK) {
-					ctxK = b.ContextK
+				// The enforced window, matching /v1/models — a group's row is read by
+				// the same harnesses and must not promise more than the hard filter
+				// will admit.
+				if usableK := usableContextTokens(b) / 1024; usableK > 0 && (ctxK == 0 || usableK < ctxK) {
+					ctxK = usableK
 				}
 			}
 		}

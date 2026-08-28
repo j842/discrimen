@@ -35,7 +35,11 @@ package router
 //     to them.
 //   - EMPTY ONLY, not truncated. A length-capped answer hit the CALLER's token
 //     ceiling; a bigger model runs into the same wall and bills twice for it.
-//     See classifyResponse.
+//     See classifyResponse. Truncation is not therefore unrepairable — it is
+//     repairable by a different move, on the SAME worker, and rescue.go makes it:
+//     a model that spent its whole budget inside the thinking block is asked for
+//     its conclusion with thinking off. What is wrong for a truncation is moving
+//     it, not fixing it.
 //   - ROUTER-CHOSEN ROUTES ONLY. A client that named a model, pinned a worker or
 //     hit /debug asked for that worker specifically. Silently answering from a
 //     different model would be a worse failure than the empty reply.
@@ -143,6 +147,16 @@ func (r *Router) dispatchBuffered(w http.ResponseWriter, req *http.Request, d *d
 	// denying the request a better home.
 	if !res.ok() && retryableFailure(res) && len(nextCandidates(d.plan, tried)) == 0 {
 		res = r.stripAndRetry(req, backend, d, r.requestBufferedWithDelays(req, backend, d.body, proxyRetryDelays, d.remainingBudget()))
+	}
+
+	// Before escalation, because it is the cheaper repair and they never contend:
+	// a burnout carries a reasoning trace, so classifyResponse calls it truncated
+	// rather than empty and the escalation below would not have fired on it at all.
+	if res.ok() {
+		if rescued, ok := r.rescueLength(req, d, res); ok {
+			res = rescued
+			w.Header().Set("X-LLM-Rescue", "length")
+		}
 	}
 
 	if res.ok() && classifyResponse(res.body, false) == responseEmpty {

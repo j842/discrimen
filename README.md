@@ -160,6 +160,17 @@ the old window. Discrimen re-reads it — one metadata GET, no benchmark — on
 every certification and again on the health loop's periodic check, so a change
 lands within ten minutes of the restart with nothing to do by hand.
 
+Alongside the claim there is a needle-in-a-haystack ladder that climbs 4K, 8K,
+16K… and stops when a rung fails, because a model advertising 256K that loses
+facts past 64K passes an advertised-context filter and then answers badly —
+which shows up as "the agent got confused", never as an error. Routing filters
+on the *measured* window when the ladder found an edge. It does **not** when the
+ladder merely ran out of room: the rungs double, and the next one has to fit
+inside the claim to be attempted at all, so a 256K endpoint proves 128K and is
+never asked about 256K. That is not a measurement, and reading it as one halved
+every power-of-two window in the fleet — which is every large one. A claim the
+ladder declined to test stands.
+
 On a paid endpoint, that cost is money. The benchmark is 401 questions: 393
 graded thinking-on against a 32768-token ceiling, and 8 — the two control tiers —
 graded thinking-off against a 1024-token one. A reasoning answer on this set runs
@@ -407,6 +418,7 @@ Four deliberate boundaries:
 - **Non-streamed only.** Once SSE bytes are on the wire they cannot be recalled.
 - **Empty only, not truncated.** A length-capped answer hit the *caller's* token
   ceiling; a bigger model runs into the same wall and bills twice for it.
+  Truncation gets a different repair — see the length rescue below.
 - **Router-chosen routes only.** A client that named a model or pinned an
   endpoint asked for that one. Answering from a different one would be a worse
   surprise than the empty reply.
@@ -419,6 +431,37 @@ other route: the background judge grades the answer that
 was finally returned and attributes it to the worker that produced it, which is
 the escalated one. The worker that returned nothing is not currently credited
 with having done so.
+
+## Length rescue
+
+A hybrid reasoning model can pour its whole token budget into the thinking block
+and stop at the cap before writing a word of the answer. What comes back is a
+200 with `finish_reason: "length"`, a full reasoning trace, and `content: ""`.
+To the caller that is a failed turn; it is not even *empty* by the classifier's
+reckoning, because the reasoning trace counts as output — so escalation never
+fired on it and the caller was handed the nothing.
+
+The repair is one cheap follow-up turn to the **same** endpoint: replay the
+conversation, append the working notes as an incomplete assistant turn, and ask
+for the conclusion with thinking off and a small budget. The prefix is already
+in that worker's KV cache, so the second pass is mostly decode. The reply is
+spliced into the original response — the trace is kept, the usage of both
+generations is added up, and `finish_reason` becomes `stop`, because it is now
+true. `X-LLM-Rescue: length` reports it.
+
+Same endpoint, deliberately: the fix is not a better model — a bigger one hits
+the same ceiling and bills twice for it — it is asking this one to stop
+thinking. The off-switch is written in the spelling that endpoint was *measured*
+to honour, which is why this lives in the router rather than in a per-worker
+sidecar.
+
+It fires only on a truncation with **no content and a reasoning trace**. A
+truncation that produced real text is the caller's `max_tokens` doing its job,
+and re-asking would bill them for a shorter answer they did not want; a response
+carrying a tool call is not a failed turn whatever its finish reason; and a
+truncation with nothing in it at all is escalation's case, since there is
+nothing to conclude from. Non-streamed only, one attempt, and it never returns
+anything worse than what it was given.
 
 ## Profiling, and self-improvement
 
@@ -889,6 +932,7 @@ standard library.
 | `benchmark.go`, `benchmark_data*.go` | the tiered quality benchmark, its graders, and the question bank |
 | `session.go` | conversation identity, tool-loop detection, affinity tracker |
 | `escalate.go` | buffered dispatch, inline escalation, strip-and-retry |
+| `rescue.go` | the length rescue — asking an endpoint that spent its whole budget thinking for its conclusion |
 | `relay.go` | routing through another discrimen: the relay key, `/relay/fleet`, the loop guard, and the fleet import |
 | `inadequacy.go` | the response-adequacy classifier — is a 2xx body actually an answer, and is it empty (the worker's failure, escalated) or truncated (the caller's ceiling, not escalated). Split out when the online tier adapter that used to share the file was removed |
 | `judge.go` | background LLM-as-judge |

@@ -97,6 +97,12 @@ type Config struct {
 	// before replying, instead of only teaching the adapter about the region (see
 	// escalate.go).
 	EscalateInline bool
+
+	// RescueTruncated asks a worker that spent its whole token budget inside the
+	// thinking block — finish_reason "length", no content, a full reasoning trace —
+	// for its conclusion in one cheap follow-up turn, instead of handing the caller
+	// the empty answer (see rescue.go).
+	RescueTruncated bool
 }
 
 type BackendRegistration struct {
@@ -692,6 +698,9 @@ func Main() {
 	if cfg.EscalateInline {
 		log.Printf("inline escalation enabled (empty non-streamed answers are re-dispatched to a better worker)")
 	}
+	if cfg.RescueTruncated {
+		log.Printf("length rescue enabled (a worker that spends its whole budget thinking is asked for its conclusion)")
+	}
 	router.loadGroups(context.Background())
 	router.loadRelays(context.Background())
 	if saved, err := logs.LoadBackendRegistrations(context.Background()); err != nil {
@@ -930,7 +939,8 @@ func loadConfig() *Config {
 		SandboxURL:   strings.TrimSpace(os.Getenv("SANDBOX_URL")),
 		SandboxToken: strings.TrimSpace(os.Getenv("SANDBOX_TOKEN")),
 
-		EscalateInline: true,
+		EscalateInline:  true,
+		RescueTruncated: true,
 	}
 }
 
@@ -1516,8 +1526,14 @@ func (r *Router) modelCatalogue() []map[string]any {
 		}
 		servable = append(servable, b)
 		fleetFeatures = append(fleetFeatures, b.Features...)
-		if b.ContextK*1024 > fleetCtx {
-			fleetCtx = b.ContextK * 1024
+		// The window ROUTING enforces, not the one the server claims. These were
+		// different numbers, and a coding harness believed this one: it read a 256K
+		// context_length here, sized max_tokens as (256K - prompt), and grew its
+		// conversation until every worker failed the hard context filter — a 503 the
+		// menu had promised would be served. What is published and what is admitted
+		// have to be the same figure.
+		if usable := usableContextTokens(b); usable > fleetCtx {
+			fleetCtx = usable
 		}
 		entry, seen := byModel[b.Model]
 		if !seen {
@@ -1528,8 +1544,8 @@ func (r *Router) modelCatalogue() []map[string]any {
 				"features": append([]string(nil), b.Features...),
 				"workers":  1,
 			}
-			if b.ContextK > 0 {
-				entry["context_length"] = b.ContextK * 1024
+			if usable := usableContextTokens(b); usable > 0 {
+				entry["context_length"] = usable
 			}
 			byModel[b.Model] = entry
 			order = append(order, b.Model)
@@ -1543,11 +1559,12 @@ func (r *Router) modelCatalogue() []map[string]any {
 		// has it — the router may send the request to any of them.
 		entry["features"] = intersectFeatures(entry["features"].([]string), b.Features)
 		// Same intersection logic for the window: the pooled id may land on any
-		// worker, so advertise the smallest measured one. A worker that didn't
-		// report stays out of the min — its requests are context-filtered at
+		// worker, so advertise the smallest one routing would admit. A worker that
+		// didn't report stays out of the min — its requests are context-filtered at
 		// route time anyway (see hard filter), so the claim stays honest.
-		if cur, ok := entry["context_length"].(int); b.ContextK > 0 && (!ok || b.ContextK*1024 < cur) {
-			entry["context_length"] = b.ContextK * 1024
+		usable := usableContextTokens(b)
+		if cur, ok := entry["context_length"].(int); usable > 0 && (!ok || usable < cur) {
+			entry["context_length"] = usable
 		}
 	}
 	// The menu id is the human spelling when it is unambiguous: the alias

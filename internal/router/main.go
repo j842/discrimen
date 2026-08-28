@@ -3371,13 +3371,11 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 	// pinned/debug path).
 	tr := r.resolveThinking(req, "route", cl)
 
-	neededContext := reqs.MinContextK
-	if neededContext <= 0 {
-		toolTokens := 0
-		if len(req.Tools) > 0 && string(req.Tools) != "null" {
-			toolTokens = len(req.Tools) / 3
-		}
-		neededContext = estimateContextK(req.Messages, contextReserveTokens(req)+toolTokens)
+	// The characters, not a token count: the divisor is the model's, and which
+	// model is what the filter is about to decide. See hardFilter.contextNeededK.
+	promptChars := messageChars(req.Messages)
+	if len(req.Tools) > 0 && string(req.Tools) != "null" {
+		promptChars += len(req.Tools)
 	}
 	needTools := len(req.Tools) > 0 && string(req.Tools) != "null"
 	requiredFeatures := normalizeFeatures(reqs.RequiredFeatures)
@@ -5070,7 +5068,11 @@ func thinkingFromRequest(req *ChatRequest) string {
 	return ""
 }
 
-func estimateContextK(messages []Message, maxTokens int) int {
+// messageChars is the text the context estimate is derived from. Split out from
+// estimateContextK so the same character count can be divided by a MEASURED
+// chars-per-token for one model and a different one for another — the hard filter
+// asks per candidate, because the tokenizer belongs to the model (see tokens.go).
+func messageChars(messages []Message) int {
 	chars := 0
 	for _, msg := range messages {
 		chars += estimateContentChars(msg.Content)
@@ -5079,9 +5081,13 @@ func estimateContextK(messages []Message, maxTokens int) int {
 			chars += len(msg.ToolCalls)
 		}
 	}
-	// chars/3 is more conservative than chars/4 — JSON-heavy payloads
-	// (tool schemas, structured args) tokenize at ~2-3 chars/token, not 4.
-	estimatedTokens := chars/3 + maxTokens
+	return chars
+}
+
+// estimateContextK sizes a request in K of context at a given chars-per-token.
+// Pass defaultCharsPerToken where no model is in view yet.
+func estimateContextK(messages []Message, maxTokens int, charsPerToken float64) int {
+	estimatedTokens := tokensForChars(messageChars(messages), charsPerToken) + maxTokens
 	return int(math.Ceil(float64(estimatedTokens) / 1024.0))
 }
 

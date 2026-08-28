@@ -551,7 +551,7 @@ func (r *Router) answerExpert(w http.ResponseWriter, req *http.Request, plan *ro
 		// the synthesiser too — a key restricted to one model must not have another
 		// one read its answers.
 		messages = append([]Message{{Role: "system", Content: expertSynthesisSystem(answers)}}, chatReq.Messages...)
-		synth = pickSynthesiser(panel, estimateContextK(messages, contextReserveTokens(chatReq)), plan.job)
+		synth = pickSynthesiser(panel, estimateContextK(messages, contextReserveTokens(chatReq), defaultCharsPerToken), plan.job)
 		if synth == nil {
 			log.Printf("expert: %d answers do not fit any worker's context — returning the best single answer from %s",
 				len(answers), best.backend.ID)
@@ -722,7 +722,7 @@ func (r *Router) synthesisBody(body []byte, messages []Message, synth *Backend, 
 	// than the client's prompt; size the ceiling against it rather than against
 	// the request the members were sent.
 	job := plan.job
-	job.promptTokens = estimateContextK(messages, 0) * 1024
+	job.promptTokens = estimateContextK(messages, 0, r.ratios.forModel(synth.Model)) * 1024
 	off := thinkingResolution{patch: true}
 	out = patchForwardedBody(out, 0, budgetCeiling(synth, job), off.forBackend(synth), synth.ServedID)
 	return r.stripLearned(out, body, synth.ID)

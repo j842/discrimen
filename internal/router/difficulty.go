@@ -208,7 +208,12 @@ func costForRequest(req *ChatRequest, thinking bool) jobCost {
 	if req != nil && req.MaxTokens > 0 && req.MaxTokens < out {
 		out = req.MaxTokens
 	}
-	job := jobCost{promptTokens: promptTokensFor(req), outputTokens: out, mode: thinkingOff}
+	// The nominal divisor, not a measured one, and deliberately: this job prices
+	// every candidate's prefill, and ranking is comparative — a bias shared by all
+	// of them cancels. The measured ratio is for the hard filter, where the number
+	// is compared against a fixed window rather than against other workers, and an
+	// error there refuses a request instead of mildly reordering two.
+	job := jobCost{promptTokens: promptTokensFor(req, defaultCharsPerToken), outputTokens: out, mode: thinkingOff}
 	if thinking {
 		job.mode = thinkingOn
 	}
@@ -250,10 +255,8 @@ func contextReserveTokens(req *ChatRequest) int {
 	return contextAnswerReserve
 }
 
-// promptTokensFor estimates the prefill size of a request, tool schemas included.
-// Uses the same conservative chars/3 divisor as estimateContextK — JSON-heavy
-// tool definitions tokenize nearer 3 chars/token than 4.
-func promptTokensFor(req *ChatRequest) int {
+// promptCharsFor is the text a request will prefill, tool schemas included.
+func promptCharsFor(req *ChatRequest) int {
 	if req == nil {
 		return 0
 	}
@@ -264,7 +267,14 @@ func promptTokensFor(req *ChatRequest) int {
 	if n := len(req.Tools); n > 0 && string(req.Tools) != "null" {
 		chars += n
 	}
-	return chars / 3
+	return chars
+}
+
+// promptTokensFor estimates the prefill size of a request at a given
+// chars-per-token — measured for the model where the router has measured one,
+// and defaultCharsPerToken where it has not. See tokens.go.
+func promptTokensFor(req *ChatRequest, charsPerToken float64) int {
+	return tokensForChars(promptCharsFor(req), charsPerToken)
 }
 
 // ── Seed prompts ────────────────────────────────────────────────────────────

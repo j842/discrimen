@@ -3257,6 +3257,26 @@ type routePlan struct {
 	rejected []rejection
 }
 
+// widestContext returns the candidate with the largest window among those that
+// pass every hard requirement EXCEPT context, or nil when context was not the
+// only thing in the way.
+//
+// The filter is copied with its context fields cleared rather than re-derived,
+// so "the same filter minus context" cannot drift from the filter itself.
+func widestContext(candidates []*Backend, f hardFilter) *Backend {
+	f.minContextK, f.promptChars, f.reserveTokens = 0, 0, 0
+	var best *Backend
+	for _, b := range candidates {
+		if admitReason(b, f) != "" {
+			continue
+		}
+		if best == nil || usableContextTokens(b) > usableContextTokens(best) {
+			best = b
+		}
+	}
+	return best
+}
+
 // rejection is one worker the hard filter dropped, and why.
 type rejection struct {
 	ID     string `json:"id"`
@@ -3267,11 +3287,42 @@ type rejection struct {
 // serve a request. Built once per request; applied through admitReason so
 // selection and the preview can never disagree about who was eligible.
 type hardFilter struct {
-	wantModel        string
-	neededContext    int
+	wantModel string
+	// minContextK is an explicit requirements.min_context_k. A number the CLIENT
+	// stated, so it is used as given and never re-estimated.
+	minContextK int
+	// promptChars is the request's text, and reserveTokens the headroom kept for
+	// the answer. They are kept as characters rather than as one token count
+	// because the divisor is the MODEL's — see contextNeededK.
+	promptChars      int
+	reserveTokens    int
+	ratios           *tokenRatios // measured chars-per-token; nil ⇒ the default
 	needTools        bool
 	requiredFeatures []string
 	hardThink        bool
+}
+
+// contextNeededK sizes this request against ONE candidate, in K.
+//
+// Per candidate, because a token is not a fixed amount of text: two models given
+// the same 700KB of Go and JSON disagree about how many tokens it is by more than
+// the margin that decides whether it fits. The router sized every prompt at a
+// flat 3 characters per token and compared the result against every worker, which
+// on measured traffic nearer 3.5 inflated a 200K prompt by a third — enough to
+// have every worker in a fleet reject a prompt every one of them could hold.
+func (f hardFilter) contextNeededK(b *Backend) int {
+	if f.minContextK > 0 {
+		return f.minContextK
+	}
+	if f.promptChars <= 0 {
+		return 0
+	}
+	model := ""
+	if b != nil {
+		model = b.Model
+	}
+	tokens := tokensForChars(f.promptChars, f.ratios.forModel(model)) + f.reserveTokens
+	return int(math.Ceil(float64(tokens) / 1024.0))
 }
 
 // admitReason reports why b cannot serve the request, or "" if it can.
@@ -3288,12 +3339,13 @@ func admitReason(b *Backend, f hardFilter) string {
 	// which shows up as "the agent got confused", never as an error. Falls back to
 	// the claim when no probe has run, so an unprobed worker is not filtered out
 	// of everything. See usableContextTokens.
-	if usableK := usableContextTokens(b) / 1024; f.neededContext > 0 && usableK > 0 && usableK < f.neededContext {
+	needed := f.contextNeededK(b)
+	if usableK := usableContextTokens(b) / 1024; needed > 0 && usableK > 0 && usableK < needed {
 		if b.ContextProbe != nil && b.ContextProbe.UsableTokens > 0 && usableK < b.ContextK {
 			return fmt.Sprintf("context %dK < %dK required (measured; %dK advertised)",
-				usableK, f.neededContext, b.ContextK)
+				usableK, needed, b.ContextK)
 		}
-		return fmt.Sprintf("context %dK < %dK required", usableK, f.neededContext)
+		return fmt.Sprintf("context %dK < %dK required", usableK, needed)
 	}
 	if f.needTools && !hasFeature(b, "tools") {
 		return "no tools support"
@@ -3386,7 +3438,10 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 
 	hf := hardFilter{
 		wantModel:        wantModel,
-		neededContext:    neededContext,
+		minContextK:      reqs.MinContextK,
+		promptChars:      promptChars,
+		reserveTokens:    contextReserveTokens(req),
+		ratios:           r.ratios,
 		needTools:        needTools,
 		requiredFeatures: requiredFeatures,
 		hardThink:        tr.hardThink,
@@ -3422,6 +3477,29 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 		}
 		return reason == ""
 	})
+	overflow := false
+	if len(filtered) == 0 {
+		// Everything was dropped, and the reason matters. A missing feature or an
+		// unserved model is a fact: no amount of trying will make a worker without
+		// tools support grow them, and refusing is the honest answer.
+		//
+		// Context is not a fact, it is this router's ESTIMATE — and the endpoint
+		// holds the truth. So when context is the only thing standing between the
+		// request and a worker, send it to the widest window and let the tokenizer
+		// that actually counts rule on it. Two outcomes, both better than a 503:
+		// it fits, and the caller gets their answer plus a calibration sample; or
+		// it does not, and the engine's own 400 says by how much, in exact tokens,
+		// where the router could only have guessed. That refusal is also a sample —
+		// see contextLimitPromptTokens — so the estimate that caused it is corrected
+		// by the very request it turned away.
+		if wantModel == "" {
+			if widest := widestContext(candidates, hf); widest != nil {
+				log.Printf("context overflow: no worker admits an estimated %dK prompt — sending it to %s (%dK) and letting the endpoint rule",
+					hf.contextNeededK(widest), widest.ID, usableContextTokens(widest)/1024)
+				filtered, overflow = []*Backend{widest}, true
+			}
+		}
+	}
 	if len(filtered) == 0 {
 		if wantModel != "" {
 			return nil, fmt.Errorf("no worker serving model %q satisfies hard context/feature requirements", wantModel)

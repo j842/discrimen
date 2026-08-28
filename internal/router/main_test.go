@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -278,6 +280,8 @@ func TestClipLog(t *testing.T) {
 	if got := clipLog("short", 16); got != "short" {
 		t.Fatalf("short string was altered: %q", got)
 	}
+	// A budget too small to hold both ends and the marker explaining why: head
+	// plus marker, which is all there is room to say.
 	long := strings.Repeat("a", 100)
 	got := clipLog(long, 10)
 	if !strings.HasPrefix(got, strings.Repeat("a", 10)) || !strings.Contains(got, "truncated 90 bytes") {
@@ -289,6 +293,54 @@ func TestClipLog(t *testing.T) {
 	for _, r := range clipped {
 		if r == '�' {
 			t.Fatal("clip split a UTF-8 rune")
+		}
+	}
+}
+
+// The property that makes the request log worth reading: at a realistic budget
+// BOTH ENDS survive.
+//
+// A chat body is a long system prompt, then the conversation, then the turn that
+// was just asked — and an agent's runs to megabytes against a 16KB cap. Head-only
+// stored the boilerplate and dropped the question, which made every row in the
+// log look identical, because the only part that differed between rows was the
+// part being cut. This is the same trade boundedCapture makes on the way out.
+func TestClipLogKeepsBothEndsOfAnOversizedBody(t *testing.T) {
+	const budget = 16384
+	body := "SYSTEM-PROMPT-HEAD" + strings.Repeat("x", 200_000) + "THE-ACTUAL-QUESTION"
+	got := clipLog(body, budget)
+
+	if len(got) > budget {
+		t.Errorf("clipped body is %d bytes against a %d budget", len(got), budget)
+	}
+	if !strings.HasPrefix(got, "SYSTEM-PROMPT-HEAD") {
+		t.Error("the head of the body was not kept")
+	}
+	if !strings.HasSuffix(got, "THE-ACTUAL-QUESTION") {
+		t.Error("the tail of the body was not kept — the newest turn is the part " +
+			"an operator opens a log row to read, and it lives at the end")
+	}
+	// The marker names the middle it dropped, and head + dropped + tail has to add
+	// back up to the original. A marker that lies about the size is worse than no
+	// marker, because it is read as a measurement. The pattern is the one the log
+	// viewer splits on, so this also pins the shape the browser has to parse.
+	marker := regexp.MustCompile(`…\[truncated (\d+) bytes\]…`)
+	m := marker.FindStringSubmatchIndex(got)
+	if m == nil {
+		t.Fatalf("no truncation marker in the form the log viewer parses: %q", truncate(got, 200))
+	}
+	dropped, _ := strconv.Atoi(got[m[2]:m[3]])
+	if kept := m[0] + (len(got) - m[1]); kept+dropped != len(body) {
+		t.Errorf("marker claims %d bytes dropped, but %d kept + %d dropped != %d original",
+			dropped, kept, dropped, len(body))
+	}
+
+	// Rune boundaries at BOTH cuts now, not just the head one: a tail that starts
+	// halfway through a multi-byte character is invalid UTF-8 in the database.
+	wide := strings.Repeat("あ", 20_000) // 3 bytes each
+	for _, r := range clipLog(wide, budget) {
+		if r == '�' {
+			t.Fatal("a cut split a UTF-8 rune")
 		}
 	}
 }

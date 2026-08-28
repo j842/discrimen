@@ -659,7 +659,7 @@ synthesiser would record a hit rate for a model that did not earn it alone.
 | GET | `/backends/{id}/benchmark` | admin | Per-question results for that endpoint's stored profile, plus the per-category breakdown (coding / maths / reasoning / general) in both thinking modes. Answers served from the permanent cache are marked as cached rather than re-asked |
 | POST | `/debug/backends/{id}/certify`, `/debug/backends/{id}/chat` | admin | Re-profile one endpoint, or prompt it directly |
 | GET | `/logs` | admin | Stored request logs |
-| GET | `/admin/usage` | admin | Spend and traffic per key and per endpoint |
+| GET | `/admin/usage` | admin | Requests in flight over time, bucketed. `?range=1h` for the overview's one-hour frame in one-minute columns, otherwise twelve hours in five-minute ones; `?by=backend` cuts the bands on the worker that served each request instead of the address it came from. Carries a `totals` block counting the window once per request |
 | GET | `/admin/outcomes` | admin | Whether the matrix's predictions hold up: held-out accuracy over the graded evidence it is routing on |
 | any | `/admin/providers[/{id}]` | admin | CRUD over manually-entered endpoints |
 | any | `/admin/keys[/{id}]` | admin | Issue, list, disable and delete API keys |
@@ -668,6 +668,19 @@ synthesiser would record a hit rate for a model that did not earn it alone.
 | GET | `/relay/fleet` | relay | What a downstream router may see of this fleet: one entry per model it is allowed, with the measured profile and live occupancy |
 | POST | `/admin/login`, `/admin/logout` | password | Session cookie |
 | GET | `/` | none | Dashboard shell. Discloses nothing; the fleet table is fetched client-side with the admin session cookie |
+
+The dashboard opens on an **overview**: what the fleet is holding right now
+against the concurrency the router measured for it, one meter per worker, and the
+last hour of load in one-minute columns — split either by the address the work
+came from or by the worker that carried it. Behind that are tabs for the fleet,
+twelve hours of the same chart, providers, keys, groups, relays and the request
+log.
+
+Two things on that page measure different clocks and the labels say so.
+`/backends` is live: what is in flight at the instant of the poll. The hour
+figures come from the request log, and **a request is written to the log when it
+finishes**, so they trail reality by however long the in-flight requests have been
+running. During a burst the two will not add up.
 
 The dashboard holds no bearer token. It signs in through `POST /admin/login`,
 which sets an HttpOnly session cookie, and every fetch it makes is same-origin so
@@ -720,7 +733,7 @@ exists to solve. They are constants in the binary.
 | `ROUTER_CLIENT_TOKENS` | *(empty)* | Comma-separated client bearer tokens |
 | `ROUTER_PERSIST_SECRET` | *(empty)* | Encrypts stored endpoint API keys at rest. Blank generates a keyfile |
 | `LOG_RETENTION_DAYS` | `30` | |
-| `LOG_MAX_BODY_BYTES` | `16384` | Main driver of database growth |
+| `LOG_MAX_BODY_BYTES` | `16384` | Main driver of database growth. An oversized body is stored head-and-tail with a marker naming the dropped middle, so the system prompt and the turn that was actually asked both survive |
 | `HEALTH_INTERVAL_SECONDS` | `15` | Scales with fleet size |
 | `BACKEND_TIMEOUT_SECONDS` | `600` | Whole-exchange cap for non-streaming requests |
 | `BACKEND_IDLE_TIMEOUT_SECONDS` | `120` | Streaming idle watchdog. 0 disables |

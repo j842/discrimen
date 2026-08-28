@@ -94,7 +94,8 @@ func TestUnauthenticatedDashboardDisclosesNoFleetDetail(t *testing.T) {
 func TestDashboardShellCarriesEveryAdminView(t *testing.T) {
 	body := renderDashboard(t)
 	for _, anchor := range []string{
-		// The tab bar and its six panels.
+		// The tab bar and its panels.
+		`id="mtab-overview"`, `id="view-overview"`,
 		`id="mtab-fleet"`, `id="view-fleet"`,
 		`id="mtab-providers"`, `id="view-providers"`,
 		`id="mtab-keys"`, `id="view-keys"`,
@@ -190,6 +191,57 @@ func TestDashboardRendersTheBenchmarkCategoryBreakdown(t *testing.T) {
 	}
 }
 
+// The overview is the landing tab, and it is wired to elements and to an
+// endpoint no compiler reads: a renamed id is a blank panel at runtime and a
+// mistyped query string silently answers the twelve-hour frame, which looks
+// entirely plausible in a panel headed "The last hour".
+func TestDashboardCarriesTheOverview(t *testing.T) {
+	body := renderDashboard(t)
+	for _, anchor := range []string{
+		`id="overview-tiles"`, `id="fleet-meters"`,
+		`id="hour-chart"`, `id="hour-legend"`, `id="hour-summary"`, `id="hour-legend-head"`,
+		`id="hour-by-client"`, `id="hour-by-backend"`,
+		"function loadOverview", "function renderFleetMeters", "function renderOverviewTiles",
+		"function setHourBy",
+		"'/admin/usage?range=1h&by='", // the hour frame, and the grouping the toggle picks
+	} {
+		if !strings.Contains(body, anchor) {
+			t.Errorf("the dashboard has no %s — the overview is wired to something that does not exist", anchor)
+		}
+	}
+	// The landing tab, in both places that decide it: the fallback for an
+	// unknown #hash and the initial value. Getting one of the two wrong lands on
+	// the fleet table for a bare URL and on the overview for a reload, which is
+	// the kind of split nobody notices and everybody trips over.
+	if strings.Count(body, "'overview'") < 3 {
+		t.Error("the overview does not look like the default tab; check showTab's fallback and the initial activeTab")
+	}
+	// The tiles read the honest counts, not the per-bucket in-flight ones. The
+	// two differ by however slow the fleet is (see UsageTotals), and a headline
+	// figure taken from the wrong one is wrong in a direction that flatters.
+	if !strings.Contains(body, "series.totals") || !strings.Contains(body, "totals.busy_seconds") {
+		t.Error("the overview tiles are not reading the window totals")
+	}
+}
+
+// The meters are the fleet's load, and two things about them are contracts with
+// the Go side. A worker the router measured no concurrency ceiling for has no
+// ratio to draw at all, and the number always sits beside the bar: severity is
+// carried by colour, and colour is never allowed to be the only thing carrying
+// a value.
+func TestDashboardMetersHandleAnUncappedWorkerAndNeverRelyOnColourAlone(t *testing.T) {
+	body := renderDashboard(t)
+	for _, needle := range []string{
+		"function fleetLoad", "max_concurrency", "'no cap'",
+		"role: 'progressbar'", "'aria-valuenow'",
+		"class: 'meter-value'",
+	} {
+		if !strings.Contains(body, needle) {
+			t.Errorf("the fleet meters are missing %q", needle)
+		}
+	}
+}
+
 // A log row's bodies are rendered as a conversation rather than as raw JSON,
 // and the pieces that has to cover are the ones a fleet actually produces:
 // both reply shapes (a buffered completion and a captured event stream), the
@@ -211,6 +263,48 @@ func TestDashboardRendersLogBodiesAsATranscript(t *testing.T) {
 	// must never be the reason an operator cannot see what was actually sent.
 	if !strings.Contains(body, "function pane(") || !strings.Contains(body, "'Formatted'") {
 		t.Error("the log detail has no raw/formatted toggle; a body the renderer cannot parse would be unreachable")
+	}
+}
+
+// Almost every stored body is truncated — clipLog keeps a bounded head and tail
+// of an agent's chat request and drops megabytes from the middle — so the
+// viewer's parse has to survive a document that stops mid-string. It did not:
+// JSON.parse failed, renderChatRequest returned null, and the pane fell back to
+// raw JSON for 96% of rows measured against a live router. Stripping the
+// truncation marker was never enough on its own; it removes the note and leaves
+// the body just as incomplete.
+func TestDashboardReadsATruncatedBodyRatherThanFallingBackToRawJSON(t *testing.T) {
+	body := renderDashboard(t)
+	for _, needle := range []string{
+		"function parseLoose", "function repairJSON", "function scavengeMessages",
+		"function splitTruncation", "function balancedEnd",
+	} {
+		if !strings.Contains(body, needle) {
+			t.Errorf("the tolerant parser is missing %q", needle)
+		}
+	}
+	// Both renderers go through it, and so does the one-line preview in the log
+	// TABLE — that column showed the head of the raw JSON for every clipped row,
+	// which is the same generation settings over and over instead of what was
+	// asked.
+	for _, fn := range []string{"function renderChatRequest", "function renderCompletion", "function inputPreview"} {
+		start := strings.Index(body, fn)
+		if start < 0 {
+			t.Fatalf("%s is gone; this guard no longer guards anything", fn)
+		}
+		end := strings.Index(body[start:], "\n    }\n")
+		if end < 0 {
+			t.Fatalf("cannot find the end of %s", fn)
+		}
+		if !strings.Contains(body[start:start+end], "parseLoose(") {
+			t.Errorf("%s does not use the tolerant parser; a clipped body renders as raw JSON", fn)
+		}
+	}
+	// The two halves of a clipped body are parsed separately and the join is
+	// shown where it happened. Splicing head onto tail and parsing the result
+	// would be parsing a document that never existed.
+	if !strings.Contains(body, "parsed.tail") || !strings.Contains(body, "cutMidTurn") {
+		t.Error("the transcript does not render the recovered tail, or does not mark the turn the cut fell inside")
 	}
 }
 

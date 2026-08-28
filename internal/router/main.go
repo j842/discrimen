@@ -1324,8 +1324,18 @@ func (r *Router) handleLogs(w http.ResponseWriter, req *http.Request) {
 // The cached frame is keyed on its end, so it also expires the instant the
 // five-minute window rolls over. A cache that could pin the chart to a stale
 // window would be far worse than a slow one.
+//
+// One entry per VIEW (window × grouping), because there are now four of them and
+// a single slot would thrash: the overview polls the hour frame while the usage
+// tab polls the twelve-hour one, and each would evict the other on every tick,
+// which is the cache doing the opposite of its job. Four small frames is a few
+// hundred KB.
 type usageCache struct {
-	mu     sync.Mutex
+	mu      sync.Mutex
+	entries map[string]usageCacheEntry
+}
+
+type usageCacheEntry struct {
 	series *UsageSeries
 	until  time.Time
 }
@@ -1336,16 +1346,17 @@ const (
 	usageCacheMax   = time.Minute
 )
 
-func (c *usageCache) get(frameEnd int64, now time.Time) *UsageSeries {
+func (c *usageCache) get(view string, frameEnd int64, now time.Time) *UsageSeries {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.series == nil || c.series.To != frameEnd || now.After(c.until) {
+	entry, ok := c.entries[view]
+	if !ok || entry.series == nil || entry.series.To != frameEnd || now.After(entry.until) {
 		return nil
 	}
-	return c.series
+	return entry.series
 }
 
-func (c *usageCache) put(series *UsageSeries, now time.Time, cost time.Duration) {
+func (c *usageCache) put(view string, series *UsageSeries, now time.Time, cost time.Duration) {
 	ttl := cost * usageCacheRatio
 	if ttl < usageCacheMin {
 		ttl = usageCacheMin
@@ -1355,13 +1366,15 @@ func (c *usageCache) put(series *UsageSeries, now time.Time, cost time.Duration)
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.series = series
-	c.until = now.Add(ttl)
+	if c.entries == nil {
+		c.entries = map[string]usageCacheEntry{}
+	}
+	c.entries[view] = usageCacheEntry{series: series, until: now.Add(ttl)}
 }
 
-// handleUsage answers the dashboard's usage chart: the last twelve hours of
-// request logs as mean concurrency per five-minute bucket, split by the address
-// each request came from.
+// handleUsage answers the dashboard's usage charts: a window of the request log
+// as mean concurrency per bucket, with the bands cut on either the address each
+// request came from or the worker that served it, plus that window's totals.
 //
 // Admin scope, for the same reason /logs is. This is the request log with the
 // bodies taken out, and the set of addresses talking to a router is not less
@@ -1369,10 +1382,14 @@ func (c *usageCache) put(series *UsageSeries, now time.Time, cost time.Duration)
 // from where, and on a public deployment it is the reconnaissance half of the
 // log without the volume that makes the log tedious to read.
 //
-// The window and the bucket are not query parameters. There is one chart, it
-// answers one question, and an operator who wants a different window has the log
-// table; a knob here would only mean two callers disagreeing about what the
-// numbers mean.
+// Two windows and two groupings, and that is the whole knob surface. ?range=1h
+// gives the overview its live frame and anything else gives the twelve-hour one;
+// ?by=backend cuts the bands on the worker that served each request instead of
+// the address it came from. Both are enumerations rather than free values — a
+// window and a bucket a caller could dial would mean two readers disagreeing
+// about what a column means, which is the thing the fixed frame was protecting
+// against, and the grouping is a SQL identifier that must never be caller text
+// (see usageGroupColumns).
 func (r *Router) handleUsage(w http.ResponseWriter, req *http.Request) {
 	if req.Method != http.MethodGet {
 		methodNotAllowed(w)
@@ -1381,25 +1398,45 @@ func (r *Router) handleUsage(w http.ResponseWriter, req *http.Request) {
 	if !r.requireAdmin(w, req) {
 		return
 	}
+	window, bucket := usageWindow, usageBucket
+	if req.URL.Query().Get("range") == "1h" {
+		window, bucket = usageHourWindow, usageHourBucket
+	}
+	by := req.URL.Query().Get("by")
+	if _, ok := usageGroupColumns[by]; !ok {
+		by = "client"
+	}
 	now := time.Now()
-	frame := newUsageSeries(now, usageWindow, usageBucket)
+	frame := newUsageSeries(now, window, bucket)
+	frame.By = by
 	// No database configured at all. An empty frame rather than an error: the
 	// chart is not broken, there is simply nothing recording.
 	if r.logs == nil {
+		frame.Totals = &UsageTotals{}
 		writeJSON(w, http.StatusOK, frame)
 		return
 	}
-	if cached := r.usage.get(frame.To, now); cached != nil {
+	view := by + "@" + strconv.FormatInt(frame.BucketSeconds, 10)
+	if cached := r.usage.get(view, frame.To, now); cached != nil {
 		writeJSON(w, http.StatusOK, cached)
 		return
 	}
 	started := time.Now()
-	series, err := r.logs.UsageSeries(req.Context(), now, usageWindow, usageBucket, usageTopClients)
+	series, err := r.logs.UsageSeries(req.Context(), now, window, bucket, usageTopClients, by)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, validationError{Message: err.Error()})
 		return
 	}
-	r.usage.put(series, now, time.Since(started))
+	// The totals are the same window counted honestly, and they are cached with
+	// the frame rather than fetched separately so the tiles above the chart and
+	// the chart itself can never describe two different minutes.
+	totals, err := r.logs.UsageTotals(req.Context(), series.From, series.To)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, validationError{Message: err.Error()})
+		return
+	}
+	series.Totals = totals
+	r.usage.put(view, series, now, time.Since(started))
 	writeJSON(w, http.StatusOK, series)
 }
 
@@ -6436,18 +6473,62 @@ func (s *LogStore) Insert(ctx context.Context, entry RequestLog) error {
 	return err
 }
 
-// clipLog bounds a stored log field to maxBytes, trimming back to a UTF-8 rune
-// boundary and appending a truncation marker. Keeps the request-log table from
-// growing without limit on large prompts/responses.
+// clipLog bounds a stored log field to maxBytes, keeping the HEAD AND THE TAIL
+// with a marker naming what went from the middle.
+//
+// Head-only was the obvious thing and it was the wrong thing. What arrives here
+// is an agent's chat body: a long system prompt, then the conversation, then the
+// turn that was actually just asked. Those run to megabytes against a 16KB
+// budget, so keeping the head stored the boilerplate and dropped the question —
+// every row in the log looked the same, because the only part that differed
+// between them was the part that was cut. boundedCapture already keeps both ends
+// of a response stream for exactly this reason (see capture.go); this is the
+// same decision on the way in.
+//
+// The marker is the one the dashboard's log viewer matches on, and the viewer
+// splits on it to parse the two halves separately — see parseLoose in
+// dashboard.html and TestDashboardTruncationPatternMatchesWhatTheRouterWrites.
+// Both cuts land on a rune boundary, which is what keeps the stored text valid
+// UTF-8 either side of the join.
 func clipLog(s string, maxBytes int) string {
 	if maxBytes <= 0 || len(s) <= maxBytes {
 		return s
 	}
-	cut := maxBytes
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
+	// The marker is paid for out of the budget it describes, so it is sized
+	// first. Its width is bounded by the length of the whole string, which is the
+	// most bytes it could ever claim to have dropped.
+	marker := func(dropped int) string { return fmt.Sprintf("…[truncated %d bytes]…", dropped) }
+	headOnly := func() string {
+		cut := runeStart(s, maxBytes)
+		return s[:cut] + fmt.Sprintf("…[truncated %d bytes]", len(s)-cut)
 	}
-	return s[:cut] + fmt.Sprintf("…[truncated %d bytes]", len(s)-cut)
+	budget := maxBytes - len(marker(len(s)))
+	if budget < 2 {
+		// No room to keep both ends and still say so. Head plus marker, which is
+		// what this did before and still tells the reader it was cut.
+		return headOnly()
+	}
+	head := runeStart(s, budget/2)
+	tail := runeStart(s, len(s)-(budget-budget/2))
+	if tail <= head {
+		return headOnly()
+	}
+	return s[:head] + marker(tail-head) + s[tail:]
+}
+
+// runeStart trims a byte index back to the start of the rune it lands inside, so
+// a cut never splits a multi-byte character in half.
+func runeStart(s string, i int) int {
+	if i >= len(s) {
+		return len(s)
+	}
+	if i < 0 {
+		return 0
+	}
+	for i > 0 && !utf8.RuneStart(s[i]) {
+		i--
+	}
+	return i
 }
 
 func (s *LogStore) List(ctx context.Context, backendID string, limit int, offset int) ([]RequestLog, error) {
@@ -6510,6 +6591,14 @@ const (
 	// each time — the whole chart would shimmer. Aligned, a refresh changes the
 	// newest column and, twice an hour, drops the oldest.
 	usageBucket = 5 * time.Minute
+	// The overview's frame: the same chart one order of magnitude in. Sixty
+	// one-minute columns across an hour is the same "how wide is a column"
+	// arithmetic that picked five minutes above — about sixteen pixels apiece,
+	// which is wider than it needs to be and is the point, because this is the
+	// view someone opens to watch what is happening now rather than to read a
+	// shift. Aligned to the minute for the same anti-shimmer reason.
+	usageHourWindow = time.Hour
+	usageHourBucket = time.Minute
 	// The page's categorical palette has eight validated slots and a ninth colour
 	// would be indistinguishable from one of them under colour-blind simulation,
 	// so the ninth-busiest client onwards is folded into a single grey band. See
@@ -6533,12 +6622,57 @@ const (
 	usageMaxRequestAge = time.Hour
 )
 
+// usageGroupColumns is the ?by= whitelist: which column the bands are cut on.
+//
+// A map rather than the parameter reaching the SQL directly. The grouping column
+// is the one part of this query that cannot be a bound parameter — it is an
+// identifier, not a value — so it is spliced into the statement text, and the
+// only safe way to splice caller-controlled text is to not: the caller picks a
+// key, the map supplies the column.
+//
+// The two questions are genuinely different and both get asked. client_ip is
+// "who is generating this load", which is the one that matters when a router is
+// busy and you want to know whose fault it is. backend_id is "where is the load
+// landing", which is the one that matters when the fleet is unbalanced — and on
+// a deployment sitting behind one gateway it is also the only one of the two
+// with more than a single band in it.
+var usageGroupColumns = map[string]string{
+	"client":  "client_ip",
+	"backend": "backend_id",
+}
+
+// UsageTotals is the window summarised, for the stat tiles above the chart.
+//
+// Deliberately NOT derived from the buckets. A request spanning three buckets is
+// in flight in all three and the chart is right to draw it three times, but
+// adding those up gives a "request count" that grows with how slow the fleet is
+// — 1012 for about 500 requests on a twelve-hour window, and worse on
+// one-minute buckets, where a ten-minute generation would count ten times. These
+// come from a plain count over the window instead, so a headline number is a
+// number and not an artefact of the bucketing.
+type UsageTotals struct {
+	// Requests and Errors count rows whose request STARTED inside the window.
+	Requests int64 `json:"requests"`
+	Errors   int64 `json:"errors"`
+	// BusySeconds is the total time those requests spent in flight, so
+	// BusySeconds/Requests is the mean duration and BusySeconds/window is the
+	// mean number of workers occupied.
+	BusySeconds      float64 `json:"busy_seconds"`
+	PromptTokens     int64   `json:"prompt_tokens"`
+	CompletionTokens int64   `json:"completion_tokens"`
+}
+
 // UsageSeries is one render of the usage chart: a fixed frame of buckets and the
 // bands stacked inside it.
 type UsageSeries struct {
 	BucketSeconds int64 `json:"bucket_seconds"`
 	From          int64 `json:"from"`
 	To            int64 `json:"to"`
+	// By echoes which question this frame answers — see usageGroupColumns. The
+	// page reads it rather than assuming, because the two views poll the same
+	// endpoint and a late response must not repaint the other one's chart.
+	By     string       `json:"by"`
+	Totals *UsageTotals `json:"totals,omitempty"`
 	// Clients is the stacking order, busiest first, with "other" and "unknown"
 	// pinned last so the identified traffic sits at the bottom of the stack where
 	// it is easiest to compare between columns.
@@ -6553,28 +6687,49 @@ type UsageSeries struct {
 // the bands against each other but is not the height of any single column; Peak
 // is the busiest bucket that band had.
 type UsageClient struct {
-	ClientIP string  `json:"client_ip"`
+	// Name is the band's identity under whichever grouping was asked for — an
+	// address, or a backend id. ClientIP is the same string, kept for the client
+	// grouping only, because it was this payload's field name before there was a
+	// second thing to group on and something may be reading it.
+	Name     string  `json:"name"`
+	ClientIP string  `json:"client_ip,omitempty"`
 	Slots    float64 `json:"slots"`
 	Peak     float64 `json:"peak"`
-	Requests int64   `json:"requests"`
+	// Requests counts each request once, in the band it belongs to — the same
+	// counting UsageTotals does, so the bands add up to the headline figure.
+	// The per-bucket in-flight numbers are the ones that do not add up, and
+	// deliberately: see UsageBucket.
+	Requests int64 `json:"requests"`
 }
 
-// UsageBucket is one column. Slots and Requests are positional against
-// UsageSeries.Clients: the addresses are written once for the whole payload
+// UsageBucket is one column. Every slice is positional against
+// UsageSeries.Clients: the band names are written once for the whole payload
 // instead of once per bucket, which is the difference between about 25KB every
 // ten seconds and several times that.
+//
+// Requests and Started are two different questions and both get asked. Requests
+// is how many were IN FLIGHT during the bucket, so a generation running across
+// three of them is counted in all three — that is what makes it match the height
+// of the bar. Started is how many BEGAN in it, so it sums over the window to a
+// plain request count. Summing Requests instead is the mistake that inflates a
+// headline figure in proportion to how slow the fleet is.
 type UsageBucket struct {
 	At       int64     `json:"t"`
 	Slots    []float64 `json:"slots"`
 	Requests []int64   `json:"requests"`
+	Started  []int64   `json:"started"`
 }
 
-// usageSeriesQuery buckets the request log into mean concurrency per client.
+// usageSeriesQuery buckets the request log into mean concurrency per band.
 //
 // All of the work is here rather than in the browser on purpose: twelve hours of
 // this table is tens of thousands of rows carrying stored prompts and completions,
 // and shipping that to a page to bucket it in JavaScript would move megabytes
 // every ten seconds to draw a chart with 144 columns in it.
+//
+// {{col}} is the grouping column, substituted by UsageSeries from
+// usageGroupColumns. A placeholder rather than a Sprintf verb because the query
+// is full of SQLite's own strftime('%s', …), which a format string would eat.
 const usageSeriesQuery = `
 WITH RECURSIVE
 	-- Each logged request as a half-open interval of epoch seconds.
@@ -6595,7 +6750,7 @@ WITH RECURSIVE
 	-- julianday arithmetic it would take to avoid.
 	raw AS (
 		SELECT
-			CASE WHEN client_ip = '' THEN ? ELSE client_ip END AS ip,
+			CASE WHEN {{col}} = '' THEN ? ELSE {{col}} END AS ip,
 			CAST(strftime('%s', created_at) AS INTEGER) AS s0,
 			CAST(strftime('%s', created_at) AS INTEGER) + max(duration_ms, 0) / 1000.0 AS e0
 		FROM request_logs
@@ -6608,8 +6763,12 @@ WITH RECURSIVE
 	-- MATERIALIZED because this is read twice below, and the alternative is
 	-- scanning and clamping the whole window a second time to work out who the
 	-- busiest callers were. Measured at 200k rows: 1.64s down to 1.21s.
+	-- began records whether the request STARTED inside the window, which the
+	-- clamped s cannot answer: a straddler's s is dragged forward to the window
+	-- edge, so seeding the count off it would report every request already
+	-- running at the start of the window as having begun there.
 	spans AS MATERIALIZED (
-		SELECT ip, max(s0, ?) AS s, min(e0, ?) AS e FROM raw WHERE e0 >= ?
+		SELECT ip, max(s0, ?) AS s, min(e0, ?) AS e, s0 >= ? AS began FROM raw WHERE e0 >= ?
 	),
 	-- Which addresses get a band of their own. Ranked on busy time rather than on
 	-- request count, for the same reason the chart plots slots rather than
@@ -6625,16 +6784,17 @@ WITH RECURSIVE
 	-- spanned instead of only into the one it began in — the difference between a
 	-- graph that shows sustained load and one that shows a spike at the start of
 	-- it. It cannot run away: e is already clamped to the end of the window.
-	covered(ip, s, e, b) AS (
-		SELECT ip, s, e, (s / ?) * ? FROM spans
+	covered(ip, s, e, b, seed) AS (
+		SELECT ip, s, e, (s / ?) * ?, began FROM spans
 		UNION ALL
-		SELECT ip, s, e, b + ? FROM covered WHERE b + ? < e
+		SELECT ip, s, e, b + ?, 0 FROM covered WHERE b + ? < e
 	)
 SELECT
 	c.b,
 	coalesce(busiest.ip, ?) AS series,
 	sum(min(c.e, c.b + ?) - max(c.s, c.b)) AS busy_seconds,
-	count(*) AS requests
+	count(*) AS requests,
+	sum(c.seed) AS started
 FROM covered c
 LEFT JOIN busiest ON busiest.ip = c.ip
 GROUP BY c.b, series
@@ -6644,17 +6804,22 @@ ORDER BY c.b`
 // returns a complete frame: an error is an error, but an empty table is a valid
 // answer with every bucket at zero, because "nothing has happened for twelve
 // hours" is a thing an operator needs to be able to see.
-func (s *LogStore) UsageSeries(ctx context.Context, now time.Time, window, bucket time.Duration, top int) (*UsageSeries, error) {
+func (s *LogStore) UsageSeries(ctx context.Context, now time.Time, window, bucket time.Duration, top int, by string) (*UsageSeries, error) {
+	column, ok := usageGroupColumns[by]
+	if !ok {
+		by, column = "client", usageGroupColumns["client"]
+	}
 	out := newUsageSeries(now, window, bucket)
+	out.By = by
 	if top < 1 {
 		top = 1
 	}
 	lo, hi, bucketSecs := out.From, out.To, out.BucketSeconds
-	rows, err := s.db.QueryContext(ctx, usageSeriesQuery,
+	rows, err := s.db.QueryContext(ctx, strings.ReplaceAll(usageSeriesQuery, "{{col}}", column),
 		usageUnknownClient,
 		time.Unix(lo, 0).UTC().Add(-usageMaxRequestAge).Format(time.RFC3339Nano),
 		time.Unix(hi, 0).UTC().Format(time.RFC3339Nano),
-		lo, hi, lo,
+		lo, hi, lo, lo,
 		top,
 		bucketSecs, bucketSecs, bucketSecs, bucketSecs,
 		usageOtherClients,
@@ -6669,6 +6834,7 @@ func (s *LogStore) UsageSeries(ctx context.Context, now time.Time, window, bucke
 		bucket   int
 		busy     float64
 		requests int64
+		started  int64
 	}
 	cells := map[string][]cell{}
 	totals := map[string]*UsageClient{}
@@ -6678,8 +6844,9 @@ func (s *LogStore) UsageSeries(ctx context.Context, now time.Time, window, bucke
 			series   string
 			busy     float64
 			requests int64
+			started  int64
 		)
-		if err := rows.Scan(&at, &series, &busy, &requests); err != nil {
+		if err := rows.Scan(&at, &series, &busy, &requests, &started); err != nil {
 			return nil, err
 		}
 		// The window bounds are compared against created_at as TEXT, and RFC3339
@@ -6691,14 +6858,17 @@ func (s *LogStore) UsageSeries(ctx context.Context, now time.Time, window, bucke
 		if idx < 0 || idx >= len(out.Buckets) || busy < 0 {
 			continue
 		}
-		cells[series] = append(cells[series], cell{bucket: idx, busy: busy, requests: requests})
+		cells[series] = append(cells[series], cell{bucket: idx, busy: busy, requests: requests, started: started})
 		total, ok := totals[series]
 		if !ok {
-			total = &UsageClient{ClientIP: series}
+			total = &UsageClient{Name: series}
+			if out.By == "client" {
+				total.ClientIP = series
+			}
 			totals[series] = total
 		}
 		total.Slots += busy
-		total.Requests += requests
+		total.Requests += started
 		if slots := busy / float64(bucketSecs); slots > total.Peak {
 			total.Peak = slots
 		}
@@ -6719,25 +6889,69 @@ func (s *LogStore) UsageSeries(ctx context.Context, now time.Time, window, bucke
 	// has an unattributable one wobbling underneath it and moving its baseline.
 	sort.Slice(out.Clients, func(i, j int) bool {
 		a, b := out.Clients[i], out.Clients[j]
-		if ra, rb := usageBandRank(a.ClientIP), usageBandRank(b.ClientIP); ra != rb {
+		if ra, rb := usageBandRank(a.Name), usageBandRank(b.Name); ra != rb {
 			return ra < rb
 		}
 		if a.Slots != b.Slots {
 			return a.Slots > b.Slots
 		}
-		return a.ClientIP < b.ClientIP
+		return a.Name < b.Name
 	})
 	for i := range out.Buckets {
 		out.Buckets[i].Slots = make([]float64, len(out.Clients))
 		out.Buckets[i].Requests = make([]int64, len(out.Clients))
+		out.Buckets[i].Started = make([]int64, len(out.Clients))
 	}
 	for i, client := range out.Clients {
-		for _, c := range cells[client.ClientIP] {
+		for _, c := range cells[client.Name] {
 			out.Buckets[c.bucket].Slots[i] = roundSlots(c.busy / float64(bucketSecs))
 			out.Buckets[c.bucket].Requests[i] = c.requests
+			out.Buckets[c.bucket].Started[i] = c.started
 		}
 	}
 	return out, nil
+}
+
+// usageTotalsQuery counts the window the way a headline number has to be counted:
+// one row, one request. No bucketing, no interval arithmetic, no recursion — a
+// request belongs to the window it STARTED in and is counted exactly once.
+//
+// Errors are status >= 400 OR a recorded transport error. Both are needed: a
+// worker that dropped the connection mid-stream leaves a row holding HTTP 200
+// and an error string, because the status went out with the SSE preamble long
+// before the failure happened (see writeSSEError).
+const usageTotalsQuery = `
+SELECT
+	count(*),
+	sum(CASE WHEN status_code >= 400 OR error != '' THEN 1 ELSE 0 END),
+	sum(max(duration_ms, 0)) / 1000.0,
+	sum(max(prompt_tokens, 0)),
+	sum(max(completion_tokens, 0))
+FROM request_logs
+WHERE created_at >= ? AND created_at < ?`
+
+// UsageTotals summarises the same window the series covers. Its own query rather
+// than a pass over the frame — see the type's comment for the counting bug that
+// buys.
+func (s *LogStore) UsageTotals(ctx context.Context, from, to int64) (*UsageTotals, error) {
+	// sum() over no rows is NULL, which is a real answer ("nothing happened") and
+	// not one that scans into a float64.
+	var (
+		out                                    UsageTotals
+		errs, busy, promptToks, completionToks sql.NullFloat64
+	)
+	row := s.db.QueryRowContext(ctx, usageTotalsQuery,
+		time.Unix(from, 0).UTC().Format(time.RFC3339Nano),
+		time.Unix(to, 0).UTC().Format(time.RFC3339Nano),
+	)
+	if err := row.Scan(&out.Requests, &errs, &busy, &promptToks, &completionToks); err != nil {
+		return nil, err
+	}
+	out.Errors = int64(errs.Float64)
+	out.BusySeconds = math.Round(busy.Float64*10) / 10
+	out.PromptTokens = int64(promptToks.Float64)
+	out.CompletionTokens = int64(completionToks.Float64)
+	return &out, nil
 }
 
 // newUsageSeries builds the empty frame: every bucket in the window, at zero.
@@ -6764,7 +6978,7 @@ func newUsageSeries(now time.Time, window, bucket time.Duration) *UsageSeries {
 		Buckets:       make([]UsageBucket, count),
 	}
 	for i := range out.Buckets {
-		out.Buckets[i] = UsageBucket{At: lo + int64(i)*bucketSecs, Slots: []float64{}, Requests: []int64{}}
+		out.Buckets[i] = UsageBucket{At: lo + int64(i)*bucketSecs, Slots: []float64{}, Requests: []int64{}, Started: []int64{}}
 	}
 	return out
 }

@@ -1,6 +1,7 @@
 package router
 
 import (
+	"encoding/json"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -239,34 +240,294 @@ func TestUsageCacheHoldsInProportionToWhatTheQueryCost(t *testing.T) {
 	frame := newUsageSeries(now, usageWindow, usageBucket)
 
 	var cache usageCache
-	if cache.get(frame.To, now) != nil {
+	if cache.get("client@300", frame.To, now) != nil {
 		t.Fatal("an empty cache answered")
 	}
 
 	// A quiet router: milliseconds, so the chart stays live at a ten-second poll.
-	cache.put(frame, now, 20*time.Millisecond)
-	if cache.get(frame.To, now.Add(usageCacheMin-time.Second)) == nil {
+	cache.put("client@300", frame, now, 20*time.Millisecond)
+	if cache.get("client@300", frame.To, now.Add(usageCacheMin-time.Second)) == nil {
 		t.Error("a cheap query bought no reprieve at all")
 	}
-	if cache.get(frame.To, now.Add(9*time.Second)) != nil {
+	if cache.get("client@300", frame.To, now.Add(9*time.Second)) != nil {
 		t.Error("a 20ms query is holding the chart for nine seconds; it should be live")
 	}
 
 	// A busy one: the chart visibly settles down rather than hammering SQLite.
-	cache.put(frame, now, time.Second)
-	if cache.get(frame.To, now.Add(15*time.Second)) == nil {
+	cache.put("client@300", frame, now, time.Second)
+	if cache.get("client@300", frame.To, now.Add(15*time.Second)) == nil {
 		t.Error("a one-second query is being re-run every poll; that is a fifth of the connection")
 	}
-	if cache.get(frame.To, now.Add(2*usageCacheMax)) != nil {
+	if cache.get("client@300", frame.To, now.Add(2*usageCacheMax)) != nil {
 		t.Error("the cache has no ceiling")
 	}
 
 	// And a rolled-over window is never served from the previous one, however
 	// recently it was computed. A chart pinned to a stale window is worse than a
 	// slow one, because nothing on screen says it has stopped moving.
-	cache.put(frame, now, time.Second)
-	if cache.get(frame.To+frame.BucketSeconds, now) != nil {
+	cache.put("client@300", frame, now, time.Second)
+	if cache.get("client@300", frame.To+frame.BucketSeconds, now) != nil {
 		t.Error("the cache answered for a window it was not computed for")
+	}
+
+	// One entry per view. The overview polls the hour frame and the usage tab
+	// polls the twelve-hour one; a single slot would have each evict the other on
+	// every tick, which is the cache making the database busier than no cache at
+	// all. Neither may ever be answered with the other's frame.
+	hour := newUsageSeries(now, usageHourWindow, usageHourBucket)
+	cache.put("backend@60", hour, now, time.Second)
+	if cache.get("client@300", frame.To, now.Add(time.Second)) == nil {
+		t.Error("caching the hour frame evicted the twelve-hour one")
+	}
+	if got := cache.get("backend@60", hour.To, now.Add(time.Second)); got == nil || got.To != hour.To {
+		t.Error("the hour frame was not cached under its own view")
+	}
+	if cache.get("client@60", hour.To, now.Add(time.Second)) != nil {
+		t.Error("a frame grouped by backend was served to a caller asking for clients")
+	}
+}
+
+// The second grouping. On a deployment behind one gateway every request carries
+// the same client_ip, so "who is this load from" has a single band in it and the
+// only useful cut is "where is it landing" — which worker served it.
+func TestUsageSeriesGroupsByBackendWhenAsked(t *testing.T) {
+	logs := newTestLogStore(t)
+	now := time.Date(2026, 3, 4, 15, 47, 13, 0, time.UTC)
+	frame := newUsageSeries(now, usageWindow, usageBucket)
+	start := time.Unix(frame.Buckets[100].At, 0).UTC()
+
+	// One address, two workers, and the fast one holding a slot for twice as long.
+	insertUsageRowOn(t, logs, "10.0.0.1", "gpu", start, 2*usageBucket)
+	insertUsageRowOn(t, logs, "10.0.0.1", "cpu", start, usageBucket)
+
+	series, err := logs.UsageSeries(t.Context(), now, usageWindow, usageBucket, usageTopClients, "backend")
+	if err != nil {
+		t.Fatalf("UsageSeries: %v", err)
+	}
+	if series.By != "backend" {
+		t.Errorf("frame reports by=%q; the page uses this to know which chart it is drawing", series.By)
+	}
+	if len(series.Clients) != 2 {
+		t.Fatalf("got %d bands grouped by backend, want one per worker: %+v", len(series.Clients), series.Clients)
+	}
+	// Busiest first, and busiest is busy TIME, not request count.
+	if series.Clients[0].Name != "gpu" {
+		t.Errorf("bands are %q, %q; the worker holding slots longest ranks first",
+			series.Clients[0].Name, series.Clients[1].Name)
+	}
+	// client_ip is not a field this frame can honestly fill, so it does not.
+	if series.Clients[0].ClientIP != "" {
+		t.Errorf("a backend band carries client_ip=%q — that field means an address", series.Clients[0].ClientIP)
+	}
+	if got := usageValue(t, series, 100, "gpu"); math.Abs(got-1) > 1e-6 {
+		t.Errorf("gpu bucket 100 = %v slots, want 1", got)
+	}
+
+	// An unrecognised grouping is the default one, not an error and never a
+	// column name off the wire: usageGroupColumns is spliced into the SQL.
+	junk, err := logs.UsageSeries(t.Context(), now, usageWindow, usageBucket, usageTopClients, "1=1; DROP TABLE request_logs")
+	if err != nil {
+		t.Fatalf("an unknown grouping should fall back, not fail: %v", err)
+	}
+	if junk.By != "client" {
+		t.Errorf("unknown grouping resolved to %q, want the client default", junk.By)
+	}
+}
+
+// The overview's frame. Same machinery, one order of magnitude in, and the
+// alignment property has to survive the smaller bucket or the live chart
+// shimmers on every ten-second poll.
+func TestUsageSeriesServesTheHourFrame(t *testing.T) {
+	logs := newTestLogStore(t)
+	now := time.Date(2026, 3, 4, 15, 47, 13, 0, time.UTC)
+
+	series, err := logs.UsageSeries(t.Context(), now, usageHourWindow, usageHourBucket, usageTopClients, "client")
+	if err != nil {
+		t.Fatalf("UsageSeries: %v", err)
+	}
+	if len(series.Buckets) != 60 {
+		t.Errorf("the hour frame has %d columns, want 60 one-minute buckets", len(series.Buckets))
+	}
+	if series.BucketSeconds != 60 {
+		t.Errorf("bucket is %ds, want 60", series.BucketSeconds)
+	}
+	if series.From%series.BucketSeconds != 0 {
+		t.Errorf("window starts at %d, not on a minute boundary — every column would move on every poll", series.From)
+	}
+	if series.To <= now.Unix() {
+		t.Error("the live bucket is missing from the hour frame")
+	}
+}
+
+// The totals are a separate count for a reason, and this is the reason: a
+// request in flight across several buckets is drawn in all of them, so summing
+// the chart's own per-bucket counts answers "request-buckets", not "requests".
+// A headline figure computed that way grows with how SLOW the fleet is, which is
+// the opposite of what a reader takes it for.
+func TestUsageTotalsCountEachRequestOnce(t *testing.T) {
+	logs := newTestLogStore(t)
+	now := time.Date(2026, 3, 4, 15, 47, 13, 0, time.UTC)
+	frame := newUsageSeries(now, usageHourWindow, usageHourBucket)
+	start := time.Unix(frame.Buckets[10].At, 0).UTC()
+
+	// One request spanning ten one-minute buckets, and one short one.
+	insertUsageRow(t, logs, "10.0.0.1", start, 10*time.Minute)
+	insertUsageRow(t, logs, "10.0.0.1", start, 30*time.Second)
+
+	totals, err := logs.UsageTotals(t.Context(), frame.From, frame.To)
+	if err != nil {
+		t.Fatalf("UsageTotals: %v", err)
+	}
+	if totals.Requests != 2 {
+		t.Errorf("totals.Requests = %d, want 2 — the ten-minute request is one request, not ten", totals.Requests)
+	}
+	if math.Abs(totals.BusySeconds-630) > 0.5 {
+		t.Errorf("totals.BusySeconds = %v, want 630 (600 + 30)", totals.BusySeconds)
+	}
+	// The bands add up to the headline, because both count starts. The legend
+	// under the chart and the tile above it are read together and must agree.
+	series, err := logs.UsageSeries(t.Context(), now, usageHourWindow, usageHourBucket, usageTopClients, "client")
+	if err != nil {
+		t.Fatalf("UsageSeries: %v", err)
+	}
+	var banded int64
+	for _, c := range series.Clients {
+		banded += c.Requests
+	}
+	if banded != totals.Requests {
+		t.Errorf("bands total %d requests against a headline of %d", banded, totals.Requests)
+	}
+	// And the per-bucket in-flight count is deliberately the OTHER number: the
+	// ten-minute request is drawn in ten columns and counted in ten. Pinned so
+	// that someone "fixing" the discrepancy has to read why there are two.
+	var inFlight int64
+	for _, b := range series.Buckets {
+		for _, n := range b.Requests {
+			inFlight += n
+		}
+	}
+	if inFlight <= banded {
+		t.Errorf("in-flight per bucket totals %d against %d requests; if these have "+
+			"converged, one of the two is now measuring the wrong thing", inFlight, banded)
+	}
+}
+
+// A request already running when the window opened did not START in it. The
+// clamped span cannot tell you that — it is dragged forward to the window edge —
+// so a start count seeded off it would report every straddler as beginning in
+// the first bucket, and a router restarted mid-generation would show a spike of
+// arrivals that never happened.
+func TestUsageSeriesDoesNotCountAStraddlerAsStartingInTheWindow(t *testing.T) {
+	logs := newTestLogStore(t)
+	now := time.Date(2026, 3, 4, 15, 47, 13, 0, time.UTC)
+	frame := newUsageSeries(now, usageHourWindow, usageHourBucket)
+
+	// Starts five minutes before the window and runs for ten, so half of it is
+	// on screen — one slot held in the first buckets, zero arrivals.
+	insertUsageRow(t, logs, "10.0.0.1", time.Unix(frame.From, 0).UTC().Add(-5*time.Minute), 10*time.Minute)
+	insertUsageRow(t, logs, "10.0.0.1", time.Unix(frame.Buckets[30].At, 0).UTC(), time.Minute)
+
+	series, err := logs.UsageSeries(t.Context(), now, usageHourWindow, usageHourBucket, usageTopClients, "client")
+	if err != nil {
+		t.Fatalf("UsageSeries: %v", err)
+	}
+	if got := usageValue(t, series, 0, "10.0.0.1"); math.Abs(got-1) > 1e-6 {
+		t.Errorf("first bucket = %v slots, want 1: the in-window half of the straddler", got)
+	}
+	if got := series.Buckets[0].Started[0]; got != 0 {
+		t.Errorf("bucket 0 records %d arrivals; the straddler started before the window", got)
+	}
+	if got := series.Buckets[30].Started[0]; got != 1 {
+		t.Errorf("bucket 30 records %d arrivals, want 1", got)
+	}
+	if got := series.Clients[0].Requests; got != 1 {
+		t.Errorf("the band counts %d requests, want 1 — only one of the two began inside the window", got)
+	}
+}
+
+// An empty window is a real answer with real zeroes, not a NULL scan error. A
+// router that has served nothing for an hour is a state the overview has to be
+// able to draw.
+func TestUsageTotalsOverAnEmptyWindow(t *testing.T) {
+	logs := newTestLogStore(t)
+	now := time.Date(2026, 3, 4, 15, 47, 13, 0, time.UTC)
+	frame := newUsageSeries(now, usageHourWindow, usageHourBucket)
+
+	totals, err := logs.UsageTotals(t.Context(), frame.From, frame.To)
+	if err != nil {
+		t.Fatalf("UsageTotals over an empty window: %v", err)
+	}
+	if totals.Requests != 0 || totals.Errors != 0 || totals.BusySeconds != 0 {
+		t.Errorf("empty window totalled %+v", totals)
+	}
+}
+
+// Errors are status >= 400 OR a recorded transport error, and the second half is
+// the one that gets missed: a worker that drops the connection mid-stream leaves
+// a row holding HTTP 200, because the status went out with the SSE preamble long
+// before the failure. Counting only the status code would report a fleet that
+// is dropping streams as perfectly healthy.
+func TestUsageTotalsCountAMidStreamFailureAsAnError(t *testing.T) {
+	logs := newTestLogStore(t)
+	now := time.Date(2026, 3, 4, 15, 47, 13, 0, time.UTC)
+	frame := newUsageSeries(now, usageHourWindow, usageHourBucket)
+	start := time.Unix(frame.Buckets[10].At, 0).UTC()
+
+	if err := logs.Insert(t.Context(), RequestLog{
+		CreatedAt: start, BackendID: "gpu", StatusCode: http.StatusOK,
+		DurationMillis: 1000, ClientIP: "10.0.0.1",
+		Error: `Post "http://worker:8001/v1/chat/completions": context canceled`,
+	}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := logs.Insert(t.Context(), RequestLog{
+		CreatedAt: start, BackendID: "gpu", StatusCode: http.StatusOK,
+		DurationMillis: 1000, ClientIP: "10.0.0.1",
+	}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	totals, err := logs.UsageTotals(t.Context(), frame.From, frame.To)
+	if err != nil {
+		t.Fatalf("UsageTotals: %v", err)
+	}
+	if totals.Errors != 1 {
+		t.Errorf("totals.Errors = %d, want 1 — a 200 carrying an error string is a failed request", totals.Errors)
+	}
+}
+
+// The endpoint's knobs are enumerations. Anything else is the default, because
+// the grouping reaches SQL as an identifier and the window is a contract with
+// the reader about what a column means.
+func TestUsageEndpointServesBothWindowsAndBothGroupings(t *testing.T) {
+	router := adminRouter(t)
+	for _, tc := range []struct {
+		query, wantBy string
+		wantBucket    int64
+	}{
+		{"", "client", 300},
+		{"?range=1h", "client", 60},
+		{"?range=1h&by=backend", "backend", 60},
+		{"?by=backend", "backend", 300},
+		{"?range=nonsense&by=nonsense", "client", 300},
+	} {
+		rec := serveAdmin(router, adminReq(http.MethodGet, "/admin/usage"+tc.query, ""))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /admin/usage%s returned %d: %s", tc.query, rec.Code, rec.Body.String())
+		}
+		var got UsageSeries
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("decode %s: %v", tc.query, err)
+		}
+		if got.By != tc.wantBy || got.BucketSeconds != tc.wantBucket {
+			t.Errorf("GET /admin/usage%s → by=%q bucket=%ds, want by=%q bucket=%ds",
+				tc.query, got.By, got.BucketSeconds, tc.wantBy, tc.wantBucket)
+		}
+		// The tiles above the chart and the chart itself come back together, so
+		// they can never be describing two different minutes.
+		if got.Totals == nil {
+			t.Errorf("GET /admin/usage%s carried no totals; the stat tiles have nothing to read", tc.query)
+		}
 	}
 }
 
@@ -330,9 +591,14 @@ func TestDashboardAssignsChartColoursByAddressNotRank(t *testing.T) {
 
 func insertUsageRow(t *testing.T, logs *LogStore, ip string, start time.Time, took time.Duration) {
 	t.Helper()
+	insertUsageRowOn(t, logs, ip, "worker", start, took)
+}
+
+func insertUsageRowOn(t *testing.T, logs *LogStore, ip, backend string, start time.Time, took time.Duration) {
+	t.Helper()
 	if err := logs.Insert(t.Context(), RequestLog{
 		CreatedAt:      start.UTC(),
-		BackendID:      "worker",
+		BackendID:      backend,
 		BackendModel:   "model",
 		Route:          "auto",
 		StatusCode:     http.StatusOK,
@@ -345,7 +611,7 @@ func insertUsageRow(t *testing.T, logs *LogStore, ip string, start time.Time, to
 
 func usageSeries(t *testing.T, logs *LogStore, now time.Time) *UsageSeries {
 	t.Helper()
-	series, err := logs.UsageSeries(t.Context(), now, usageWindow, usageBucket, usageTopClients)
+	series, err := logs.UsageSeries(t.Context(), now, usageWindow, usageBucket, usageTopClients, "client")
 	if err != nil {
 		t.Fatalf("UsageSeries: %v", err)
 	}
@@ -355,7 +621,7 @@ func usageSeries(t *testing.T, logs *LogStore, now time.Time) *UsageSeries {
 func usageBand(t *testing.T, series *UsageSeries, client string) int {
 	t.Helper()
 	for i, c := range series.Clients {
-		if c.ClientIP == client {
+		if c.Name == client {
 			return i
 		}
 	}

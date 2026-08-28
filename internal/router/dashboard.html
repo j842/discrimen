@@ -124,6 +124,50 @@
     .tip-value { color: #e9edf3; font-variant-numeric: tabular-nums; }
     .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 8px; vertical-align: -1px; }
     .num { font-variant-numeric: tabular-nums; }
+    /* Overview. The landing page answers three questions in the order an
+       operator asks them: how busy is the fleet right now, which worker is
+       carrying it, and what has the last hour looked like. Figures first, then
+       meters, then the plot — a chart is the slowest of the three to read and
+       the only one of them that needs a second look. */
+    .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; margin-bottom: 18px; }
+    .tile { background: #151923; border: 1px solid #2a2f3a; border-radius: 8px; padding: 12px 14px; min-width: 0; }
+    .tile .label { color: #9aa4b2; font-size: 12px; margin-bottom: 6px; }
+    /* Proportional figures, not tabular: tabular-nums gives every digit the
+       width of a zero, which at this size reads as loose spacing. The tables
+       below are where digits have to line up vertically, and they set it. */
+    .tile .value { font-size: 22px; font-weight: 600; line-height: 1.15; }
+    .tile .sub { color: #9aa4b2; font-size: 12px; margin-top: 4px; }
+    /* Exactly one hero on the page. It is the number the whole view is about:
+       how much of the fleet is busy at this instant. */
+    .tile.hero { grid-column: span 2; }
+    .tile.hero .value { font-size: 48px; font-weight: 600; letter-spacing: -.02em; }
+    @media (max-width: 700px) { .tile.hero { grid-column: span 1; } .tile.hero .value { font-size: 34px; } }
+    /* A meter, not a gauge. A dial spends most of its ink on a bezel and puts
+       the same ratio at a different angle on every row, so a column of them
+       cannot be scanned; a track shares one baseline and one length, and the
+       eye compares them without being asked to. The fill carries severity and
+       the empty part of the track is a dark step of the same hue, so the state
+       reads across the whole bar rather than only the filled end. */
+    .meters { display: grid; gap: 10px; }
+    .meter-row { display: grid; grid-template-columns: minmax(150px, 1.4fr) 1fr minmax(96px, auto); gap: 12px; align-items: center; }
+    .meter-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .meter-name .muted { display: block; font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
+    .meter { height: 10px; border-radius: 5px; overflow: hidden; background: #1a2130; }
+    .meter > i { display: block; height: 100%; border-radius: 5px; background: #3987e5; transition: width .3s ease; }
+    .meter.idle > i { background: #39414f; }
+    .meter.warm { background: #2b2712; } .meter.warm > i { background: #f7c948; }
+    .meter.full { background: #2e1a1c; } .meter.full > i { background: #ff6b6b; }
+    .meter.down { background: #2e1a1c; }
+    .meter-value { text-align: right; font-variant-numeric: tabular-nums; font-size: 13px; }
+    .meter-value .muted { font-size: 12px; }
+    /* Segmented control for the two questions the same chart can answer. Not a
+       <select>: there are two options, both are always relevant, and which one
+       is showing has to be visible without opening anything. */
+    .seg { display: inline-flex; border: 1px solid #303847; border-radius: 6px; overflow: hidden; }
+    .seg button { border-radius: 0; background: #151923; color: #cbd5e1; padding: 5px 12px; font-size: 13px; }
+    .seg button + button { border-left: 1px solid #303847; }
+    .seg button.active { background: #1d4ed8; color: #fff; }
+    .spread { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
     @media (max-width: 900px) { .wide { display: none; } .grid { grid-template-columns: 1fr; } table { font-size: 12px; } }
   </style>
 </head>
@@ -162,6 +206,7 @@
 
     <div id="admin-view" hidden>
       <nav class="tabbar" id="main-tabs">
+        <button class="secondary" id="mtab-overview">Overview</button>
         <button class="secondary" id="mtab-fleet">Fleet</button>
         <button class="secondary" id="mtab-usage">Usage</button>
         <button class="secondary" id="mtab-providers">Providers</button>
@@ -170,6 +215,57 @@
         <button class="secondary" id="mtab-relays">Relays</button>
         <button class="secondary" id="mtab-logs">Logs</button>
       </nav>
+
+      <section class="view" id="view-overview">
+        <div class="tiles" id="overview-tiles"></div>
+
+        <section class="panel">
+          <h2>Where the work is landing</h2>
+          <div class="panel-body stack">
+            <div class="meters" id="fleet-meters">
+              <div class="muted">Loading the fleet…</div>
+            </div>
+            <div class="hint">
+              Live, not averaged: this is what each worker is holding at the instant of the last poll, against
+              the concurrency the router measured for it. A worker sitting at its ceiling is not a fault — it
+              is a worker being used — but it is also the one making the next caller queue.
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>The last hour</h2>
+          <div class="panel-body stack">
+            <div class="spread">
+              <div class="seg" id="hour-by" role="group" aria-label="What to split the columns by">
+                <button id="hour-by-client">By caller</button>
+                <button id="hour-by-backend">By worker</button>
+              </div>
+              <span class="muted" id="hour-summary">Loading…</span>
+            </div>
+            <div class="chart-wrap" id="hour-wrap">
+              <svg class="chart" id="hour-chart" viewBox="0 0 1200 260" preserveAspectRatio="xMidYMid meet"
+                   role="img" aria-label="Requests in flight over the last hour, one column per minute, stacked."></svg>
+              <div class="chart-empty" id="hour-empty" hidden></div>
+            </div>
+            <table id="hour-legend-table">
+              <thead>
+                <tr><th id="hour-legend-head">Caller</th><th>Average slots</th><th>Busiest minute</th><th>Requests</th></tr>
+              </thead>
+              <tbody id="hour-legend">
+                <tr><td colspan="4" class="muted">Loading…</td></tr>
+              </tbody>
+            </table>
+            <div class="hint">
+              One <strong>slot</strong> is one request in flight, so a column at 2 means two workers were busy
+              for the whole minute — or four for half of it. Splitting by caller answers "whose load is this";
+              splitting by worker answers "where is it landing", which is the one to look at when the fleet is
+              lopsided. The newest column is faded because its minute has not finished, and a request is only
+              written to the log when it ends, so anything running right now appears when it lands.
+            </div>
+          </div>
+        </section>
+      </section>
 
       <section class="view" id="view-fleet">
         <table>
@@ -461,8 +557,8 @@
     // two disagreeing answers to "am I signed in". The cookie is HttpOnly, is
     // revoked server-side by /admin/logout, and expires on its own.
     let signedIn = false;
-    let activeTab = 'fleet';
-    const TABS = ['fleet', 'usage', 'providers', 'keys', 'groups', 'relays', 'logs'];
+    let activeTab = 'overview';
+    const TABS = ['overview', 'fleet', 'usage', 'providers', 'keys', 'groups', 'relays', 'logs'];
 
     // Any key the previous version of this page left behind. Removed rather than
     // migrated: it is a live admin credential in a store this page no longer has
@@ -526,8 +622,9 @@
         profileRuns = {};
         showTab(activeTab);
         // The per-backend log tabs are built from the fleet listing, so it is
-        // fetched once on sign-in whichever tab is open.
-        if (activeTab !== 'fleet') refreshBackends();
+        // fetched once on sign-in whichever tab is open. The two tabs that fetch
+        // it themselves are skipped rather than made to do it twice.
+        if (activeTab !== 'fleet' && activeTab !== 'overview') refreshBackends();
       } else {
         closeDialog(true);
         setBanner('login-note', note || '', note ? 'warn' : '');
@@ -557,7 +654,7 @@
 
     // ── Tabs ────────────────────────────────────────────────────────────────
     function showTab(name) {
-      if (TABS.indexOf(name) === -1) name = 'fleet';
+      if (TABS.indexOf(name) === -1) name = 'overview';
       activeTab = name;
       TABS.forEach(t => {
         document.getElementById('view-' + t).classList.toggle('active', t === name);
@@ -568,7 +665,8 @@
     }
     function loadTab(name) {
       if (!signedIn) return;
-      if (name === 'fleet') refreshBackends();
+      if (name === 'overview') loadOverview();
+      else if (name === 'fleet') refreshBackends();
       else if (name === 'usage') loadUsage();
       else if (name === 'providers') loadProviders();
       else if (name === 'keys') loadKeys();
@@ -1142,18 +1240,24 @@
       return null;
     }
 
-    // ── Usage graph ─────────────────────────────────────────────────────────
+    // ── Usage charts ────────────────────────────────────────────────────────
     //
-    // Twelve hours of active slots, stacked by the address each request came
-    // from. GET /admin/usage does every bit of the arithmetic in SQL and answers
-    // with 144 columns and at most ten bands; this page never sees a request row,
-    // which is the point — twelve hours of the log table is tens of thousands of
-    // rows carrying stored prompts and completions, and it is refetched every ten
-    // seconds.
+    // Two frames of one chart, drawn by one function: twelve hours in
+    // five-minute columns on the Usage tab, and the last hour in one-minute
+    // columns on the overview. GET /admin/usage does every bit of the arithmetic
+    // in SQL and answers with the columns already bucketed and at most ten
+    // bands; this page never sees a request row, which is the point — twelve
+    // hours of the log table is tens of thousands of rows carrying stored
+    // prompts and completions, and it is refetched every ten seconds.
     //
-    // See the constants above handleUsage in main.go for why the window is twelve
-    // hours, why the bucket is five minutes, and why the buckets are aligned to
-    // the clock rather than to the moment of the poll.
+    // ?by= picks what the bands are cut on. "client" is who sent the work,
+    // "backend" is which worker did it. Same stack, two different questions, and
+    // on a router sitting behind one gateway the second is the only one of the
+    // two with more than a single band in it.
+    //
+    // See the constants above handleUsage in main.go for why the windows are
+    // twelve hours and one hour, why the buckets are what they are, and why both
+    // are aligned to the clock rather than to the moment of the poll.
 
     // The eight categorical slots, stepped for a dark surface and validated as a
     // SET against this page's #0f141d plot: lightness band, chroma floor,
@@ -1169,58 +1273,105 @@
       unknown: 'Requests logged before this router recorded where they came from. The address was never ' +
                'stored for these, so there is nothing to attribute them to — they are shown rather than ' +
                'dropped, because hiding them would make a busy router look idle.',
-      other: 'Everything past the eight busiest addresses, added together. Eight is the palette: a ninth ' +
-             'colour would be indistinguishable from one of the others to a colour-blind reader.',
+      other: 'Everything past the eight busiest, added together. Eight is the palette: a ninth colour ' +
+             'would be indistinguishable from one of the others to a colour-blind reader.',
     };
-    const PLOT = {w: 1200, h: 320, left: 52, right: 14, top: 14, bottom: 30, gap: 2};
-    PLOT.iw = PLOT.w - PLOT.left - PLOT.right;
-    PLOT.ih = PLOT.h - PLOT.top - PLOT.bottom;
-    let usageLoading = false;
+    const BACKEND_NOTE = {
+      unknown: 'Requests that never reached a worker — no backend could serve them, or none had a free ' +
+               'slot before the caller gave up. They are load the fleet was asked for and did not carry.',
+      other: 'Everything past the eight busiest workers, added together.',
+    };
+    // Each view is one <svg> and the table under it. The plot geometry differs
+    // (the hour chart is shorter — sixty columns need less height than a
+    // hundred and forty-four to stay readable) and so does the tick rule, which
+    // has to land on times a reader can line something else up against.
+    const CHART_VIEWS = {
+      usage: {
+        chart: 'usage-chart', wrap: 'usage-wrap', empty: 'usage-empty',
+        legend: 'usage-legend', summary: 'usage-summary',
+        plot: {w: 1200, h: 320, left: 52, right: 14, top: 14, bottom: 30, gap: 2},
+        tick: at => at.getMinutes() === 0 && at.getHours() % 2 === 0,
+        quiet: 'No requests in the last 12 hours. The axis is drawn so you can see that this is a router ' +
+               'with nothing to do, rather than a chart that failed to load.',
+      },
+      hour: {
+        chart: 'hour-chart', wrap: 'hour-wrap', empty: 'hour-empty',
+        legend: 'hour-legend', legendHead: 'hour-legend-head', summary: 'hour-summary',
+        plot: {w: 1200, h: 260, left: 52, right: 14, top: 14, bottom: 30, gap: 2},
+        tick: at => at.getMinutes() % 10 === 0,
+        quiet: 'Nothing has been served in the last hour. The axis is drawn so you can see that this is an ' +
+               'idle router rather than a chart that failed to load.',
+      },
+    };
+    for (const key in CHART_VIEWS) {
+      const p = CHART_VIEWS[key].plot;
+      p.iw = p.w - p.left - p.right;
+      p.ih = p.h - p.top - p.bottom;
+    }
 
-    // usageFill is the address→colour map, and the reason it lives out here
-    // rather than being recomputed from each response is that a colour has to be
-    // a property of the CLIENT, not of its position in the list.
+    // bandName is the band's identity. The payload gained `name` when the bands
+    // stopped always being addresses; `client_ip` is what it used to be called
+    // and is still sent for the client grouping.
+    function bandName(band) {
+      return String((band && (band.name || band.client_ip)) || '');
+    }
+
+    // usageFill is the band→colour map, one per grouping, and the reason it lives
+    // out here rather than being recomputed from each response is that a colour
+    // has to be a property of the BAND, not of its position in the list.
     //
-    // The list arrives ranked by busy time over a sliding twelve hours, and that
+    // The list arrives ranked by busy time over a sliding window, and that
     // ranking drifts on its own — no one has to touch anything. Colouring by
     // position would mean two clients silently trading colours between one poll
     // and the next, with nothing on screen to say they had; a reader who has
     // learned that the laptop is blue would then be reading someone else's
-    // traffic and would have no way to know. So the first time an address is
-    // seen it is given a slot, and it keeps it.
+    // traffic and would have no way to know. So the first time a band is seen it
+    // is given a slot, and it keeps it.
     //
     // Seeded IN RANK ORDER on that first sight, which is the other half of the
     // problem. The eight slots are an ordering, not a set: what was validated is
     // that every ADJACENT pair stays apart under colour-blind simulation, and in
     // a stack "adjacent" means the band above and the band below. Handing out
-    // slots by, say, a hash of the address would satisfy stability and put
-    // arbitrary pairs against each other — the two greens are slots 3 and 6 and
-    // were never checked as neighbours. Rank order makes the stack and the
-    // palette the same sequence.
+    // slots by, say, a hash of the name would satisfy stability and put arbitrary
+    // pairs against each other — the two greens are slots 3 and 6 and were never
+    // checked as neighbours. Rank order makes the stack and the palette the same
+    // sequence.
     //
-    // A slot is released when its address falls out of the window, so a router
-    // that sees a lot of one-off addresses does not exhaust the palette.
+    // Keyed per GROUPING because an address and a worker id are different
+    // namespaces, and released only when the band has fallen out of every chart
+    // drawing that grouping — the hour frame and the twelve-hour frame hold
+    // different sets of the same addresses, and releasing on one view alone
+    // would have the two charts hand each other's colours back and forth on
+    // every poll.
     let usageFill = {};
-    function seriesFill(clients) {
-      const present = (clients || []).map(c => c.client_ip).filter(ip => !NEUTRAL_FILL[ip]);
+    let usagePresent = {};
+    function seriesFill(clients, group, viewKey) {
+      const names = (clients || []).map(bandName).filter(n => n && !NEUTRAL_FILL[n]);
+      usagePresent[viewKey] = {group: group, names: names};
+      const live = {};
+      for (const key in usagePresent) {
+        if (usagePresent[key].group !== group) continue;
+        usagePresent[key].names.forEach(n => { live[n] = true; });
+      }
+      const held = usageFill[group] || {};
       const kept = {};
       const taken = {};
-      present.forEach(ip => {
-        if (usageFill[ip] === undefined) return;
-        kept[ip] = usageFill[ip];
-        taken[SERIES_FILL.indexOf(kept[ip])] = true;
-      });
-      present.forEach(ip => {
-        if (kept[ip]) return;
+      for (const name in held) {
+        if (!live[name]) continue;
+        kept[name] = held[name];
+        taken[SERIES_FILL.indexOf(held[name])] = true;
+      }
+      names.forEach(name => {
+        if (kept[name]) return;
         let slot = 0;
         while (slot < SERIES_FILL.length && taken[slot]) slot++;
         // Unreachable while the server caps named bands at eight, which it does
         // for exactly this reason. Reusing slot 1 is still better than undefined.
         if (slot >= SERIES_FILL.length) slot = 0;
         taken[slot] = true;
-        kept[ip] = SERIES_FILL[slot];
+        kept[name] = SERIES_FILL[slot];
       });
-      usageFill = kept;
+      usageFill[group] = kept;
       return Object.assign({}, kept, NEUTRAL_FILL);
     }
 
@@ -1248,7 +1399,17 @@
       const at = new Date(epoch * 1000);
       return String(at.getHours()).padStart(2, '0') + ':' + String(at.getMinutes()).padStart(2, '0');
     }
+    function durationText(seconds) {
+      const s = Number(seconds) || 0;
+      if (s <= 0) return '0s';
+      if (s < 1) return Math.round(s * 1000) + 'ms';
+      if (s < 60) return (s < 10 ? s.toFixed(1) : s.toFixed(0)) + 's';
+      const mins = Math.floor(s / 60);
+      if (mins < 60) return mins + 'm ' + Math.round(s - mins * 60) + 's';
+      return Math.floor(mins / 60) + 'h ' + (mins % 60) + 'm';
+    }
 
+    let usageLoading = false;
     async function loadUsage() {
       usageLoading = true;
       const res = await request('/admin/usage');
@@ -1259,14 +1420,16 @@
         document.getElementById('usage-summary').textContent = res.error;
         return;
       }
-      drawUsage(res.data || {});
+      drawUsage(res.data || {}, CHART_VIEWS.usage, 'usage');
     }
 
-    function drawUsage(series) {
-      const svg = document.getElementById('usage-chart');
+    function drawUsage(series, view, viewKey) {
+      const PLOT = view.plot;
+      const svg = document.getElementById(view.chart);
       const buckets = series.buckets || [];
       const clients = series.clients || [];
-      const fill = seriesFill(clients);
+      const group = series.by === 'backend' ? 'backend' : 'client';
+      const fill = seriesFill(clients, group, viewKey);
       const totals = buckets.map(b => (b.slots || []).reduce((a, v) => a + v, 0));
       const busiest = totals.reduce((a, v) => Math.max(a, v), 0);
       const ticks = axisTicks(busiest);
@@ -1285,11 +1448,11 @@
         }));
         svg.appendChild(svgEl('text', {x: PLOT.left - 8, y: yOf(t) + 4, 'text-anchor': 'end'}, [slotText(t)]));
       });
-      // The time axis every two hours on the hour, so the labels are wall-clock
-      // times an operator can line up against something else that happened.
+      // The time axis, labelled at whatever interval this frame's tick rule
+      // picks, so the labels are wall-clock times an operator can line up
+      // against something else that happened.
       buckets.forEach((b, i) => {
-        const at = new Date(b.t * 1000);
-        if (at.getMinutes() !== 0 || at.getHours() % 2 !== 0) return;
+        if (!view.tick(new Date(b.t * 1000))) return;
         const x = PLOT.left + i * slot;
         svg.appendChild(svgEl('line', {
           x1: x, x2: x, y1: PLOT.top, y2: PLOT.top + PLOT.ih, stroke: '#212734', 'stroke-width': '1',
@@ -1319,7 +1482,7 @@
           const drawn = full > PLOT.gap + 1 ? full - PLOT.gap : full;
           const rect = svgEl('rect', {
             x: x, y: top, width: width, height: Math.max(drawn, 0.75), rx: '1',
-            fill: fill[(clients[s] || {}).client_ip] || NEUTRAL_FILL.other,
+            fill: fill[bandName(clients[s])] || NEUTRAL_FILL.other,
           });
           if (live) rect.setAttribute('opacity', '.55');
           svg.appendChild(rect);
@@ -1334,30 +1497,38 @@
         const hit = svgEl('rect', {
           class: 'hit', x: PLOT.left + i * slot, y: PLOT.top, width: slot, height: PLOT.ih,
         });
-        hit.addEventListener('pointermove', ev => showUsageTip(ev, series, i, fill, totals[i]));
-        hit.addEventListener('pointerleave', hideUsageTip);
+        hit.addEventListener('pointermove', ev => showUsageTip(ev, series, i, fill, totals[i], view));
+        hit.addEventListener('pointerleave', () => hideUsageTip(view));
         svg.appendChild(hit);
       });
 
       const anyTraffic = clients.length > 0;
-      const empty = document.getElementById('usage-empty');
+      const empty = document.getElementById(view.empty);
       empty.hidden = anyTraffic;
       if (!anyTraffic) {
         // An empty chart with an axis and an explanation, not a broken one. A
-        // router that has served nothing for twelve hours is a real state and has
-        // to be legible as one.
+        // router that has served nothing all window is a real state and has to be
+        // legible as one.
         empty.innerHTML = '';
-        empty.appendChild(el('span', {}, [
-          'No requests in the last 12 hours. The axis is drawn so you can see that this is a router with ' +
-          'nothing to do, rather than a chart that failed to load.',
-        ]));
+        empty.appendChild(el('span', {}, [view.quiet]));
       }
-      const requests = clients.reduce((a, c) => a + (c.requests || 0), 0);
-      const span = Math.round((series.to - series.from) / 3600);
-      document.getElementById('usage-summary').textContent =
-        'Last ' + span + ' hours · ' + Math.round((series.bucket_seconds || 300) / 60) + '-minute buckets · ' +
+      const span = series.to - series.from;
+      const spanText = span >= 7200 ? Math.round(span / 3600) + ' hours' : Math.round(span / 60) + ' minutes';
+      const bucketSecs = series.bucket_seconds || 300;
+      const bucketText = bucketSecs >= 120 ? Math.round(bucketSecs / 60) + '-minute' : bucketSecs + '-second';
+      // The honest count, which is not the sum of the bands: a request in flight
+      // across three buckets is drawn in all three and counted in all three. See
+      // UsageTotals in main.go.
+      const requests = series.totals
+        ? series.totals.requests
+        : clients.reduce((a, c) => a + (c.requests || 0), 0);
+      if (view.legendHead) {
+        document.getElementById(view.legendHead).textContent = group === 'backend' ? 'Worker' : 'Caller';
+      }
+      document.getElementById(view.summary).textContent =
+        'Last ' + spanText + ' · ' + bucketText + ' buckets · ' +
         numberText(requests) + ' request' + (requests === 1 ? '' : 's') + ' · peak ' + slotText(busiest) + ' slots';
-      renderUsageLegend(clients, fill);
+      renderUsageLegend(clients, fill, view, group);
     }
 
     // The legend and the table view are the same table. A legend has to exist for
@@ -1366,24 +1537,26 @@
     // table of totals does for the aggregates. (Per-column values live in the
     // tooltip and, request by request, in the Logs tab. 144 tab stops across the
     // chart would be worse for a keyboard reader than this table is.)
-    function renderUsageLegend(clients, fill) {
+    function renderUsageLegend(clients, fill, view, group) {
       if (!clients.length) {
-        emptyRow('usage-legend', 4, 'Nothing to attribute yet.');
+        emptyRow(view.legend, 4, 'Nothing to attribute yet.');
         return;
       }
-      const body = document.getElementById('usage-legend');
+      const notes = group === 'backend' ? BACKEND_NOTE : USAGE_NOTE;
+      const body = document.getElementById(view.legend);
       body.innerHTML = '';
       clients.forEach(c => {
+        const label = bandName(c);
         const swatch = el('span', {class: 'swatch'});
-        swatch.style.background = fill[c.client_ip] || NEUTRAL_FILL.other;
-        const name = NEUTRAL_FILL[c.client_ip]
-          ? el('span', {class: 'muted', title: USAGE_NOTE[c.client_ip] || ''}, [c.client_ip])
-          : el('code', {}, [String(c.client_ip)]);
+        swatch.style.background = fill[label] || NEUTRAL_FILL.other;
+        const name = NEUTRAL_FILL[label]
+          ? el('span', {class: 'muted', title: notes[label] || ''}, [label])
+          : el('code', {}, [label]);
         const tr = el('tr', {});
         tr.appendChild(td([swatch, name]));
         tr.appendChild(td([slotText(c.slots)], {class: 'num', title: 'Averaged over the whole window, so it ranks the bands against each other rather than describing any one column.'}));
-        tr.appendChild(td([slotText(c.peak)], {class: 'num', title: 'The busiest five minutes this client had.'}));
-        tr.appendChild(td([numberText(c.requests)], {class: 'num'}));
+        tr.appendChild(td([slotText(c.peak)], {class: 'num', title: 'The busiest single bucket this band had.'}));
+        tr.appendChild(td([numberText(c.requests)], {class: 'num', title: 'Counted once each, in the window they started in — so the bands add up to the figure above the chart.'}));
         body.appendChild(tr);
       });
     }
@@ -1392,9 +1565,9 @@
     // the reader already has the series and wants the number, which is the
     // legend's hierarchy inverted. Names are addresses off the wire and reach the
     // DOM as text nodes, never as concatenated markup.
-    function showUsageTip(event, series, i, fill, total) {
-      const wrap = document.getElementById('usage-wrap');
-      hideUsageTip();
+    function showUsageTip(event, series, i, fill, total, view) {
+      const wrap = document.getElementById(view.wrap);
+      hideUsageTip(view);
       const bucket = (series.buckets || [])[i];
       if (!bucket) return;
       const clients = series.clients || [];
@@ -1403,7 +1576,7 @@
         ' · ' + slotText(total) + ' slots' + (live ? ' · still filling' : '');
       const tip = el('div', {class: 'tip'}, [
         el('div', {class: 'tip-head'}, [head]),
-        el('div', {class: 'tip-units'}, ['slots · requests']),
+        el('div', {class: 'tip-units'}, ['slots · in flight']),
       ]);
       let shown = 0;
       clients.forEach((c, s) => {
@@ -1412,10 +1585,10 @@
         if (!slots && !requests) return;
         shown++;
         const key = el('span', {class: 'tip-key'});
-        key.style.background = fill[c.client_ip] || NEUTRAL_FILL.other;
+        key.style.background = fill[bandName(c)] || NEUTRAL_FILL.other;
         tip.appendChild(el('div', {class: 'tip-row'}, [
           key,
-          el('span', {class: 'tip-name'}, [String(c.client_ip)]),
+          el('span', {class: 'tip-name'}, [bandName(c)]),
           el('span', {class: 'tip-value'}, [slotText(slots) + ' · ' + numberText(requests)]),
         ]));
       });
@@ -1434,8 +1607,181 @@
       tip.style.left = Math.max(4, Math.min(x + 14, box.width - tip.offsetWidth - 4)) + 'px';
       tip.style.top = Math.max(4, above) + 'px';
     }
-    function hideUsageTip() {
-      document.querySelectorAll('#usage-wrap .tip').forEach(n => n.remove());
+    function hideUsageTip(view) {
+      document.querySelectorAll('#' + view.wrap + ' .tip').forEach(n => n.remove());
+    }
+
+    // ── Overview ────────────────────────────────────────────────────────────
+    //
+    // The landing page, in the order the questions get asked: how busy is the
+    // fleet right now, which worker is carrying it, and what has the last hour
+    // looked like. Figures, then meters, then the plot — the chart is the
+    // slowest of the three to read and the only one that needs a second look.
+    //
+    // Two sources and they measure different things, which the labels have to
+    // keep straight. /backends is LIVE: what each worker is holding at the
+    // instant of the poll. /admin/usage?range=1h is the request log, and a
+    // request is only written when it FINISHES — so the hour figures trail
+    // reality by however long the requests in flight have been running, and the
+    // two will not add up during a burst. That is not a bug in either of them.
+    let hourBy = 'client';
+    let overviewLoading = false;
+    let lastHourSeries = null;
+
+    async function loadOverview() {
+      if (overviewLoading) return;
+      overviewLoading = true;
+      try {
+        await refreshBackends();
+        renderFleetMeters(fleetCache);
+        await loadHourChart();
+        renderOverviewTiles(fleetCache, lastHourSeries);
+      } finally {
+        overviewLoading = false;
+      }
+    }
+
+    async function loadHourChart() {
+      const asked = hourBy;
+      const res = await request('/admin/usage?range=1h&by=' + encodeURIComponent(asked));
+      if (!res.ok) {
+        document.getElementById('hour-summary').textContent = res.error;
+        return;
+      }
+      // The toggle may have moved while this was in flight. Drawing a stale
+      // grouping into the chart the button now says something else about is the
+      // one failure mode a two-way switch on a polled endpoint has, so the
+      // server echoes what it answered and a mismatch is dropped.
+      if (asked !== hourBy) return;
+      lastHourSeries = res.data || {};
+      drawUsage(lastHourSeries, CHART_VIEWS.hour, 'hour');
+    }
+
+    function setHourBy(by) {
+      if (hourBy === by) return;
+      hourBy = by;
+      document.getElementById('hour-by-client').classList.toggle('active', by === 'client');
+      document.getElementById('hour-by-backend').classList.toggle('active', by === 'backend');
+      loadHourChart();
+    }
+
+    // fleetLoad is the live occupancy of one worker. max_concurrency 0 means the
+    // router measured no ceiling for it (the embeddings worker is the usual
+    // one), and a ratio against no ceiling is not a number — so those report a
+    // count and no bar rather than a bar that silently means nothing.
+    function fleetLoad(b) {
+      const active = Number(b.active_requests) || 0;
+      const cap = Number(b.max_concurrency) || 0;
+      return {active: active, cap: cap, ratio: cap > 0 ? Math.min(active / cap, 1) : 0, capped: cap > 0};
+    }
+    function meterClass(b, load) {
+      if (b.status !== 'ready') return 'down';
+      if (!load.capped || load.active === 0) return 'idle';
+      if (load.ratio >= 1) return 'full';
+      if (load.ratio >= 0.8) return 'warm';
+      return '';
+    }
+
+    function renderFleetMeters(list) {
+      const box = document.getElementById('fleet-meters');
+      box.innerHTML = '';
+      if (!list.length) {
+        box.appendChild(el('div', {class: 'muted'}, ['No backends registered.']));
+        return;
+      }
+      // Busiest first so the row that explains a queue is at the top, then by id
+      // so the order is stable between two polls that see the same load.
+      const rows = list.slice().sort((a, b) => {
+        const la = fleetLoad(a), lb = fleetLoad(b);
+        if (lb.active !== la.active) return lb.active - la.active;
+        return String(a.id).localeCompare(String(b.id));
+      });
+      rows.forEach(b => {
+        const load = fleetLoad(b);
+        const cls = meterClass(b, load);
+        const bar = el('i', {});
+        bar.style.width = (load.ratio * 100).toFixed(1) + '%';
+        const meter = el('div', {
+          class: 'meter' + (cls ? ' ' + cls : ''),
+          role: 'progressbar',
+          'aria-label': String(b.id) + ' slots in use',
+          'aria-valuemin': '0',
+          'aria-valuemax': String(load.cap),
+          'aria-valuenow': String(load.active),
+        }, [bar]);
+        const name = el('div', {class: 'meter-name'}, [el('code', {}, [String(b.id || '')])]);
+        name.appendChild(el('span', {class: 'muted'}, [String(b.model || '')]));
+        // The number is always beside the bar: severity is a colour, and a colour
+        // is never allowed to be the only thing carrying a value.
+        const value = el('div', {class: 'meter-value'});
+        if (b.status !== 'ready') {
+          value.appendChild(el('div', {class: b.status === 'probing' ? 'warn' : 'bad'}, [String(b.status || 'unknown')]));
+        } else if (load.capped) {
+          value.appendChild(el('div', {}, [load.active + ' / ' + load.cap]));
+          value.appendChild(el('div', {class: 'muted'}, [Math.round(load.ratio * 100) + '%']));
+        } else {
+          value.appendChild(el('div', {}, [numberText(load.active)]));
+          value.appendChild(el('div', {class: 'muted', title: 'The router measured no concurrency ceiling for this worker, so there is no ratio to draw.'}, ['no cap']));
+        }
+        box.appendChild(el('div', {class: 'meter-row'}, [name, meter, value]));
+      });
+    }
+
+    function tile(label, value, sub, opts) {
+      const node = el('div', {class: 'tile' + ((opts && opts.hero) ? ' hero' : '')}, [
+        el('div', {class: 'label'}, [label]),
+        el('div', {class: 'value' + ((opts && opts.tone) ? ' ' + opts.tone : '')}, [value]),
+      ]);
+      if (sub) node.appendChild(el('div', {class: 'sub'}, [sub]));
+      if (opts && opts.title) node.setAttribute('title', opts.title);
+      return node;
+    }
+
+    function renderOverviewTiles(list, hour) {
+      const box = document.getElementById('overview-tiles');
+      box.innerHTML = '';
+      const ready = list.filter(b => b.status === 'ready');
+      const inFlight = list.reduce((a, b) => a + (Number(b.active_requests) || 0), 0);
+      const slots = ready.reduce((a, b) => a + (Number(b.max_concurrency) || 0), 0);
+      const busy = slots > 0 ? Math.min(inFlight / slots, 1) : 0;
+
+      box.appendChild(tile('In flight now', numberText(inFlight),
+        slots ? 'of ' + numberText(slots) + ' slots on ' + ready.length + ' ready worker' + (ready.length === 1 ? '' : 's') +
+                ' · ' + Math.round(busy * 100) + '% of the fleet busy'
+              : 'no worker has a measured concurrency ceiling',
+        {hero: true, title: 'Live from /backends: what the workers are holding right now, not a figure from the log.'}));
+
+      const notReady = list.filter(b => b.status !== 'ready');
+      box.appendChild(tile('Workers', ready.length + ' ready',
+        notReady.length ? notReady.map(b => b.id + ' ' + b.status).join(', ') : 'the whole fleet is serving',
+        {tone: notReady.length ? 'warn' : 'ok'}));
+
+      const totals = (hour && hour.totals) || null;
+      if (!totals) {
+        box.appendChild(tile('Last hour', '—', 'the request log has not answered yet'));
+        return;
+      }
+      const requests = Number(totals.requests) || 0;
+      const errors = Number(totals.errors) || 0;
+      const failRate = requests ? (errors / requests) : 0;
+      box.appendChild(tile('Requests · last hour', numberText(requests),
+        requests ? (requests / 60).toFixed(1) + ' a minute' : 'nothing served',
+        {title: 'Counted once each, from the request log. The per-band figures under the chart count a request once per bucket it was in flight for, which is a different number on purpose.'}));
+
+      box.appendChild(tile('Failed · last hour', numberText(errors),
+        requests ? (failRate * 100).toFixed(errors && failRate < 0.1 ? 1 : 0) + '% of requests' : 'nothing to fail',
+        {tone: errors === 0 ? 'ok' : (failRate >= 0.05 ? 'bad' : 'warn'),
+         title: 'HTTP 4xx/5xx, plus the ones that answered 200 and then dropped the stream — those keep the status they had already sent.'}));
+
+      box.appendChild(tile('Mean duration', requests ? durationText(totals.busy_seconds / requests) : '—',
+        'fleet averaged ' + slotText((Number(totals.busy_seconds) || 0) / 3600) + ' slots busy',
+        {title: 'Total time in flight over the hour, divided by the requests that ran. Long generations dominate it, which is what makes it the number that predicts queueing.'}));
+
+      const out = Number(totals.completion_tokens) || 0;
+      box.appendChild(tile('Tokens out · last hour', kTokens(out),
+        kTokens(Number(totals.prompt_tokens) || 0) + ' in' +
+        (out ? ' · ' + (out / 3600).toFixed(1) + '/s across the fleet' : ''),
+        {title: 'Only requests whose worker reported usage are counted, so this is a floor rather than a total.'}));
     }
 
     // ── Providers ───────────────────────────────────────────────────────────
@@ -2026,15 +2372,28 @@
     let logOffset = 0;
     const LOG_LIMIT = 50;
     let lastLogData = [];
+    // inputPreview is the one line of each row in the log table, and what it has
+    // to show is what was ASKED. The newest user turn, wherever it survived —
+    // past the truncation marker if the body was clipped in the middle, in the
+    // head if it was not. Falling back to the raw JSON, which is what this did
+    // whenever JSON.parse choked on a clipped body, filled the column with
+    // identical generation settings for every row.
     function inputPreview(raw) {
       if (!raw) return '';
-      try {
-        const obj = JSON.parse(raw);
-        const msgs = obj.messages || [];
-        const last = msgs.filter(m => m.role === 'user').pop();
-        const text = last ? last.content : JSON.stringify(obj);
-        return text.length > 120 ? text.slice(0, 120) + '...' : text;
-      } catch (_) { return raw.length > 120 ? raw.slice(0, 120) + '...' : raw; }
+      const clip = t => (t.length > 120 ? t.slice(0, 120) + '…' : t);
+      const parsed = parseLoose(raw);
+      if (!parsed) return clip(String(raw));
+      const body = parsed.value || {};
+      const msgs = (Array.isArray(body.messages) ? body.messages : []).concat(parsed.tail);
+      const last = msgs.filter(m => m && m.role === 'user').pop();
+      if (last) return clip(messageText(last.content).trim() || '(empty user turn)');
+      // No user turn survived: a /v1/completions prompt, an embeddings input, or
+      // a body clipped before the first one.
+      const alt = body.prompt != null ? body.prompt : body.input;
+      if (alt != null) return clip(messageText(alt).trim());
+      const other = msgs[msgs.length - 1];
+      if (other) return clip(other.role + ': ' + messageText(other.content).trim());
+      return clip(String(raw));
     }
     function logTPS(row) {
       return row.observed_tps || row.certified_tps || row.baseline_tps || 0;
@@ -2087,6 +2446,157 @@
     function truncationNote(raw) {
       const found = String(raw || '').match(TRUNC);
       return found ? found.join(' ') : '';
+    }
+
+    // ── Reading a body that was cut ─────────────────────────────────────────
+    //
+    // A stored body is almost never whole. The router keeps the head and the
+    // tail of an oversized one with a marker between them (clipLog and
+    // boundedCapture in the Go side), so what arrives here is a document that
+    // stops mid-string, a note saying how many bytes went, and a fragment that
+    // starts mid-document. JSON.parse says no to every part of that.
+    //
+    // Which is not a corner case. Measured against a live router: 96% of stored
+    // request bodies are truncated, so a viewer that renders only what parses
+    // cleanly renders raw JSON for essentially every real request — and that is
+    // exactly what this did. Stripping the marker was never enough on its own;
+    // it takes out the note and leaves the body just as incomplete.
+    //
+    // So: parse the head as far as it goes, salvage whole messages out of the
+    // tail, and say plainly where the join is. Best-effort throughout, and the
+    // raw bytes stay one click away, because this makes judgements about what
+    // matters and the stored body is the thing of record.
+
+    // splitTruncation cuts a stored body at the first marker. Everything before
+    // it is a valid prefix of the original; everything after it is a valid
+    // suffix; the middle is gone.
+    function splitTruncation(raw) {
+      const text = String(raw || '');
+      const at = text.match(/…\[(capture )?truncated[^\]]*\]…?/);
+      if (!at) return {head: text, tail: '', note: ''};
+      return {
+        head: text.slice(0, at.index),
+        tail: text.slice(at.index + at[0].length),
+        note: at[0],
+      };
+    }
+
+    // repairJSON parses a PREFIX of a JSON document by cutting it back to the
+    // last point where a value had definitely finished and closing whatever was
+    // still open there.
+    //
+    // Two positions qualify and no others: immediately before a comma, and
+    // immediately after a bracket that closed a container. Both mean "an element
+    // ended here". The end of a string does NOT qualify — in an object it is
+    // just as likely to be a key, and `{"a":1,"b"}` is not a document. Cutting
+    // conservatively costs at most the one incomplete element at the end, which
+    // is the element the note above the transcript is about anyway.
+    //
+    // Returns {value, partial, insideElement} or null. partial says the tail of
+    // the document was dropped, so the caller can say so rather than presenting
+    // a shortened conversation as the whole one; insideElement says the cut fell
+    // INSIDE the last array element rather than between two of them, which is
+    // the difference between "the conversation stops here" and "this turn is
+    // half a turn" — and a half-recovered message with its content missing would
+    // otherwise render as a model that was handed nothing.
+    function repairJSON(text) {
+      const raw = String(text || '');
+      try { return {value: JSON.parse(raw), partial: false, insideElement: false}; } catch (_) { /* fall through */ }
+      const stack = [];
+      let inString = false, escaped = false;
+      let safe = -1, safeStack = null;
+      for (let i = 0; i < raw.length; i++) {
+        const ch = raw[i];
+        if (inString) {
+          if (escaped) escaped = false;
+          else if (ch === '\\') escaped = true;
+          else if (ch === '"') inString = false;
+          continue;
+        }
+        if (ch === '"') { inString = true; continue; }
+        if (ch === '{' || ch === '[') { stack.push(ch === '{' ? '}' : ']'); continue; }
+        if (ch === '}' || ch === ']') { stack.pop(); safe = i + 1; safeStack = stack.slice(); continue; }
+        if (ch === ',' && stack.length) { safe = i; safeStack = stack.slice(); }
+      }
+      if (safe < 0 || !safeStack) return null;
+      const closers = safeStack.slice().reverse().join('');
+      // The innermost container still open at the cut. An object below the root
+      // means the cut is inside one element of something; an array (or the root
+      // alone) means it fell cleanly between elements.
+      const insideElement = safeStack.length > 1 && safeStack[safeStack.length - 1] === '}';
+      try {
+        return {value: JSON.parse(raw.slice(0, safe) + closers), partial: true, insideElement: insideElement};
+      } catch (_) { return null; }
+    }
+
+    // scavengeMessages pulls whole chat messages out of a fragment that starts
+    // mid-document — the tail half of a clipped body.
+    //
+    // It anchors on `{"role":`, which is both what a message begins with and the
+    // reason this can be done at all: a fragment cannot be scanned from its
+    // first character, because the first quote in it is as likely to be the END
+    // of a string that began before the cut as the start of a new one, and
+    // getting that backwards would have the scanner swallow the braces it is
+    // looking for. Starting at a known `{` puts the string state back on solid
+    // ground. Anything between the cut and the first message is discarded; it is
+    // half a value with no name attached.
+    function scavengeMessages(text) {
+      const raw = String(text || '');
+      const anchor = /\{\s*"role"\s*:/g;
+      const out = [];
+      let m;
+      while ((m = anchor.exec(raw)) !== null) {
+        const end = balancedEnd(raw, m.index);
+        if (end < 0) break;
+        let parsed = null;
+        try { parsed = JSON.parse(raw.slice(m.index, end)); } catch (_) { /* skip it */ }
+        if (parsed && typeof parsed === 'object') out.push(parsed);
+        // Past the object either way, so a message containing the anchor text in
+        // its own content cannot be re-entered as a second message.
+        anchor.lastIndex = end;
+      }
+      return out;
+    }
+
+    // balancedEnd returns the index just past the object starting at `from`, or
+    // -1 if it never closes (the usual case for the last object in a fragment
+    // that was itself cut).
+    function balancedEnd(text, from) {
+      let depth = 0, inString = false, escaped = false;
+      for (let i = from; i < text.length; i++) {
+        const ch = text[i];
+        if (inString) {
+          if (escaped) escaped = false;
+          else if (ch === '\\') escaped = true;
+          else if (ch === '"') inString = false;
+          continue;
+        }
+        if (ch === '"') { inString = true; continue; }
+        if (ch === '{' || ch === '[') depth++;
+        else if (ch === '}' || ch === ']') {
+          depth--;
+          if (depth === 0) return i + 1;
+        }
+      }
+      return -1;
+    }
+
+    // parseLoose is the whole of the above in one call: the best object this body
+    // can be read as, plus the messages recovered from past the cut.
+    function parseLoose(raw) {
+      const split = splitTruncation(raw);
+      const head = repairJSON(split.head);
+      const tail = split.tail ? scavengeMessages(split.tail) : [];
+      if (!head && !tail.length) return null;
+      return {
+        value: head ? head.value : null,
+        tail: tail,
+        note: split.note,
+        // Partial when anything was dropped: the marker itself, or the trailing
+        // element the head parse had to cut back past.
+        partial: !!split.note || !!(head && head.partial),
+        cutMidTurn: !!(head && head.insideElement),
+      };
     }
 
     // txMsg is one coloured block: a role, an optional right-hand annotation,
@@ -2145,13 +2655,29 @@
       return node;
     }
 
+    // txTurn renders one message from a chat body. `cut` marks a turn the stored
+    // body stopped in the middle of, which has to be said on the turn itself: a
+    // tool result whose content was clipped away is otherwise indistinguishable
+    // from a tool that returned nothing, and those are very different faults.
+    function txTurn(m, cut) {
+      const role = ['system', 'user', 'assistant', 'tool'].indexOf(m.role) >= 0 ? m.role : 'system';
+      const calls = Array.isArray(m.tool_calls) ? m.tool_calls.map(toolCallNode) : [];
+      const label = [m.name || m.tool_call_id || '', cut ? 'cut off here' : ''].filter(Boolean).join(' · ');
+      const node = txMsg(role, label, messageText(m.content), calls);
+      if (cut && m.content == null && !calls.length) {
+        // Nothing of the body survived, so the "(empty)" txMsg fell back to would
+        // be a claim about the request rather than about the log.
+        node.querySelectorAll('.tx-empty').forEach(n => { n.textContent = '(content was clipped from the log)'; });
+      }
+      return node;
+    }
+
     // renderChatRequest turns a forwarded chat body into a conversation.
     function renderChatRequest(raw) {
       const wrap = el('div', {class: 'tx'});
-      const note = truncationNote(raw);
-      let body;
-      try { body = JSON.parse(String(raw).replace(TRUNC, '')); } catch (_) { return null; }
-      if (!body || typeof body !== 'object') return null;
+      const parsed = parseLoose(raw);
+      if (!parsed) return null;
+      const body = (parsed.value && typeof parsed.value === 'object') ? parsed.value : {};
       // The generation settings as chips, so the conversation below is only the
       // conversation. Only fields that were actually sent.
       const head = el('div', {class: 'tx-head'});
@@ -2168,21 +2694,29 @@
           body.tools.map(t => (t.function && t.function.name) || '?').join(', ')));
       }
       if (head.childNodes.length) wrap.appendChild(head);
-      if (note) wrap.appendChild(el('div', {class: 'tx-note'}, [note]));
+
       const msgs = Array.isArray(body.messages) ? body.messages : [];
-      if (!msgs.length) {
+      if (!msgs.length && !parsed.tail.length) {
         // /v1/completions has a prompt rather than messages, and an embeddings
         // body has neither — show whichever it turns out to be.
         const alt = body.prompt != null ? body.prompt : body.input;
         if (alt == null) return null;
+        if (parsed.note) wrap.appendChild(el('div', {class: 'tx-note'}, [parsed.note]));
         wrap.appendChild(txMsg('user', 'prompt', messageText(alt)));
         return wrap;
       }
-      msgs.forEach(m => {
-        const role = ['system', 'user', 'assistant', 'tool'].indexOf(m.role) >= 0 ? m.role : 'system';
-        const calls = Array.isArray(m.tool_calls) ? m.tool_calls.map(toolCallNode) : [];
-        wrap.appendChild(txMsg(role, m.name || m.tool_call_id || '', messageText(m.content), calls));
-      });
+      msgs.forEach((m, i) => wrap.appendChild(txTurn(m, parsed.cutMidTurn && i === msgs.length - 1)));
+      // The join, in the place it actually happened rather than at the top: the
+      // conversation above the note is the start of the request and the one
+      // below it is the end, and putting the marker anywhere else would have a
+      // reader take the two halves for one run of turns.
+      if (parsed.partial) {
+        const said = parsed.tail.length
+          ? 'The middle of the body was dropped to fit the log’s per-row budget. The turns below are the end of the request.'
+          : 'The body was cut here to fit the log’s per-row budget; the rest of the request was not stored.';
+        wrap.appendChild(el('div', {class: 'tx-note'}, [[parsed.note, said].filter(Boolean).join(' — ')]));
+      }
+      parsed.tail.forEach(m => wrap.appendChild(txTurn(m, false)));
       return wrap;
     }
 
@@ -2231,8 +2765,11 @@
         if (sse.frames) answer = sse;
       }
       if (!answer) {
-        let body;
-        try { body = JSON.parse(stripped); } catch (_) { return null; }
+        // A buffered completion, and it gets the same tolerance the request body
+        // does: a reply that overran the row budget is cut mid-string too, and
+        // "the answer stops early" is far more useful than "here is the JSON".
+        const parsed = parseLoose(text);
+        const body = parsed && parsed.value;
         if (!body || typeof body !== 'object') return null;
         const choice = (body.choices || [])[0] || {};
         const msg = choice.message || {};
@@ -2416,6 +2953,9 @@
     });
     on('btn-create-relay', 'click', createRelay);
     on('btn-cancel-relay', 'click', () => { document.getElementById('relay-form-panel').hidden = true; });
+    on('hour-by-client', 'click', () => setHourBy('client'));
+    on('hour-by-backend', 'click', () => setHourBy('backend'));
+    document.getElementById('hour-by-client').classList.add('active');
     document.addEventListener('keydown', event => {
       if (event.key !== 'Escape') return;
       closeLogDetail();
@@ -2425,17 +2965,18 @@
 
     // Auto-refresh the fleet, but only while it is on screen and the session is
     // live: polling an admin endpoint from a signed-out page just answers 401.
-    // The usage chart rides the same cadence — its window is aligned to the
-    // clock, so a poll changes the newest column and leaves the other 143 exactly
-    // where they were. usageLoading guards against a slow query overlapping the
-    // next tick and two responses racing to draw.
+    // The usage charts ride the same cadence — their windows are aligned to the
+    // clock, so a poll changes the newest column and leaves the rest exactly
+    // where they were. The *Loading guards stop a slow query overlapping the next
+    // tick and two responses racing to draw.
     setInterval(() => {
       if (!signedIn) return;
-      if (activeTab === 'fleet') refreshBackends();
+      if (activeTab === 'overview' && !overviewLoading) loadOverview();
+      else if (activeTab === 'fleet') refreshBackends();
       else if (activeTab === 'usage' && !usageLoading) loadUsage();
     }, 10000);
 
-    activeTab = TABS.indexOf(location.hash.slice(1)) === -1 ? 'fleet' : location.hash.slice(1);
+    activeTab = TABS.indexOf(location.hash.slice(1)) === -1 ? 'overview' : location.hash.slice(1);
     checkSession();
   </script>
 </body>

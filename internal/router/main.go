@@ -626,7 +626,7 @@ func Main() {
 	}
 	defer logs.Close()
 
-	router := &Router{cfg: cfg, registry: registry, client: &http.Client{Timeout: cfg.BackendHTTPTimeout}, streamClient: &http.Client{}, benchClient: &http.Client{}, logs: logs}
+	router := &Router{cfg: cfg, registry: registry, client: &http.Client{Timeout: cfg.BackendHTTPTimeout}, streamClient: &http.Client{}, benchClient: &http.Client{}, logs: logs, ratios: newTokenRatios()}
 	// The outcome matrix shares the request log's database — same file, same
 	// single connection — so a profile's results and the requests that produced
 	// them are backed up and restored together. Loading is best effort: an
@@ -765,6 +765,11 @@ type Router struct {
 	profiling       sync.Map        // worker ids with a cold-start profile in flight (de-dups overlapping profiles)
 	gateAudited     atomic.Bool     // set once the thinking-gate-vs-tier audit has logged (model-independent)
 	sessions        *sessionTracker // conversation → worker affinity; nil disables stickiness (see session.go)
+	// ratios is the measured chars-per-token per model, learned from the prompt
+	// sizes endpoints report back. Nil-safe throughout: everything that reads it
+	// falls back to defaultCharsPerToken, which is what the router used before it
+	// measured anything. See tokens.go.
+	ratios *tokenRatios
 
 	// profileMeters holds a *profileMeter per worker id for the span of that
 	// worker's profiling run, so what the run consumed can be totalled onto the
@@ -2934,6 +2939,22 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 		// inferred — so these stay 0 when the endpoint reported nothing.
 		logEntry.PromptTokens = lastJSONInt(capture.Bytes(), "prompt_tokens")
 		logEntry.CompletionTokens = lastJSONInt(capture.Bytes(), "completion_tokens")
+		// The endpoint has just told us, with its own tokenizer, how many tokens the
+		// text we sent actually was. That is the measurement the context filter was
+		// guessing at, and it arrives on every single request; the router used to
+		// write it to the log and learn nothing from it. See tokens.go.
+		//
+		// Both shapes are worth sampling. A success carries the count in its usage
+		// block; a refusal for an over-long prompt carries it in the message, and
+		// that one matters most — it is the disagreement between estimate and truth
+		// in the only region where the disagreement costs the caller their request.
+		if observed := logEntry.PromptTokens; observed > 0 {
+			r.ratios.observe(backend.Model, promptCharsFor(chatReq), observed)
+		} else if logEntry.StatusCode == http.StatusBadRequest {
+			if refused := contextLimitPromptTokens(capture.Bytes()); refused > 0 {
+				r.ratios.observe(backend.Model, promptCharsFor(chatReq), refused)
+			}
+		}
 		charged := usageTotalTokens(capture.Bytes())
 		if charged == 0 {
 			charged = job.promptTokens
@@ -2999,6 +3020,13 @@ func (r *Router) proxyToBackend(w http.ResponseWriter, req *http.Request, ident 
 	// client believing it got a panel.
 	if x := plan.expert.header(); x != "" {
 		w.Header().Set("X-LLM-Expert", x)
+	}
+	// No worker's window admitted this prompt and it went to the widest one
+	// regardless, for the endpoint to rule on. Worth saying: a client that gets a
+	// 400 back needs to know the refusal came from the model and not from routing,
+	// and a client whose request SUCCEEDS here is being told it is at the edge.
+	if plan.overflow {
+		w.Header().Set("X-LLM-Context-Overflow", strconv.Itoa(usableContextTokens(backend)/1024))
 	}
 
 	// Streaming requests can't be retried — once headers are committed we
@@ -3255,6 +3283,10 @@ type routePlan struct {
 	// rejected records why each eligible worker was hard-filtered out. Only
 	// populated when explain is set — the proxy path allocates nothing for it.
 	rejected []rejection
+	// overflow records that NO worker admitted this prompt and it is being sent to
+	// the widest window anyway, for the endpoint's own tokenizer to rule on. The
+	// answer may be the engine's 400; that is the point (see planRoute).
+	overflow bool
 }
 
 // widestContext returns the candidate with the largest window among those that
@@ -3542,6 +3574,7 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 				tr:         tr,
 				expert:     expert,
 				rejected:   rejected,
+				overflow:   overflow,
 			}, nil
 		}
 		if !explain {
@@ -3614,6 +3647,7 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 				expert:   expert,
 				rejected: rejected,
 				able:     able,
+				overflow: overflow,
 			}, nil
 		}
 	}
@@ -3645,6 +3679,7 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 		group:    gr,
 		expert:   expert,
 		rejected: rejected,
+		overflow: overflow,
 	}, nil
 }
 

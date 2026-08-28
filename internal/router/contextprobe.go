@@ -157,7 +157,7 @@ func (r *Router) probeContextLevel(b *Backend, size int, thinking bool) ContextP
 		// Seeded per (size, depth) so a re-probe of the same rung asks the same
 		// question — a worker that improves or regresses did so for a reason
 		// other than being handed a different needle.
-		prompt, want := contextNeedlePrompt(size, depth, int64(size)+int64(i))
+		prompt, want := contextNeedlePrompt(size, depth, int64(size)+int64(i), r.ratios.forModel(b.Model))
 		got, ttft, err := r.askContextNeedle(b, prompt, thinking)
 		if err != nil {
 			level.Errored = true
@@ -186,16 +186,21 @@ func (r *Router) probeContextLevel(b *Backend, size int, thinking bool) ContextP
 // identical text is compressible in a way real context is not, and a model that
 // skims it is not being tested on the thing we care about. It also carries no
 // digits, so the needle's value cannot be confused with the surroundings.
-func contextNeedlePrompt(size int, depth float64, seed int64) (prompt, want string) {
+func contextNeedlePrompt(size int, depth float64, seed int64, charsPerToken float64) (prompt, want string) {
 	rng := rand.New(rand.NewSource(seed))
 	want = strconv.Itoa(100000 + rng.Intn(899999))
 	needle := "The access code for the north archive is " + want + ". Remember it."
 
-	// ~4 characters per token is the same approximation the router uses
-	// everywhere else it has no tokenizer (see estimatePromptTokens). Being
-	// approximate is fine: the ladder doubles, so a 20% error never confuses one
-	// rung with the next.
-	targetChars := size * 4
+	// The haystack is built with the SAME chars-per-token the hard filter sizes
+	// prompts by, because the two numbers have to mean the same thing: this rung
+	// licenses the filter to admit a prompt it calls `size` tokens, and it can only
+	// do that honestly if it tested the amount of text the filter would call
+	// `size` tokens. The comment here used to say 4 was "the same approximation the
+	// router uses everywhere else" — it was not; the filter divided by 3, so a rung
+	// labelled 128K was built from 512K characters the filter would have called
+	// 170K, and the ladder was quietly proving a different length from the one it
+	// reported. See tokensForChars.
+	targetChars := charsForTokens(size, charsPerToken)
 	var sb strings.Builder
 	sb.Grow(targetChars + len(needle) + 256)
 	insertAt := int(float64(targetChars) * depth)

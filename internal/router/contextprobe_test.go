@@ -12,7 +12,7 @@ import (
 func TestContextNeedlePrompt(t *testing.T) {
 	for _, size := range []int{4096, 16384, 65536} {
 		for _, depth := range contextProbeDepths {
-			prompt, want := contextNeedlePrompt(size, depth, 42)
+			prompt, want := contextNeedlePrompt(size, depth, 42, defaultCharsPerToken)
 			if !strings.Contains(prompt, want) {
 				t.Fatalf("size=%d depth=%.1f: needle %q absent from the haystack", size, depth, want)
 			}
@@ -20,9 +20,11 @@ func TestContextNeedlePrompt(t *testing.T) {
 				t.Errorf("size=%d depth=%.1f: needle appears %d times; a second copy makes the probe unfalsifiable",
 					size, depth, strings.Count(prompt, want))
 			}
-			// ~4 chars/token, so allow a wide band — the ladder doubles, and a
-			// 25% error can never confuse one rung with the next.
-			est := len(prompt) / 4
+			// Sized by the SAME divisor the hard filter uses, which is the whole
+			// point of the shared helper — a rung must contain the amount of text
+			// the filter would call `size` tokens. Wide band because the ladder
+			// doubles: a 25% error can never confuse one rung with the next.
+			est := tokensForChars(len(prompt), defaultCharsPerToken)
 			if est < size/2 || est > size*2 {
 				t.Errorf("size=%d: haystack estimates %d tokens, too far off to be labelled %d", size, est, size)
 			}
@@ -48,12 +50,12 @@ func TestContextFillerHasNoDigits(t *testing.T) {
 // Same seed must produce the same question, or a re-probe measures a different
 // thing and a change in the result cannot be attributed to the worker.
 func TestContextNeedleDeterministic(t *testing.T) {
-	a, wa := contextNeedlePrompt(8192, 0.5, 7)
-	b, wb := contextNeedlePrompt(8192, 0.5, 7)
+	a, wa := contextNeedlePrompt(8192, 0.5, 7, defaultCharsPerToken)
+	b, wb := contextNeedlePrompt(8192, 0.5, 7, defaultCharsPerToken)
 	if a != b || wa != wb {
 		t.Error("same seed produced a different probe")
 	}
-	if _, wc := contextNeedlePrompt(8192, 0.5, 8); wc == wa {
+	if _, wc := contextNeedlePrompt(8192, 0.5, 8, defaultCharsPerToken); wc == wa {
 		t.Error("different seeds produced the same needle; the ladder would reuse one value throughout")
 	}
 }
@@ -172,7 +174,7 @@ func TestHardFilterAdmitsAWorkerAtTheWindowItAdvertises(t *testing.T) {
 		},
 	}
 	for _, neededK := range []int{100, 128, 160, 200, 250} {
-		if reason := admitReason(flashNext, hardFilter{neededContext: neededK}); reason != "" {
+		if reason := admitReason(flashNext, hardFilter{minContextK: neededK}); reason != "" {
 			t.Errorf("%dK prompt rejected from a 256K worker: %s", neededK, reason)
 		}
 	}
@@ -188,7 +190,7 @@ func TestHardFilterAdmitsAWorkerAtTheWindowItAdvertises(t *testing.T) {
 			},
 		},
 	}
-	reason := admitReason(lost, hardFilter{neededContext: 100})
+	reason := admitReason(lost, hardFilter{minContextK: 100})
 	if reason == "" {
 		t.Fatal("a worker measured to lose facts at 128K must not take a 100K prompt")
 	}

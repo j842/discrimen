@@ -1044,6 +1044,14 @@ func (r *Router) handleHealth(w http.ResponseWriter, req *http.Request) {
 		"healthy_backends": healthy,
 		"total_backends":   len(backends),
 	}
+	// The measured chars-per-token per model. A number an operator cannot predict
+	// and cannot otherwise see, and the one that decides whether a long prompt is
+	// admitted — an absent entry means that model has served nothing large enough
+	// to calibrate from and is still being sized at defaultCharsPerToken. See
+	// tokens.go.
+	if ratios := r.ratios.snapshot(); len(ratios) > 0 {
+		resp["chars_per_token"] = ratios
+	}
 	// Auto-routing requires an embeddings worker (the difficulty + thinking
 	// classifiers embed through it); surface its absence instead of silently
 	// degrading to plain quality/speed routing.

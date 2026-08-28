@@ -350,6 +350,17 @@ func (r *Router) renderPreview(chatReq *ChatRequest, plan *routePlan, budget tim
 			resp.Rejected = []rejection{}
 		}
 	}
+	// Say it before anything else: every worker in rejected[] was dropped, and the
+	// pick below is not a normal selection but a deliberate overrule of the
+	// router's own estimate. Reading the rejections without this would look like a
+	// contradiction.
+	if plan.overflow {
+		resp.Notes = append(resp.Notes, fmt.Sprintf(
+			"context overflow: no worker's window admits this prompt at the router's estimate, so it goes to the "+
+				"widest (%s, %dK) and the endpoint's own tokenizer rules. The estimate is chars/token, measured per "+
+				"model from served traffic; a refusal here would come from the engine, with exact numbers",
+			plan.candidates[0].ID, usableContextTokens(plan.candidates[0])/1024))
+	}
 	if plan.cl != nil {
 		d, rs := plan.cl.difficulty, plan.cl.reasoning
 		resp.Difficulty, resp.Reasoning, resp.Classified = &d, &rs, true

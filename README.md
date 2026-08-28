@@ -171,6 +171,14 @@ never asked about 256K. That is not a measurement, and reading it as one halved
 every power-of-two window in the fleet — which is every large one. A claim the
 ladder declined to test stands.
 
+The ladder fills its haystacks using the same chars-per-token the hard filter
+sizes prompts by, and that matters more than it looks: a rung licenses the filter
+to admit a prompt it *calls* N tokens, which it can only do honestly if it tested
+the amount of text the filter would call N tokens. The two used to disagree — the
+probe filling at 4 characters per token while the filter divided by 3 — so a rung
+labelled 128K was built from 512K characters the filter would have sized at 170K,
+and the ladder was proving a different length from the one it reported.
+
 On a paid endpoint, that cost is money. The benchmark is 401 questions: 393
 graded thinking-on against a 32768-token ceiling, and 8 — the two control tiers —
 graded thinking-off against a 1024-token one. A reasoning answer on this set runs
@@ -238,6 +246,29 @@ For each `POST /v1/chat/completions`:
    nominal answer reserve, *not* the client's `max_tokens` ceiling), missing
    required features (`tools` detected from the request's `tools` field,
    `vision` from image content), or thinking required and unsupported.
+
+   The context estimate is *per candidate*, because a token is not a fixed
+   amount of text: the same 700KB of Go and JSON is a different number of tokens
+   to two models, by more than the margin that decides whether it fits. The
+   divisor is **measured** — the endpoint reports `usage.prompt_tokens` on every
+   response, its own tokenizer's count of the text just sent, and the router
+   learns a chars-per-token per model from it (visible as `chars_per_token` in
+   `/health`). It moves toward caution fast and away from it slowly, is clamped
+   at both ends, and only samples prompts large enough that the chat template's
+   fixed overhead is noise. Before that it was a flat 3.0 for every model, which
+   on traffic that really runs 3.5 inflated a 200K prompt to a 233K estimate —
+   enough to have every worker in the fleet refuse a prompt every one of them
+   could hold.
+
+   And when context is the *only* thing left standing between a request and a
+   worker, the filter does not refuse it. A missing feature is a fact; context is
+   this router's estimate, and the endpoint holds the truth. So the request goes
+   to the widest window and the real tokenizer rules: either it fits, and the
+   caller gets their answer plus a calibration sample, or the engine returns a
+   400 that says by how much in exact tokens — which is a better answer than a
+   503, and is *also* a sample, so the estimate that caused the refusal is
+   corrected by the request it turned away. `X-LLM-Context-Overflow` reports it,
+   and `/v1/route-preview` explains it.
 
 2. **Embed the prompt, once.** An embeddings worker turns the prompt into a
    vector. Everything below reads that one vector: the reasoning score, and the
@@ -933,6 +964,7 @@ standard library.
 | `session.go` | conversation identity, tool-loop detection, affinity tracker |
 | `escalate.go` | buffered dispatch, inline escalation, strip-and-retry |
 | `rescue.go` | the length rescue — asking an endpoint that spent its whole budget thinking for its conclusion |
+| `tokens.go` | prompt sizing: the measured chars-per-token per model, and reading a prompt size out of an endpoint's refusal |
 | `relay.go` | routing through another discrimen: the relay key, `/relay/fleet`, the loop guard, and the fleet import |
 | `inadequacy.go` | the response-adequacy classifier — is a 2xx body actually an answer, and is it empty (the worker's failure, escalated) or truncated (the caller's ceiling, not escalated). Split out when the online tier adapter that used to share the file was removed |
 | `judge.go` | background LLM-as-judge |

@@ -255,23 +255,6 @@ func TestSkippedResultsStayIndexAligned(t *testing.T) {
 	}
 }
 
-// The bound must never cut below the floor, or a worker gets placed on a 0-100
-// scale from a handful of questions.
-func TestProfileBudgetConstantsAreSane(t *testing.T) {
-	if benchMinProfileQuestions < 24 {
-		t.Errorf("benchMinProfileQuestions is %d — too few to place a worker on a 0-100 scale", benchMinProfileQuestions)
-	}
-	if benchProfileBudget < 30*time.Minute {
-		t.Errorf("benchProfileBudget is %s — short enough that ordinary workers would be truncated", benchProfileBudget)
-	}
-	// The floor has to be reachable within the question set, or every profile is
-	// forced to run to completion and the bound does nothing.
-	if len(benchmarkQuestions) > 0 && benchMinProfileQuestions > len(benchmarkQuestions) {
-		t.Errorf("floor %d exceeds the %d questions available, so the budget can never apply",
-			benchMinProfileQuestions, len(benchmarkQuestions))
-	}
-}
-
 // A skipped question must leave the category breakdown alone. Counting it in
 // Total but never in Passed reads as a miss, so a truncated profile would report
 // a model as weak in whichever categories the budget ran out in — and it runs

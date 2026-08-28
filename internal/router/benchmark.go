@@ -293,7 +293,9 @@ type BenchResult struct {
 	Unsupported bool `json:"unsupported,omitempty"`
 	// LatencyMS is how long this answer took, for the outcome matrix.
 	LatencyMS int64 `json:"latency_ms,omitempty"`
-	// Skipped means the profile budget stopped before this question was asked.
+	// Skipped means the question was never asked — the wall-clock profile budget,
+	// since removed, stopped dispatch before reaching it. New runs ask the whole
+	// bank, so this survives only in profiles recorded under the old budget.
 	// Deliberately phrased as "skipped" rather than "ran": false is the zero
 	// value, so a result recorded before this field existed reads as HAVING run,
 	// which is what those profiles did.
@@ -537,8 +539,8 @@ const (
 // whenever ANY OTHER concurrent question succeeds, so on a rate-limited endpoint
 // that answers some requests and 429s the rest, the streak never reaches its
 // ceiling while the unlucky questions retry at 1/sec indefinitely. The busy path
-// `continue`s, so it never reaches the attempt cap either, and the profile budget
-// gates DISPATCH only — wg.Wait() is unbounded. runQualityBenchmark then never
+// `continue`s, so it never reaches the attempt cap either, and nothing bounds
+// dispatch — wg.Wait() is unbounded. runQualityBenchmark then never
 // returns, profileBackend never returns, and the caller's
 // `defer r.profiling.Delete(id)` never runs: that worker shows "profiling"
 // forever and can never be re-certified or re-profiled for the life of the
@@ -557,9 +559,10 @@ type benchOutcome struct {
 	// outcome matrix predicts "how long does this KIND of prompt take this
 	// worker", which a fleet-wide throughput average cannot answer.
 	latencyMS int64
-	// skipped means the question was never asked, because the profile budget ran
-	// out before it was dispatched. It is NOT a miss and must not be scored as
-	// one; it exists so the results slice can stay index-aligned with
+	// skipped means the question was never asked. New runs ask the whole bank,
+	// but a stored profile recorded under the old wall-clock budget can still
+	// carry skipped rows. It is NOT a miss and must not be scored as one; it
+	// exists so the results slice can stay index-aligned with
 	// benchmarkQuestions, which runNoThinkQualityBenchmark consumes positionally.
 	skipped bool
 	// unsupported means the prompt does not fit this worker's context window. A
@@ -600,7 +603,7 @@ func (r *Router) benchOne(b *Backend, q benchmarkQ, think bool, busy *benchBusyT
 	// length, and the generic retry path would record res.errd — which leaves the
 	// question out of the denominator entirely. A 32K worker asked a 48K question
 	// would come back neither right nor wrong but UNMEASURED, reported exactly
-	// like a worker the profile budget never got to.
+	// like a question that was never asked at all.
 	//
 	// That is backwards for the one thing these questions exist to measure. "This
 	// model cannot reason over 48K of context" is a real, useful weakness and the
@@ -834,28 +837,18 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 	busy := &benchBusyTracker{}
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
-	// Bounded, and dispatched tier-first-then-round-robin so that stopping early
-	// leaves a balanced sample rather than every easy question and no hard one.
+	// Dispatched tier-first-then-round-robin so that an interrupted run leaves a
+	// balanced sample rather than every easy question and no hard one.
 	//
-	// The bound exists because the deadline and the question count multiply: at
-	// six minutes a question, a worker with one slot and the current 401 questions
-	// is a 40-hour profile, and a benchmarkVersion bump re-profiles the whole fleet
-	// at once. That worker would be saturated for two days while still serving
-	// traffic. (The permacache takes the sting out of a REPEAT profile — an answer
-	// this model has already given costs nothing — but a worker seen for the first
-	// time still pays the full bill, which is the case this bound is for.)
-	ran := make([]bool, len(benchmarkQuestions))
-	started := time.Now()
-	dispatched := 0
+	// There is no wall-clock budget: every question in the bank runs, however long
+	// the worker takes. At six minutes a question, a worker with one slot and the
+	// current 401 questions can be a 40-hour profile — accepted, because the
+	// budget's alternative was worse: a truncated pass left most of the bank
+	// unmeasured, and the partial per-category coverage it produced read as
+	// ability where it was only absence. The permacache keeps a REPEAT profile
+	// cheap (an answer this model has already given costs nothing); only a worker
+	// seen for the first time pays the full bill.
 	for _, i := range benchStratifiedOrder(benchmarkQuestions) {
-		// The floor wins over the budget: a score from a handful of questions is
-		// worse than a slow profile, so the budget can only stop dispatch once
-		// enough questions are already in flight to score on.
-		if dispatched >= benchMinProfileQuestions && time.Since(started) > benchProfileBudget {
-			break
-		}
-		ran[i] = true
-		dispatched++
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(i int) {
@@ -869,10 +862,6 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 		}(i)
 	}
 	wg.Wait()
-	if dispatched < len(benchmarkQuestions) {
-		log.Printf("quality benchmark %s: stopped after %d/%d questions (%s budget) — scoring the sample",
-			b.ID, dispatched, len(benchmarkQuestions), benchProfileBudget)
-	}
 
 	maxTier := benchMaxTier()
 	pass := make([]int, maxTier+1)
@@ -881,18 +870,6 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 	errored, slowFailed, truncated, looseTotal, cachedHits := 0, 0, 0, 0, 0
 	for i, res := range results {
 		q := benchmarkQuestions[i]
-		// A question that was never dispatched is not a miss — excluded from every
-		// tally, but still emitted so the slice stays index-aligned with
-		// benchmarkQuestions. runNoThinkQualityBenchmark indexes into it and
-		// refuses to run at all unless it lines up position for position
-		// (benchResultsAlignWithBank), so dropping the entry would silently disable
-		// no-think scoring on any truncated profile.
-		if !ran[i] {
-			details = append(details, BenchResult{
-				Tier: q.Tier, Prompt: q.Prompt, Expect: q.Expect, Skipped: true,
-			})
-			continue
-		}
 		// An errored question stays OUT of the denominator. It is one we could not
 		// GRADE — sandbox unreachable, transport failed, worker abandoned — and
 		// counting it left a zero in the numerator and a one in the denominator,
@@ -948,13 +925,10 @@ func (r *Router) runQualityBenchmark(b *Backend, concurrency int) (score int, ok
 	}
 	// If many requests failed to even respond, the worker went unreachable mid-run
 	// — it isn't "bad", we just can't grade it. Signal not-ok so the caller
-	// discards this run instead of persisting an under-rating.
-	// Judged over the questions this pass actually ASKED. Against the full set the
-	// guard could never trip on a truncated run — a budget-limited pass that asked
-	// 48 of 392 and errored on all 48 scored 0 with ok=true, and the caller
-	// persisted it. Slow workers are both the ones that truncate and the ones this
-	// guard most protects.
-	if dispatched > 0 && errored*2 > dispatched {
+	// discards this run instead of persisting an under-rating. Every question in
+	// the bank is dispatched (the wall-clock budget is gone), so the whole set is
+	// the population the guard judges over.
+	if len(benchmarkQuestions) > 0 && errored*2 > len(benchmarkQuestions) {
 		return 0, false, "", nil, nil
 	}
 	// v34/v35: quality is a WEIGHTED three-bucket score — base 60 / insight 20 / coding 20
@@ -1062,11 +1036,13 @@ func (r *Router) runNoThinkQualityBenchmark(b *Backend, concurrency int, mixed [
 	}
 	// Only the hard questions the MIXED pass actually asked. The two scores are
 	// compared against each other and against the whole fleet on one absolute
-	// 0-100 scale, so they have to be computed over the same exam — and they were
-	// not: this pass gets a fresh budget, and no-think answers are short, so it
-	// routinely completed while the mixed pass truncated. Measured on one worker:
-	// 137 questions in the mixed pass against 380 here, meaning 255 hard questions
-	// were graded no-think that Quality never saw.
+	// 0-100 scale, so they have to be computed over the same exam — and under the
+	// old per-pass wall-clock budget they were not: no-think answers are short,
+	// so this pass routinely completed while the mixed pass truncated. Measured
+	// on one worker: 137 questions in the mixed pass against 380 here, meaning
+	// 255 hard questions were graded no-think that Quality never saw. New mixed
+	// runs ask everything, but a cached mixed pass recorded under the budget can
+	// still carry skips.
 	//
 	// A question the mixed pass skipped is therefore skipped here too, which also
 	// keeps the pair meaningful per question: the matrix records both modes for
@@ -1082,16 +1058,10 @@ func (r *Router) runNoThinkQualityBenchmark(b *Backend, concurrency int, mixed [
 	busy := &benchBusyTracker{}
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
-	// Bounded on the same terms as the mixed pass — this is a second full pass
-	// over the hard tiers, so leaving it unbounded would undo the bound there.
-	started := time.Now()
-	dispatched := 0
+	// Unbounded on the same terms as the mixed pass: every hard question the
+	// mixed pass asked is re-asked here, however long it takes, so the two scores
+	// are always computed over the same exam.
 	for _, j := range benchStratifiedOrderOf(hardIdx) {
-		if dispatched >= benchMinProfileQuestions && time.Since(started) > benchProfileBudget {
-			rerun[j].skipped = true
-			continue
-		}
-		dispatched++
 		i := hardIdx[j]
 		wg.Add(1)
 		sem <- struct{}{}
@@ -1105,10 +1075,6 @@ func (r *Router) runNoThinkQualityBenchmark(b *Backend, concurrency int, mixed [
 		}(j, i)
 	}
 	wg.Wait()
-	if dispatched < len(hardIdx) {
-		log.Printf("no-think benchmark %s: stopped after %d/%d questions (%s budget)",
-			b.ID, dispatched, len(hardIdx), benchProfileBudget)
-	}
 
 	maxTier := benchMaxTier()
 	pass := make([]int, maxTier+1)
@@ -2516,27 +2482,6 @@ func (t *benchBusyTracker) abandoned() bool {
 	defer t.mu.Unlock()
 	return t.gaveUp
 }
-
-// benchProfileBudget bounds one quality-benchmark pass. It is a wall-clock
-// bound, not a question bound, because the thing that varies between workers by
-// two orders of magnitude is time per question, not count.
-//
-// benchMinProfileQuestions is the floor the budget cannot cut into: below it the
-// sample is too small to place a worker on a 0-100 scale, and a confidently
-// wrong quality score is worse than a slow profile. A worker slow enough to need
-// longer than the budget for even this many still gets scored — it just takes as
-// long as it takes.
-//
-// Vars rather than consts so a test can shrink them: what a budget-stopped pass
-// does with its results is exactly where the no-think give-up guard was wrong,
-// and reproducing that against the real 90 minutes is not a test anyone runs.
-// Nothing in the router writes them; timing_log_test.go asserts bounds on both,
-// so a shrink left behind by a test edit fails CI rather than silently truncating
-// every profile.
-var (
-	benchProfileBudget       = 90 * time.Minute
-	benchMinProfileQuestions = 48
-)
 
 // benchStratifiedOrder returns question indices ordered so that any PREFIX of
 // the result is spread across tiers, by taking one question from each tier in

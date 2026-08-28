@@ -326,18 +326,15 @@ func TestNoThinkScoreExcludesErroredQuestions(t *testing.T) {
 	}
 }
 
-// The give-up guard has to divide by what the pass actually ASKED. Against the
-// full hard-tier set it could never trip on a budget-truncated run: 48 questions
-// dispatched, all 48 errored, and `96 > 300` is false — so a score near zero came
-// back with ok=true, and ok=true is what persists a profile and routes on it.
+// The give-up guard has to divide by what the pass actually ASKED — historically
+// it divided by the questions the pass INTENDED to ask, which under the old
+// wall-clock budget let an all-errored truncated run persist a near-zero score
+// with ok=true. The budget is gone, but a cached mixed pass recorded under it
+// can still carry skips, so the pass can still ask fewer questions than the
+// hard-tier set holds.
 func TestNoThinkGiveUpGuardCountsWhatItAsked(t *testing.T) {
-	savedQs, savedBudget, savedFloor := benchmarkQuestions, benchProfileBudget, benchMinProfileQuestions
-	defer func() {
-		benchmarkQuestions, benchProfileBudget, benchMinProfileQuestions = savedQs, savedBudget, savedFloor
-	}()
-	// A budget already spent, and a floor of 2, so dispatch stops after two of the
-	// six hard questions — the truncated-run shape, at test speed.
-	benchProfileBudget, benchMinProfileQuestions = time.Nanosecond, 2
+	savedQs := benchmarkQuestions
+	defer func() { benchmarkQuestions = savedQs }()
 	benchmarkQuestions = nil
 	broken := map[string]bool{}
 	for i := 0; i < 6; i++ {
@@ -351,11 +348,15 @@ func TestNoThinkGiveUpGuardCountsWhatItAsked(t *testing.T) {
 
 	r := &Router{benchClient: &http.Client{}}
 	b := &Backend{BackendRegistration: BackendRegistration{ID: "w", URL: srv.URL, Model: "m"}}
-	// The mixed pass asks these thinking-ON, which the server answers, so it
-	// scores normally and hands over a full detail list.
+	// A cached mixed pass shaped like an old budget-truncated run: it answered
+	// the first two hard questions thinking-ON and never reached the rest.
 	mixed := make([]BenchResult, len(benchmarkQuestions))
 	for i, q := range benchmarkQuestions {
-		mixed[i] = BenchResult{Tier: q.Tier, Prompt: q.Prompt, Expect: q.Expect, Pass: true, LatencyMS: 5}
+		if i < 2 {
+			mixed[i] = BenchResult{Tier: q.Tier, Prompt: q.Prompt, Expect: q.Expect, Pass: true, LatencyMS: 5}
+		} else {
+			mixed[i] = BenchResult{Tier: q.Tier, Prompt: q.Prompt, Expect: q.Expect, Skipped: true}
+		}
 	}
 	score, ok, _, _ := r.runNoThinkQualityBenchmark(b, 4, mixed)
 	if ok {

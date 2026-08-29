@@ -622,14 +622,27 @@ type bankTally struct {
 	total   int
 }
 
-// rate is the overall hit rate, or the fleet-neutral 0.5 for a model never
-// profiled in this mode. Zero would read as "reliably wrong" and exclude a newly
-// registered worker from everything.
-func (t bankTally) rate() float64 {
+// rate is the model's overall hit rate on the bank, and ok reports whether
+// anything was measured in this mode at all.
+//
+// TWO values rather than a rate with a stand-in for the empty case, and the
+// difference is the whole reason this signature is what it is. It used to answer
+// a "fleet-neutral" 0.5 for a model nothing had been profiled on — so that a new
+// worker would not read as "reliably wrong" and be excluded from everything —
+// and the fallback ordering below then compared that placeholder against real
+// measurements inside outcomeSpeedMargin AS THOUGH IT WERE ONE. A model measured
+// at 0.67 is 0.17 above the placeholder, which is wider than the margin, so a
+// single measured worker demoted every unmeasured one in the fleet onto the far
+// side of a correctness boundary and won every request without its speed being
+// looked at. Measured on the live fleet: a CPU llama.cpp worker at 0.67 took
+// commit-message prompts off a GPU that prefills 60x faster, 216 seconds against
+// 11. "Not measured" is not a score, and a type that cannot express the
+// difference will eventually be read as though there is none.
+func (t bankTally) rate() (float64, bool) {
 	if t.total == 0 {
-		return 0.5
+		return 0, false
 	}
-	return float64(t.correct) / float64(t.total)
+	return float64(t.correct) / float64(t.total), true
 }
 
 // bankTallies is the one walk of the observation map that both overall-hit-rate
@@ -682,10 +695,9 @@ func (m *outcomeMatrix) bankTallies(thinking bool, only string) map[string]bankT
 // and the median, and a headline compressed out of it would be the same mistake
 // the retired quality scalar made.
 //
-// Zero observations reports (0, 0) rather than bankTally.rate's fleet-neutral
-// 0.5: the caller distinguishes "measured at zero" from "not measured" on n, and
-// the 0.5 exists for the ordering in the fallback, where an unmeasured worker
-// must not be excluded.
+// Zero observations reports (0, 0), and the caller distinguishes "measured at
+// zero" from "not measured" on n — the same distinction bankTally.rate makes
+// with its second return value, drawn the same way for the same reason.
 func (m *outcomeMatrix) summary(model string, thinking bool) (rate float64, n int) {
 	t := m.bankTallies(thinking, model)[model]
 	if t.total == 0 {
@@ -1022,6 +1034,13 @@ const outcomeSpeedMargin = 0.15
 // is bounded at one request in twenty and only when an unmeasured candidate
 // actually exists, and the route reason says "explore" so the price is
 // measurable rather than inferred.
+//
+// BOTH ranking paths use it, on this one counter. It was on the measured path
+// alone at first, which left it absent from the branch that needs it most: the
+// fallback ranks on a bank record, bank rows come only from profiling, and a
+// worker that cannot earn one by serving well would have been frozen behind the
+// measured workers permanently. One counter rather than two because the policy is
+// "one request in N", not "one in N per branch".
 const outcomeExploreEvery = 20
 
 // outcomeExploreTick counts EXPLORATION OPPORTUNITIES — routed requests that had
@@ -1155,8 +1174,23 @@ func (m *outcomeMatrix) chooseByOutcome(cands []*Backend, vec []float64, thinkin
 	}
 
 	// FALLBACK: nothing similar has been profiled, which is the common case for
-	// traffic unlike the bank. Best overall, leaning speed — take the fastest
-	// worker whose overall hit rate is within outcomeSpeedMargin of the best.
+	// traffic unlike the bank. Rank on each MODEL's overall record on the bank
+	// instead — best overall, leaning speed.
+	//
+	// The SAME THREE BANDS as the measured path above, and for the same reason:
+	//
+	//	measured, and as good as the best   by speed
+	//	not measured at all                 by speed, behind anything known to be good
+	//	measured, and worse than that       by hit rate, behind both
+	//
+	// This branch used to have two, because an unmeasured model was handed a
+	// "fleet-neutral" 0.5 and then compared against real measurements inside
+	// outcomeSpeedMargin as though that were a measurement of it (see
+	// bankTally.rate). Both directions were wrong. A single model measured at 0.67
+	// put every unmeasured worker in the fleet below a correctness boundary — 0.17
+	// is wider than the margin — and won on a comparison its speed never entered;
+	// and in the other direction the placeholder outranked a model honestly
+	// measured at 0.45, on no evidence whatever.
 	//
 	// ONE pass for every worker's overall rate, not one scan per candidate. See
 	// bankRates: this branch used to call summary() in the loop, which is the same
@@ -1164,39 +1198,92 @@ func (m *outcomeMatrix) chooseByOutcome(cands []*Backend, vec []float64, thinkin
 	// split out of predict.
 	tallies := m.bankRates(thinking)
 	best := 0.0
+	// Keyed by MODEL in the tally (that is what the evidence is about) and by
+	// worker in `rates` (that is what the ordering below indexes). A worker absent
+	// from `rates` is one nothing has measured in this mode, which is a state of
+	// the evidence and not a value it can hold.
 	rates := make(map[string]float64, len(cands))
 	for _, b := range cands {
-		// A worker never profiled in this mode reads as the fleet-neutral 0.5
-		// rather than as zero, which would exclude a newly registered worker from
-		// everything. See bankTally.rate.
-		// Keyed by MODEL in the tally (that is what the evidence is about) and by
-		// worker in `rates` (that is what the ordering below indexes).
-		rate := tallies[modelHash(b)].rate()
+		rate, ok := tallies[modelHash(b)].rate()
+		if !ok {
+			continue
+		}
 		rates[b.ID] = rate
 		if rate > best {
 			best = rate
 		}
 	}
-	// Same rule as above: rank, do not narrow. Workers within the margin of the
-	// best overall hit rate go first, fastest among them — "best overall, leaning
-	// speed" — and everything else follows in accuracy order rather than being
-	// dropped, so failover still has somewhere to go.
-	var eligible, rest []outcomeChoice
+	// Rank, do not narrow — everything is returned in some order, so failover and
+	// escalation still have somewhere to go.
+	//
+	// Admission to the first band tests the floor as well as the margin, and the
+	// margin alone is not enough: it is RELATIVE to the best measured worker, so on
+	// a fleet whose best is 0.45 it would seat a model measured to fail more than
+	// half the bank ahead of one nobody has measured at all. outcomeCorrectFloor is
+	// reused rather than a second constant invented — it is the same question asked
+	// of a coarser measurement, and the live fleet's bank rates (0.40, 0.55, 0.67,
+	// 0.79, 0.95) straddle it exactly where "would you rather have the unknown"
+	// starts to be the right answer.
+	var able, unmeasured, unable []outcomeChoice
 	for _, c := range choices {
-		if rates[c.Backend.ID] >= best-outcomeSpeedMargin {
-			eligible = append(eligible, c)
-		} else {
-			rest = append(rest, c)
+		rate, measured := rates[c.Backend.ID]
+		switch {
+		case !measured:
+			unmeasured = append(unmeasured, c)
+		case rate > outcomeCorrectFloor && rate >= best-outcomeSpeedMargin:
+			able = append(able, c)
+		default:
+			unable = append(unable, c)
 		}
 	}
-	sortBySeconds(eligible)
-	sort.SliceStable(rest, func(i, j int) bool { return rates[rest[i].Backend.ID] > rates[rest[j].Backend.ID] })
-	ordered := append(eligible, rest...)
+	sortBySeconds(able)
+	sortBySeconds(unmeasured)
+	sort.SliceStable(unable, func(i, j int) bool { return rates[unable[i].Backend.ID] > rates[unable[j].Backend.ID] })
+	ordered := make([]outcomeChoice, 0, len(choices))
+	ordered = append(ordered, able...)
+	ordered = append(ordered, unmeasured...)
+	ordered = append(ordered, unable...)
 	if len(ordered) == 0 {
 		return nil, "no candidates", 0
 	}
-	// The fallback has measured nothing about this prompt, so it protects nothing.
-	return backendsOf(ordered), fmt.Sprintf("outcome:unknown,fallback-speed,q=%.2f", rates[ordered[0].Backend.ID]), 0
+	// Exploration, on the same counter and for the same reason as the measured
+	// path (see outcomeExploreEvery) — and it was missing HERE, which is where it
+	// bites hardest. Ranking a worker nothing has measured behind every measured
+	// one is only defensible if it can stop being unmeasured, and on this path it
+	// could not: bank rows come from profiling, so a relay row whose evidence lives
+	// on the upstream router, or a worker whose profile predates the matrix, has no
+	// way to earn one by serving well. It would sit behind a measured worker
+	// forever on a judgement nothing ever revisited.
+	//
+	// One request in twenty gives it a turn, and what that turn earns is JUDGED
+	// evidence, which the bank tally above deliberately ignores but the measured
+	// path's neighbours do not — so the way out is not a better bank rate, it is
+	// prompts like this one moving onto the path that can rank it on its merits.
+	if len(able) > 0 && len(unmeasured) > 0 && outcomeExploreTick.Add(1)%outcomeExploreEvery == 0 {
+		promoted := unmeasured[0]
+		rest := make([]outcomeChoice, 0, len(ordered))
+		for _, c := range ordered {
+			if c.Backend != promoted.Backend {
+				rest = append(rest, c)
+			}
+		}
+		ordered = append([]outcomeChoice{promoted}, rest...)
+		return backendsOf(ordered), fmt.Sprintf("outcome:unknown,fallback-explore,1in%d", outcomeExploreEvery), 0
+	}
+	// The fallback has measured nothing about THIS PROMPT, so it protects no
+	// prefix: `able` here is a record on the bank as a whole, which says nothing
+	// about the question in hand, and acquisition is free to reorder on cost and
+	// locality across all of it. That is a different claim from the measured
+	// path's, and returning a band length here would quietly promote it.
+	//
+	// q= is the leading worker's bank rate, and reads `none` when the request is
+	// being served by a worker nothing has measured — the one number that says
+	// which band won, from a log line.
+	rate, measured := rates[ordered[0].Backend.ID]
+	if !measured {
+		return backendsOf(ordered), "outcome:unknown,fallback-speed,q=none", 0
+	}
+	return backendsOf(ordered), fmt.Sprintf("outcome:unknown,fallback-speed,q=%.2f", rate), 0
 }
 
 // outcomeSeconds predicts wall clock for one worker on this job.

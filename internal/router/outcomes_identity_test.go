@@ -147,16 +147,19 @@ func TestSummaryAgreesWithTheBankRateItSharesAWalkWith(t *testing.T) {
 	if n != tally.total || n != 3 {
 		t.Errorf("summary counted %d rows, bankRates counted %d, want 3 for both", n, tally.total)
 	}
-	if rate != tally.rate() {
-		t.Errorf("summary rate %.4f vs bankRates rate %.4f", rate, tally.rate())
+	tallyRate, measured := tally.rate()
+	if !measured || rate != tallyRate {
+		t.Errorf("summary rate %.4f vs bankRates rate %.4f (measured=%v)", rate, tallyRate, measured)
 	}
-	// A model with nothing in this mode is "not measured" here and fleet-neutral
-	// in the fallback ordering, and those are deliberately different numbers.
+	// A model with nothing in this mode reports "not measured" from BOTH, and
+	// neither invents a number for it. The fallback ordering used to be handed a
+	// fleet-neutral 0.5 here and compared it against real measurements as though
+	// it were one — see bankTally.rate.
 	if _, none := m.summary(mh("never-seen"), true); none != 0 {
 		t.Errorf("summary of an unprofiled model returned %d observations", none)
 	}
-	if r := m.bankRates(true)[mh("never-seen")].rate(); r != 0.5 {
-		t.Errorf("bankRates of an unprofiled model = %.2f, want the fleet-neutral 0.5", r)
+	if r, ok := m.bankRates(true)[mh("never-seen")].rate(); ok {
+		t.Errorf("bankRates of an unprofiled model reported a measurement of %.2f", r)
 	}
 }
 

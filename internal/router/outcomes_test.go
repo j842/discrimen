@@ -1090,6 +1090,116 @@ func TestFallbackScansTheMatrixOnce(t *testing.T) {
 	}
 }
 
+// ── The fallback: no evidence is not a middling measurement ─────────────────
+
+// A worker nothing has been measured on used to be handed a "fleet-neutral" 0.5
+// and compared against real bank rates inside outcomeSpeedMargin as though that
+// were a measurement of it. Both directions of that comparison were wrong; this
+// is the one that cost the most.
+//
+// The order asserted here is the three bands: measured-and-good, then unmeasured,
+// then measured-and-worse. Under the placeholder the last two swapped, so a model
+// MEASURED to get 40% of the bank wrong outranked one carrying no evidence at all
+// — on the strength of a number nobody had measured.
+func TestFallbackRanksUnmeasuredAheadOfMeasuredWorse(t *testing.T) {
+	noExploration(t)
+	m := newTestMatrix(t)
+	ctx := context.Background()
+	m.setVector("q1", vec(1, 0, 0))
+	var recs []Observation
+	for i := 0; i < 5; i++ {
+		qid := "q" + string(rune('a'+i))
+		recs = append(recs, obs(qid, "strong", true, true, 100, obsSourceBench))    // 5/5
+		recs = append(recs, obs(qid, "middling", true, i < 3, 100, obsSourceBench)) // 3/5 = 0.60
+	}
+	if err := m.record(ctx, recs); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	// "middling" is the FASTEST of the three, so nothing but the band ordering can
+	// hold it back; "fresh" is faster than "strong" and carries no evidence.
+	cands := []*Backend{testBackend("strong", 100), testBackend("middling", 1000), testBackend("fresh", 500)}
+	// A prompt orthogonal to everything profiled, so the fallback decides.
+	got, reason, able := m.chooseByOutcome(cands, vec(0, 0, 1), true, jobCost{outputTokens: 200, mode: thinkingOn})
+	if !strings.Contains(reason, "fallback") {
+		t.Fatalf("expected the fallback path, got reason %q", reason)
+	}
+	order := []string{got[0].ID, got[1].ID, got[2].ID}
+	if order[0] != "strong" || order[1] != "fresh" || order[2] != "middling" {
+		t.Errorf("fallback order %v, want [strong fresh middling] — an unmeasured worker belongs "+
+			"between a model measured to be good and one measured to be worse (reason %q)", order, reason)
+	}
+	if able != 0 {
+		t.Errorf("the fallback reported a protected band of %d; a record on the bank as a whole is "+
+			"not a correctness judgement about this prompt", able)
+	}
+}
+
+// The route reason has to say when the worker serving the request is one nothing
+// has measured, because "q=0.50" for a worker with no evidence is exactly the
+// confusion the placeholder created — indistinguishable in a log from a model
+// genuinely measured at half the bank.
+func TestFallbackReasonSaysWhenTheLeaderIsUnmeasured(t *testing.T) {
+	noExploration(t)
+	m := newTestMatrix(t)
+	ctx := context.Background()
+	m.setVector("q1", vec(1, 0, 0))
+	var recs []Observation
+	for i := 0; i < 5; i++ {
+		recs = append(recs, obs("q"+string(rune('a'+i)), "weak", true, i == 0, 100, obsSourceBench)) // 1/5 = 0.20
+	}
+	if err := m.record(ctx, recs); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	cands := []*Backend{testBackend("weak", 1000), testBackend("fresh", 10)}
+	got, reason, _ := m.chooseByOutcome(cands, vec(0, 0, 1), true, jobCost{outputTokens: 200, mode: thinkingOn})
+	if got[0].ID != "fresh" {
+		t.Fatalf("a model measured at 0.20 led an unmeasured one (order %q, %q; reason %q)",
+			got[0].ID, got[1].ID, reason)
+	}
+	if !strings.Contains(reason, "q=none") {
+		t.Errorf("route reason %q reports a hit rate for a worker nothing has measured", reason)
+	}
+}
+
+// Ranking an unmeasured worker behind every measured one is only fair if it can
+// stop being unmeasured, and on the fallback path it could not: bank rows come
+// from profiling alone, so a relay row — whose evidence lives on the upstream
+// router — would have been frozen behind the measured workers for good.
+func TestFallbackExploresAnUnmeasuredWorker(t *testing.T) {
+	noExploration(t)
+	m := newTestMatrix(t)
+	ctx := context.Background()
+	m.setVector("q1", vec(1, 0, 0))
+	var recs []Observation
+	for i := 0; i < 5; i++ {
+		recs = append(recs, obs("q"+string(rune('a'+i)), "measured", true, true, 10, obsSourceBench))
+	}
+	if err := m.record(ctx, recs); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	// Measured, correct on the whole bank, and faster: nothing but exploration
+	// will ever put the fresh one first.
+	cands := []*Backend{testBackend("measured", 500), testBackend("fresh", 10)}
+
+	const rounds = outcomeExploreEvery * 2
+	explored := 0
+	reasons := map[string]int{}
+	for i := 0; i < rounds; i++ {
+		got, reason, _ := m.chooseByOutcome(cands, vec(0, 0, 1), true, jobCost{outputTokens: 200, mode: thinkingOn})
+		reasons[reason]++
+		if got[0].ID == "fresh" {
+			explored++
+			if !strings.Contains(reason, "explore") {
+				t.Errorf("round %d promoted the unmeasured worker but reported %q", i, reason)
+			}
+		}
+	}
+	if explored == 0 {
+		t.Fatalf("%d fallback requests and the unmeasured worker was never tried, so it can never earn "+
+			"the judged evidence that would let the measured path rank it (reasons seen: %v)", rounds, reasons)
+	}
+}
+
 // ── Exploration: the one place the router does not pick its best ────────────
 
 // An unmeasured worker ranks behind every measured one, and the only way to stop

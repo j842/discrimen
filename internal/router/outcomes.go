@@ -1017,37 +1017,25 @@ const outcomeCorrectFloor = 0.5
 // observations was routed ahead of one at p=1.00 for a 3% speed edge.
 const outcomeSpeedMargin = 0.15
 
-// outcomeExploreEvery is how often the router deliberately does NOT pick its
-// current best: one opportunity in this many promotes the best UNMEASURED
-// candidate to the front instead.
+// AUTOMATIC ROUTING NEVER CHOOSES A WORKER NOTHING HAS MEASURED. Both rankings
+// below put unmeasured workers last, behind even a worker measured to be wrong,
+// and there is no mechanism anywhere that promotes one — measurement is what
+// earns a worker traffic, and it is available on demand.
 //
-// THIS IS THE ONE PLACE THE ROUTER KNOWINGLY ROUTES SUBOPTIMALLY, and it is here
-// because without it early estimates are load-bearing forever. An unmeasured
-// worker ranks behind every measured one, and the only way to stop being
-// unmeasured on real traffic is to be served — so a worker that is never tried
-// never earns evidence, and the matrix's first impression of a fleet becomes
-// permanent. Combined with the judged-evidence feedback loop that is
-// self-reinforcing: the workers that get traffic accumulate judged rows, which
-// is what keeps them ahead of the ones that do not.
+// There used to be one: outcomeExploreEvery, a counter that promoted the best
+// unmeasured candidate to the front of one request in twenty, on the argument
+// that a worker never tried never earns evidence and the matrix's first
+// impression of a fleet therefore becomes permanent. That argument was written
+// when profiling did not fill the matrix. It does now — every worker records its
+// bench results as observations when it profiles, and a cold start profiles
+// automatically — so the bootstrap it existed for happens before the worker takes
+// a single request, and the exploration was left buying evidence at the price of
+// misrouting live traffic to workers whose quality was unknown BECAUSE nobody had
+// asked for it.
 //
-// Deliberately the crudest thing that works — a counter, not a bandit. The cost
-// is bounded at one request in twenty and only when an unmeasured candidate
-// actually exists, and the route reason says "explore" so the price is
-// measurable rather than inferred.
-//
-// BOTH ranking paths use it, on this one counter. It was on the measured path
-// alone at first, which left it absent from the branch that needs it most: the
-// fallback ranks on a bank record, bank rows come only from profiling, and a
-// worker that cannot earn one by serving well would have been frozen behind the
-// measured workers permanently. One counter rather than two because the policy is
-// "one request in N", not "one in N per branch".
-const outcomeExploreEvery = 20
-
-// outcomeExploreTick counts EXPLORATION OPPORTUNITIES — routed requests that had
-// an unmeasured candidate to promote — rather than routed requests. A fleet
-// where unmeasured candidates are rare is exactly the fleet that needs the
-// exploration, and counting every request would make it rarest there.
-var outcomeExploreTick atomic.Uint64
+// What remains genuinely unmeasured is a relay row, whose evidence sits on the
+// upstream router. Gambling one request in twenty on it is not the way to reach
+// that evidence; importing it is.
 
 // chooseByOutcome ranks candidates for a prompt: workers predicted to answer it
 // correctly first, and among those of comparable predicted correctness, the
@@ -1056,7 +1044,7 @@ var outcomeExploreTick atomic.Uint64
 //
 // Returns the ordered candidates and a short reason for the route header, so a
 // decision can be read back afterwards — including, importantly, whether the
-// matrix actually knew anything, fell back, or was exploring.
+// matrix actually knew anything or fell back.
 // The third return value is how many LEADING candidates the matrix considers
 // interchangeable on correctness — the `able` band. It exists because the
 // ordering this function returns is a complete policy decision, and the
@@ -1108,12 +1096,21 @@ func (m *outcomeMatrix) chooseByOutcome(cands []*Backend, vec []float64, thinkin
 		// Three bands, best first:
 		//
 		//	predicted correct  by correctness margin, then speed — the routing goal
-		//	unmeasured         by speed, behind anything known to be right
 		//	predicted wrong    by predicted correctness, best of a bad lot
+		//	unmeasured         by speed, behind both — never the router's choice
 		//
-		// The last band sorts on ACCURACY rather than speed because a request that
-		// reaches it is one the fleet is not good at, and a fast wrong answer helps
-		// nobody.
+		// The second band sorts on ACCURACY rather than speed because a request
+		// that reaches it is one the fleet is not good at, and a fast wrong answer
+		// helps nobody.
+		//
+		// The last band used to sit in the middle, ahead of the workers the matrix
+		// predicted WRONG, on the reasoning that an unknown beats a known failure.
+		// It is last now because automatic routing does not choose a worker nothing
+		// has measured, at all: an unmeasured worker is one nobody has run the
+		// profiler against, and the answer to that is to measure it — not to find
+		// out at the cost of somebody's request. Being last is not being evicted;
+		// failover, escalation and slot spill still reach it, and a fleet where
+		// NOTHING is measured has one band and routes on speed as it always did.
 		//
 		// Admission to the first band is on supportedCorrect, not the raw rate: a
 		// worker that got one of two nearby questions right sat exactly on the
@@ -1131,31 +1128,12 @@ func (m *outcomeMatrix) chooseByOutcome(cands []*Backend, vec []float64, thinkin
 			}
 		}
 		sortByCorrectnessThenSpeed(able)
-		sortBySeconds(unmeasured)
 		sort.SliceStable(unable, func(i, j int) bool { return unable[i].Pred.Correct > unable[j].Pred.Correct })
+		sortBySeconds(unmeasured)
 		ordered := make([]outcomeChoice, 0, len(choices))
 		ordered = append(ordered, able...)
-		ordered = append(ordered, unmeasured...)
 		ordered = append(ordered, unable...)
-		// Exploration, and the only place this file does not return its own best
-		// answer. See outcomeExploreEvery. Gated on there BEING a current best to
-		// pass over: when the able band is empty the unmeasured workers already
-		// lead, so promoting one would report an exploration that cost nothing and
-		// proved nothing.
-		if len(able) > 0 && len(unmeasured) > 0 && outcomeExploreTick.Add(1)%outcomeExploreEvery == 0 {
-			promoted := unmeasured[0]
-			rest := make([]outcomeChoice, 0, len(ordered))
-			for _, c := range ordered {
-				if c.Backend != promoted.Backend {
-					rest = append(rest, c)
-				}
-			}
-			ordered = append([]outcomeChoice{promoted}, rest...)
-			// An exploration deliberately puts an UNMEASURED worker first, so no
-			// prefix is authoritative: letting acquisition prefer a cheap local
-			// worker here would quietly undo the exploration it was told to make.
-			return backendsOf(ordered), fmt.Sprintf("outcome:explore,1in%d", outcomeExploreEvery), 0
-		}
+		ordered = append(ordered, unmeasured...)
 		switch {
 		case len(able) > 0:
 			// Support is reported alongside the rate because the two are not
@@ -1165,11 +1143,16 @@ func (m *outcomeMatrix) chooseByOutcome(cands []*Backend, vec []float64, thinkin
 			// decides whether the first one survives band admission.
 			return backendsOf(ordered), fmt.Sprintf("outcome:p=%.2f,n=%d,sup=%.1f",
 				able[0].Pred.Correct, able[0].Pred.Observations, able[0].Pred.Support), len(able)
-		case len(unmeasured) > 0:
-			return backendsOf(ordered), "outcome:none-above-floor,unmeasured-first", 0
-		default:
+		case len(unable) > 0:
 			return backendsOf(ordered), fmt.Sprintf("outcome:best-effort,p=%.2f,sup=%.1f",
 				unable[0].Pred.Correct, unable[0].Pred.Support), 0
+		default:
+			// Unreachable: this branch runs only when some candidate carried a
+			// prediction, and such a candidate is in one of the two bands above. Said
+			// as a total rather than by indexing a band that is empty by
+			// construction — the previous shape read unable[0] here, which was safe
+			// only because the case above it could not fall through to it.
+			return backendsOf(ordered), "outcome:none-measured,unmeasured-last", 0
 		}
 	}
 
@@ -1177,20 +1160,27 @@ func (m *outcomeMatrix) chooseByOutcome(cands []*Backend, vec []float64, thinkin
 	// traffic unlike the bank. Rank on each MODEL's overall record on the bank
 	// instead — best overall, leaning speed.
 	//
-	// The SAME THREE BANDS as the measured path above, and for the same reason:
+	// The SAME THREE BANDS as the measured path above, in the same order and for
+	// the same reasons:
 	//
 	//	measured, and as good as the best   by speed
-	//	not measured at all                 by speed, behind anything known to be good
-	//	measured, and worse than that       by hit rate, behind both
+	//	measured, and worse than that       by hit rate
+	//	not measured at all                 by speed, behind both
 	//
-	// This branch used to have two, because an unmeasured model was handed a
-	// "fleet-neutral" 0.5 and then compared against real measurements inside
+	// The last band is the whole of this change. An unmeasured model used to be
+	// handed a "fleet-neutral" 0.5 and compared against real bank rates inside
 	// outcomeSpeedMargin as though that were a measurement of it (see
-	// bankTally.rate). Both directions were wrong. A single model measured at 0.67
-	// put every unmeasured worker in the fleet below a correctness boundary — 0.17
-	// is wider than the margin — and won on a comparison its speed never entered;
-	// and in the other direction the placeholder outranked a model honestly
-	// measured at 0.45, on no evidence whatever.
+	// bankTally.rate), and both directions of that comparison were wrong. A single
+	// model measured at 0.67 sits 0.17 above the placeholder, wider than the
+	// margin, so ONE measured worker put every unmeasured worker in the fleet on
+	// the far side of a correctness boundary and won every request without its
+	// speed being looked at — 216 seconds on a CPU box against 11 on the GPU it
+	// out-ranked. In the other direction the same placeholder outranked a model
+	// honestly measured at 0.45, on no evidence whatever.
+	//
+	// Ranking them last needs no floor and no second constant: "measured worse
+	// than the best" and "not measured" are different bands, so nothing has to
+	// decide how a rate compares to the absence of one.
 	//
 	// ONE pass for every worker's overall rate, not one scan per candidate. See
 	// bankRates: this branch used to call summary() in the loop, which is the same
@@ -1214,61 +1204,29 @@ func (m *outcomeMatrix) chooseByOutcome(cands []*Backend, vec []float64, thinkin
 		}
 	}
 	// Rank, do not narrow — everything is returned in some order, so failover and
-	// escalation still have somewhere to go.
-	//
-	// Admission to the first band tests the floor as well as the margin, and the
-	// margin alone is not enough: it is RELATIVE to the best measured worker, so on
-	// a fleet whose best is 0.45 it would seat a model measured to fail more than
-	// half the bank ahead of one nobody has measured at all. outcomeCorrectFloor is
-	// reused rather than a second constant invented — it is the same question asked
-	// of a coarser measurement, and the live fleet's bank rates (0.40, 0.55, 0.67,
-	// 0.79, 0.95) straddle it exactly where "would you rather have the unknown"
-	// starts to be the right answer.
+	// escalation still have somewhere to go, and a fleet with no bank evidence at
+	// all is one band ordered by speed rather than a 503.
 	var able, unmeasured, unable []outcomeChoice
 	for _, c := range choices {
 		rate, measured := rates[c.Backend.ID]
 		switch {
 		case !measured:
 			unmeasured = append(unmeasured, c)
-		case rate > outcomeCorrectFloor && rate >= best-outcomeSpeedMargin:
+		case rate >= best-outcomeSpeedMargin:
 			able = append(able, c)
 		default:
 			unable = append(unable, c)
 		}
 	}
 	sortBySeconds(able)
-	sortBySeconds(unmeasured)
 	sort.SliceStable(unable, func(i, j int) bool { return rates[unable[i].Backend.ID] > rates[unable[j].Backend.ID] })
+	sortBySeconds(unmeasured)
 	ordered := make([]outcomeChoice, 0, len(choices))
 	ordered = append(ordered, able...)
-	ordered = append(ordered, unmeasured...)
 	ordered = append(ordered, unable...)
+	ordered = append(ordered, unmeasured...)
 	if len(ordered) == 0 {
 		return nil, "no candidates", 0
-	}
-	// Exploration, on the same counter and for the same reason as the measured
-	// path (see outcomeExploreEvery) — and it was missing HERE, which is where it
-	// bites hardest. Ranking a worker nothing has measured behind every measured
-	// one is only defensible if it can stop being unmeasured, and on this path it
-	// could not: bank rows come from profiling, so a relay row whose evidence lives
-	// on the upstream router, or a worker whose profile predates the matrix, has no
-	// way to earn one by serving well. It would sit behind a measured worker
-	// forever on a judgement nothing ever revisited.
-	//
-	// One request in twenty gives it a turn, and what that turn earns is JUDGED
-	// evidence, which the bank tally above deliberately ignores but the measured
-	// path's neighbours do not — so the way out is not a better bank rate, it is
-	// prompts like this one moving onto the path that can rank it on its merits.
-	if len(able) > 0 && len(unmeasured) > 0 && outcomeExploreTick.Add(1)%outcomeExploreEvery == 0 {
-		promoted := unmeasured[0]
-		rest := make([]outcomeChoice, 0, len(ordered))
-		for _, c := range ordered {
-			if c.Backend != promoted.Backend {
-				rest = append(rest, c)
-			}
-		}
-		ordered = append([]outcomeChoice{promoted}, rest...)
-		return backendsOf(ordered), fmt.Sprintf("outcome:unknown,fallback-explore,1in%d", outcomeExploreEvery), 0
 	}
 	// The fallback has measured nothing about THIS PROMPT, so it protects no
 	// prefix: `able` here is a record on the bank as a whole, which says nothing

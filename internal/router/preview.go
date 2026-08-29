@@ -92,10 +92,12 @@ type previewCandidate struct {
 type previewOutcome struct {
 	// Band is which of chooseByOutcome's three groups this worker landed in,
 	// and is the single most useful field here. "able" is "the matrix expects
-	// this worker to get prompts like yours right"; "unmeasured" is "nothing
-	// resembling your prompt has been graded on it"; "unable" is "prompts like
-	// yours HAVE been graded on it and it got them wrong". The bands are ranked
-	// in that order, and within the able band by correctness margin then speed.
+	// this worker to get prompts like yours right"; "unable" is "prompts like
+	// yours HAVE been graded on it and it got them wrong"; "unmeasured" is
+	// "nothing resembling your prompt has been graded on it". The bands rank in
+	// that order — automatic routing does not choose an unmeasured worker, so
+	// that band is last rather than middle — and within the able band by
+	// correctness margin then speed.
 	Band string `json:"band"`
 	// Correct is the similarity-weighted hit rate on nearby graded questions,
 	// in [0,1]. It is the number an operator reads and the number the route
@@ -157,9 +159,9 @@ type previewResponse struct {
 	// — preferring a free local worker over a paid remote one — and must not
 	// reorder across it, so this is the boundary that says which of the
 	// candidate ordering below is a correctness judgement and which is a cost
-	// preference. Zero means no prefix is authoritative: the tier path, the
-	// matrix's own bank-rate fallback, and a request the matrix chose to explore
-	// on all report 0. Admin-only, like the candidate list it indexes into.
+	// preference. Zero means no prefix is authoritative: the tier path and the
+	// matrix's own bank-rate fallback both report 0. Admin-only, like the
+	// candidate list it indexes into.
 	Able int `json:"able,omitempty"`
 	// Candidates and Rejected are the ADMIN half — the fleet, worker by worker.
 	// Omitted entirely for a client rather than sent empty, because an empty list

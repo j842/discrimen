@@ -310,19 +310,22 @@ For each `POST /v1/chat/completions`:
    shrinking it leaves them nowhere to go at exactly the moment the first choice
    has failed.
 
-   **Exploration.** One in twenty opportunities (an opportunity being a request
-   where there is both something known-good and something unmeasured to learn
-   about), the fastest unmeasured worker is promoted to the head instead. That is
-   how a newly registered endpoint earns evidence without waiting for a full
-   profile, and it is the only place this step does not return its own best
-   answer. Explored requests protect no ordering downstream, so the cost step
-   below cannot quietly undo them.
+   **Automatic routing never chooses a worker nothing has measured.** An
+   unmeasured worker ranks last — behind even one the matrix predicts will get
+   this prompt wrong — because a bad measurement is a fact about a worker and a
+   missing one is a fact about the fleet's record-keeping, and the answer to the
+   second is to profile it, not to find out at the cost of somebody's request.
+   Last is not evicted: failover, escalation and slot spill all still reach it,
+   and a fleet where nothing has been graded yet is a single band ordered by
+   speed.
 
    **When the matrix has nothing to say** about a prompt — which is the ordinary
    case for traffic unlike the question bank — it falls back to each model's
    overall graded hit rate, taking the fastest worker within 15 points of the
-   best. A model never graded in this mode reads as a fleet-neutral 0.5 rather
-   than as zero, so a fresh endpoint is not excluded from everything.
+   best, then the rest in hit-rate order, then the unmeasured ones. A model never
+   graded in this mode carries no rate at all rather than a stand-in for one: it
+   is ranked as unmeasured, and never compared against a real measurement as
+   though the two were the same kind of number.
 
    **Where the time estimate comes from.** "Fastest" is prefill time for this
    prompt, plus decode time for the expected output, plus queue occupancy, plus
@@ -378,9 +381,9 @@ For each `POST /v1/chat/completions`:
 The decision is reported back in headers: `X-LLM-Route`
 (`route:outcome:p=0.95,n=12,sup=8.3` for an automatic pick — predicted
 correctness, observation count and evidence weight for the worker at the head —
-`route:outcome:explore,1in20` when the request was spent on exploration,
 `route:outcome:unknown,fallback-speed,q=0.71` when nothing similar had been
-graded, and bare `route` when the classifier was unavailable),
+graded — `q=none` there means the worker serving it carries no bank evidence at
+all — and bare `route` when the classifier was unavailable),
 `X-LLM-Backend-Model` for who answered, `X-LLM-Session` for what affinity did,
 `X-LLM-Escalated` when an empty answer was repaired, `X-LLM-Group` when a group
 fell back to automatic. A route the *client* chose reports `model:` in place of
@@ -719,8 +722,8 @@ working with no edits.
 Fourteen environment variables. The test for whether a setting belongs here is
 whether it describes something only the operator can know: hardware, network,
 ports, credentials, retention, how long a caller is willing to queue. Learning
-rates, classifier thresholds, latency estimates, the correctness floor, the
-exploration rate and the old tier bands are not: they are the router's own
+rates, classifier thresholds, latency estimates, the correctness floor and the
+old tier bands are not: they are the router's own
 decisions, and a site that has to set them has been handed the problem the router
 exists to solve. They are constants in the binary.
 
@@ -967,7 +970,7 @@ standard library.
 | | |
 |---|---|
 | `main.go` | server, registry, proxy, selection, persistence, health and certification loops |
-| `outcomes.go`, `outcomes_bank.go` | **the routing policy**: the outcome matrix, the neighbour lookup, the three bands, exploration, and the backfill that rebuilds it from stored profiles |
+| `outcomes.go`, `outcomes_bank.go` | **the routing policy**: the outcome matrix, the neighbour lookup, the three bands, and the backfill that rebuilds it from stored profiles |
 | `outcomes_validate.go` | `/admin/outcomes` — whether the matrix's predictions actually hold up |
 | `identity.go` | what makes a question and a model identifiable, and therefore what the permanent cache is keyed by |
 | `difficulty.go` | embedding-centroid classifier, and the superseded target-quality ranker it still hosts |

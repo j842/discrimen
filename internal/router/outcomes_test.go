@@ -28,16 +28,6 @@ func newTestMatrix(t *testing.T) *outcomeMatrix {
 	return newOutcomeMatrix(nil) // no DB: persistence is exercised separately
 }
 
-// noExploration parks the exploration counter where the next opportunities are
-// not multiples of outcomeExploreEvery, so a test asserting on the ORDER the
-// matrix produces is not occasionally handed the deliberately-suboptimal one.
-// See outcomeExploreEvery — the counter is package-level because the policy is
-// "one request in N" across the whole router, not per matrix.
-func noExploration(t *testing.T) {
-	t.Helper()
-	outcomeExploreTick.Store(0)
-}
-
 // The central claim: a prediction reflects how a worker did on questions LIKE
 // this one, and workers are ranked by that rather than by a global score.
 func TestPredictUsesNearbyQuestions(t *testing.T) {
@@ -471,7 +461,6 @@ func TestPruneJudgedKeepsBankQuestions(t *testing.T) {
 // Ranking, not filtering, is what keeps failover viable. A single measured
 // worker used to reduce a whole fleet to one candidate.
 func TestChooseNeverNarrowsTheCandidateList(t *testing.T) {
-	noExploration(t)
 	m := newTestMatrix(t)
 	ctx := context.Background()
 	m.setVector("q1", vec(1, 0))
@@ -814,7 +803,6 @@ func TestPruneJudgedDropsStoredVectors(t *testing.T) {
 // MORE speed-dominant than the fallback it supersedes. Reproduced: a worker at
 // p=0.50 with two observations beat one at p=1.00 on a 3% speed edge.
 func TestAbleBandWeighsCorrectnessNotJustSpeed(t *testing.T) {
-	noExploration(t)
 	m := newTestMatrix(t)
 	ctx := context.Background()
 	var recs []Observation
@@ -1033,7 +1021,6 @@ func TestJudgedEvidenceAloneCannotSatisfyTheObservationFloor(t *testing.T) {
 // operator reading X-Llm-Route could not tell whether a route rested on one
 // strong neighbour or a dozen weak ones.
 func TestRouteReasonReportsSupport(t *testing.T) {
-	noExploration(t)
 	m := newTestMatrix(t)
 	ctx := context.Background()
 	m.setVector("q1", vec(1, 0))
@@ -1061,7 +1048,6 @@ func TestRouteReasonReportsSupport(t *testing.T) {
 // scans per routed request: the same shape, on the same hot path, that
 // neighboursOf was split out of predict to remove at a measured 13ms a request.
 func TestFallbackScansTheMatrixOnce(t *testing.T) {
-	noExploration(t)
 	m := newTestMatrix(t)
 	ctx := context.Background()
 	m.setVector("q1", vec(1, 0, 0))
@@ -1094,15 +1080,15 @@ func TestFallbackScansTheMatrixOnce(t *testing.T) {
 
 // A worker nothing has been measured on used to be handed a "fleet-neutral" 0.5
 // and compared against real bank rates inside outcomeSpeedMargin as though that
-// were a measurement of it. Both directions of that comparison were wrong; this
-// is the one that cost the most.
+// were a measurement of it — so a model measured at 0.67 demoted every unmeasured
+// worker in the fleet across a correctness boundary and won on a comparison their
+// speed never entered.
 //
-// The order asserted here is the three bands: measured-and-good, then unmeasured,
-// then measured-and-worse. Under the placeholder the last two swapped, so a model
-// MEASURED to get 40% of the bank wrong outranked one carrying no evidence at all
-// — on the strength of a number nobody had measured.
-func TestFallbackRanksUnmeasuredAheadOfMeasuredWorse(t *testing.T) {
-	noExploration(t)
+// Automatic routing does not choose a worker nothing has measured, so the bands
+// are measured-and-good, measured-and-worse, then unmeasured — and the last one
+// is last however fast it is. "fresh" here is quicker than the worker that leads
+// and quicker than the one it follows, and still finishes third.
+func TestFallbackRanksUnmeasuredLast(t *testing.T) {
 	m := newTestMatrix(t)
 	ctx := context.Background()
 	m.setVector("q1", vec(1, 0, 0))
@@ -1124,9 +1110,9 @@ func TestFallbackRanksUnmeasuredAheadOfMeasuredWorse(t *testing.T) {
 		t.Fatalf("expected the fallback path, got reason %q", reason)
 	}
 	order := []string{got[0].ID, got[1].ID, got[2].ID}
-	if order[0] != "strong" || order[1] != "fresh" || order[2] != "middling" {
-		t.Errorf("fallback order %v, want [strong fresh middling] — an unmeasured worker belongs "+
-			"between a model measured to be good and one measured to be worse (reason %q)", order, reason)
+	if order[0] != "strong" || order[1] != "middling" || order[2] != "fresh" {
+		t.Errorf("fallback order %v, want [strong middling fresh] — automatic routing does not pick a "+
+			"worker nothing has measured, however fast it looks (reason %q)", order, reason)
 	}
 	if able != 0 {
 		t.Errorf("the fallback reported a protected band of %d; a record on the bank as a whole is "+
@@ -1134,12 +1120,11 @@ func TestFallbackRanksUnmeasuredAheadOfMeasuredWorse(t *testing.T) {
 	}
 }
 
-// The route reason has to say when the worker serving the request is one nothing
-// has measured, because "q=0.50" for a worker with no evidence is exactly the
-// confusion the placeholder created — indistinguishable in a log from a model
-// genuinely measured at half the bank.
-func TestFallbackReasonSaysWhenTheLeaderIsUnmeasured(t *testing.T) {
-	noExploration(t)
+// A worker measured to get four questions in five WRONG still leads one nothing
+// has measured. That is the rule stated at its least comfortable, and it is the
+// rule: a bad measurement is a fact about a worker, an absent one is a fact about
+// the fleet's record-keeping, and the answer to the second is to profile it.
+func TestFallbackPrefersAMeasuredFailureToAnUnknown(t *testing.T) {
 	m := newTestMatrix(t)
 	ctx := context.Background()
 	m.setVector("q1", vec(1, 0, 0))
@@ -1150,129 +1135,80 @@ func TestFallbackReasonSaysWhenTheLeaderIsUnmeasured(t *testing.T) {
 	if err := m.record(ctx, recs); err != nil {
 		t.Fatalf("record: %v", err)
 	}
-	cands := []*Backend{testBackend("weak", 1000), testBackend("fresh", 10)}
+	cands := []*Backend{testBackend("weak", 10), testBackend("fresh", 1000)}
 	got, reason, _ := m.chooseByOutcome(cands, vec(0, 0, 1), true, jobCost{outputTokens: 200, mode: thinkingOn})
-	if got[0].ID != "fresh" {
-		t.Fatalf("a model measured at 0.20 led an unmeasured one (order %q, %q; reason %q)",
+	if got[0].ID != "weak" {
+		t.Fatalf("an unmeasured worker was routed to automatically (order %q, %q; reason %q)",
 			got[0].ID, got[1].ID, reason)
+	}
+	// Still returned, and still last: failover and slot spill have to reach it.
+	if len(got) != 2 || got[1].ID != "fresh" {
+		t.Errorf("candidates %v — an unmeasured worker is ranked last, not evicted", got)
+	}
+}
+
+// A fleet where NOTHING has been measured in this mode still routes, on speed,
+// and says so: q=none rather than a hit rate for a worker carrying no evidence,
+// which in a log is indistinguishable from a model genuinely measured at half
+// the bank.
+func TestFallbackWithNothingMeasuredRoutesOnSpeed(t *testing.T) {
+	m := newTestMatrix(t)
+	ctx := context.Background()
+	m.setVector("q1", vec(1, 0, 0))
+	// Evidence exists, but for the OTHER mode, so this request has none of it.
+	if err := m.record(ctx, []Observation{obs("q1", "a", false, true, 100, obsSourceBench)}); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	cands := []*Backend{testBackend("a", 10), testBackend("b", 1000)}
+	got, reason, _ := m.chooseByOutcome(cands, vec(0, 0, 1), true, jobCost{outputTokens: 200, mode: thinkingOn})
+	if got[0].ID != "b" {
+		t.Errorf("picked %q; with nothing measured there is one band and it sorts on speed (reason %q)",
+			got[0].ID, reason)
 	}
 	if !strings.Contains(reason, "q=none") {
 		t.Errorf("route reason %q reports a hit rate for a worker nothing has measured", reason)
 	}
 }
 
-// Ranking an unmeasured worker behind every measured one is only fair if it can
-// stop being unmeasured, and on the fallback path it could not: bank rows come
-// from profiling alone, so a relay row — whose evidence lives on the upstream
-// router — would have been frozen behind the measured workers for good.
-func TestFallbackExploresAnUnmeasuredWorker(t *testing.T) {
-	noExploration(t)
-	m := newTestMatrix(t)
-	ctx := context.Background()
-	m.setVector("q1", vec(1, 0, 0))
-	var recs []Observation
-	for i := 0; i < 5; i++ {
-		recs = append(recs, obs("q"+string(rune('a'+i)), "measured", true, true, 10, obsSourceBench))
-	}
-	if err := m.record(ctx, recs); err != nil {
-		t.Fatalf("record: %v", err)
-	}
-	// Measured, correct on the whole bank, and faster: nothing but exploration
-	// will ever put the fresh one first.
-	cands := []*Backend{testBackend("measured", 500), testBackend("fresh", 10)}
+// ── Automatic routing never chooses an unmeasured worker ────────────────────
 
-	const rounds = outcomeExploreEvery * 2
-	explored := 0
-	reasons := map[string]int{}
-	for i := 0; i < rounds; i++ {
-		got, reason, _ := m.chooseByOutcome(cands, vec(0, 0, 1), true, jobCost{outputTokens: 200, mode: thinkingOn})
-		reasons[reason]++
-		if got[0].ID == "fresh" {
-			explored++
-			if !strings.Contains(reason, "explore") {
-				t.Errorf("round %d promoted the unmeasured worker but reported %q", i, reason)
-			}
-		}
-	}
-	if explored == 0 {
-		t.Fatalf("%d fallback requests and the unmeasured worker was never tried, so it can never earn "+
-			"the judged evidence that would let the measured path rank it (reasons seen: %v)", rounds, reasons)
-	}
-}
-
-// ── Exploration: the one place the router does not pick its best ────────────
-
-// An unmeasured worker ranks behind every measured one, and the only way to stop
-// being unmeasured on real traffic is to be served. Without exploration a worker
-// that is never tried never earns evidence, and the matrix's first impression of
-// a fleet becomes permanent.
-func TestExplorationOccasionallyTriesAnUnmeasuredWorker(t *testing.T) {
-	noExploration(t)
+// The measured path holds the same rule as the fallback, and this is the case
+// that used to break it: a worker the matrix predicts WRONG still leads one it
+// knows nothing about, and no counter ever promotes the unknown.
+//
+// There was such a counter — one request in twenty put the best unmeasured
+// candidate at the front, to buy evidence about it. It was written when
+// profiling did not fill the matrix; it does now, so the evidence arrives before
+// the worker takes a single request and the promotion was left paying for it
+// with somebody's live request instead.
+func TestAutomaticRoutingNeverPicksAnUnmeasuredWorker(t *testing.T) {
 	m := newTestMatrix(t)
 	ctx := context.Background()
 	m.setVector("q1", vec(1, 0))
 	m.setVector("q2", vec(0.999, 0.02))
+	// Measured, and measured to be WRONG: the weakest thing the matrix can say
+	// about a worker while still having said something.
 	if err := m.record(ctx, []Observation{
-		obs("q1", "measured", true, true, 10, obsSourceBench),
-		obs("q2", "measured", true, true, 10, obsSourceBench),
+		obs("q1", "wrong", true, false, 10, obsSourceBench),
+		obs("q2", "wrong", true, false, 10, obsSourceBench),
 	}); err != nil {
 		t.Fatalf("record: %v", err)
 	}
-	// The measured worker is both known-correct and faster, so nothing but
-	// exploration will ever put the fresh one first.
-	cands := []*Backend{testBackend("measured", 500), testBackend("fresh", 10)}
+	// ...against an unmeasured worker that is fifty times faster.
+	cands := []*Backend{testBackend("wrong", 10), testBackend("fresh", 500)}
 
-	const rounds = outcomeExploreEvery * 2
-	explored := 0
-	reasons := map[string]int{}
+	const rounds = 60
 	for i := 0; i < rounds; i++ {
 		got, reason, _ := m.chooseByOutcome(cands, vec(1, 0.01), true, jobCost{outputTokens: 200, mode: thinkingOn})
 		if len(got) != 2 {
-			t.Fatalf("round %d returned %d candidates", i, len(got))
+			t.Fatalf("round %d returned %d candidates — an unmeasured worker is ranked last, not evicted",
+				i, len(got))
 		}
-		reasons[reason]++
-		if got[0].ID == "fresh" {
-			explored++
-			if !strings.Contains(reason, "explore") {
-				t.Errorf("round %d promoted the unmeasured worker but reported %q — an exploration that "+
-					"cannot be distinguished in X-Llm-Route cannot be measured", i, reason)
-			}
+		if got[0].ID != "wrong" {
+			t.Fatalf("round %d routed to the unmeasured worker (%q)", i, reason)
 		}
-	}
-	if explored == 0 {
-		t.Fatalf("%d routed requests and the unmeasured worker was never tried, so it can never earn "+
-			"evidence (reasons seen: %v)", rounds, reasons)
-	}
-	// Bounded: exploration is a deliberate, priced cost, not a policy.
-	if explored > rounds/outcomeExploreEvery+1 {
-		t.Errorf("%d of %d requests explored, want about 1 in %d", explored, rounds, outcomeExploreEvery)
-	}
-}
-
-// Exploration must not invent a candidate: with nothing unmeasured there is
-// nothing to try, and the ranking stands.
-func TestExplorationDoesNothingWithoutAnUnmeasuredCandidate(t *testing.T) {
-	noExploration(t)
-	m := newTestMatrix(t)
-	ctx := context.Background()
-	m.setVector("q1", vec(1, 0))
-	m.setVector("q2", vec(0.999, 0.02))
-	var recs []Observation
-	for _, id := range []string{"a", "b"} {
-		recs = append(recs, obs("q1", id, true, true, 10, obsSourceBench))
-		recs = append(recs, obs("q2", id, true, true, 10, obsSourceBench))
-	}
-	if err := m.record(ctx, recs); err != nil {
-		t.Fatalf("record: %v", err)
-	}
-	cands := []*Backend{testBackend("a", 10), testBackend("b", 500)}
-	for i := 0; i < outcomeExploreEvery*2; i++ {
-		got, reason, _ := m.chooseByOutcome(cands, vec(1, 0.01), true, jobCost{outputTokens: 200, mode: thinkingOn})
 		if strings.Contains(reason, "explore") {
-			t.Fatalf("round %d explored with every candidate already measured (%q)", i, reason)
-		}
-		if got[0].ID != "b" {
-			t.Fatalf("round %d picked %q, want the faster measured worker", i, got[0].ID)
+			t.Fatalf("round %d explored (%q) — measurement, not live traffic, is how a worker earns evidence", i, reason)
 		}
 	}
 }

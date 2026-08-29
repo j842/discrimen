@@ -168,7 +168,6 @@ func TestSummaryAgreesWithTheBankRateItSharesAWalkWith(t *testing.T) {
 // fleet. fullScans could never have caught it: neighboursOf does not touch the
 // observation map. One scan for the whole request, whatever the fleet size.
 func TestChooseByOutcomeScansTheVectorMapOnce(t *testing.T) {
-	noExploration(t)
 	m := newTestMatrix(t)
 	ctx := context.Background()
 	m.setVector("q1", vec(1, 0))

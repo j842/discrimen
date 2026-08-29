@@ -236,7 +236,39 @@ type relayModelEntry struct {
 	TTFTMillis     int64    `json:"ttft_ms,omitempty"`
 	MaxConcurrency int      `json:"max_concurrency"`
 	ActiveRequests int      `json:"active_requests"`
+	// Observations is the upstream's graded bank answers for this worker's model,
+	// sent only when the downstream asks (`?observations=1`) — see
+	// handleRelayFleet. Quality above is the SCALAR those rows add up to, and the
+	// scalar is not enough: routing ranks on per-question evidence, so a relay row
+	// carrying a quality of 89 and no rows was still a worker nothing had
+	// measured, and automatic routing does not choose one of those. It sat last in
+	// the fleet on a technicality of where its evidence happened to live.
+	Observations []relayObservation `json:"observations,omitempty"`
 }
+
+// relayObservation is one graded answer as it crosses the relay boundary.
+//
+// The identity is the QID alone, and that is what makes this work without any
+// agreement between the two routers beyond running the same bank: a qid hashes
+// the question, its expected answer, how it is matched and the version of the
+// grader that scored it, so a row means the same thing on both sides or it
+// matches nothing on either. The MODEL identity is deliberately NOT sent — the
+// downstream files these under the hash its own registry computes for the relay
+// row, because evidence filed under an address nothing looks up is the failure
+// backfillOutcomesFromProfiles exists to prevent.
+type relayObservation struct {
+	QID       string `json:"qid"`
+	Thinking  bool   `json:"thinking,omitempty"`
+	Correct   bool   `json:"correct,omitempty"`
+	Loose     bool   `json:"loose,omitempty"`
+	LatencyMS int64  `json:"latency_ms,omitempty"`
+}
+
+// relayMaxObservations bounds what one upstream worker may hand over in a single
+// fetch. The bank is ~400 questions in two modes, so this is an order of
+// magnitude of headroom and still a bound: a peer is trusted for its
+// measurements, not for the size of its response (see sanitizeRelayEntry).
+const relayMaxObservations = 4096
 
 // relayFleetResponse is the whole of GET /relay/fleet.
 //
@@ -277,11 +309,58 @@ func (r *Router) handleRelayFleet(w http.ResponseWriter, req *http.Request) {
 		})
 		return
 	}
+	models := relayFleetFor(ident, r.registry.eligible())
+	// The graded answers ride along only when asked for. They are ~400 rows per
+	// worker against the dozen fields of everything else, and the downstream needs
+	// them once rather than every fifteen seconds — so the poll that runs forever
+	// stays the small one, and the request that carries a fleet's evidence is the
+	// rare one. See relayNeedsObservations for when a downstream asks.
+	//
+	// Publishing them is not a disclosure decision of the same kind as
+	// redactForRelay's: those rows are gradings of a fixed public question bank,
+	// not of anybody's traffic (see benchObservationsFor).
+	if wantsRelayObservations(req) {
+		r.attachRelayObservations(models)
+	}
 	writeJSON(w, http.StatusOK, relayFleetResponse{
 		RouterID:     r.routerID(),
 		BenchVersion: benchmarkVersion,
-		Models:       relayFleetFor(ident, r.registry.eligible()),
+		Models:       models,
 	})
+}
+
+// wantsRelayObservations reports whether this fetch asked for the graded rows.
+func wantsRelayObservations(req *http.Request) bool {
+	switch strings.ToLower(strings.TrimSpace(req.URL.Query().Get("observations"))) {
+	case "1", "true", "yes":
+		return true
+	}
+	return false
+}
+
+// attachRelayObservations fills in each published worker's graded bank answers,
+// under the identity THIS router computes for it — the downstream re-files them
+// under its own, since the two registries fingerprint the same worker
+// differently (a relay row knows a served id and no parameter count).
+func (r *Router) attachRelayObservations(models []relayModelEntry) {
+	if r.outcomes == nil {
+		return
+	}
+	for i := range models {
+		b := r.liveBackend(models[i].ID)
+		if b == nil {
+			continue
+		}
+		rows := r.outcomes.benchObservationsFor(modelHash(b))
+		out := make([]relayObservation, 0, len(rows))
+		for _, o := range rows {
+			out = append(out, relayObservation{
+				QID: o.QID, Thinking: o.Thinking, Correct: o.Correct,
+				Loose: o.Loose, LatencyMS: o.LatencyMS,
+			})
+		}
+		models[i].Observations = out
+	}
 }
 
 // relayFleetFor renders the eligible fleet as one entry per WORKER, restricted
@@ -687,7 +766,7 @@ func (r *Router) refreshRelays() {
 // upstream that is really gone fails its own health check and stops being
 // eligible, without anything here having to guess.
 func (r *Router) refreshRelay(rel Relay) []string {
-	fleet, rtt, err := r.fetchRelayFleet(rel)
+	fleet, rtt, err := r.fetchRelayFleet(rel, r.relayNeedsObservations(rel))
 	r.relays.noteFetch(rel.Name, fleet, rtt, err)
 	if err != nil {
 		log.Printf("relay %s: fetch fleet failed: %v", rel.Name, err)
@@ -817,6 +896,24 @@ func sanitizeRelayEntry(relay string, e relayModelEntry) relayModelEntry {
 		log.Printf("relay %s: worker %s reported context_k=%d — treated as undeclared", relay, e.ID, e.ContextK)
 		e.ContextK = 0
 	}
+	// The graded rows, on the same terms as the numbers above: a peer's
+	// measurements are believed, the SHAPE of its response is not. A bank of ~400
+	// questions in two modes cannot honestly be a hundred thousand rows, and an
+	// unbounded array from a WAN peer is memory this router has not agreed to
+	// spend. Truncated rather than dropped — a partial import still measures the
+	// worker — and said once with a count rather than once per row.
+	if len(e.Observations) > relayMaxObservations {
+		log.Printf("relay %s: worker %s sent %d graded answers, more than the %d this router will take — truncated",
+			relay, e.ID, len(e.Observations), relayMaxObservations)
+		e.Observations = e.Observations[:relayMaxObservations]
+	}
+	for i := range e.Observations {
+		// A negative latency is not a fast answer, it is a broken field, and zero
+		// already reads as "not timed" to outcomeLengthShape.
+		if e.Observations[i].LatencyMS < 0 {
+			e.Observations[i].LatencyMS = 0
+		}
+	}
 	return e
 }
 
@@ -836,11 +933,15 @@ func clampNonNegative(relay, id, field string, v float64) float64 {
 // includes the upstream building the response, which is a registry snapshot and
 // therefore small. Erring high is the safe direction for a number that exists to
 // stop this router preferring a remote fleet it has under-priced.
-func (r *Router) fetchRelayFleet(rel Relay) (*relayFleetResponse, float64, error) {
+func (r *Router) fetchRelayFleet(rel Relay, withObservations bool) (*relayFleetResponse, float64, error) {
 	base := strings.TrimSuffix(strings.TrimSpace(rel.URL), "/")
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/relay/fleet", nil)
+	url := base + "/relay/fleet"
+	if withObservations {
+		url += "?observations=1"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -946,6 +1047,9 @@ func (r *Router) applyRelayEntry(rel Relay, id string, entry relayModelEntry, fl
 			"relay": {OK: true, Message: message},
 		}, entry.BaselineTPS, entry.TTFTMillis, "")
 	}
+	// Last, because it files under the identity the registry computes for this
+	// row, and everything above is what the registry knows about it.
+	r.importRelayObservations(rel, id, entry, mismatch)
 }
 
 // relayProfile turns what the upstream reported into the same WorkerProfile a
@@ -994,6 +1098,107 @@ func relayProfile(entry relayModelEntry) *WorkerProfile {
 		Thinking:        entry.Thinking,
 		ThinkingDialect: thinkingDialectEffort,
 		MeasuredAt:      time.Now(),
+	}
+}
+
+// relayNeedsObservations reports whether this relay's next fetch should ask for
+// the upstream's graded rows.
+//
+// The answer is "when a row would otherwise be unmeasured": before any rows
+// exist, and for as long as any of them has nothing filed against its model.
+// Once a fetch has landed the evidence the question answers itself and the poll
+// goes back to being small, so the expensive response is sent about once per
+// upstream worker rather than four times a minute for ever.
+//
+// What this deliberately does NOT do is notice the upstream RE-grading a model it
+// had already graded. That evidence would be a refinement of evidence this router
+// already holds, of the same model on the same hardware, and paying for it on a
+// poll that runs forever is the wrong trade for it. A model CHANGE is caught,
+// because it moves the worker's fingerprint and the new hash has nothing filed
+// against it.
+func (r *Router) relayNeedsObservations(rel Relay) bool {
+	if r.outcomes == nil {
+		return false
+	}
+	// An upstream on another benchmark version has nothing to send that this
+	// router would file (see importRelayObservations), and BenchVersion here is
+	// what its last fetch reported. Asking anyway would move a fleet's worth of
+	// rows across a WAN every fifteen seconds to refuse them on arrival, for as
+	// long as the two builds disagree.
+	if rel.BenchVersion != 0 && rel.BenchVersion != benchmarkVersion {
+		return false
+	}
+	ids := r.relayRowIDs(rel.Name)
+	if len(ids) == 0 {
+		return true // nothing imported yet, including the first fetch after a restart
+	}
+	for _, id := range ids {
+		if b := r.liveBackend(id); b != nil && !r.outcomes.hasBenchEvidence(modelHash(b)) {
+			return true
+		}
+	}
+	return false
+}
+
+// importRelayObservations files an upstream's graded answers as this router's own
+// evidence about the relay row.
+//
+// The MODEL HASH is recomputed here from the registry rather than taken off the
+// wire, because the two routers fingerprint the same worker differently — the
+// upstream knows its parameter count, quantisation and engine, and a relay row
+// knows a served id and nothing else — so the upstream's identity for it is an
+// address nothing downstream ever looks up. This is the same lesson
+// backfillOutcomesFromProfiles learned the expensive way: 497 observations
+// present, every worker reporting total=0.
+//
+// The rows are stamped NOW rather than with the upstream's own timestamps. Two
+// reasons, and both are about what At is for: recordIfNewer uses it to refuse to
+// walk newer evidence backwards, and there is no local evidence to walk back —
+// this router never grades a relay row itself, and asks for these rows only when
+// it holds none. Sending a timestamp per row to preserve an ordering nothing
+// consults would be protocol for its own sake.
+//
+// The one gate is the benchmark version, and it is the same gate the quality
+// scalar passes through a few lines up: a bank answered against a different
+// question set is not evidence on this router's scale, and importing it would put
+// rates nobody can compare into the one place the ranker reads.
+func (r *Router) importRelayObservations(rel Relay, id string, entry relayModelEntry, mismatch bool) {
+	if r.outcomes == nil || len(entry.Observations) == 0 {
+		return
+	}
+	if mismatch {
+		log.Printf("relay %s: not importing %d graded answers for %s — they were graded against benchmark v%d, not this router's v%d",
+			rel.Name, len(entry.Observations), id, entry.BenchVersion, benchmarkVersion)
+		return
+	}
+	b := r.liveBackend(id)
+	if b == nil {
+		return
+	}
+	hash := modelHash(b)
+	now := time.Now()
+	obs := make([]Observation, 0, len(entry.Observations))
+	for _, o := range entry.Observations {
+		if o.QID == "" {
+			continue
+		}
+		obs = append(obs, Observation{
+			QID: o.QID, ModelHash: hash, Backend: id, Thinking: o.Thinking,
+			Correct: o.Correct, Loose: o.Loose, LatencyMS: o.LatencyMS,
+			Source: obsSourceBench, At: now,
+		})
+	}
+	if len(obs) == 0 {
+		return
+	}
+	n, err := r.outcomes.recordIfNewer(context.Background(), obs)
+	if err != nil {
+		log.Printf("relay %s: importing graded answers for %s failed: %v", rel.Name, id, err)
+		return
+	}
+	if n > 0 {
+		log.Printf("relay %s: imported %d graded answers for %s — it can now be routed to on its own record",
+			rel.Name, n, id)
 	}
 }
 

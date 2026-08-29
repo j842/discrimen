@@ -712,6 +712,49 @@ func (m *outcomeMatrix) bankRates(thinking bool) map[string]bankTally {
 	return m.bankTallies(thinking, "")
 }
 
+// benchObservationsFor is every bank row filed for one model, both modes, for
+// publishing across a relay (see relayFleetFor). Bench only: a judged row is a
+// grading of somebody's real prompt, and its vector — without which it is
+// unreachable by any query anyway — would carry that prompt's embedding over the
+// wire. The bank is a fixed, public question set, so these rows disclose nothing
+// but how a model did on it.
+func (m *outcomeMatrix) benchObservationsFor(hash string) []Observation {
+	if hash == "" {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var out []Observation
+	for _, list := range m.obs {
+		for _, o := range list {
+			if o.Source == obsSourceBench && o.ModelHash == hash {
+				out = append(out, o)
+			}
+		}
+	}
+	return out
+}
+
+// hasBenchEvidence reports whether anything has been graded on this model in
+// either mode — "is this worker measured at all", which is what decides whether
+// automatic routing will consider it. Early-returns, so the common answer (yes)
+// costs a partial walk rather than a full one.
+func (m *outcomeMatrix) hasBenchEvidence(hash string) bool {
+	if hash == "" {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, list := range m.obs {
+		for _, o := range list {
+			if o.Source == obsSourceBench && o.ModelHash == hash {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // ── persistence ────────────────────────────────────────────────────────────
 
 func (m *outcomeMatrix) persist(ctx context.Context, obs []Observation) error {

@@ -754,6 +754,85 @@ func TestRelayKeepsRowsWhenFetchFails(t *testing.T) {
 // routable — at the same provisional tier an unproven worker holds — rather
 // than adopting a score from another scale or claiming a local re-measurement
 // that a relay can never do.
+// A relay row has to arrive MEASURED, and a quality score is not that.
+//
+// Everything else about an upstream worker already crossed the wire — speed,
+// capacity, context, capabilities, and the benchmark score — but the score is a
+// scalar, and routing ranks on the per-question rows behind it. So a relay row
+// arrived carrying q=89 and no evidence, which is exactly the state automatic
+// routing refuses to choose: last in the fleet, behind workers measured to be
+// worse, for as long as it existed. The rows are the fix; the fleet response
+// carries them when the downstream asks.
+func TestRelayImportsTheEvidenceBehindTheQualityScore(t *testing.T) {
+	graded := []relayObservation{
+		{QID: "q1", Thinking: true, Correct: true, LatencyMS: 900},
+		{QID: "q2", Thinking: true, Correct: true, LatencyMS: 900},
+		{QID: "q3", Thinking: true, Correct: false, LatencyMS: 900},
+		{QID: "q4", Thinking: true, Correct: true, LatencyMS: 900},
+	}
+	var fetches, asked int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		fetches++
+		entry := relayModelEntry{
+			ID: "up-qwen", Model: "qwen", Quality: 89, BenchVersion: benchmarkVersion,
+			ContextK: 128, Features: []string{"chat"}, Thinking: true,
+			BaselineTPS: 100, MaxConcurrency: 4,
+		}
+		// The rows ride along only when asked for: they are ~400 per worker, and
+		// the poll that carries everything else runs every fifteen seconds.
+		if wantsRelayObservations(req) {
+			asked++
+			entry.Observations = graded
+		}
+		writeJSON(w, http.StatusOK, relayFleetResponse{
+			RouterID: "r-up", BenchVersion: benchmarkVersion, Models: []relayModelEntry{entry},
+		})
+	}))
+	defer upstream.Close()
+
+	r := adminRouter(t)
+	r.outcomes = newOutcomeMatrix(nil)
+	r.relays.put(Relay{Name: "work", URL: upstream.URL, Enabled: true})
+	r.refreshRelays()
+
+	id := relayBackendID("work", "up-qwen")
+	b := r.registry.get(id)
+	if b == nil {
+		t.Fatalf("relay row %q was not registered", id)
+	}
+	// Filed under the identity THIS registry computes for the row. The upstream's
+	// own hash for the same worker is a different string and would be an address
+	// nothing here ever looks up.
+	rate, measured := r.outcomes.bankRates(true)[modelHash(b)].rate()
+	if !measured {
+		t.Fatal("the relay row is still unmeasured after importing its graded answers — " +
+			"automatic routing will not choose it")
+	}
+	if rate != 0.75 {
+		t.Errorf("imported hit rate = %.2f, want 0.75 (three of four)", rate)
+	}
+
+	// The point of all of it: ranked on its own record, ahead of a local worker
+	// nothing has measured. Before the import both were unmeasured and the relay
+	// row could only ever be reached by failover.
+	got, reason, _ := r.outcomes.chooseByOutcome([]*Backend{testBackend("local-fresh", 1000), b},
+		vec(0, 0, 1), true, jobCost{outputTokens: 200, mode: thinkingOn})
+	if len(got) == 0 || got[0].ID != id {
+		t.Errorf("the relayed worker did not lead an unmeasured local one (reason %q)", reason)
+	}
+
+	// Asked once, not on every poll. The fleet fetch runs every fifteen seconds
+	// for the life of the router; the evidence is needed once per worker.
+	r.refreshRelays()
+	r.refreshRelays()
+	if fetches < 3 {
+		t.Fatalf("test setup: %d fetches, want at least 3", fetches)
+	}
+	if asked != 1 {
+		t.Errorf("asked for the graded rows on %d of %d fetches, want exactly 1", asked, fetches)
+	}
+}
+
 func TestRelayBenchmarkMismatchHoldsProvisionalQuality(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, relayFleetResponse{
@@ -761,14 +840,28 @@ func TestRelayBenchmarkMismatchHoldsProvisionalQuality(t *testing.T) {
 			Models: []relayModelEntry{{
 				ID: "m", Model: "m", Quality: 99, BenchVersion: benchmarkVersion + 1,
 				ContextK: 64, MaxConcurrency: 3, Features: []string{"chat"},
+				// Graded against the other router's question set, so these rows are
+				// on the same incomparable scale as the 99 above.
+				Observations: []relayObservation{
+					{QID: "other-bank-q1", Thinking: true, Correct: true},
+					{QID: "other-bank-q2", Thinking: true, Correct: true},
+				},
 			}},
 		})
 	}))
 	defer upstream.Close()
 
 	r := adminRouter(t)
+	r.outcomes = newOutcomeMatrix(nil)
 	r.relays.put(Relay{Name: "up", URL: upstream.URL, Enabled: true})
 	r.refreshRelays()
+
+	// The rows go through the same gate as the score they add up to. Importing
+	// them would file a hit rate measured on another question set under the one
+	// identity the ranker reads.
+	if b := r.registry.get(relayBackendID("up", "m")); b != nil && r.outcomes.hasBenchEvidence(modelHash(b)) {
+		t.Error("graded answers from a different benchmark version were imported as evidence on this router's scale")
+	}
 
 	b := r.registry.get(relayBackendID("up", "m"))
 	if b == nil {

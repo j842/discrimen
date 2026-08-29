@@ -668,7 +668,7 @@ synthesiser would record a hit rate for a model that did not earn it alone.
 | any | `/admin/keys[/{id}]` | admin | Issue, list, disable and delete API keys |
 | any | `/admin/groups[/{id}]` | admin | CRUD over named groups |
 | any | `/admin/relays[/{name}]` | admin | CRUD over upstream routers this one relays to |
-| GET | `/relay/fleet` | relay | What a downstream router may see of this fleet: one entry per model it is allowed, with the measured profile and live occupancy |
+| GET | `/relay/fleet` | relay | What a downstream router may see of this fleet: one entry per model it is allowed, with the measured profile and live occupancy. `?observations=1` adds each worker's graded bank answers |
 | POST | `/admin/login`, `/admin/logout` | password | Session cookie |
 | GET | `/` | none | Dashboard shell. Discloses nothing; the fleet table is fetched client-side with the admin session cookie |
 
@@ -823,6 +823,18 @@ says the two measurements were made the same way; when it does not match,
 capacity and capabilities still cross and the quality is held at the provisional
 30 an unproven worker gets, rather than adopting a score derived by a different
 method. `/health` reports the mismatch under `relays`.
+
+**The graded answers cross with it.** The quality score is a scalar, and routing
+ranks on the per-question rows behind it — so a relay row carrying a score and no
+rows was a worker nothing had measured, which automatic routing does not choose.
+The downstream asks for those rows (`GET /relay/fleet?observations=1`) when a row
+would otherwise be unmeasured, and files them under the identity its own registry
+computes for that row. They are gradings of a fixed public question bank rather
+than of anybody's traffic, and they are identified by a hash of the question and
+its grader, so a row means the same thing on both sides or it matches nothing on
+either. Judged rows do not cross: those grade real prompts. The ordinary
+fifteen-second poll stays small — a fleet's evidence is asked for about once per
+worker, not four times a minute.
 
 **Relayed traffic leaves no prompts upstream.** A relay key marks its caller,
 and a marked caller's request and response bodies are dropped before the log row

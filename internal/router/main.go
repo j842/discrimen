@@ -6432,6 +6432,25 @@ func (s *LogStore) init(ctx context.Context) error {
 		// (see relay.go). Every key issued before relays existed is not one, and
 		// 0 is what the default gives them.
 		`ALTER TABLE api_keys ADD COLUMN relay INTEGER NOT NULL DEFAULT 0`,
+		// Half credit (see Observation.Loose). Added to the observations CREATE by
+		// the same commit that started naming it in the INSERT and the SELECT — and
+		// CREATE TABLE IF NOT EXISTS does not touch a table that already exists, so
+		// every database created before that commit kept the old shape and every
+		// statement naming the column failed against it.
+		//
+		// The failure was total, silent to a caller, and lasted two days on the live
+		// fleet: load() came up empty on every boot ("no such column: loose"), so did
+		// the permacache; every write failed, which is the startup backfill and every
+		// judged verdict the matrix would have corrected itself with. What routed on
+		// the wreckage was one worker's evidence — backfillOutcomesFromProfiles files
+		// into the map before it persists and returned at the first error, so the
+		// first profile row it read kept its observations in memory and no other
+		// worker was reached. That worker was a CPU llama.cpp box at 0.67 no-think,
+		// every GPU in the fleet read as the unmeasured 0.5, and 0.17 is wider than
+		// outcomeSpeedMargin — so the fallback ranker put the slowest worker in the
+		// fleet first on correctness and never compared speed at all. A 6.5k-token
+		// commit-message prompt took 149s to first token.
+		`ALTER TABLE observations ADD COLUMN loose INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return err

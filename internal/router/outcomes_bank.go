@@ -418,7 +418,8 @@ func (r *Router) backfillOutcomesFromProfiles(ctx context.Context) error {
 	}
 	rows.Close()
 
-	var recovered, workers int
+	var recovered, workers, failed int
+	var firstErr error
 	for _, s := range profiles {
 		// Identity from the STORED profile, never from the live registry: the
 		// worker may be long gone, and keeping its results is the point.
@@ -469,18 +470,33 @@ func (r *Router) backfillOutcomesFromProfiles(ctx context.Context) error {
 		}
 		n, err := r.outcomes.recordIfNewer(ctx, obs)
 		if err != nil {
-			return fmt.Errorf("backfilling %s: %w", s.id, err)
+			// One worker's failure must not cost the rest of the fleet its evidence,
+			// and this loop used to return here. What that cost is not theoretical:
+			// a missing `loose` column made every persist fail, the first profile row
+			// read aborted the whole walk, and because recordIfNewer files into the
+			// map BEFORE it persists, the fleet went on routing with exactly one
+			// worker's observations in memory and every other worker reading as
+			// unmeasured. Carrying on would have left the matrix fully populated in
+			// memory and only unpersisted — a degradation instead of an inversion.
+			//
+			// The error is still returned, after every profile has been tried, so a
+			// broken table cannot pass as a clean start.
+			failed++
+			if firstErr == nil {
+				firstErr = fmt.Errorf("backfilling %s: %w", s.id, err)
+			}
+			continue
 		}
 		if n > 0 {
 			recovered += n
 			workers++
 		}
 	}
-	if recovered > 0 || unreadable > 0 {
-		log.Printf("outcome matrix: recovered %d observations from %d stored profiles (%d unreadable) — %s",
-			recovered, workers, unreadable, r.outcomes)
+	if recovered > 0 || unreadable > 0 || failed > 0 {
+		log.Printf("outcome matrix: recovered %d observations from %d stored profiles (%d unreadable, %d failed) — %s",
+			recovered, workers, unreadable, failed, r.outcomes)
 	}
-	return nil
+	return firstErr
 }
 
 // liveBackend is the registered worker with this id, or nil — including when

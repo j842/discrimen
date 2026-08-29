@@ -185,6 +185,85 @@ func TestMigrationsApplyToAnOldDatabase(t *testing.T) {
 	logs2.Close()
 }
 
+// preLooseObservations is the observations table as the model-hash migration
+// created it, copied verbatim from LogStore.init as it stood then — the shape
+// every live database is still carrying. Written out in full for the same reason
+// oldSchema is: a future edit to init must not quietly redefine "the database in
+// the field".
+const preLooseObservations = `CREATE TABLE IF NOT EXISTS observations (
+	qid TEXT NOT NULL,
+	model_hash TEXT NOT NULL,
+	backend_id TEXT NOT NULL DEFAULT '',
+	thinking INTEGER NOT NULL,
+	correct INTEGER NOT NULL,
+	latency_ms INTEGER NOT NULL DEFAULT 0,
+	output_tokens INTEGER NOT NULL DEFAULT 0,
+	source TEXT NOT NULL,
+	created_at TEXT NOT NULL,
+	PRIMARY KEY (qid, model_hash, thinking, source)
+)`
+
+// TestObservationsMigrateOntoAnExistingTable opens a database whose observations
+// table predates the half-credit column and asserts the matrix can still read and
+// write it.
+//
+// The regression is worth stating exactly, because nothing about it looked like a
+// database fault from outside. `loose` was added to the CREATE in the same commit
+// that named it in the INSERT and the SELECT — but CREATE TABLE IF NOT EXISTS
+// does not alter a table that already exists, so on every deployed router the
+// column was absent: the matrix loaded empty on each boot, and every write failed
+// (the startup backfill, and every judged verdict). Routing then ran on whatever
+// the backfill had filed in memory before it gave up, which was one worker — and
+// an unmeasured worker reads 0.5, so a mid-quality CPU box at 0.67 outranked the
+// GPUs by more than outcomeSpeedMargin and took traffic none of them was even
+// compared for.
+func TestObservationsMigrateOntoAnExistingTable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "logs.sqlite")
+	ctx := context.Background()
+
+	old, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := old.ExecContext(ctx, preLooseObservations); err != nil {
+		t.Fatalf("pre-loose schema: %v", err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	logs, err := openLogStore(path, 16384, "")
+	if err != nil {
+		t.Fatalf("migrating a database with a pre-loose observations table: %v", err)
+	}
+	defer logs.Close()
+
+	obs := Observation{
+		QID: "q1", ModelHash: "m1", Backend: "llm-a750", Thinking: false,
+		Correct: true, Loose: true, LatencyMS: 1234, Source: obsSourceBench,
+		At: time.Now().UTC(),
+	}
+	m := newOutcomeMatrix(logs.db)
+	if err := m.record(ctx, []Observation{obs}); err != nil {
+		t.Fatalf("recording an observation after the migration: %v", err)
+	}
+
+	// The half credit has to survive the round trip, not just the INSERT: a load
+	// that dropped it would re-score the same cached answers lower on every
+	// re-profile. See Observation.Loose.
+	fresh := newOutcomeMatrix(logs.db)
+	if err := fresh.load(ctx); err != nil {
+		t.Fatalf("loading observations after the migration: %v", err)
+	}
+	got := fresh.obs["q1"]
+	if len(got) != 1 {
+		t.Fatalf("observation did not survive a reload: %+v", got)
+	}
+	if !got[0].Correct || !got[0].Loose || got[0].LatencyMS != 1234 || got[0].ModelHash != "m1" {
+		t.Errorf("observation came back altered: %+v", got[0])
+	}
+}
+
 // ── Keys ────────────────────────────────────────────────────────────────────
 
 func TestAPIKeyRoundTrip(t *testing.T) {

@@ -111,3 +111,54 @@ func TestServeCheckRequiresConsecutiveFailures(t *testing.T) {
 		t.Error("reported a pull for a backend that is not registered")
 	}
 }
+
+// The doubling ladder can never reach the top of a window — the next rung is
+// always double the last — so on a power-of-two claim it stops at exactly half
+// and the upper half goes untested. runContextProbe now probes the top directly,
+// and ladderRanOutOfRoom has to believe that rung when it fails: it sits just
+// under the claim, so the old `usable*2+reserve > advertised` arithmetic reads a
+// genuine ceiling found up there as "never tested" and discards it.
+func TestTopRungCeilingIsNotDiscardedAsUntested(t *testing.T) {
+	const advertised = 192 * 1024
+	top := advertised - contextProbeReserve
+
+	// The 6000 Pro's real shape: everything passed to 128K, and the top rung
+	// (195,584 — within 300 tokens of the prompt that wedged it) did not.
+	measured := &ContextProbe{
+		UsableTokens: 128 * 1024, AdvertisedTokens: advertised,
+		Levels: []ContextProbeLevel{
+			{Tokens: 128 * 1024, Passed: 3, Total: 3},
+			{Tokens: top, Passed: 1, Total: 3},
+		},
+	}
+	if ladderRanOutOfRoom(measured) {
+		t.Error("a failed top rung read as 'ran out of room' — the arithmetic still holds " +
+			"above half the claim, which is exactly why the evidence has to come first")
+	}
+	b := &Backend{BackendRegistration: BackendRegistration{ContextK: 192}, ContextProbe: measured}
+	if got := usableContextTokens(b); got != 128*1024 {
+		t.Errorf("usableContextTokens = %d, want the measured 128K — routing would otherwise "+
+			"admit prompts at %dK that the probe just proved it cannot hold", got, advertised/1024)
+	}
+
+	// The top rung PASSING is the other half: the claim is then proven, not merely
+	// unrefuted, and the window stands.
+	proven := &ContextProbe{
+		UsableTokens: top, AdvertisedTokens: advertised,
+		Levels: []ContextProbeLevel{{Tokens: top, Passed: 3, Total: 3}},
+	}
+	if !ladderRanOutOfRoom(proven) {
+		t.Error("a passing top rung should leave nothing above the mark to refute the claim")
+	}
+
+	// Back-compat: a cached profile from before the top rung exists has no level
+	// above its mark, so it must keep falling back to the advertised claim rather
+	// than being halved — the regression ladderRanOutOfRoom was written to stop.
+	old := &ContextProbe{
+		UsableTokens: 128 * 1024, AdvertisedTokens: 256 * 1024,
+		Levels: []ContextProbeLevel{{Tokens: 128 * 1024, Passed: 3, Total: 3}},
+	}
+	if !ladderRanOutOfRoom(old) {
+		t.Error("a pre-existing profile was read as having measured a ceiling it never tested")
+	}
+}

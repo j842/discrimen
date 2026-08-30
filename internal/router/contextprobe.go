@@ -133,7 +133,34 @@ func (r *Router) runContextProbe(b *Backend, thinking bool) ContextProbe {
 	started := time.Now()
 	for size := contextProbeStart; size <= contextProbeCeiling; size *= 2 {
 		if size+contextProbeReserve > advertised {
-			break // the next rung would not fit; the claim is unrefuted up to here
+			// The doubling ladder can never reach the top of the window: the next
+			// rung is always DOUBLE the last, and a claim is rarely double a rung.
+			// For any power-of-two window the climb therefore stops at exactly
+			// half, and the whole upper half of the worker's claim goes untested —
+			// which is the gap ladderRanOutOfRoom exists to paper over.
+			//
+			// Test the top itself instead. It is the rung that matters: on
+			// llm-6000pro-qwen38-flash-next this is 195,584 tokens, and the prompt
+			// that wedged that worker on 2026-08-30 was 195,302. The one length
+			// the ladder declined to attempt is where the worker actually broke.
+			//
+			// Safe to attempt: top + contextProbeMaxTokens is still inside the
+			// window, so an endpoint that refuses oversized requests has nothing
+			// to refuse, and one that would grind on a too-long prefill is never
+			// handed one.
+			if top := advertised - contextProbeReserve; top > out.UsableTokens &&
+				top >= contextProbeStart && top <= contextProbeCeiling {
+				if time.Since(started) > contextProbeBudget {
+					out.Truncated = true
+					break
+				}
+				level := r.probeContextLevel(b, top, thinking)
+				out.Levels = append(out.Levels, level)
+				if !level.Errored && level.Passed >= level.Total {
+					out.UsableTokens = top
+				}
+			}
+			break
 		}
 		if time.Since(started) > contextProbeBudget {
 			out.Truncated = true
@@ -319,6 +346,19 @@ func medianInt64(xs []int64) int64 {
 // A ladder abandoned on its time budget is the same — the room check passes
 // before the budget check, so the rung it gave up on also fit. Only running out
 // of room leaves the last proven rung more than half the claim.
+//
+// EXCEPT for the top rung, which runContextProbe now probes directly when the
+// doubling runs out of room (see the room break there). That rung sits just under
+// the claim rather than at or below half, so a genuine ceiling found up there
+// still satisfies `last*2+reserve > advertised` and the arithmetic alone would
+// wave it through as "never tested" — discarding the one measurement that most
+// needed keeping. Direct evidence therefore comes first: a rung recorded above
+// the proven mark ran, and did not pass.
+//
+// An ERRORED rung counts as refuting here, unlike in contextProbeMessage where
+// the distinction is about what to tell an operator. Routing is deciding whether
+// to send a prompt that long, and a worker whose answer at that length never
+// arrived is not one to send it to.
 func ladderRanOutOfRoom(p *ContextProbe) bool {
 	if p == nil || p.UsableTokens <= 0 {
 		return false
@@ -329,6 +369,11 @@ func ladderRanOutOfRoom(p *ContextProbe) bool {
 	// field, or one stored malformed, keeps the old conservative reading.
 	if p.AdvertisedTokens <= 0 {
 		return false
+	}
+	for _, level := range p.Levels {
+		if level.Tokens > p.UsableTokens {
+			return false // attempted above the proven mark, and it did not pass
+		}
 	}
 	return p.UsableTokens*2+contextProbeReserve > p.AdvertisedTokens
 }

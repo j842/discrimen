@@ -1069,6 +1069,13 @@ func (r *Router) resolveCapacity(b *Backend, ramp int) int {
 			b.ID, ramp, slots, slots)
 		ramp = slots
 	}
+	// Same rule, different publication: a beacon row's own declaration. Lowering
+	// only, for the reason above — see Registry.beaconMaxConcurrency.
+	if declared := r.registry.beaconMaxConcurrency(b.ID); declared > 0 && ramp > declared {
+		log.Printf("capacity probe: %s ramp measured %d but the worker registered a ceiling of %d — using %d",
+			b.ID, ramp, declared, declared)
+		ramp = declared
+	}
 	if declared := r.registry.operatorMaxConcurrency(b.ID); declared > 0 && declared != ramp {
 		log.Printf("capacity probe: %s ramp measured %d but the operator declared %d — using the declared value",
 			b.ID, ramp, declared)

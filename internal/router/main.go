@@ -117,8 +117,8 @@ type BackendRegistration struct {
 	HealthPath  string   `json:"health_path"`
 	TTLSeconds  int      `json:"ttl_seconds"`
 	// MaxConcurrency is a declared concurrency ceiling. On a MANUAL row it
-	// outranks the capacity ramp outright; on a beacon row it is the seed it has
-	// always been, replaced by the measurement. See providers.go.
+	// outranks the capacity ramp outright; on a beacon row it seeds the ramp and
+	// then caps it, lowering only. See providers.go.
 	MaxConcurrency int    `json:"max_concurrency"`
 	APIKey         string `json:"api_key,omitempty"`
 

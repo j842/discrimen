@@ -239,3 +239,27 @@ func TestContextOverflowDoesNotOverrideOtherRequirements(t *testing.T) {
 		t.Errorf("overflow target = %v, want the tools-capable worker", got)
 	}
 }
+
+// The overflow gamble must hold for a NAMED model too — a group member, a relay
+// row, or the caller's explicit pick. Refusing named models broke the gamble
+// across a relay: the upstream router forwarded its own overflow pinned to the
+// relay's model name, the downstream planner refused on its estimate, and the
+// endpoint never got to rule — the caller saw a 503 naming a worker they never
+// asked for instead of the engine's exact 400.
+func TestContextOverflowForwardsNamedModel(t *testing.T) {
+	served := &Backend{BackendRegistration: BackendRegistration{
+		ID: "narrow-named", Model: "relay-model", ContextK: 8, Features: []string{"chat"},
+	}}
+	other := &Backend{BackendRegistration: BackendRegistration{
+		ID: "wide-other", Model: "different-model", ContextK: 256, Features: []string{"chat"},
+	}}
+	f := hardFilter{promptChars: 900000, wantModel: "relay-model"}
+	if got := widestContext([]*Backend{served, other}, f); got != served {
+		t.Errorf("named-model overflow target = %v, want the worker serving that model", got)
+	}
+	// And when nothing serves the model at all, refusal stays the honest answer.
+	f = hardFilter{promptChars: 900000, wantModel: "unserved-model"}
+	if widestContext([]*Backend{served, other}, f) != nil {
+		t.Error("a worker not serving the named model was offered as an overflow target")
+	}
+}

@@ -3613,12 +3613,19 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 			log.Printf("context: estimated %dK exceeds every worker, but fits %d of them at the sparsest plausible ratio (%dK) — routing normally",
 				hf.contextNeededK(nil), len(relaxed), hf.optimistic().contextNeededK(nil))
 			filtered = relaxed
-		} else if wantModel == "" {
-			if widest := widestContext(candidates, hf); widest != nil {
-				log.Printf("context overflow: no worker admits an estimated %dK prompt — sending it to %s (%dK) and letting the endpoint rule",
-					hf.contextNeededK(widest), widest.ID, usableContextTokens(widest)/1024)
-				filtered, overflow = []*Backend{widest}, true
-			}
+		} else if widest := widestContext(candidates, hf); widest != nil {
+			// The same gamble holds for a NAMED model — a group member, a relay
+			// row, or the caller's explicit pick. widestContext keeps every
+			// non-context filter (including wantModel), so the widest worker
+			// actually serving that model takes the request and its endpoint
+			// rules. Refusing named models here broke the gamble across a relay:
+			// the upstream router forwarded its own overflow pinned to the relay's
+			// model name, this planner refused on its estimate, and the endpoint
+			// never got to rule — the caller saw a 503 naming a worker they never
+			// asked for instead of the engine's exact 400 (2026-08-30).
+			log.Printf("context overflow: no worker admits an estimated %dK prompt — sending it to %s (%dK) and letting the endpoint rule",
+				hf.contextNeededK(widest), widest.ID, usableContextTokens(widest)/1024)
+			filtered, overflow = []*Backend{widest}, true
 		}
 	}
 	if len(filtered) == 0 {

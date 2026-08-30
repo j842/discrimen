@@ -186,3 +186,39 @@ func TestBeaconCeilingCapsACachedRamp(t *testing.T) {
 		t.Errorf("cached ramp applied as %d, want the measured 2", got)
 	}
 }
+
+// The serving check must not compete for a slot. Queued behind real work it
+// measures the queue rather than the worker, and on a single-slot worker any
+// traffic at all guarantees a timeout — which pulled a healthy 14 tok/s worker
+// out of rotation on 2026-08-30 and sent it back through full certification.
+func TestServeCheckSkipsAFullyOccupiedWorker(t *testing.T) {
+	ready := CertState{Ready: true}
+	full := &Backend{BackendRegistration: BackendRegistration{
+		ID: "naples", MaxConcurrency: 1, Features: []string{"chat"}}, Certification: ready}
+	full.ActiveRequests = 1
+	r := &Registry{backends: map[string]*Backend{"naples": full}}
+	if r.serveCheckDue("naples", 0) {
+		t.Error("probed a worker whose only slot was busy — the check would time out on the " +
+			"queue and read a working worker as wedged")
+	}
+
+	// The wedge this check exists for holds SOME slots, not all: the worker that
+	// started this had 3-5 of 8 occupied throughout, so there was always a free
+	// slot to probe through.
+	wedged := &Backend{BackendRegistration: BackendRegistration{
+		ID: "wedged", MaxConcurrency: 8, Features: []string{"chat"}}, Certification: ready}
+	wedged.ActiveRequests = 5
+	r.backends["wedged"] = wedged
+	if !r.serveCheckDue("wedged", 0) {
+		t.Error("skipped a worker with 3 free slots — that is the case the check is for")
+	}
+
+	// An unknown ceiling must not silently disable the check.
+	unknown := &Backend{BackendRegistration: BackendRegistration{
+		ID: "unknown", Features: []string{"chat"}}, Certification: ready}
+	unknown.ActiveRequests = 3
+	r.backends["unknown"] = unknown
+	if !r.serveCheckDue("unknown", 0) {
+		t.Error("skipped a worker with no declared concurrency")
+	}
+}

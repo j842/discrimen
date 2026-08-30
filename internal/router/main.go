@@ -5127,6 +5127,21 @@ func (r *Registry) serveCheckDue(id string, interval time.Duration) bool {
 	if b == nil || !b.Certification.Ready || isEmbeddingsOnly(b) {
 		return false
 	}
+	// Never make the check COMPETE for a slot. Queued behind real work it measures
+	// the queue, not the worker, and on a single-slot worker any traffic at all
+	// guarantees a timeout: llm-naples-qwen38-flash-next (max_concurrency 1,
+	// 14 tok/s) was pulled from rotation on 2026-08-30 for being busy, then spent
+	// minutes re-certifying from scratch at 14 tok/s — the check causing the
+	// outage it exists to prevent.
+	//
+	// This does not blind it to the failure it is for. A wedged worker holds its
+	// slots without finishing anything, but it does not hold ALL of them: the one
+	// that started this had 3-5 of 8 occupied for the whole outage, so a free slot
+	// was always there to probe through. A worker genuinely at full occupancy is
+	// one the router is already declining to route to (see isFull).
+	if b.MaxConcurrency > 0 && occupancy(b) >= b.MaxConcurrency {
+		return false
+	}
 	if time.Since(b.lastServeCheck) < interval {
 		return false
 	}

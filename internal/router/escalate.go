@@ -522,6 +522,17 @@ func (r *Router) requestBufferedWithDelays(req *http.Request, backend *Backend, 
 		if err != nil {
 			r.registry.setError(backend.ID, err.Error())
 			last = bufferedResult{netErr: err}
+			// A transport error with the CALLER's context already cancelled is not
+			// a flaky upstream — it is the caller having given up, and the only
+			// thing a retry can still reach is the worker. That distinction cost a
+			// GPU on 2026-08-30: an over-long prompt was forced onto the widest
+			// worker, the client timed out, and each "attempt n/4 retrying after 2s
+			// (prev status=0 err=... context canceled)" started the same
+			// unfinishable prefill again on a worker nobody was waiting for.
+			// Deliver the error to a caller who is still there; otherwise stop.
+			if req.Context().Err() != nil {
+				return last
+			}
 			continue
 		}
 		respBody, readErr := io.ReadAll(resp.Body)

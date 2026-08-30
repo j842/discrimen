@@ -108,6 +108,13 @@ var deadlineSafetyFactor = 0.8
 type jobCost struct {
 	promptTokens int
 	outputTokens int
+	// promptChars is the text promptTokens was estimated FROM, kept so an
+	// absolute fit decision can re-size it at a ratio of its own choosing.
+	// promptTokens is priced at the nominal divisor because ranking is
+	// comparative and a shared bias cancels; budgetCeiling is not comparative,
+	// and reusing the ranking number there granted an output budget the worker
+	// had no room for. See budgetCeiling.
+	promptChars int
 	// incumbent is the worker that served the previous turn of this conversation,
 	// if any (see session.go). It rides in the job rather than in a separate
 	// argument so every existing caller of expectedLatency — the ranker AND the
@@ -213,7 +220,8 @@ func costForRequest(req *ChatRequest, thinking bool) jobCost {
 	// of them cancels. The measured ratio is for the hard filter, where the number
 	// is compared against a fixed window rather than against other workers, and an
 	// error there refuses a request instead of mildly reordering two.
-	job := jobCost{promptTokens: promptTokensFor(req, defaultCharsPerToken), outputTokens: out, mode: thinkingOff}
+	job := jobCost{promptTokens: promptTokensFor(req, defaultCharsPerToken),
+		promptChars: promptCharsFor(req), outputTokens: out, mode: thinkingOff}
 	if thinking {
 		job.mode = thinkingOn
 	}

@@ -162,3 +162,27 @@ func TestTopRungCeilingIsNotDiscardedAsUntested(t *testing.T) {
 		t.Error("a pre-existing profile was read as having measured a ceiling it never tested")
 	}
 }
+
+// The fleet certifies from cached profiles, and a cached ramp is keyed per
+// (id, model) and never re-measured on its own. A ceiling that only applied on a
+// fresh capacity probe would therefore apply to nobody.
+func TestBeaconCeilingCapsACachedRamp(t *testing.T) {
+	reg := BackendRegistration{ID: "w", MaxConcurrency: 6, Source: sourceBeacon}
+	r := &Registry{backends: map[string]*Backend{"w": {
+		BackendRegistration: reg, lastReg: &reg,
+	}}}
+	r.applyProfileIfGen("w", 0, &WorkerProfile{MaxConcurrency: 8})
+	if got := r.backends["w"].MaxConcurrency; got != 6 {
+		t.Errorf("cached ramp applied as %d, want the registered ceiling 6 — SGLang queues past "+
+			"--max-running-requests, so the ramp reads slots the engine does not run", got)
+	}
+
+	// Lowering only: a cached ramp BELOW the declared ceiling is the measurement,
+	// and a worker must not talk its own capacity up.
+	reg2 := BackendRegistration{ID: "w2", MaxConcurrency: 6, Source: sourceBeacon}
+	r.backends["w2"] = &Backend{BackendRegistration: reg2, lastReg: &reg2}
+	r.applyProfileIfGen("w2", 0, &WorkerProfile{MaxConcurrency: 2})
+	if got := r.backends["w2"].MaxConcurrency; got != 2 {
+		t.Errorf("cached ramp applied as %d, want the measured 2", got)
+	}
+}

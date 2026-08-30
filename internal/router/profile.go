@@ -1421,7 +1421,16 @@ func (r *Registry) applyProfileIfGen(id string, gen int64, p *WorkerProfile) boo
 		b.ContextK = p.ContextK
 	}
 	if p.MaxConcurrency > 0 && declared.MaxConcurrency == 0 {
-		b.MaxConcurrency = p.MaxConcurrency
+		conc := p.MaxConcurrency
+		// A cached ramp outlives the registration it was measured under, and is
+		// keyed per (id, model) so it is never re-measured on its own. Without this
+		// the beacon ceiling in resolveCapacity only ever applies to a worker that
+		// happens to get a fresh capacity probe — the fleet certifies from cache,
+		// so in practice it would apply to nobody. Lowering only, as there.
+		if ceiling := beaconDeclared(b); ceiling > 0 && conc > ceiling {
+			conc = ceiling
+		}
+		b.MaxConcurrency = conc
 	}
 	if p.BaselineTPS > 0 && declared.BaselineTPS == 0 {
 		b.BaselineTPS = p.BaselineTPS

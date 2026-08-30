@@ -164,7 +164,11 @@ func (r *Registry) operatorMaxConcurrency(id string) int {
 func (r *Registry) beaconMaxConcurrency(id string) int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	b := r.backends[id]
+	return beaconDeclared(r.backends[id])
+}
+
+// beaconDeclared is beaconMaxConcurrency for callers already holding the lock.
+func beaconDeclared(b *Backend) int {
 	if b == nil || b.lastReg == nil || isManualRow(b) {
 		return 0
 	}

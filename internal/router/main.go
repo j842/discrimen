@@ -3796,9 +3796,10 @@ func intersectFeatures(have []string, also []string) []string {
 // prompt — the clamp patchForwardedBody applies to the caller's max_tokens.
 //
 // Both inputs are the pessimistic reading on purpose, because being wrong here is
-// not symmetric. Grant too little and the answer is short. Grant too much and vLLM
-// neither refuses nor copes: it logs "Requested token count (195302 input + 62770
-// new) exceeds the model's context length. Truncating max_new_tokens" and starts a
+// not symmetric. Grant too little and the answer is short. Grant too much and an
+// endpoint that auto-truncates neither refuses nor copes: SGLang under
+// allow_auto_truncate logs "Requested token count (195302 input + 62770 new)
+// exceeds the model's context length. Truncating max_new_tokens" and starts a
 // prefill it cannot finish, holding the slot at 0% GPU while every later request
 // queues behind it. That is what happened on 2026-08-30, and both readings below
 // are what let it: the window came from the ADVERTISED claim rather than the one

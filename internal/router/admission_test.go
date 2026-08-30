@@ -4,7 +4,8 @@ import "testing"
 
 // The 2026-08-30 wedge, as arithmetic. A worker advertising 192K was handed a
 // prompt whose real size was 195,302 tokens together with a 62,770-token output
-// budget, and vLLM answered by truncating max_new_tokens and starting a prefill
+// budget, and SGLang (allow_auto_truncate=True) answered by truncating
+// max_new_tokens and starting a prefill
 // it could never finish — 0% GPU, every later request queued behind it. Both
 // readings that produced that budget are fixed here: the window is the one
 // routing enforces, and the prompt is sized at the densest ratio rather than the

@@ -146,6 +146,31 @@ func (r *Registry) operatorMaxConcurrency(id string) int {
 	return operatorDeclared(r.backends[id]).MaxConcurrency
 }
 
+// beaconMaxConcurrency is the ceiling a SELF-registering worker declared, or 0.
+//
+// It behaves like llama.cpp's total_slots rather than like an operator's
+// declaration: it can only ever LOWER the ramp, never raise it. A beacon row is
+// the worker describing itself, so letting it inflate its own capacity would let
+// a misconfigured start.sh claim whatever it liked; but a worker does know its
+// own engine's hard limit, and the ramp cannot always see it.
+//
+// SGLang is the case that needs this. It QUEUES past --max-running-requests
+// instead of refusing, so eight concurrent callers all get answers and
+// measureConcurrent reads eight slots' worth of aggregate throughput off a
+// worker running six. Measured on llm-6000pro-qwen38-flash-next 2026-08-30:
+// declared 6, ramp 8, "8 concurrent (aggregate tok/s 1:108 2:179 4:262 8:331)".
+// The over-count is not free — it is what the queue-depth term in
+// expectedLatency prices against.
+func (r *Registry) beaconMaxConcurrency(id string) int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	b := r.backends[id]
+	if b == nil || b.lastReg == nil || isManualRow(b) {
+		return 0
+	}
+	return b.lastReg.MaxConcurrency
+}
+
 // declaredRegistration returns a row's registration AS RECEIVED — what the
 // operator typed, before the profiler wrote its measurements over the fields
 // they left blank. It is what an edit has to be applied to: patching the live

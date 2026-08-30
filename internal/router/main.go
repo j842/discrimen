@@ -117,8 +117,8 @@ type BackendRegistration struct {
 	HealthPath  string   `json:"health_path"`
 	TTLSeconds  int      `json:"ttl_seconds"`
 	// MaxConcurrency is a declared concurrency ceiling. On a MANUAL row it
-	// outranks the capacity ramp outright; on a beacon row it is the seed it has
-	// always been, replaced by the measurement. See providers.go.
+	// outranks the capacity ramp outright; on a beacon row it seeds the ramp and
+	// then caps it, lowering only. See providers.go.
 	MaxConcurrency int    `json:"max_concurrency"`
 	APIKey         string `json:"api_key,omitempty"`
 
@@ -251,6 +251,11 @@ type Backend struct {
 	lastReg        *BackendRegistration
 	profileGen     int64
 	lastModelCheck time.Time
+	// lastServeCheck is when the health loop last proved the worker can actually
+	// COMPLETE something, and serveFailures how many of those in a row have
+	// failed. See serveCheckDue.
+	lastServeCheck time.Time
+	serveFailures  int
 	// rejectedAt is when each RejectedFields entry was learned, so a verdict can
 	// age out and be re-tested instead of standing for the life of the process
 	// (see rejectedFieldTTL).
@@ -3377,6 +3382,30 @@ type hardFilter struct {
 	needTools        bool
 	requiredFeatures []string
 	hardThink        bool
+	// sparsestSizing sizes the prompt at the sparsest ratio any real tokenizer
+	// produces instead of the model's measured one. See hardFilter.optimistic.
+	sparsestSizing bool
+}
+
+// optimistic is this filter sized at maxCharsPerToken — the fewest tokens the
+// text could plausibly be — for the one question "could this prompt fit at all?".
+//
+// The measured ratio is deliberately biased toward over-estimating: calibration
+// moves toward denser at weight 0.5 and away at 0.1, "toward caution in one step,
+// away from it in ten", because under-estimating is what gets a prompt rejected by
+// the endpoint. That bias is the right default and the wrong one at the moment
+// every candidate has just been rejected, because the next step is the overflow
+// gamble. Measured 2026-08-30 on Qwen3.8-Flash-Next-NVFP4 (ratio 2.585): English
+// prose tokenizes at 4.91 chars/token, so the filter sized a real 6,772-token
+// prompt at 12,873 — 1.9x. At that error a prose context filling the 196608 the
+// router itself publishes is sized past every worker in the fleet, and the request
+// is forced onto a worker that cannot take it.
+//
+// Only ever consulted after the normal filter has emptied, so a prompt that fits
+// on its measured size still routes on the measured size.
+func (f hardFilter) optimistic() hardFilter {
+	f.sparsestSizing = true
+	return f
 }
 
 // contextNeededK sizes this request against ONE candidate, in K.
@@ -3398,7 +3427,11 @@ func (f hardFilter) contextNeededK(b *Backend) int {
 	if b != nil {
 		model = b.Model
 	}
-	tokens := tokensForChars(f.promptChars, f.ratios.forModel(model)) + f.reserveTokens
+	cpt := f.ratios.forModel(model)
+	if f.sparsestSizing && maxCharsPerToken > cpt {
+		cpt = maxCharsPerToken
+	}
+	tokens := tokensForChars(f.promptChars, cpt) + f.reserveTokens
 	return int(math.Ceil(float64(tokens) / 1024.0))
 }
 
@@ -3569,7 +3602,18 @@ func (r *Router) planRoute(req *ChatRequest, budget time.Duration, explain bool)
 		// where the router could only have guessed. That refusal is also a sample —
 		// see contextLimitPromptTokens — so the estimate that caused it is corrected
 		// by the very request it turned away.
-		if wantModel == "" {
+		// The estimate that emptied the set is biased high (see hardFilter.
+		// optimistic). Re-ask at the sparsest plausible ratio before gambling: if
+		// the prompt fits any worker on that reading it is an ordinary route to a
+		// worker that can hold it, not an overflow, and the endpoint still has the
+		// final say on the real count.
+		if relaxed := filterCandidates(candidates, func(b *Backend) bool {
+			return admitReason(b, hf.optimistic()) == ""
+		}); len(relaxed) > 0 {
+			log.Printf("context: estimated %dK exceeds every worker, but fits %d of them at the sparsest plausible ratio (%dK) — routing normally",
+				hf.contextNeededK(nil), len(relaxed), hf.optimistic().contextNeededK(nil))
+			filtered = relaxed
+		} else if wantModel == "" {
 			if widest := widestContext(candidates, hf); widest != nil {
 				log.Printf("context overflow: no worker admits an estimated %dK prompt — sending it to %s (%dK) and letting the endpoint rule",
 					hf.contextNeededK(widest), widest.ID, usableContextTokens(widest)/1024)
@@ -3748,11 +3792,38 @@ func intersectFeatures(have []string, also []string) []string {
 // don't clamp). The margin absorbs the difference between our chars/3 estimate
 // and the worker's real tokenizer: overshooting the clamp downward costs a few
 // tokens of answer, overshooting upward is a 400 on a strict engine.
+// budgetCeiling is the output budget this worker can still fit alongside the
+// prompt — the clamp patchForwardedBody applies to the caller's max_tokens.
+//
+// Both inputs are the pessimistic reading on purpose, because being wrong here is
+// not symmetric. Grant too little and the answer is short. Grant too much and an
+// endpoint that auto-truncates neither refuses nor copes: SGLang under
+// allow_auto_truncate logs "Requested token count (195302 input + 62770 new)
+// exceeds the model's context length. Truncating max_new_tokens" and starts a
+// prefill it cannot finish, holding the slot at 0% GPU while every later request
+// queues behind it. That is what happened on 2026-08-30, and both readings below
+// are what let it: the window came from the ADVERTISED claim rather than the one
+// routing enforces, and the prompt from the nominal 3.0 chars/token divisor while
+// the content was nearer 2.25 — a 25% under-count, which is precisely how a 62,770
+// budget survived onto a worker with room for none.
 func budgetCeiling(b *Backend, job jobCost) int {
-	if b == nil || b.ContextK <= 0 {
+	if b == nil {
 		return 0
 	}
-	room := b.ContextK*1024 - job.promptTokens - contextClampMargin
+	window := usableContextTokens(b)
+	if window <= 0 {
+		return 0
+	}
+	prompt := job.promptTokens
+	// minCharsPerToken is the densest any real tokenizer gets on text, so this is
+	// the most tokens the prompt could turn out to be. Never below the estimate:
+	// on sparse text the nominal divisor is already the pessimistic one.
+	if job.promptChars > 0 {
+		if densest := tokensForChars(job.promptChars, minCharsPerToken); densest > prompt {
+			prompt = densest
+		}
+	}
+	room := window - prompt - contextClampMargin
 	if room < contextClampFloor {
 		return contextClampFloor // let the worker itself reject a prompt this close to full
 	}
@@ -5030,6 +5101,108 @@ func (r *Registry) modelCheckDue(id string, interval time.Duration) bool {
 	return true
 }
 
+const (
+	// serveCheckInterval is how often a ready chat worker has to prove it can
+	// still finish something. Cheap enough to run forever (a 1-token completion),
+	// often enough that a wedge is measured in minutes rather than in the time it
+	// takes somebody to notice every model saying "working…".
+	serveCheckInterval = 2 * time.Minute
+	// serveCheckTimeout is generous by two orders of magnitude. A healthy worker
+	// answers this in ~0.2s; the wedged one on 2026-08-30 could not do it in 35.
+	// Nothing in between is a worker anyone wants routed to.
+	serveCheckTimeout = 15 * time.Second
+	// serveCheckFailures required before a worker is pulled. One is not enough:
+	// a worker legitimately saturated with long prefills can miss a deadline
+	// without being broken, and a health check that removes capacity under load
+	// is how an overload becomes an outage.
+	serveCheckFailures = 2
+)
+
+// serveCheckDue reports whether a ready chat backend owes a serving proof, and
+// stamps the time so concurrent ticks don't pile on. Mirrors modelCheckDue.
+func (r *Registry) serveCheckDue(id string, interval time.Duration) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	b := r.backends[id]
+	if b == nil || !b.Certification.Ready || isEmbeddingsOnly(b) {
+		return false
+	}
+	if time.Since(b.lastServeCheck) < interval {
+		return false
+	}
+	b.lastServeCheck = time.Now()
+	return true
+}
+
+// noteServeResult records one serving proof and reports whether the worker has
+// now failed enough of them in a row to be pulled from rotation.
+func (r *Registry) noteServeResult(id string, ok bool) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	b := r.backends[id]
+	if b == nil {
+		return false
+	}
+	if ok {
+		b.serveFailures = 0
+		return false
+	}
+	b.serveFailures++
+	return b.serveFailures >= serveCheckFailures
+}
+
+// checkServing asks the worker for one token and requires an answer inside
+// serveCheckTimeout.
+//
+// A 200 from /health means the HTTP server is up, which is a different claim
+// from "this worker can serve a request" and stops being the same claim exactly
+// when it matters most. On 2026-08-30 a worker held status=ready, healthy=true
+// and a 200 /health for the whole of an outage during which it could not return
+// 16 tokens in 35 seconds: it was stuck on a prefill it could never finish, at
+// 0% GPU, with every request queued behind it. Routing kept choosing it because
+// nothing it measured disagreed.
+func (r *Router) checkServing(backend *Backend) error {
+	// ServedID is only populated once the runtime has been queried; before that
+	// the registered model name is what the worker answers to.
+	served := backend.ServedID
+	if served == "" {
+		served = backend.Model
+	}
+	body, err := json.Marshal(map[string]any{
+		"model":      served,
+		"messages":   []map[string]string{{"role": "user", "content": "ok"}},
+		"max_tokens": 1,
+		// Cheapest possible generation: no sampling, no reasoning preamble. The
+		// question is whether the worker can complete at all, not what it says.
+		"temperature": 0,
+	})
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), serveCheckTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		backendRootURL(backend)+"/v1/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	setBackendCredential(req, backend)
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	// A 4xx is the worker answering — it disagreed with the request, which still
+	// proves it is serving. Only a timeout, a transport failure or a 5xx says it
+	// cannot. Being strict here would pull a worker over a schema quibble.
+	if resp.StatusCode >= 500 {
+		return fmt.Errorf("serving check returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
 func (r *Router) checkBackend(id string) error {
 	backend := r.registry.get(id)
 	if backend == nil {
@@ -5065,6 +5238,22 @@ func (r *Router) checkBackend(id string) error {
 	// Backend is healthy — refresh LastSeen to keep registration alive.
 	// This means TTL only expires for backends that are truly unreachable.
 	r.registry.refreshLastSeen(id)
+
+	// /health only proved the HTTP server is up. Periodically prove the harder
+	// claim as well, and let a run of failures override the 200 above.
+	if r.registry.serveCheckDue(id, serveCheckInterval) {
+		serveErr := r.checkServing(backend)
+		if pull := r.registry.noteServeResult(id, serveErr == nil); pull {
+			msg := fmt.Sprintf("health 200 but not serving: %v", serveErr)
+			log.Printf("backend=%s %s — pulling from rotation", id, msg)
+			r.registry.setHealth(id, false, msg)
+			return errors.New(msg)
+		}
+		if serveErr != nil {
+			log.Printf("backend=%s serving check failed (%v) — one more before pulling", id, serveErr)
+		}
+	}
+
 	r.registry.setHealth(id, true, "")
 	return nil
 }
